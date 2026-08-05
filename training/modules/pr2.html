@@ -1,0 +1,1002 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PR2 · Model Routing, Latency &amp; Cost — FDE Mastery</title>
+<script>(function(){const t=localStorage.getItem('fde-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');})();</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: { extend: {
+    colors: {
+      cream:'#FAF9F5', creamdark:'#0A0A0A', card:'#FFFFFF', carddark:'#161618',
+      sand:'#F0EEE6', sanddark:'#222225', ink:'#141413', inkdark:'#F0EEE9',
+      mute:'#6E6B64', mutedark:'#A8A49B', line:'#E6E3DA', linedark:'#2A2A2E',
+      coral:{ DEFAULT:'#D97757', deep:'#B4532E', soft:'#F7E9E2', softdark:'#4A352C' },
+      viol:{ DEFAULT:'#6d5acd', soft:'#efecfb', softdark:'#332e4d' },
+    },
+    fontFamily: {
+      display:['"Space Grotesk"','Inter','ui-sans-serif','sans-serif'],
+      body:['Inter','ui-sans-serif','-apple-system','sans-serif'],
+      mono:['"JetBrains Mono"','ui-monospace','monospace'],
+    },
+  }}
+};
+</script>
+<link rel="stylesheet" href="../assets/site.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script defer src="../assets/site.js"></script>
+</head>
+<body class="bg-cream dark:bg-creamdark text-ink dark:text-inkdark font-body antialiased">
+
+<div class="min-h-screen lg:flex">
+  <div id="overlay" class="hidden fixed inset-0 bg-black/40 z-30 lg:hidden"></div>
+  <aside id="sidebar" class="fixed z-40 inset-y-0 left-0 w-72 -translate-x-full lg:translate-x-0 transition-transform bg-card dark:bg-carddark border-r border-line dark:border-linedark flex flex-col">
+    <div class="px-5 py-5 border-b border-line dark:border-linedark">
+      <a href="../index.html" class="block">
+        <div class="font-display text-lg font-bold leading-tight">FDE Mastery</div>
+        <div class="text-xs text-mute dark:text-mutedark mt-0.5">AI Forward Deployed Engineer</div>
+      </a>
+    </div>
+    <nav id="module-nav" class="flex-1 overflow-y-auto px-2 py-3"></nav>
+  </aside>
+
+  <main class="flex-1 lg:ml-72 min-w-0">
+    <!-- floating controls (no header bar) -->
+    <button id="menu-btn" class="lg:hidden fixed top-3 left-3 z-20 w-10 h-10 rounded-full border border-line dark:border-linedark bg-card/80 dark:bg-carddark/80 backdrop-blur flex items-center justify-center text-sm hover:border-coral hover:bg-sand dark:hover:bg-sanddark transition-colors">☰</button>
+    <button data-theme-toggle class="fixed top-3 right-3 z-20 w-10 h-10 rounded-full border border-line dark:border-linedark bg-card/80 dark:bg-carddark/80 backdrop-blur flex items-center justify-center hover:border-coral hover:bg-sand dark:hover:bg-sanddark transition-colors" aria-label="Toggle theme">
+      <span data-theme-icon class="inline-flex align-middle"></span>
+    </button>
+
+    <div class="hero-gradient">
+      <article class="max-w-[52rem] mx-auto px-6 pt-20 lg:pt-12 pb-2 prose-fde">
+        <div class="flex flex-wrap items-center gap-1.5">
+          <span data-group-chip class="badge"></span>
+          <span class="badge badge-critical">Critical skill</span>
+          <span class="badge badge-neutral">Target score: 3 / 4</span>
+          <span class="badge badge-accent">~1.5 weeks · 4 labs</span>
+        </div>
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Model Routing, Latency &amp; Cost</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Choose models by task, cache what repeats, stream what's slow, and measure everything —
+          the engineering discipline that turns a $45K/month pilot bill into a $12K/month production system
+          the CFO signs off without flinching.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters for an FDE:</strong> Cost is the #1 reason pilots never reach production —
+          FDEs must design for cost from the start. The demo that wowed everyone at 50 requests/day becomes
+          a budget line nobody approves at 50,000/day, unless routing, caching and latency were engineered in
+          from week one.
+        </div>
+      </article>
+    </div>
+
+    <article class="max-w-[52rem] mx-auto px-6 pb-12 prose-fde">
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · The cost equation, mastered</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Where the money actually goes</h2>
+
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Every LLM bill in existence reduces to one equation. Learn it cold, because every optimization
+        in this module is an attack on one of its terms:
+      </p>
+      <pre class="code mt-3">cost = Σ over requests of
+       ( input_tokens  × price_in
+       + cached_tokens × price_cached      <span class="cm"># ~0.1× price_in on reads</span>
+       + output_tokens × price_out )       <span class="cm"># output is ~5× input price!</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Reference prices (standard first-party rates, per <strong>million</strong> tokens, as of mid-2026 —
+        always re-check before quoting a customer):
+      </p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Model</th><th class="px-4 py-3">Input / 1M</th><th class="px-4 py-3">Output / 1M</th><th class="px-4 py-3">Cache read / 1M</th><th class="px-4 py-3">Character</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">claude-sonnet-5</td><td class="px-4 py-3 font-mono">$3.00</td><td class="px-4 py-3 font-mono">$15.00</td><td class="px-4 py-3 font-mono">$0.30</td><td class="px-4 py-3">The production workhorse — near-Opus quality on most tasks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">claude-haiku-4-5-20251001</td><td class="px-4 py-3 font-mono">$1.00</td><td class="px-4 py-3 font-mono">$5.00</td><td class="px-4 py-3 font-mono">$0.10</td><td class="px-4 py-3">Fast &amp; cheap — classification, condensation, extraction, easy Q&amp;A</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two ratios drive everything downstream: <strong>output costs ~5× input</strong> (verbose answers are
+        expensive answers), and <strong>Sonnet costs 3× Haiku</strong> (every request that Haiku could have
+        handled is a 3× overpayment). Cache reads at ~0.1× make re-sent context nearly free —
+        <em>if</em> you engineer for the cache (Part III).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The four leaks in real systems</h3>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Where LLM spend leaks">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">ONE REQUEST, DISSECTED — every box is billed, every request</text>
+          <g class="anim-pulse"><rect x="10" y="36" width="150" height="46" rx="9" fill="#0284C7"/><text x="85" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">System prompt</text><text x="85" y="70" text-anchor="middle" fill="#ffffffbb" font-size="9">2,000 tok · re-sent every call</text></g>
+          <g class="anim-pulse d1"><rect x="180" y="36" width="140" height="46" rx="9" fill="#0284C7"/><text x="250" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">History / chunks</text><text x="250" y="70" text-anchor="middle" fill="#ffffffbb" font-size="9">1,500–4,000 tok · grows</text></g>
+          <g class="anim-pulse d2"><rect x="340" y="36" width="110" height="46" rx="9" fill="#0284C7"/><text x="395" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Question</text><text x="395" y="70" text-anchor="middle" fill="#ffffffbb" font-size="9">200 tok · the only new part</text></g>
+          <g class="anim-pulse d3"><rect x="480" y="36" width="90" height="46" rx="9" fill="#6d5acd"/><text x="525" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Model</text><text x="525" y="70" text-anchor="middle" fill="#ffffffbb" font-size="9">which one?</text></g>
+          <g class="anim-pulse d4"><rect x="600" y="36" width="90" height="46" rx="9" fill="#D97757"/><text x="645" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Output</text><text x="645" y="70" text-anchor="middle" fill="#ffffffbb" font-size="9">300 tok × 5× price</text></g>
+          <line x1="160" y1="59" x2="176" y2="59" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="320" y1="59" x2="336" y2="59" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="450" y1="59" x2="476" y2="59" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="570" y1="59" x2="596" y2="59" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="12" y="118" font-size="11" font-weight="700" fill="#6E6B64">THE FOUR LEAKS</text>
+          <g><rect x="10" y="130" width="160" height="52" rx="9" fill="none" stroke="#DB2777" stroke-width="1.5"/><text x="90" y="150" text-anchor="middle" fill="#DB2777" font-size="10" font-weight="700">Re-sent system prompts</text><text x="90" y="166" text-anchor="middle" fill="#6E6B64" font-size="9">fix: prompt caching (III)</text></g>
+          <g><rect x="185" y="130" width="160" height="52" rx="9" fill="none" stroke="#DB2777" stroke-width="1.5"/><text x="265" y="150" text-anchor="middle" fill="#DB2777" font-size="10" font-weight="700">Retrieval stuffing</text><text x="265" y="166" text-anchor="middle" fill="#6E6B64" font-size="9">fix: rerank, fewer chunks (AI4)</text></g>
+          <g><rect x="360" y="130" width="160" height="52" rx="9" fill="none" stroke="#DB2777" stroke-width="1.5"/><text x="440" y="150" text-anchor="middle" fill="#DB2777" font-size="10" font-weight="700">Verbose outputs</text><text x="440" y="166" text-anchor="middle" fill="#6E6B64" font-size="9">fix: max_tokens + format (IV)</text></g>
+          <g><rect x="535" y="130" width="155" height="52" rx="9" fill="none" stroke="#DB2777" stroke-width="1.5"/><text x="612" y="150" text-anchor="middle" fill="#DB2777" font-size="10" font-weight="700">Agent loop multipliers</text><text x="612" y="166" text-anchor="middle" fill="#6E6B64" font-size="9">fix: cache + cap iterations</text></g>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note what's <em>not</em> a leak: the user's actual question. In a typical chatbot request the genuinely
+        new content is ~5% of the input tokens. The other 95% is repeated context — which is exactly why
+        caching and routing move the bill so dramatically.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Three worked examples — the dominant term moves</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Do this arithmetic by hand once and you'll never again nod through a "roughly a few cents per call"
+        estimate. All three use <code class="inline">claude-sonnet-5</code> at $3/$15 per 1M tokens.
+      </p>
+
+      <div class="mt-4 rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 text-sm leading-relaxed">
+        <div class="font-semibold text-sky-600 dark:text-sky-400">Example 1 — Support chatbot at 50K requests/day</div>
+        <pre class="code mt-2">per request: 2,000 (system) + 1,500 (history) + 200 (question) = 3,700 input · 300 output
+input:  3,700 × $3.00 / 1M  = $0.0111
+output:   300 × $15.00 / 1M = $0.0045
+total:  $0.0156 / request  →  × 50,000/day = <span class="out">$780/day ≈ $23,400/month</span>
+dominant term: INPUT — 71% of spend, and 95% of the input is repeated context</pre>
+        <p class="mt-2 text-mute dark:text-mutedark">Cache the 2,000-token system prompt and stable history prefix and that 71% collapses: 3,500 tokens at $0.30/1M instead of $3.00/1M saves ~$0.0095/request — <strong>$472/day</strong> from one config change.</p>
+      </div>
+
+      <div class="mt-4 rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 text-sm leading-relaxed">
+        <div class="font-semibold text-sky-600 dark:text-sky-400">Example 2 — RAG answering at 10K requests/day</div>
+        <pre class="code mt-2">per request: 800 (system) + 5 × 800 (chunks) + 50 (query) = 4,850 input · 350 output
+input:  4,850 × $3.00 / 1M  = $0.01455   ← retrieved chunks alone: $0.0120 (82%)
+output:   350 × $15.00 / 1M = $0.00525
+total:  $0.0198 / request  →  × 10,000/day = <span class="out">$198/day ≈ $5,940/month</span>
+dominant term: RETRIEVAL STUFFING — the 4,000 chunk tokens dwarf everything</pre>
+        <p class="mt-2 text-mute dark:text-mutedark">Reranking 25→3 chunks instead of shipping top-5 (see <a href="./ai4.html" class="text-viol underline decoration-viol/40">AI4</a>) cuts chunk tokens 40% with <em>higher</em> answer quality — irrelevant chunks distract the model. Cost and quality improve together; measure both.</p>
+      </div>
+
+      <div class="mt-4 rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 text-sm leading-relaxed">
+        <div class="font-semibold text-sky-600 dark:text-sky-400">Example 3 — A 12-iteration agent, 1K tasks/day</div>
+        <pre class="code mt-2">each iteration re-sends the FULL history; each adds ~1,500 tok of tool results
+input  = Σ (3,000 + 1,500·(i−1)) for i=1..12 = 36,000 + 1,500 × 66 = 135,000 tok/task
+output = 12 × 400 = 4,800 tok/task
+cost   = 135,000 × $3/1M + 4,800 × $15/1M = $0.405 + $0.072 = <span class="out">$0.48/task → $477/day</span>
+dominant term: THE LOOP — context grows quadratically; one task = ~30 chatbot requests</pre>
+        <p class="mt-2 text-mute dark:text-mutedark">Agents multiply every other leak by the iteration count. Two mandatory fixes: conversation-prefix caching (the re-sent 99,000 tokens become ~$0.03 instead of ~$0.30), and a hard iteration cap — a runaway retry loop is the classic "why is today's bill 40×" incident (Part V).</p>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The pre-sales cost model: estimate BEFORE building</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The score-3 habit that saves engagements: build the cost model in the <em>scoping call</em>, not after
+        the pilot bill lands. You need four numbers — requests/day at target scale, average input tokens,
+        average output tokens, and the model mix — and ten minutes of the arithmetic above. Then present it as
+        <strong>cost-per-outcome, never cost-per-token</strong>: "$0.09 per ticket processed, versus $4.20 of
+        agent handling time" is a business case; "$0.0156 per request" is a shrug. Scope-stage economics and
+        the value narrative live in <a href="./fd4.html" class="text-viol underline decoration-viol/40">FD4</a> —
+        this module gives you the numbers to put in it.
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> put the cost model <em>in the proposal</em>, with the routing and caching
+        plan that keeps it flat as volume grows. "At 10× your pilot volume this costs $X because we designed
+        for it" is the sentence that gets production budgets approved — and the one competitors who demoed
+        with a single expensive model can't say.
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Routing strategies</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The right model for each task, provably</h2>
+
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Routing is the highest-leverage cost decision because it's multiplicative: everything else (caching,
+        output discipline) applies <em>on top of</em> whichever per-token price you routed to. Strategies below
+        are ordered by value-per-risk — start at the top.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">1 · Static routing by task type — most value, zero risk</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Your application is not one workload; it's a bundle of features with wildly different difficulty.
+        Query condensation, intent classification, field extraction — these are Haiku-grade tasks that most
+        teams accidentally run on their most expensive model because "that's the client we instantiated."
+        A config map fixes it permanently:
+      </p>
+      <pre class="code mt-3">CHEAP  = "claude-haiku-4-5-20251001"
+STRONG = "claude-sonnet-5"
+
+ROUTES = {
+    "condense_query":  {"model": CHEAP,  "max_tokens": 60},
+    "classify_intent": {"model": CHEAP,  "max_tokens": 10},
+    "extract_fields":  {"model": CHEAP,  "max_tokens": 400},
+    "answer_grounded": {"model": STRONG, "max_tokens": 600},
+    "write_report":    {"model": STRONG, "max_tokens": 2000},
+}
+
+def call(feature, system, user_content, **overrides):
+    cfg = {**ROUTES[feature], **overrides}          <span class="cm"># route is config, not code</span>
+    return client.messages.create(
+        model=cfg["model"], max_tokens=cfg["max_tokens"],
+        system=system, messages=[{"role": "user", "content": user_content}])</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This is deterministic, auditable, and instantly explainable to a customer. Rule of thumb:
+        <strong>cheap model for plumbing, strong model for the output the user reads.</strong>
+        Most systems get 30–50% of their savings from this table alone.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">2 · Heuristic routing by input shape</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Within one feature, route by cheap signals: input length (a 200-token question and a 40-page contract
+        are different jobs), presence of code blocks or tables, or keyword triggers ("compare", "analyze
+        step by step" → strong model). Heuristics are crude proxies — deploy them only with an eval showing
+        the boundary doesn't leak hard cases to the cheap path.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">3 · The dynamic cascade — cheap first, escalate on doubt</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The workhorse pattern for mixed-difficulty traffic: <strong>Haiku answers everything</strong>, reports
+        its own confidence (or is checked by a validator), and only low-confidence requests escalate to Sonnet.
+        You pay double for escalated requests — the cascade wins because most traffic never escalates:
+      </p>
+      <pre class="code mt-3">blend = p_easy × cost_cheap + (1 − p_easy) × (cost_cheap + cost_strong)
+
+<span class="cm"># chatbot from Example 1, 80% handled by Haiku:</span>
+haiku/req  = 3,700 × $1/1M + 300 × $5/1M            = $0.0052
+sonnet/req = 3,700 × $3/1M + 300 × $15/1M           = $0.0156
+cascade    = 0.8 × $0.0052 + 0.2 × ($0.0052 + $0.0156) = <span class="out">$0.0083/req  — 47% below Sonnet-only</span></pre>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    Q([Request]) --> SR{Static route<br/>by feature}
+    SR -->|condense · classify<br/>· extract| H1[Haiku<br/>terse config]
+    SR -->|user-facing<br/>answer| CG[Haiku answers +<br/>self-reported confidence]
+    CG -->|confidence high<br/>AND validator passes| OUT([Response])
+    CG -->|confidence low<br/>OR validator fails| S[Sonnet<br/>escalation]
+    S --> OUT
+    H1 --> OUT
+    S -.->|log route + tokens| M[(Metering<br/>PR1)]
+    CG -.->|log route + tokens| M
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The gate matters more than the models. Self-reported confidence ("end with CONFIDENCE: high|medium|low")
+        is imperfect but surprisingly usable when the model is told to be honest and the threshold is tuned
+        against a golden set. Sturdier gates: a mechanical validator (does the answer cite a source? parse as
+        JSON? pass the regex?) or a Haiku-as-checker second call. Lab 2 builds this end-to-end and
+        <strong>measures the quality delta against your <a href="./ai9.html" class="text-viol underline decoration-viol/40">AI9</a>
+        golden set — it should be ≈0 while cost drops ~40–50%</strong>. Never ship a cascade whose quality retention
+        you haven't measured; that's the difference between engineering and hoping.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">4 · Classifier-router, reasoning dials, and fallback</h3>
+      <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Classifier-router:</strong> a tiny, fast model (or even embeddings + nearest-centroid) labels the intent, and a config table maps intent → model + prompt. Shines when you have many distinct intents with different difficulty; costs one extra cheap hop of latency and a classifier you must maintain and eval.</li>
+        <li><strong>Reasoning on/off as a routing dimension:</strong> model choice isn't the only dial. On current models, extended/adaptive thinking depth (the <code class="inline">effort</code> setting) is a second axis — run easy paths at low effort and reserve high effort for genuinely hard requests. Same model, very different token spend and latency. Treat effort levels exactly like model routes: put them in the config table and eval each path.</li>
+        <li><strong>Fallback-on-error is routing too:</strong> on 429/529/timeouts, retry once with backoff, then route to the alternate model rather than failing the user. This buys availability, not savings — and the fallback path needs its own eval, because "we silently degraded quality during the outage" is a real incident type. Resilience patterns live in <a href="./ai2.html" class="text-viol underline decoration-viol/40">AI2</a>.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">The routing decision table</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Strategy</th><th class="px-4 py-3">Use when</th><th class="px-4 py-3">Typical saving</th><th class="px-4 py-3">Risk / cost</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Static by task type</td><td class="px-4 py-3">Always — first thing you do</td><td class="px-4 py-3">30–50%</td><td class="px-4 py-3">None; needs a task taxonomy</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Input-shape heuristics</td><td class="px-4 py-3">One feature, visibly bimodal difficulty</td><td class="px-4 py-3">10–20%</td><td class="px-4 py-3">Crude boundary — eval it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Dynamic cascade</td><td class="px-4 py-3">Mixed-difficulty user-facing traffic at volume</td><td class="px-4 py-3">40–50%</td><td class="px-4 py-3">Gate tuning + escalation latency on hard requests</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Classifier-router</td><td class="px-4 py-3">Many intents, different difficulty per intent</td><td class="px-4 py-3">varies</td><td class="px-4 py-3">Extra hop; classifier drift needs monitoring</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Effort / reasoning dial</td><td class="px-4 py-3">Hard-path features on reasoning-capable models</td><td class="px-4 py-3">20–60% of thinking spend</td><td class="px-4 py-3">Mis-gated hard tasks under-think</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Fallback-on-error</td><td class="px-4 py-3">Always, for availability</td><td class="px-4 py-3">0% (resilience)</td><td class="px-4 py-3">Unevaled quality delta on fallback path</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Routing without an eval is gambling with quality.</strong> Every route boundary — cascade gate,
+        heuristic threshold, fallback model — is a place where a user can silently get a worse answer. The
+        golden set from <a href="./ai9.html" class="text-viol underline decoration-viol/40">AI9</a> is the
+        instrument that makes routing an engineering decision: run it per-route, compare, then ship.
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Caching, deeply</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pay for a token once, read it for a tenth</h2>
+
+      <h3 class="font-semibold text-lg mt-7">Provider prompt caching: the mechanics that bite</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Prompt caching is a <strong>prefix match on exact bytes</strong>. The request renders as
+        <code class="inline">tools → system → messages</code>; you place <code class="inline">cache_control</code>
+        breakpoints (max 4), and any byte that differs anywhere <em>before</em> a breakpoint invalidates
+        everything after it. The economics (full treatment in <a href="./fn2.html" class="text-viol underline decoration-viol/40">FN2</a>):
+        cache <em>writes</em> cost 1.25× input price (2× for 1-hour TTL), cache <em>reads</em> cost ~0.1×.
+        With the default 5-minute TTL you break even at two requests; everything after is ~90% off the cached span.
+      </p>
+      <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Stable-prefix design:</strong> frozen system prompt first, deterministic tool list (sorted!), then per-session context, then per-request content <em>after</em> the last breakpoint. This is an architecture decision, not a flag — retrofit is painful.</li>
+        <li><strong>Minimum cacheable prefix is model-dependent</strong> and fails <em>silently</em> below it: ~1,024 tokens on <code class="inline">claude-sonnet-5</code>, ~4,096 on <code class="inline">claude-haiku-4-5-20251001</code>. A 2K-token prompt caches on one and silently doesn't on the other — a routing × caching interaction most teams discover on the invoice.</li>
+        <li><strong>TTL behavior:</strong> 5 minutes by default, refreshed on read; 1-hour TTL for bursty traffic with gaps (at 2× write cost — needs ≥3 reads to pay off). Traffic arriving more often than the TTL keeps itself warm.</li>
+        <li><strong>Measure hit rate from the response</strong>, never assume: <code class="inline">usage.cache_read_input_tokens</code> (served at 0.1×), <code class="inline">usage.cache_creation_input_tokens</code> (the 1.25× write), <code class="inline">usage.input_tokens</code> (full price). If reads stay zero across identical-prefix requests, a silent invalidator is at work.</li>
+      </ul>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Silent cache killer</th><th class="px-4 py-3">Why it kills</th><th class="px-4 py-3">Fix</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-mono text-xs">datetime.now() in system prompt</td><td class="px-4 py-3">Prefix differs every request</td><td class="px-4 py-3">Inject the date late, in the user turn</td></tr>
+            <tr><td class="px-4 py-3 font-mono text-xs">request_id / uuid early in content</td><td class="px-4 py-3">Every request is unique bytes</td><td class="px-4 py-3">Move after the last breakpoint, or drop</td></tr>
+            <tr><td class="px-4 py-3 font-mono text-xs">json.dumps() without sort_keys</td><td class="px-4 py-3">Non-deterministic serialization</td><td class="px-4 py-3"><code class="inline">sort_keys=True</code>, stable tool order</td></tr>
+            <tr><td class="px-4 py-3 font-mono text-xs">per-user tool sets / A-B prompt flags</td><td class="px-4 py-3">Tools render at position 0 — full invalidation</td><td class="px-4 py-3">One tool set; pass modes as message content</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Response-level caching: don't call the model at all</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Prompt caching discounts a call; response caching <em>eliminates</em> it — the only 100% saving there is.
+        Three tiers, in order of safety:
+      </p>
+      <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Exact-match cache</strong> for idempotent operations: key = hash(model + prompt version + normalized input). Perfect for classification, extraction, condensation of repeated inputs. Zero false hits; include the prompt version in the key so a prompt change invalidates cleanly.</li>
+        <li><strong>Semantic cache</strong> for user-phrased questions: embed the query, serve a stored answer when cosine similarity to a previous query exceeds a threshold. The trade-off is unavoidable — a loose threshold (0.90) serves wrong answers to questions that merely <em>look</em> alike ("refund policy for EU?" vs "refund policy for enterprise?"); a tight one (0.98) rarely hits. Tune against real query pairs, log every semantic hit for audit, and never semantic-cache anything user-specific or permission-scoped.</li>
+        <li><strong>Negative caching</strong> for known-bad inputs: cache the refusal/error for inputs you've already classified as unanswerable, out-of-scope, or abusive. Stops a retry-happy client (or an attacker probing your guardrails) from billing you for the same "no" thousands of times.</li>
+      </ul>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Invalidation policy is part of the design</strong>, not an afterthought: exact and semantic
+        caches must be flushed (or version-keyed) when the underlying documents, prompt, or model change —
+        a stale cached answer citing last quarter's policy is a correctness bug wearing a cost-optimization
+        costume. Write the invalidation triggers down in the same doc as the cache.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Latency engineering</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Fast enough to feel instant, measured well enough to prove it</h2>
+
+      <h3 class="font-semibold text-lg mt-7">The anatomy of a slow response</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <svg viewBox="0 0 700 170" class="w-full min-w-[620px]" role="img" aria-label="Latency anatomy timeline">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">ONE REQUEST'S CLOCK — total = network + queue + prefill (TTFT) + decode</text>
+          <rect x="10"  y="40" width="70"  height="34" rx="7" fill="#64748B"/><text x="45"  y="61" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">network</text>
+          <rect x="84"  y="40" width="60"  height="34" rx="7" fill="#64748B"/><text x="114" y="61" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">queue</text>
+          <rect x="148" y="40" width="150" height="34" rx="7" fill="#D97706"/><text x="223" y="61" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">prefill — reads input</text>
+          <rect x="302" y="40" width="388" height="34" rx="7" fill="#0D9488"/><text x="496" y="61" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">decode — writes output, token by token</text>
+          <g class="anim-token" style="--slide:360px"><circle cx="320" cy="57" r="4" fill="#fff"/></g>
+          <g class="anim-token t2" style="--slide:360px"><circle cx="320" cy="57" r="4" fill="#ffffffaa"/></g>
+          <line x1="302" y1="84" x2="302" y2="100" stroke="#D97706" stroke-width="1.5"/>
+          <text x="302" y="114" text-anchor="middle" font-size="10" font-weight="700" fill="#D97706">TTFT — user sees the first token here</text>
+          <text x="12" y="146" font-size="10" fill="#6E6B64">prefill scales with INPUT tokens (long prompts = slow first token) · decode scales with OUTPUT tokens — the usual dominant term</text>
+          <text x="12" y="162" font-size="10" fill="#6E6B64">⇒ the two biggest latency levers are the same as the two biggest cost levers: shorter inputs, shorter outputs</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Approximate mental model: <code class="inline">total ≈ TTFT + output_tokens / decode_rate</code>.
+        A 600-token answer at ~60 tok/s is ~10 seconds of decode no matter how clever your infrastructure —
+        which is why output-length discipline (below) is a latency feature, not just a cost feature.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Streaming: the UX weapon</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Streaming doesn't make the model faster — it makes the wait <em>feel</em> like reading instead of
+        waiting. Perceived latency is TTFT (often &lt;1s) rather than total time (often 10s+). Every
+        user-facing text surface should stream; pair it with skeleton states for pre-TTFT ("Searching your
+        documents…") so no phase is a dead spinner. Non-streamed responses are fine for pipelines and
+        anything a human isn't watching.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Parallelize what's independent</h3>
+      <pre class="code mt-3">import asyncio, anthropic
+
+aclient = anthropic.AsyncAnthropic()
+
+async def summarize(doc):
+    msg = await aclient.messages.create(
+        model="claude-haiku-4-5-20251001", max_tokens=300,
+        messages=[{"role": "user", "content": f"Summarize in 3 bullets:\n{doc}"}])
+    return msg.content[0].text
+
+async def summarize_all(docs):                     <span class="cm"># 10 docs: ~1× latency, not 10×</span>
+    return await asyncio.gather(*(summarize(d) for d in docs))</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Sequential-by-habit code is the most common self-inflicted latency wound: N independent calls in a
+        loop is N× slower for zero benefit. A spicier variant is the <strong>speculative parallel</strong>
+        race — fire cheap and strong simultaneously, return the cheap answer if it passes the validator,
+        else wait for the strong one. Latency of the cascade's slow path disappears; the price is paying for
+        both calls on easy requests, so it only makes sense on latency-critical routes where the cheap model
+        usually wins.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Output-length discipline</h3>
+      <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong><code class="inline">max_tokens</code> per route</strong>, sized to the task: a classification needs 10, a condensed query 60, a grounded answer 600. A generous default cap invites the model to fill it — remember every route in the Part II table carries its own cap.</li>
+        <li><strong>Terse formats:</strong> ask for the label, not the essay ("Respond with only the category name"); JSON fields instead of prose where a machine consumes the output; "3 bullets, max 15 words each" for summaries. Instructed brevity beats truncation — a <code class="inline">max_tokens</code> cut-off mid-sentence is a bug, not a saving.</li>
+        <li><strong>Stop sequences</strong> end generation the instant a structural boundary is reached — e.g. stop at <code class="inline">"\n\n"</code> for single-paragraph answers or at a closing delimiter for templated output — so you never pay for tokens after the answer is complete.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Model size vs latency — and how to measure honestly</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Route</th><th class="px-4 py-3">TTFT (typical)</th><th class="px-4 py-3">Decode speed</th><th class="px-4 py-3">Feels like</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Haiku, short output</td><td class="px-4 py-3">fastest</td><td class="px-4 py-3">fastest</td><td class="px-4 py-3">Instant — right for interactive plumbing (condense, classify)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sonnet, streamed</td><td class="px-4 py-3">moderate</td><td class="px-4 py-3">moderate</td><td class="px-4 py-3">Reading speed — right for user-facing answers</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sonnet + high effort / long output</td><td class="px-4 py-3">slow (thinking first)</td><td class="px-4 py-3">moderate</td><td class="px-4 py-3">A wait — reserve for hard paths, always stream, show progress</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cascade escalation</td><td class="px-4 py-3">cheap TTFT + full strong call</td><td class="px-4 py-3">—</td><td class="px-4 py-3">Slowest path — monitor its p95 separately</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Measure with the numbers users experience: <strong>TTFT and total time, at p50 and p95, per feature —
+        never averages.</strong> An average hides the tail, and the tail is what users complain about; one
+        slow route blended into a global mean is invisible. The measurement harness:
+      </p>
+      <pre class="code mt-3">import time
+
+def measure(model, messages, **kw):
+    t0, ttft = time.perf_counter(), None
+    with client.messages.stream(model=model, max_tokens=600,
+                                messages=messages, **kw) as stream:
+        for text in stream.text_stream:
+            if ttft is None:
+                ttft = time.perf_counter() - t0    <span class="cm"># first token = perceived latency</span>
+        final = stream.get_final_message()
+    return {"ttft": ttft, "total": time.perf_counter() - t0,
+            "out_tokens": final.usage.output_tokens}
+
+<span class="cm"># run ≥20 iterations per route; report p50/p95, not mean — Lab 4 automates this</span></pre>
+
+      <!-- ═══════════════ PART V ═══════════════ -->
+      <div class="kicker text-rose-500 mt-14">Part V · Cost governance in production</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Budgets, alerts, and the monthly ritual</h2>
+
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Optimization is a project; governance is a system. Once live, cost must be <em>bounded</em> (budgets),
+        <em>watched</em> (alerts), and <em>reviewed</em> (the ritual) — or six months of drift quietly undoes
+        everything Parts I–IV won.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Budgets per feature and tenant, with hard caps</h3>
+      <pre class="code mt-3">def guarded_call(feature, tenant, system, user_content):
+    <span class="cm"># 1 · pre-flight estimate — count real tokens, don't guess</span>
+    est_in = client.messages.count_tokens(
+        model=ROUTES[feature]["model"], system=system,
+        messages=[{"role": "user", "content": user_content}]).input_tokens
+    est = cost_per_request(ROUTES[feature]["model"],
+                           est_in, ROUTES[feature]["max_tokens"])
+
+    <span class="cm"># 2 · running meter (backed by the PR1 trace pipeline)</span>
+    spent = meter.today(tenant, feature)
+    if spent + est &gt; BUDGETS[feature]["daily_cap"]:
+        raise BudgetExceeded(feature, tenant, spent)   <span class="cm"># degrade or queue, don't just 500</span>
+
+    msg = call(feature, system, user_content)
+
+    <span class="cm"># 3 · meter ACTUAL usage from the response — estimates drift, usage doesn't</span>
+    meter.add(tenant, feature, cost_from_usage(ROUTES[feature]["model"], msg.usage))
+    return msg</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Log model, feature, tenant, and all four usage fields (input / output / cache-read / cache-write) on
+        <strong>every</strong> call — this is the same trace pipeline as
+        <a href="./pr1.html" class="text-viol underline decoration-viol/40">PR1</a>, with cost as one more
+        dimension. Per-tenant caps also protect you commercially: one enthusiastic customer script can't eat
+        the whole engagement's budget.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Anomaly alerts: a cost spike is a bug report</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Alert on day-over-day spend per feature (e.g. &gt;2× trailing 7-day median). In practice a cost spike
+        is almost never "usage grew" — it's a <strong>retry loop</strong> hammering the API, a <strong>prompt
+        edit</strong> that broke the cache prefix (watch cache hit-rate drop in the same graph), an
+        <strong>agent</strong> that lost its iteration cap, or a deploy that silently rerouted a Haiku feature
+        to Sonnet. The alert that fires within hours turns a five-figure invoice surprise into a same-day fix.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The monthly cost review ritual</h3>
+      <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Top 5 features by spend</strong> — is the ranking expected? Any feature whose cost-per-request crept up?</li>
+        <li><strong>Top tenants</strong> — concentration risk, and who's approaching their cap.</li>
+        <li><strong>Cache hit rate per feature</strong> — a falling hit rate means someone broke a prefix; find the commit.</li>
+        <li><strong>Routing mix drift</strong> — escalation rate on cascades trending up? The cheap model may be degrading on new traffic, or the gate threshold rotted. Re-run the golden set.</li>
+        <li><strong>Cost-per-outcome</strong> — the number the customer sees. Keep the "$/ticket vs staff cost" slide current; it's your renewal argument.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">The cost regression test</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Your eval suite (<a href="./ai9.html" class="text-viol underline decoration-viol/40">AI9</a>) already
+        runs on every prompt change — make it report <strong>token usage alongside quality</strong>. A prompt
+        edit that adds 800 tokens of instructions, or coaxes 2× longer answers, is a cost regression exactly
+        like a quality regression, and CI should fail on it the same way:
+      </p>
+      <pre class="code mt-3"><span class="cm"># in the eval harness — after asserting quality:</span>
+tokens = sum(r.usage.input_tokens + r.usage.output_tokens for r in results)
+baseline = json.load(open("eval_token_baseline.json"))["total_tokens"]
+assert tokens &lt;= baseline * 1.10, (
+    f"Cost regression: {tokens} tokens vs baseline {baseline} (+10% budget). "
+    "Intentional? Update the baseline in the same PR.")</pre>
+      <div class="mt-4 callout callout-info">
+        <strong>Why this matters:</strong> prompt bloat is the most common silent cost creep — every incident
+        adds "one more instruction", nobody ever removes one, and a year later the system prompt is 6,000
+        tokens of scar tissue re-sent on every call. A 10%-budget assertion in CI makes the creep visible at
+        the pull request, where it's a conversation instead of an invoice.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Uses whatever model the tutorial used; has never opened the pricing page.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows the cost equation and the price ratios; can explain why output tokens and model choice dominate a bill.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Has swapped a model to save money and turned on caching once; doesn't measure hit rates, latency percentiles, or quality deltas — optimizes by vibes.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Independent production (target).</strong> Builds the pre-sales cost model; ships static routing + a measured cascade with ≈0 quality delta; designs stable-prefix caching and verifies hit rates; streams user-facing paths and reports TTFT/p95 per feature; meters spend per feature/tenant with caps and a cost regression test in CI.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Designs org-wide cost governance across engagements; sets routing/caching standards and review rituals; catches cost architecture risks in other teams' designs before they ship; teaches the cost-per-outcome narrative to sales.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 3:</strong> a customer says "the bill doubled this week." Write down,
+        in order, the four dashboards you'd open and what each would prove. (Spend by feature → cache hit rate
+        on the spiked feature → routing mix / escalation rate → trace samples for retry loops or prompt-length
+        change. If that sequence isn't automatic, revisit Part V.)
+      </div>
+
+      <!-- ═══════════════ labs ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on labs</h2>
+      <p class="mt-2 text-sm text-mute dark:text-mutedark">
+        Click a lab for the full step-by-step guide. Shared prereqs:
+        <code class="inline">pip install anthropic</code>, an Anthropic API key, and your 20+ question
+        golden set from AI9 (Lab 2 needs it to measure quality retention).
+        Lab 4 produces this module's evidence artifact.
+      </p>
+
+      <div class="mt-5 grid sm:grid-cols-2 gap-4">
+        <div class="lab-card rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5" style="--lab-color:#0ea5e9">
+          <div class="flex items-center justify-between">
+            <span class="text-white text-xs font-bold rounded-md px-2 py-1" style="background:#0ea5e9">LAB 1</span>
+            <span class="text-xs text-mute dark:text-mutedark">~1.5 h</span>
+          </div>
+          <h3 class="font-semibold mt-3">The cost model</h3>
+          <p class="mt-1.5 text-sm text-mute dark:text-mutedark leading-relaxed">Script + spreadsheet pricing a real feature at 1K/50K/500K req/day across Sonnet-only, Haiku-only, and an 80/20 cascade — ending in the decision chart.</p>
+          <button data-modal-open="lab1" class="lab-open-btn mt-4 w-full rounded-lg text-white text-sm font-semibold py-2" style="background:#0ea5e9">Open lab →</button>
+        </div>
+        <div class="lab-card rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5" style="--lab-color:#14b8a6">
+          <div class="flex items-center justify-between">
+            <span class="text-white text-xs font-bold rounded-md px-2 py-1" style="background:#14b8a6">LAB 2</span>
+            <span class="text-xs text-mute dark:text-mutedark">~2.5 h</span>
+          </div>
+          <h3 class="font-semibold mt-3">Build the cascade router</h3>
+          <p class="mt-1.5 text-sm text-mute dark:text-mutedark leading-relaxed">Haiku-first with a confidence gate and validator escalation to Sonnet — run against your golden set, measure quality delta (≈0) and cost delta (big), tune the gate.</p>
+          <button data-modal-open="lab2" class="lab-open-btn mt-4 w-full rounded-lg text-white text-sm font-semibold py-2" style="background:#14b8a6">Open lab →</button>
+        </div>
+        <div class="lab-card rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5" style="--lab-color:#6d5acd">
+          <div class="flex items-center justify-between">
+            <span class="text-white text-xs font-bold rounded-md px-2 py-1" style="background:#6d5acd">LAB 3</span>
+            <span class="text-xs text-mute dark:text-mutedark">~1.5 h</span>
+          </div>
+          <h3 class="font-semibold mt-3">Prompt caching done right</h3>
+          <p class="mt-1.5 text-sm text-mute dark:text-mutedark leading-relaxed">Restructure a fat prompt for stable-prefix, measure hit rate over 100 calls — then break it on purpose and watch the hit rate die. The lesson sticks.</p>
+          <button data-modal-open="lab3" class="lab-open-btn mt-4 w-full rounded-lg text-white text-sm font-semibold py-2" style="background:#6d5acd">Open lab →</button>
+        </div>
+        <div class="lab-card rounded-2xl border-2 border-coral bg-card dark:bg-carddark p-5" style="--lab-color:#D97757">
+          <div class="flex items-center justify-between">
+            <span class="bg-coral text-white text-xs font-bold rounded-md px-2 py-1">LAB 4 · EVIDENCE</span>
+            <span class="text-xs text-mute dark:text-mutedark">~2 h</span>
+          </div>
+          <h3 class="font-semibold mt-3">Routing rules, latency measurements &amp; cost comparison</h3>
+          <p class="mt-1.5 text-sm text-mute dark:text-mutedark leading-relaxed">The routing config with rationale, the TTFT/p95 latency table by route, and the before/after monthly cost projection — all reproducible from scripts.</p>
+          <button data-modal-open="lab4" class="lab-open-btn mt-4 w-full rounded-lg bg-coral text-white text-sm font-semibold py-2">Open lab →</button>
+        </div>
+      </div>
+
+      <!-- ═══════════════ in the field ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">In the field</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 text-[15px] leading-relaxed">
+        <p><em>Logistics customer, ticket-triage assistant. The pilot ran beautifully at 2K requests/day — then finance projected the full rollout at 60K/day and the number came back at $41K/month. The sponsor's exact words: "we can hire two people for that."</em></p>
+        <p class="mt-3">The score-2 move is defending the number or hand-waving about future price drops. The score-3 FDE opens the trace data instead: 62% of calls were query condensation and intent classification running on Sonnet; the 2,300-token system prompt was uncached (a timestamp sat in its first line); answers averaged 480 tokens where 150 would do. One week later: static routing sends plumbing to Haiku, the prefix is cached at a measured 91% hit rate, answers are capped and terse, and the cascade escalates only 18% of user-facing questions. Projected rollout cost: <strong>$11.8K/month — 71% down, with the golden set showing a quality delta of zero</strong>.</p>
+        <p class="mt-3">The deck that saved the deal had one slide: $0.19 per ticket triaged, versus $3.80 of human handling time — and the re-run scripts to prove both numbers on demand. The sponsor forwarded it to the CFO unedited. Cost engineering isn't a discount exercise; it's how pilots become production.</p>
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Pricing the pilot without a cost model</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">"We'll optimize later" means finding out at invoice time that later was too late. Four numbers and ten minutes of arithmetic in the scoping call prevent the meeting that kills the rollout.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Averages in latency (or cost) reports</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The mean hides the tail, and users live in the tail. Report p50/p95 TTFT and total, per feature. One global average across routes is a number that answers no question anyone actually has.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Cascading without a golden set</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A cascade whose quality retention you didn't measure is a quality incident on a timer. The eval run is two hours; the churned customer is forever. Route boundaries are exactly where silent degradation hides.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Assuming the cache works</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A timestamp, an unsorted dict, or a below-minimum prefix and you're paying full price while believing you're not. <code class="inline">cache_read_input_tokens</code> is the only truth — chart it per feature and alert when it drops.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Design the terse output</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Output tokens are the 5× line item and the decode clock. Per-route <code class="inline">max_tokens</code>, format instructions, and stop sequences cut cost and latency in the same stroke — the rare free lunch.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Sell cost-per-outcome</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Nobody budgets in tokens. "$0.19 per ticket vs $3.80 of staff time" survives the CFO meeting; "$3 per million input tokens" doesn't. Keep the outcome slide current every month — it's your renewal argument (<a href="./fd6.html" class="text-viol underline decoration-viol/40">FD6</a>).</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="costmodel"> <span>Built a cost model for a real feature at three traffic tiers and three routing strategies, with the decision chart.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cascade"> <span>Implemented a Haiku→Sonnet cascade with a confidence/validator gate; measured quality delta ≈0 and cost delta ≥40% against the golden set.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="caching"> <span>Restructured a prompt for stable-prefix caching, measured hit rate over 100 calls, and demonstrated (by breaking it) how a prefix change kills the cache.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="latency"> <span>Measured TTFT and total latency at p50/p95 per route with a streaming harness — no averages.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="artifact"> <span class="font-semibold">Produced the routing rules + rationale doc, latency table, and before/after monthly cost comparison with re-run scripts (catalog evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.anthropic.com/en/docs/about-claude/pricing" target="_blank" rel="noopener">Anthropic — Pricing</a> — the live per-token rates; re-check before every customer quote.</li>
+        <li><a class="text-coral underline" href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" target="_blank" rel="noopener">Anthropic — Prompt caching</a> — breakpoints, TTLs, minimum prefix sizes, and the usage fields that prove hits.</li>
+        <li><a class="text-coral underline" href="https://docs.anthropic.com/en/docs/build-with-claude/token-counting" target="_blank" rel="noopener">Anthropic — Token counting</a> — <code class="inline">count_tokens</code> for pre-flight estimates; never use a tokenizer from another provider.</li>
+        <li><a class="text-coral underline" href="https://docs.anthropic.com/en/docs/about-claude/models/choosing-a-model" target="_blank" rel="noopener">Anthropic — Choosing a model</a> — the capability/latency/cost trade-off, straight from the source (<a class="text-coral underline" href="./fn2.html">FN2</a> covers the economics foundations).</li>
+      </ul>
+
+      <nav id="page-nav" class="mt-14 flex gap-4"></nav>
+    </article>
+
+    <footer class="px-6 py-8 text-center text-xs text-mute dark:text-mutedark">
+      FDE Mastery · PR2 Model Routing, Latency &amp; Cost
+    </footer>
+  </main>
+</div>
+
+<!-- ═══════════════════════ LAB MODALS ═══════════════════════ -->
+
+<dialog id="lab1" class="lab-modal" style="--lab-color:#0ea5e9">
+  <div class="modal-head">
+    <div>
+      <div class="text-[11px] font-bold uppercase tracking-wider opacity-80">Lab 1 · ~1.5 h</div>
+      <div class="font-display font-bold text-lg leading-tight">The cost model</div>
+    </div>
+    <button data-modal-close class="rounded-lg bg-white/20 hover:bg-white/30 px-3 py-1.5 text-sm font-semibold">✕ Close</button>
+  </div>
+  <div class="modal-body">
+    <h4>🎯 Objective</h4>
+    <p class="text-sm leading-relaxed mt-1">Price a real feature at three traffic tiers and three routing strategies — producing the decision chart you'll present in every scoping call from now on. No API calls needed until the last step; this is arithmetic made rigorous.</p>
+    <h4>📦 Setup</h4>
+    <div class="step"><div class="step-n">1</div><div class="step-body">
+      Workspace:
+      <pre class="code">mkdir pr2-labs &amp;&amp; cd pr2-labs &amp;&amp; python3 -m venv .venv &amp;&amp; source .venv/bin/activate
+pip install anthropic
+export ANTHROPIC_API_KEY=sk-ant-...</pre>
+      <span class="text-mute dark:text-mutedark">Pick a feature you actually know — the AI4 RAG answerer, a support chatbot, an extraction pipeline. Real token shapes make this lab land; invented ones make it homework.</span>
+    </div></div>
+    <h4>🔬 Steps</h4>
+    <div class="step"><div class="step-n">2</div><div class="step-body">
+      <strong>The pricing engine.</strong> Create <code class="inline">cost_model.py</code>:
+      <pre class="code">PRICES = {   <span class="cm"># $ per 1M tokens — verify against the live pricing page TODAY</span>
+    "claude-sonnet-5":           {"in": 3.00, "out": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+    "claude-haiku-4-5-20251001": {"in": 1.00, "out": 5.00,  "cache_read": 0.10, "cache_write": 1.25},
+}
+
+def cost_per_request(model, input_tok, output_tok, cached_tok=0):
+    p = PRICES[model]
+    fresh = input_tok - cached_tok
+    return (fresh * p["in"] + cached_tok * p["cache_read"]
+            + output_tok * p["out"]) / 1_000_000
+
+def monthly(model, req_per_day, input_tok, output_tok, cached_tok=0):
+    return cost_per_request(model, input_tok, output_tok, cached_tok) * req_per_day * 30</pre>
+      Date the price constants in a comment. Prices change; a cost model with stale prices is worse than none, because it's confidently wrong.
+    </div></div>
+    <div class="step"><div class="step-n">3</div><div class="step-body">
+      <strong>Measure your real token shape</strong> — don't guess. Use the token-counting endpoint on 5 representative requests:
+      <pre class="code">import anthropic
+client = anthropic.Anthropic()
+
+n = client.messages.count_tokens(
+    model="claude-sonnet-5",
+    system=MY_SYSTEM_PROMPT,
+    messages=[{"role": "user", "content": SAMPLE_REQUEST}])
+print(n.input_tokens)   <span class="cm"># repeat for 5 samples; use the mean</span></pre>
+      For output tokens, run 5 real calls and read <code class="inline">msg.usage.output_tokens</code>. Teams that guess typically miss by 2–3× — usually underestimating the system prompt and overestimating the question.
+    </div></div>
+    <div class="step"><div class="step-n">4</div><div class="step-body">
+      <strong>The 3×3 grid.</strong> Compute all nine cells — three strategies × three traffic tiers:
+      <pre class="code">TIERS = [1_000, 50_000, 500_000]           <span class="cm"># requests/day</span>
+IN, OUT = 3_700, 300                        <span class="cm"># YOUR measured numbers</span>
+
+for req in TIERS:
+    sonnet  = monthly("claude-sonnet-5", req, IN, OUT)
+    haiku   = monthly("claude-haiku-4-5-20251001", req, IN, OUT)
+    <span class="cm"># 80/20 cascade: everyone pays haiku; 20% ALSO pay sonnet</span>
+    cascade = haiku + 0.2 * sonnet
+    print(f"{req:&gt;8}/day  sonnet ${sonnet:&gt;9,.0f}  haiku ${haiku:&gt;8,.0f}  cascade ${cascade:&gt;9,.0f}")</pre>
+      Expected shape for the Example-1 numbers: <span class="out">50K/day → sonnet ≈ $23.4K, haiku ≈ $7.8K, cascade ≈ $12.5K per month</span>. Now add a fourth row: cascade <em>plus</em> a cached system prompt (pass <code class="inline">cached_tok=2000</code>) — watch the input term collapse.
+    </div></div>
+    <div class="step"><div class="step-n">5</div><div class="step-body">
+      <strong>The decision chart.</strong> Put the grid in a spreadsheet (or matplotlib) as cost-vs-traffic lines, one per strategy, log-x. Mark your customer's current volume and their rollout target. Then add the line that turns math into a business case: <strong>cost-per-outcome</strong> — divide monthly cost by monthly outcomes (tickets triaged, documents processed) and put the human-equivalent cost next to it.
+    </div></div>
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Pressure-test it.</strong> Answer in writing, from your model: At what daily volume does the cascade's engineering effort pay for itself? If output length doubled after a prompt change, which strategy's cost grows fastest? Which single parameter is your estimate most sensitive to? If you can answer these in a customer meeting without opening a laptop, the lab worked.
+    </div></div>
+    <h4>🧯 Troubleshooting</h4>
+    <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
+      <li>Numbers feel implausibly small at 1K/day → they are small; that's the point. Cost engineering matters at scale — the chart shows <em>where</em> it starts mattering.</li>
+      <li>count_tokens errors → check the model ID string exactly; token counts are model-specific, so count with the model you'll bill on.</li>
+      <li>Cascade math confusion → escalated requests pay <em>both</em> models (cheap attempt + strong retry). It's in the formula: <code class="inline">haiku + 0.2 × sonnet</code>.</li>
+    </ul>
+    <h4>✅ Done when</h4>
+    <p class="text-sm leading-relaxed mt-1">The 3×3 (plus caching row) grid exists with your measured token shapes, the decision chart is presentable to a non-engineer, and you've written the cost-per-outcome sentence for your feature.</p>
+  </div>
+</dialog>
+
+<dialog id="lab2" class="lab-modal" style="--lab-color:#14b8a6">
+  <div class="modal-head">
+    <div>
+      <div class="text-[11px] font-bold uppercase tracking-wider opacity-80">Lab 2 · ~2.5 h</div>
+      <div class="font-display font-bold text-lg leading-tight">Build the cascade router</div>
+    </div>
+    <button data-modal-close class="rounded-lg bg-white/20 hover:bg-white/30 px-3 py-1.5 text-sm font-semibold">✕ Close</button>
+  </div>
+  <div class="modal-body">
+    <h4>🎯 Objective</h4>
+    <p class="text-sm leading-relaxed mt-1">Build the Haiku-first cascade with a confidence gate and validator escalation, run it against your AI9 golden set, and prove the two numbers that make it shippable: quality delta ≈ 0, cost delta large.</p>
+    <h4>📦 Setup</h4>
+    <div class="step"><div class="step-n">1</div><div class="step-body">
+      You need your golden set from AI9 — 20+ questions with known-good answers (<code class="inline">golden.jsonl</code>, one <code class="inline">{"q": ..., "expected": ...}</code> per line). If yours is RAG-based, include the retrieved context in the prompt exactly as production does; the cascade must be tested on the real task, not a toy version.
+    </div></div>
+    <h4>🔬 Steps</h4>
+    <div class="step"><div class="step-n">2</div><div class="step-body">
+      <strong>Answer + self-reported confidence.</strong> Create <code class="inline">cascade.py</code>:
+      <pre class="code">import anthropic, re
+
+client = anthropic.Anthropic()
+CHEAP, STRONG = "claude-haiku-4-5-20251001", "claude-sonnet-5"
+
+GATE_SYSTEM = (
+    "Answer the user's question accurately and concisely. "
+    "Then, on the FINAL line, output exactly: CONFIDENCE: high|medium|low — "
+    "your honest confidence that the answer is complete and correct. "
+    "Report low confidence when the question is ambiguous, multi-step, "
+    "or needs information you are unsure about. Honesty beats bravado.")
+
+def ask(model, question):
+    msg = client.messages.create(
+        model=model, max_tokens=500,
+        system=GATE_SYSTEM,
+        messages=[{"role": "user", "content": question}])
+    text = msg.content[0].text
+    m = re.search(r"CONFIDENCE:\s*(high|medium|low)", text, re.I)
+    conf = m.group(1).lower() if m else "low"      <span class="cm"># unparseable = low, fail safe</span>
+    answer = re.sub(r"CONFIDENCE:.*$", "", text).strip()
+    return answer, conf, msg.usage</pre>
+      Note the failure default: if the confidence line is missing or mangled, treat it as <em>low</em> and escalate. Gates must fail toward quality, never toward savings.
+    </div></div>
+    <div class="step"><div class="step-n">3</div><div class="step-body">
+      <strong>Add a mechanical validator</strong> — the second, sturdier gate. Tailor to your task; for a grounded-answer feature:
+      <pre class="code">def validate(answer):
+    if len(answer) &lt; 20:                       return False   <span class="cm"># suspiciously thin</span>
+    if "i don't have" in answer.lower():       return True    <span class="cm"># honest refusal is valid!</span>
+    if not re.search(r"\[\d+\]", answer):      return False   <span class="cm"># grounded task must cite</span>
+    return True
+
+def cascade(question):
+    answer, conf, u1 = ask(CHEAP, question)
+    if conf == "high" and validate(answer):
+        return {"answer": answer, "route": "haiku", "usages": [("haiku", u1)]}
+    answer, _, u2 = ask(STRONG, question)      <span class="cm"># escalate — pay both calls</span>
+    return {"answer": answer, "route": "escalated", "usages": [("haiku", u1), ("sonnet", u2)]}</pre>
+    </div></div>
+    <div class="step"><div class="step-n">4</div><div class="step-body">
+      <strong>Run the golden set through three configurations</strong> — Sonnet-only (baseline), Haiku-only (floor), cascade — grading each answer against expected (reuse your AI9 grader, LLM-judge or exact-match) and summing real cost from usage:
+      <pre class="code">import json
+from cost_model import PRICES     <span class="cm"># lab 1</span>
+
+def run_config(fn, golden):
+    correct, cost = 0, 0.0
+    for g in golden:
+        r = fn(g["q"])
+        correct += grade(r["answer"], g["expected"])     <span class="cm"># your AI9 grader</span>
+        for model_name, u in r["usages"]:
+            model = CHEAP if model_name == "haiku" else STRONG
+            p = PRICES[model]
+            cost += (u.input_tokens * p["in"] + u.output_tokens * p["out"]) / 1e6
+    return {"accuracy": correct / len(golden), "cost": round(cost, 4)}
+
+golden = [json.loads(l) for l in open("golden.jsonl")]
+print("sonnet :", run_config(lambda q: {"answer": ask(STRONG, q)[0], "usages": [("sonnet", ask(STRONG, q)[2])]}, golden))
+print("haiku  :", run_config(lambda q: {"answer": ask(CHEAP, q)[0],  "usages": [("haiku",  ask(CHEAP, q)[2])]}, golden))
+print("cascade:", run_config(cascade, golden))</pre>
+      Expected shape: <span class="out">cascade accuracy within a point or two of Sonnet-only, at 40–55% of its cost</span>, with Haiku-only visibly worse on the hard questions — that gap is exactly what the gate exists to catch.
+    </div></div>
+    <div class="step"><div class="step-n">5</div><div class="step-body">
+      <strong>Tune the gate.</strong> Log escalation rate and inspect the routing decisions: which questions did Haiku confidently get <em>wrong</em> (the dangerous quadrant)? Which did it escalate but had answered fine (wasted spend)? Adjust — treat "medium" as escalate or not, strengthen the validator, tweak the honesty instruction — and re-run. Two or three iterations typically lands escalation at 15–30% with the dangerous quadrant empty on your set.
+    </div></div>
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Record the result table</strong> — accuracy, cost per run, escalation rate, per configuration. This table goes verbatim into Lab 4's evidence artifact, so save it as <code class="inline">cascade_results.json</code>.
+    </div></div>
+    <h4>🧯 Troubleshooting</h4>
+    <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
+      <li>Haiku reports "high" on everything → strengthen the honesty framing and add examples of low-confidence situations to the system prompt; lean harder on the validator.</li>
+      <li>Escalation rate &gt; 50% → your traffic (or golden set) is mostly hard questions; a cascade may genuinely not pay here — that's a valid finding, write it down.</li>
+      <li>Accuracy noise between runs → grade with your AI9 judge at consistent settings and run the set twice; small sets wobble. 20 questions detects big deltas, not 1% ones.</li>
+    </ul>
+    <h4>✅ Done when</h4>
+    <p class="text-sm leading-relaxed mt-1">The three-configuration table shows cascade quality ≈ Sonnet-only with a ≥40% cost reduction on your golden set, and you can explain — with logged examples — what the gate catches and what it wastes.</p>
+  </div>
+</dialog>
+
+<dialog id="lab3" class="lab-modal" style="--lab-color:#6d5acd">
+  <div class="modal-head">
+    <div>
+      <div class="text-[11px] font-bold uppercase tracking-wider opacity-80">Lab 3 · ~1.5 h</div>
+      <div class="font-display font-bold text-lg leading-tight">Prompt caching done right</div>
+    </div>
+    <button data-modal-close class="rounded-lg bg-white/20 hover:bg-white/30 px-3 py-1.5 text-sm font-semibold">✕ Close</button>
+  </div>
+  <div class="modal-body">
+    <h4>🎯 Objective</h4>
+    <p class="text-sm leading-relaxed mt-1">Restructure a fat prompt for stable-prefix caching, measure the hit rate and savings over 100 calls — then deliberately break the prefix and watch the hit rate die. You'll never put a timestamp in a system prompt again.</p>
+    <h4>📦 Setup</h4>
+    <div class="step"><div class="step-n">1</div><div class="step-body">
+      Build (or borrow from your AI4 work) a system prompt of <strong>≥1,500 tokens</strong> — instructions plus reference material, saved as <code class="inline">fat_prompt.txt</code>. It must clear <code class="inline">claude-sonnet-5</code>'s ~1,024-token minimum cacheable prefix with headroom; below the minimum, caching silently no-ops and the lab teaches nothing.
+    </div></div>
+    <h4>🔬 Steps</h4>
+    <div class="step"><div class="step-n">2</div><div class="step-body">
+      <strong>The instrumented caller.</strong> Create <code class="inline">cache_lab.py</code>:
+      <pre class="code">import anthropic, time
+
+client = anthropic.Anthropic()
+SYSTEM = open("fat_prompt.txt").read()
+
+def call(question, system_text):
+    t0 = time.perf_counter()
+    msg = client.messages.create(
+        model="claude-sonnet-5", max_tokens=200,
+        system=[{"type": "text", "text": system_text,
+                 "cache_control": {"type": "ephemeral"}}],   <span class="cm"># breakpoint after the prefix</span>
+        messages=[{"role": "user", "content": question}])
+    u = msg.usage
+    return {"latency": round(time.perf_counter() - t0, 2),
+            "fresh":   u.input_tokens,                    <span class="cm"># billed at 1×</span>
+            "written": u.cache_creation_input_tokens,     <span class="cm"># billed at 1.25×</span>
+            "read":    u.cache_read_input_tokens}         <span class="cm"># billed at ~0.1×</span></pre>
+    </div></div>
+    <div class="step"><div class="step-n">3</div><div class="step-body">
+      <strong>Measure 100 calls with a stable prefix.</strong> Vary only the question:
+      <pre class="code">QUESTIONS = [f"Question variant {i}: what does the policy say about case {i}?"
+             for i in range(100)]
+
+stats = [call(q, SYSTEM) for q in QUESTIONS]
+reads   = sum(s["read"] for s in stats)
+written = sum(s["written"] for s in stats)
+fresh   = sum(s["fresh"] for s in stats)
+total   = reads + written + fresh
+print(f"hit rate (token-weighted): {reads/total:.0%}")
+print(f"call 1: {stats[0]}")     <span class="cm"># expect: written &gt; 0, read == 0 (cold write)</span>
+print(f"call 2: {stats[1]}")     <span class="cm"># expect: read ≈ prompt size (warm)</span></pre>
+      Expected: <span class="out">call 1 writes the prefix; calls 2–100 read it — token-weighted hit rate well above 90%</span>. Also compare latency: warm calls have visibly faster TTFT because prefill skips the cached span. Compute the dollar saving with Lab 1's price table: 99 calls × prompt_tokens × ($3.00 − $0.30)/1M.
+    </div></div>
+    <div class="step"><div class="step-n">4</div><div class="step-body">
+      <strong>Now break it on purpose</strong> — the step this lab exists for. Move a timestamp into the prefix:
+      <pre class="code">from datetime import datetime
+
+def broken_system():
+    <span class="cm"># the classic mistake: "helpful" dynamic context at the TOP of the prompt</span>
+    return f"Current time: {datetime.now().isoformat()}\n\n" + SYSTEM
+
+stats = [call(q, broken_system()) for q in QUESTIONS[:20]]
+reads = sum(s["read"] for s in stats)
+print(f"reads with timestamp in prefix: {reads}")   <span class="out"># → 0. every. single. call.</span></pre>
+      Twenty consecutive full-price cache <em>writes</em>, zero reads — you're now paying 1.25× instead of 0.1× for the privilege of a timestamp nobody asked for. This is the single most common caching bug in production systems, and now you've watched it happen in your own usage numbers.
+    </div></div>
+    <div class="step"><div class="step-n">5</div><div class="step-body">
+      <strong>Fix it the right way</strong> — dynamic content goes <em>after</em> the breakpoint, in the user turn:
+      <pre class="code">def good_call(question):
+    dated_question = f"(Today is {datetime.now().date()})\n{question}"
+    return call(dated_question, SYSTEM)      <span class="cm"># prefix untouched → cache lives</span></pre>
+      Re-run 20 calls and confirm the hit rate is back. Write the one-sentence rule in your notes: <em>stable bytes before the breakpoint, volatile bytes after — always.</em>
+    </div></div>
+    <h4>🧯 Troubleshooting</h4>
+    <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
+      <li><code class="inline">read == 0</code> and <code class="inline">written == 0</code> on every call → prompt is below the model's minimum cacheable prefix; make it longer or check the model ID.</li>
+      <li>Reads drop mid-run → you paused longer than the 5-minute TTL; calls within the TTL keep it warm.</li>
+      <li>Rate limits at 100 calls → add a small sleep between calls; the lab's conclusions survive at 50 calls too.</li>
+    </ul>
+    <h4>✅ Done when</h4>
+    <p class="text-sm leading-relaxed mt-1">You have the measured hit rate and dollar saving for the stable prefix, the zero-hit-rate printout from the broken version, and the fixed version proving recovery — three numbers that together are the whole caching lesson.</p>
+  </div>
+</dialog>
+
+<dialog id="lab4" class="lab-modal" style="--lab-color:#D97757">
+  <div class="modal-head">
+    <div>
+      <div class="text-[11px] font-bold uppercase tracking-wider opacity-80">Lab 4 · evidence artifact · ~2 h</div>
+      <div class="font-display font-bold text-lg leading-tight">Routing rules, latency measurements &amp; cost comparison</div>
+    </div>
+    <button data-modal-close class="rounded-lg bg-white/20 hover:bg-white/30 px-3 py-1.5 text-sm font-semibold">✕ Close</button>
+  </div>
+  <div class="modal-body">
+    <h4>🎯 Objective</h4>
+    <p class="text-sm leading-relaxed mt-1">Produce PR2's catalog evidence — <em>"routing rules, latency measurements and cost comparison"</em> — as one reproducible package: the routing config with rationale, the TTFT/p95 latency table by route, and the before/after monthly cost projection, each backed by a re-run script.</p>
+    <h4>🔬 Steps</h4>
+    <div class="step"><div class="step-n">1</div><div class="step-body">
+      <strong>The routing config + rationale doc.</strong> Formalize your Lab 2 routing as versioned config, and — the part reviewers actually read — a rationale for every rule:
+      <pre class="code"># routing.yaml
+version: 2026-08-04
+routes:
+  condense_query:   { model: claude-haiku-4-5-20251001, max_tokens: 60 }
+  classify_intent:  { model: claude-haiku-4-5-20251001, max_tokens: 10 }
+  answer_grounded:
+    strategy: cascade
+    cheap:    { model: claude-haiku-4-5-20251001, max_tokens: 500 }
+    strong:   { model: claude-sonnet-5,           max_tokens: 600 }
+    gate:     confidence_high AND validator_pass    # escalation measured at 18%
+fallback_on_error: { retries: 1, then: alternate_model, alert: true }</pre>
+      In <code class="inline">ROUTING.md</code>, justify each rule with the evidence: "condense_query on Haiku — golden-set condensation accuracy identical to Sonnet (Lab 2 run of 2026-08-__), 3× cheaper, faster TTFT." A routing table without rationale is folklore; with rationale it survives your handover.
+    </div></div>
+    <div class="step"><div class="step-n">2</div><div class="step-body">
+      <strong>The latency script.</strong> <code class="inline">measure_latency.py</code> — Part IV's streaming harness looped per route with percentiles:
+      <pre class="code">import statistics, time
+
+def percentiles(xs):
+    xs = sorted(xs)
+    return {"p50": round(statistics.median(xs), 2),
+            "p95": round(xs[max(0, int(len(xs) * 0.95) - 1)], 2)}
+
+def bench(route_name, fn, samples, n=20):
+    ttfts, totals = [], []
+    for s in samples[:n]:
+        m = fn(s)                       <span class="cm"># the measure() harness from Part IV</span>
+        ttfts.append(m["ttft"]); totals.append(m["total"])
+    return {"route": route_name,
+            "ttft": percentiles(ttfts), "total": percentiles(totals)}
+
+<span class="cm"># bench every route in routing.yaml, incl. the cascade's ESCALATED path —</span>
+<span class="cm"># its p95 is your worst user experience and belongs in the table, not hidden</span></pre>
+      Output as a Markdown table: route · TTFT p50/p95 · total p50/p95 · output tokens p50. Run at a realistic time of day and note it — latency has weather.
+    </div></div>
+    <div class="step"><div class="step-n">3</div><div class="step-body">
+      <strong>The cost comparison.</strong> <code class="inline">cost_compare.py</code> joins Lab 1's model with Lab 2's measured escalation rate and Lab 3's measured cache hit rate — real measurements, not assumptions:
+      <pre class="code">BEFORE = monthly("claude-sonnet-5", REQ_PER_DAY, IN_TOK, OUT_TOK)   <span class="cm"># naive: sonnet, no cache</span>
+
+esc  = 0.18      <span class="cm"># measured, Lab 2</span>
+hit  = 0.91      <span class="cm"># measured, Lab 3 — fraction of prefix served from cache</span>
+cached = int(PREFIX_TOK * hit)
+AFTER = (monthly("claude-haiku-4-5-20251001", REQ_PER_DAY, IN_TOK, OUT_TOK, cached)
+         + esc * monthly("claude-sonnet-5", REQ_PER_DAY, IN_TOK, OUT_TOK, cached))
+
+print(f"before ${BEFORE:,.0f}/mo   after ${AFTER:,.0f}/mo   saving {1 - AFTER/BEFORE:.0%}")</pre>
+      Present it at the pilot volume <em>and</em> the rollout target volume, plus the cost-per-outcome line for each. The "after" column must state its assumptions (escalation %, hit rate) so a skeptic can challenge them — that transparency is what makes the number credible.
+    </div></div>
+    <div class="step"><div class="step-n">4</div><div class="step-body">
+      <strong>Assemble the one-page report</strong> — this exact skeleton, your numbers:
+      <pre class="code"># PR2 evidence — routing, latency &amp; cost — &lt;feature name&gt;      2026-08-__
+## Routing (see routing.yaml + ROUTING.md)
+plumbing → haiku · answers → cascade (gate: confidence+validator, esc 18%)
+quality retention: golden set n=24 → sonnet 0.92 / cascade 0.91 / haiku 0.79
+## Latency (n=20/route, streamed, measured 14:00 local)
+| route              | TTFT p50 | TTFT p95 | total p50 | total p95 |
+|--------------------|----------|----------|-----------|-----------|
+| condense (haiku)   | 0.4s     | 0.7s     | 0.9s      | 1.4s      |
+| answer (haiku)     | 0.6s     | 1.1s     | 4.2s      | 6.8s      |
+| answer (escalated) | 0.6s     | 1.2s     | 9.8s      | 14.1s     |
+## Cost (projected month @ 50K req/day)
+before: sonnet-only, uncached          $23,400
+after:  routed + cascade + 91% cache   $ 6,900   (−71%)
+per-outcome: $0.19/ticket vs $3.80 human handling
+## Re-run
+python measure_latency.py &amp;&amp; python cost_compare.py &amp;&amp; python cascade_eval.py</pre>
+    </div></div>
+    <div class="step"><div class="step-n">5</div><div class="step-body">
+      <strong>Reproducibility check.</strong> Fresh terminal, fresh clone: do the three scripts run and regenerate every number in the report? A teammate should reproduce the whole artifact from the repo in under ten minutes. If any number in the report can't be regenerated by a script, it's an opinion, not evidence.
+    </div></div>
+    <h4>✅ Done when</h4>
+    <p class="text-sm leading-relaxed mt-1">The report exists with real measured numbers, every figure traces to a re-run script, and the routing rationale would survive you leaving the project tomorrow. Keep the whole kit — routing.yaml, the three scripts, the report skeleton — it deploys at every future engagement's cost conversation.</p>
+  </div>
+</dialog>
+
+</body>
+</html>
