@@ -61,7 +61,8 @@ const MODULES = [
 
 /* ---------- i18n ---------- */
 const PATH = location.pathname.replace(/\\/g, "/");
-const LANG = PATH.startsWith("/vn/") || PATH.includes("/vn/") ? "vn" : "en";
+const PATH_SEGMENTS = PATH.split("/").filter(Boolean);
+const LANG = PATH_SEGMENTS.includes("vn") ? "vn" : "en";
 
 const VI = {
   "All topics": "Tất cả chủ đề",
@@ -110,9 +111,7 @@ const TOPICS = [
 ];
 
 const IN_MODULES_DIR = PATH.includes("/modules/");
-/* Section root = the topic folder (aifde/); site root = the hub above it.
-   When inside vn/, ROOT and SITE_ROOT include the vn/ prefix so nav stays in-language. */
-const VN_PREFIX = LANG === "vn" ? "vn/" : "";
+/* Section root = the topic folder (aifde/); site root = the hub above it. */
 const ROOT = IN_MODULES_DIR ? "../" : "./";
 const IN_TOPIC = TOPICS.some((t) => PATH.includes(`/${t.slug}/`));
 const SITE_ROOT = IN_MODULES_DIR ? "../../" : IN_TOPIC ? "../" : "./";
@@ -123,15 +122,18 @@ function moduleHref(code) {
 }
 
 function langSwapHref() {
-  /* Return the equivalent page in the other language. */
-  const p = location.pathname.replace(/\\/g, "/");
+  /* Return the equivalent page in the other language.
+     Works with any hosting setup: local file://, localhost, subdirectory, GitHub Pages. */
+  const segs = location.pathname.replace(/\\/g, "/").split("/").filter(Boolean);
   if (LANG === "vn") {
-    // Strip /vn prefix to get English URL
-    return p.replace(/^\/vn/, "") || "/";
+    // Remove the 'vn' segment wherever it appears
+    const idx = segs.indexOf("vn");
+    if (idx >= 0) segs.splice(idx, 1);
   } else {
-    // Add /vn prefix for Vietnamese URL
-    return "/vn" + p;
+    // Insert 'vn' as the first path segment
+    segs.unshift("vn");
   }
+  return "/" + segs.join("/");
 }
 
 function groupOf(code) {
