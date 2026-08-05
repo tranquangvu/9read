@@ -66,7 +66,8 @@ const TOPICS = [
       "A 44-module curriculum taking an engineer from Python and LLM fundamentals to shipping, " +
       "operating and selling AI systems inside a customer's stack — each module with hands-on labs " +
       "and an evidence artifact.",
-    meta: `${MODULES.length} modules · 4 tracks`,
+    meta: `${MODULES.length} modules`,
+    tags: GROUPS.map((g) => g.name),
     accent: "#D97757",
     status: "live",
   },
@@ -238,24 +239,37 @@ function buildIndexCards() {
   }
 }
 
-/* ---------- root hub: topic cards ---------- */
+/* ---------- root hub: topic rows ---------- */
+const ICON_ARROW = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>`;
+
 function buildTopicCards() {
-  const wrap = document.getElementById("topic-grid");
+  const wrap = document.getElementById("topic-list");
   if (!wrap) return;
-  wrap.innerHTML = TOPICS.map((t) => {
+  const count = document.getElementById("topic-count");
+  if (count) count.textContent = `${TOPICS.length} available`;
+  wrap.innerHTML = TOPICS.map((t, i) => {
     const soon = t.status === "soon";
+    const tags = (t.tags || [])
+      .map((x) => `<span class="topic-tag">${x}</span>`)
+      .join("");
     const inner = `
-      <div class="flex items-center justify-between gap-3">
-        <span class="text-white text-xs font-bold rounded-md px-2 py-1" style="background:${t.accent}">${t.name}</span>
-        <span class="text-xs text-mute dark:text-mutedark">${t.meta}</span>
+      <span class="topic-index" aria-hidden="true">${String(i + 1).padStart(2, "0")}</span>
+      <div class="min-w-0">
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <h3 class="font-display text-xl md:text-2xl font-bold tracking-[-0.015em]">${t.name}</h3>
+          <span class="topic-tagline">${t.tagline}</span>
+          ${soon ? '<span class="topic-tag topic-tag-soon">Coming soon</span>' : ""}
+        </div>
+        <p class="mt-3 text-sm md:text-[15px] text-mute dark:text-mutedark leading-relaxed max-w-[46rem]">${t.blurb}</p>
+        <div class="mt-4 flex flex-wrap items-center gap-1.5">
+          <span class="topic-tag topic-tag-meta">${t.meta}</span>${tags}
+        </div>
       </div>
-      <div class="mt-3 font-display text-xl font-bold leading-snug">${t.tagline}</div>
-      <p class="mt-2 text-sm text-mute dark:text-mutedark leading-relaxed">${t.blurb}</p>
-      <div class="mt-4 text-sm font-semibold" style="color:${t.accent}">${soon ? "Coming soon" : "Open topic →"}</div>`;
-    const shell = `topic-card block rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6`;
+      <span class="topic-arrow">${soon ? "" : ICON_ARROW}</span>`;
+    const cls = `topic-row${soon ? " is-soon" : ""}`;
     return soon
-      ? `<div class="${shell} opacity-60 cursor-default" style="--topic-color:${t.accent}">${inner}</div>`
-      : `<a href="${SITE_ROOT}${t.slug}/index.html" class="${shell} hover:border-coral hover:shadow-sm transition-all" style="--topic-color:${t.accent}">${inner}</a>`;
+      ? `<div class="${cls}" style="--topic-color:${t.accent}">${inner}</div>`
+      : `<a href="${SITE_ROOT}${t.slug}/index.html" class="${cls}" style="--topic-color:${t.accent}">${inner}</a>`;
   }).join("");
 }
 
