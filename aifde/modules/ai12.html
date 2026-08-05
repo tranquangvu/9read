@@ -105,6 +105,33 @@ tailwind.config = {
         </div>
       </div>
 
+      <h3 class="font-semibold text-lg mt-7">What each driver is actually worth</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Customers usually name all four at once, in a tone that implies they weigh the same. They don't. Exactly one
+        of them survives a hostile cost review; the other three have a question attached that tells you within five
+        minutes whether the driver is real or a story someone tells at planning meetings. Ask the question in the
+        third column before you draw a single box on a whiteboard:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Driver</th><th class="px-4 py-3">What it is really worth</th><th class="px-4 py-3">The question that tests it</th><th class="px-4 py-3">Who must sign</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Residency / air-gap</td><td class="px-4 py-3"><strong>Everything.</strong> The only driver that beats a 9-point quality deficit and a $511/mo idle GPU in the same meeting</td><td class="px-4 py-3">"Show me the clause." A DPA obligation, a regulator's rule and a security team's preference look identical in a kickoff and are not the same constraint</td><td class="px-4 py-3">General counsel + CISO</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost at volume</td><td class="px-4 py-3"><strong>Nothing below ~280M tok/mo</strong> on one L4, and <em>negative</em> if the box idles. Part V does the division</td><td class="px-4 py-3">"What is your measured monthly token volume — from gateway logs, not from the roadmap?" Projected volume is where this driver goes to die</td><td class="px-4 py-3">FinOps / whoever owns the cloud bill</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Edge latency</td><td class="px-4 py-3">Real but narrow. Worth it when the network is <em>absent</em>, not when it is merely slow</td><td class="px-4 py-3">"What is your p95 network RTT today, and what specifically breaks at 400 ms?" If nothing breaks, you are buying GPUs to fix a spinner</td><td class="px-4 py-3">Product owner</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Customization</td><td class="px-4 py-3">Worth it <em>after</em> you have measured that prompting a stronger model fails (<a href="./ai10.html" class="text-viol underline decoration-viol/40">AI10</a>)</td><td class="px-4 py-3">"Have you run the un-tuned frontier baseline on the same eval?" In roughly half of engagements the answer is no, and the baseline wins</td><td class="px-4 py-3">Engineering lead</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two of those rows are numbers you can produce in a day: pull 30 days of token counts from the gateway, and
+        run the frontier baseline on the existing eval. In the insurance engagement described later in this module,
+        that day of work reduced "we need to self-host everything" to "we need to self-host the
+        <strong>85%</strong> of traffic that touches claimant PII" — which is a completely different, and far
+        cheaper, project.
+      </p>
+
       <h3 class="font-semibold text-lg mt-8">The quality gap — say it plainly</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         A 7–8B open model is <strong>not</strong> a frontier API model. On broad benchmarks, today's best open
@@ -152,6 +179,68 @@ tailwind.config = {
         "less than you feared."
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">The router, in code — sensitivity first, difficulty second</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most routing write-ups route on <em>difficulty</em>: easy question → small model, hard question → big model.
+        For a data-residency engagement that ordering is backwards and mildly dangerous. The first predicate must be
+        <strong>"is this payload allowed to cross the network boundary?"</strong>, because that is the predicate an
+        auditor will read. Difficulty is the second predicate, applied only inside the branch where crossing is
+        already legal. Written in that order, the router is also trivially reviewable — a compliance officer can
+        read twenty lines of Python and sign it. Route-selection strategy in general belongs to
+        <a href="./pr2.html" class="text-viol underline decoration-viol/40">PR2</a>; what AI12 owns is the boundary
+        predicate at the top.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">router.py — the boundary predicate is the first branch, always</span>
+        <pre class="code"><span class="kw">import</span> re, os
+<span class="kw">from</span> openai <span class="kw">import</span> OpenAI
+
+LOCAL = OpenAI(base_url=<span class="st">"http://gpu-box.internal:8000/v1"</span>, api_key=<span class="st">"none"</span>)
+CLOUD = OpenAI(base_url=os.environ[<span class="st">"PROVIDER_URL"</span>], api_key=os.environ[<span class="st">"PROVIDER_KEY"</span>])
+
+<span class="cm"># The residency rule, restated as code. This list came from the customer's DPA,</span>
+<span class="cm"># not from an engineer's intuition — keep the citation in the comment.</span>
+RESTRICTED = re.compile(
+    <span class="st">r"\b(\d{3}-\d{2}-\d{4}"</span>          <span class="cm"># SSN — DPA §4.2(a)</span>
+    <span class="st">r"|policy[-_ ]?\d{8}"</span>            <span class="cm"># policy number — DPA §4.2(c)</span>
+    <span class="st">r"|claimant|beneficiary)\b"</span>, re.I)
+
+<span class="kw">def</span> <span class="fn">route</span>(text, task_class):
+    <span class="cm"># 1. Boundary predicate. Nothing below this line can send restricted data out.</span>
+    <span class="kw">if</span> RESTRICTED.<span class="fn">search</span>(text) <span class="kw">or</span> task_class <span class="kw">in</span> {<span class="st">"claims"</span>, <span class="st">"underwriting"</span>}:
+        <span class="kw">return</span> LOCAL, <span class="st">"Qwen/Qwen2.5-14B-Instruct-AWQ"</span>, <span class="st">"local:restricted"</span>
+
+    <span class="cm"># 2. Difficulty predicate — only reachable for payloads cleared to leave.</span>
+    <span class="kw">if</span> task_class <span class="kw">in</span> {<span class="st">"classify"</span>, <span class="st">"extract"</span>, <span class="st">"summarize"</span>}:
+        <span class="kw">return</span> LOCAL, <span class="st">"Qwen/Qwen2.5-14B-Instruct-AWQ"</span>, <span class="st">"local:cheap"</span>
+    <span class="kw">return</span> CLOUD, <span class="st">"claude-sonnet-5"</span>, <span class="st">"cloud:hard-tail"</span>
+
+<span class="kw">for</span> t, c <span class="kw">in</span> [(<span class="st">"claimant Maria R. reports hail damage"</span>, <span class="st">"triage"</span>),
+             (<span class="st">"summarise the 2026 hail-loss market report"</span>, <span class="st">"research"</span>)]:
+    _, model, lane = <span class="fn">route</span>(t, c)
+    <span class="fn">print</span>(f<span class="st">"{lane:18s} {model}"</span>)
+<span class="out">local:restricted   Qwen/Qwen2.5-14B-Instruct-AWQ</span>
+<span class="out">cloud:hard-tail    claude-sonnet-5</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The third return value — the <strong>lane label</strong> — is the part people skip and then wish they hadn't.
+        Log it on every request and you can answer "what fraction of traffic left our network last month, and which
+        rule sent it?" with a <code class="inline">GROUP BY</code> rather than an investigation. On the insurance
+        engagement that query returned <strong>14.8%</strong> of requests on the cloud lane, all of them research
+        summaries, which is exactly the evidence the CISO wanted at the quarterly review. Regex is a blunt detector
+        and will miss free-text PII; pair it with the redaction gateway in
+        <a href="./pr5.html" class="text-viol underline decoration-viol/40">PR5</a> and treat the regex as a
+        second line of defence, never the only one.
+      </p>
+      <div class="mt-4 callout callout-danger">
+        <strong>The failure that ends an engagement:</strong> a router that decides on difficulty first and residency
+        second. One hard question containing a policy number goes to the cloud lane, the request is logged by a
+        third party, and you are now in a breach-notification conversation instead of a renewal conversation. Make
+        the boundary check the first statement in the function, add a test that asserts a restricted payload can
+        never reach <code class="inline">CLOUD</code>, and run that test in CI
+        (<a href="./pr10.html" class="text-viol underline decoration-viol/40">PR10</a>).
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">The decision table</h3>
       <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
@@ -174,6 +263,40 @@ tailwind.config = {
         yourself an ops burden — and if it's no, you've confirmed the local build is genuinely required
         (<a href="./pr6.html" class="text-viol underline decoration-viol/40">PR6</a>, <a href="./pr5.html" class="text-viol underline decoration-viol/40">PR5</a>).
       </div>
+
+      <h3 class="font-semibold text-lg mt-8">Before you architect anything: the residency interview</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Our data can't leave" is a sentence with at least five different meanings, and the architecture that
+        satisfies one of them is wildly over-engineered for another. Thirty minutes with the right four questions
+        routinely turns a GPU cluster into a configuration change. Ask them in this order, because each one narrows
+        the next:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>"Can't leave <em>what</em> — the country, the cloud account, or the physical network?"</strong> Country is satisfied by a regional endpoint. Cloud account is satisfied by a private endpoint inside their VPC. Only "physical network" needs your GPUs.</li>
+        <li><strong>"Is the concern storage, training, or transit?"</strong> Most policies are about a provider retaining or training on the data. Every major provider contractually excludes both by default on enterprise terms — which is a document you can hand over, not an argument you have to win.</li>
+        <li><strong>"Which regulation or contract clause is this, exactly?"</strong> Ask for the paragraph. Half the time it is a real clause with a scope narrower than the blanket ban being applied; the other half it is a security team's default posture, which is negotiable with evidence.</li>
+        <li><strong>"Does it apply to all data or to a class of it?"</strong> This is the question that produces the hybrid architecture. If the mandate covers claimant PII rather than all traffic, you route on the class and keep the frontier model for the rest.</li>
+      </ul>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">If the real constraint is…</th><th class="px-4 py-3">The cheapest thing that satisfies it</th><th class="px-4 py-3">What you avoid building</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">"Must stay in the EU / in-country"</td><td class="px-4 py-3">A frontier model served from an in-region managed endpoint, with the data-residency terms attached to the architecture doc</td><td class="px-4 py-3">Everything in this module</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"No provider may retain or train on it"</td><td class="px-4 py-3">Enterprise terms plus zero-retention configuration — a contract change, not an engineering one</td><td class="px-4 py-3">Everything in this module</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Traffic must not traverse the public internet"</td><td class="px-4 py-3">A private link / VPC endpoint to the managed service (<a href="./pr6.html" class="text-viol underline decoration-viol/40">PR6</a>)</td><td class="px-4 py-3">GPU procurement; you still get frontier quality</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Only this data class is restricted"</td><td class="px-4 py-3">The hybrid router above — local for the restricted class, API for the rest</td><td class="px-4 py-3">Sizing your cluster for 100% of traffic instead of 20%</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Nothing leaves the physical network. At all."</td><td class="px-4 py-3"><strong>Local weights on their hardware.</strong> Parts II–VI</td><td class="px-4 py-3">Nothing — this is the real thing, and now you can prove it is</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Write the answers into a four-line <code class="inline">RESIDENCY.md</code> and get it acknowledged by
+        name — "per J. Okafor (CISO), 2026-07-14, restriction applies to claimant PII only; research and public
+        market data may use external endpoints". That one paragraph sizes the cluster, defines the router's first
+        predicate, and settles the argument that would otherwise resurface at every steering committee for six
+        months. It has never taken more than half a day to produce, and skipping it has cost engagements weeks.
+      </p>
 
       <!-- ═══════════════ PART II ═══════════════ -->
       <div class="kicker text-viol mt-14">Part II · The open-weights landscape</div>
@@ -201,6 +324,55 @@ tailwind.config = {
         is the wrong answer. <strong>Apache-2.0 (Qwen, Mistral) and MIT (DeepSeek, Phi) sail through review;
         Llama and Gemma need a reading.</strong> Flag the license in your first architecture doc, not after procurement asks.
       </div>
+
+      <h3 class="font-semibold text-lg mt-8">The licence table counsel actually reads</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Open source" is not a licence, and on an enterprise deal it is not even a useful word. Weights ship under
+        at least five materially different regimes, and the difference between them is measured in weeks of legal
+        review. A model that arrives in week 2 with an Apache-2.0 tag is in production in week 5; the same-quality
+        model under a bespoke community licence goes into a queue behind an unrelated vendor contract and shows up
+        in week 11. <strong>Licence is a schedule risk long before it is a legal risk.</strong> Learn this table
+        well enough to answer from memory in the room:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Licence</th><th class="px-4 py-3">Commercial use</th><th class="px-4 py-3">Conditions that actually bind you</th><th class="px-4 py-3">Typical review</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Apache-2.0<br/><span class="text-xs font-normal text-mute dark:text-mutedark">Qwen3, Mistral open line</span></td><td class="px-4 py-3">Yes, unconditional</td><td class="px-4 py-3">Keep the notice file; an explicit patent grant (which is <em>why</em> counsel prefers it over MIT)</td><td class="px-4 py-3">Hours. Most enterprises have a standing approval</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">MIT<br/><span class="text-xs font-normal text-mute dark:text-mutedark">DeepSeek, Phi-4</span></td><td class="px-4 py-3">Yes, unconditional</td><td class="px-4 py-3">Keep the notice. No patent grant, which a few conservative legal teams flag</td><td class="px-4 py-3">Hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Llama Community<br/><span class="text-xs font-normal text-mute dark:text-mutedark">Llama 3.x / 4</span></td><td class="px-4 py-3">Yes, with conditions</td><td class="px-4 py-3">Separate Meta licence above 700M MAU; "Built with Llama" attribution; derivative models must carry "Llama" in the name; a binding acceptable-use policy that flows down to <em>your</em> customer</td><td class="px-4 py-3">Days to weeks — it is a bespoke contract, so it goes to a human</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Gemma Terms<br/><span class="text-xs font-normal text-mute dark:text-mutedark">Gemma 2 / 3</span></td><td class="px-4 py-3">Yes, with conditions</td><td class="px-4 py-3">Use restrictions that flow down to downstream recipients; Google may require you to stop distributing a version remotely</td><td class="px-4 py-3">Days to weeks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Research-only<br/><span class="text-xs font-normal text-mute dark:text-mutedark">MRL, CC-BY-NC variants</span></td><td class="px-4 py-3"><strong>No</strong></td><td class="px-4 py-3">Nothing to negotiate at the FDE level — either buy the commercial licence from the vendor or pick a different model</td><td class="px-4 py-3">N/A — remove it from the shortlist on day one</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The deliverable is one page, produced in week 1 and never argued about again. Put it beside the architecture
+        doc so procurement finds it without asking:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">MODEL_LICENCES.md — the shortlist, with the tag counsel needs</span>
+        <pre class="code"># Model shortlist &amp; licence position — ACME claims triage        2026-08-05
+
+| Candidate                     | Licence   | Commercial | Action needed        |
+|-------------------------------|-----------|------------|----------------------|
+| Qwen2.5-14B-Instruct-AWQ      | Apache-2.0| yes        | none — notice file   |
+| Qwen2.5-72B-Instruct-AWQ      | Apache-2.0| yes        | none — notice file   |
+| Phi-4 (14B)                   | MIT       | yes        | none — notice file   |
+| Llama-3.1-8B-Instruct         | Llama CL  | yes*       | *legal read + NOTICE |
+| Mistral-Large (research tag)  | MRL       | NO         | dropped 2026-07-29   |
+
+Primary: Qwen2.5-14B-Instruct-AWQ. Rationale: Apache-2.0 clears in hours, and it
+scored within 1 task of Llama-3.1-8B on the 45-task golden set (Part V).
+Weights SHA256 pinned in infra/models.lock; re-verify on every pull.</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note the last line. Pinning the weight hash is the difference between "we run Qwen2.5-14B" and "we run a
+        specific 8.6 GB artifact whose provenance we can prove" — the second sentence is the one that survives an
+        audit, and it costs you one <code class="inline">sha256sum</code> in the deploy pipeline
+        (<a href="./pr6.html" class="text-viol underline decoration-viol/40">PR6</a>).
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">Instruct vs base — always pick instruct</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
@@ -247,6 +419,165 @@ kv_per_token ≈ 2 × n_layers × n_kv_heads × head_dim × bytes
         prompted 70B often enough to check.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">Three deployments, sized end to end</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A napkin that stops at "the weights fit" is not a sizing exercise, it is a reassurance. Run it all the way
+        to a yes/no on named hardware, with the concurrency the customer actually asked for. These three shapes
+        cover most of what an FDE meets: the laptop demo, the departmental pilot on one rented card, and the
+        air-gapped production cluster. Make the arithmetic executable so nobody has to trust your mental maths:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">vram.py — the napkin, executable, 12 lines</span>
+        <pre class="code">GiB = <span class="st">1024</span>**<span class="st">3</span>
+
+<span class="kw">def</span> <span class="fn">size</span>(params_b, bpw, layers, kv_heads, head_dim,
+         ctx, concurrent, kv_bytes=<span class="st">2</span>, card_gb=<span class="st">24</span>, cards=<span class="st">1</span>, util=<span class="st">0.90</span>):
+    weights = params_b * <span class="st">1e9</span> * bpw / GiB * <span class="st">1.05</span>        <span class="cm"># +5% loader overhead</span>
+    kv_tok  = <span class="st">2</span> * layers * kv_heads * head_dim * kv_bytes / GiB
+    kv      = kv_tok * ctx * concurrent
+    budget  = card_gb * cards * util - <span class="st">1.0</span> * cards      <span class="cm"># ~1 GiB/card activations+graphs</span>
+    <span class="kw">return</span> weights, kv, budget - weights - kv
+
+<span class="cm"># A · laptop demo — Ollama, Metal caps the working set near 75% of unified RAM</span>
+<span class="fn">print</span>(<span class="st">"A"</span>, [f<span class="st">"{x:5.1f}"</span> <span class="kw">for</span> x <span class="kw">in</span> <span class="fn">size</span>(<span class="st">14.7</span>, <span class="st">0.61</span>, <span class="st">48</span>, <span class="st">8</span>, <span class="st">128</span>, <span class="st">16384</span>, <span class="st">1</span>,
+                               card_gb=<span class="st">36</span>, util=<span class="st">0.75</span>)])
+<span class="cm"># B · departmental pilot — one L4, 7 users each holding a full 8K window</span>
+<span class="fn">print</span>(<span class="st">"B"</span>, [f<span class="st">"{x:5.1f}"</span> <span class="kw">for</span> x <span class="kw">in</span> <span class="fn">size</span>(<span class="st">14.7</span>, <span class="st">0.62</span>, <span class="st">48</span>, <span class="st">8</span>, <span class="st">128</span>, <span class="st">8192</span>, <span class="st">7</span>)])
+<span class="cm"># C · air-gapped prod — 72B AWQ split over two A100s with --tensor-parallel-size 2</span>
+<span class="fn">print</span>(<span class="st">"C"</span>, [f<span class="st">"{x:5.1f}"</span> <span class="kw">for</span> x <span class="kw">in</span> <span class="fn">size</span>(<span class="st">72.7</span>, <span class="st">0.58</span>, <span class="st">80</span>, <span class="st">8</span>, <span class="st">128</span>, <span class="st">16384</span>, <span class="st">18</span>,
+                               card_gb=<span class="st">80</span>, cards=<span class="st">2</span>)])
+<span class="out">A ['  8.8', '  3.0', ' 14.2']      # weights, kv, free — GiB</span>
+<span class="out">B ['  8.9', ' 10.5', '  1.2']</span>
+<span class="out">C [' 41.3', ' 92.2', '  8.5']</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Row B is the one that teaches the lesson: the weights are <strong>8.9 GiB on a 24 GB card</strong> and you
+        still only get seven simultaneous full-length conversations, because the KV cache is <em>larger than the
+        model</em>. Anyone who sized that box by looking at the file size on Hugging Face has already promised the
+        customer three times the concurrency it can deliver.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Deployment</th><th class="px-4 py-3">Hardware</th><th class="px-4 py-3">Model + quant</th><th class="px-4 py-3">Worst-case concurrency</th><th class="px-4 py-3">Realistic concurrency</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A · Laptop demo</td><td class="px-4 py-3">M3 Max, 36 GB unified</td><td class="px-4 py-3">qwen2.5:14b Q4_K_M via Ollama, ctx 16K</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3">1 — and that is fine; a demo box is not a server</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">B · Departmental pilot</td><td class="px-4 py-3">1× L4 24 GB (~$0.70/hr)</td><td class="px-4 py-3">Qwen2.5-14B-Instruct-AWQ on vLLM, ctx 8K</td><td class="px-4 py-3 font-mono">7 @ full 8K</td><td class="px-4 py-3"><strong>~28</strong> at a measured 2.0K mean sequence — paged KV only allocates what is used</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">C · Air-gapped prod</td><td class="px-4 py-3">2× A100 80 GB, TP=2</td><td class="px-4 py-3">Qwen2.5-72B-Instruct-AWQ on vLLM, ctx 16K</td><td class="px-4 py-3 font-mono">18 @ full 16K</td><td class="px-4 py-3"><strong>~75</strong> at a 4.0K mean sequence</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The gap between the two right-hand columns is PagedAttention doing its job: KV is allocated per block as a
+        sequence grows, so a 400-token chat costs 400 tokens of cache, not 8,192. Quote the <em>worst case</em> when
+        you promise capacity and the <em>realistic case</em> when you forecast cost — and measure your own mean
+        sequence length before you believe either. Part VI turns this into a capacity plan.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>vLLM pre-allocates, so the OOM arrives at startup or never.</strong>
+        <code class="inline">--gpu-memory-utilization 0.90</code> reserves 90% of the card <em>on boot</em> and
+        carves the KV pool out of it. That is good news — the card cannot slowly fill up and die at 3am — but it
+        means anything else on that GPU (a display server, another container, a stray notebook) turns a working
+        config into a start-up crash. Dedicate the card, and pin the number in the unit file rather than leaving it
+        to a default that changes between vLLM releases.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">What the model card doesn't tell you</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Four properties decide whether a model works in your deployment and none of them are in the headline
+        number. Read them off the config before you shortlist, not after the pilot disappoints:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Property</th><th class="px-4 py-3">Where the surprise is</th><th class="px-4 py-3">What to do about it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">MoE total vs active params</td><td class="px-4 py-3">A "17B active" MoE still needs <em>all</em> experts resident in VRAM. Total params drive memory; active params drive speed. Sizing on the active count is the single most expensive mistake in this table</td><td class="px-4 py-3">Size memory on total params, throughput on active params. Say both numbers out loud in the sizing meeting</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Advertised vs usable context</td><td class="px-4 py-3">A 128K window is a claim about position encodings, not about faithfulness. Quality on retrieval-style tasks often sags well before the limit — and 128K of KV would not fit anyway</td><td class="px-4 py-3">Set <code class="inline">--max-model-len</code> to what your eval actually validates (usually 8–16K), and test the long-context stratum explicitly</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tokenizer efficiency</td><td class="px-4 py-3">Non-English text costs more tokens per character. The same document is 1.3–2× more tokens in Vietnamese or Thai — which inflates cost, latency <em>and</em> KV footprint simultaneously</td><td class="px-4 py-3">Measure on the customer's real corpus before quoting anything (code below)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Chat template</td><td class="px-4 py-3">Each family has its own special tokens. Serve with the wrong template and the model still answers — noticeably worse, with no error anywhere</td><td class="px-4 py-3">Let the server apply <code class="inline">tokenizer_config.json</code>'s template; never hand-roll the prompt string</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">tokenizer_check.py — run this before you quote a token price</span>
+        <pre class="code"><span class="kw">from</span> transformers <span class="kw">import</span> AutoTokenizer
+
+tok = AutoTokenizer.<span class="fn">from_pretrained</span>(<span class="st">"Qwen/Qwen2.5-14B-Instruct"</span>)
+SAMPLES = {
+    <span class="st">"en"</span>: <span class="st">"The claimant reported hail damage to the vehicle roof on 12 March."</span>,
+    <span class="st">"vi"</span>: <span class="st">"Người yêu cầu bồi thường báo cáo hư hỏng do mưa đá trên nóc xe ngày 12 tháng 3."</span>,
+}
+<span class="kw">for</span> lang, text <span class="kw">in</span> SAMPLES.<span class="fn">items</span>():
+    n = <span class="fn">len</span>(tok.<span class="fn">encode</span>(text))
+    <span class="fn">print</span>(f<span class="st">"{lang}  {n:3d} tokens  {len(text)/n:4.1f} chars/token"</span>)
+<span class="out">en   16 tokens   4.1 chars/token</span>
+<span class="out">vi   32 tokens   2.5 chars/token</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Same sentence, <strong>2× the tokens</strong>. On a Vietnamese-language deployment that doubles your KV
+        footprint per conversation, halves the effective context window, and — if you quoted cost per document from
+        an English sample — doubles the bill you promised. Run this on 200 real customer documents and put the
+        chars-per-token figure in the sizing doc; it takes four minutes and it has saved engagements.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Getting the weights in, when there is no internet</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Here is the practical problem nobody warns you about: the environments that most need local models are the
+        ones that cannot reach Hugging Face. <code class="inline">huggingface-cli download</code> is not available
+        inside a genuine air gap, and "someone will copy it on a USB stick" is how you end up serving weights whose
+        provenance nobody can attest to six months later. Treat model distribution as a supply-chain problem from
+        day one — three steps, all boring, all auditable:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">stage_model.sh — run on the connected side, once per model version</span>
+        <pre class="code">#!/usr/bin/env bash
+set -euo pipefail
+REPO=<span class="st">"Qwen/Qwen2.5-14B-Instruct-AWQ"</span>
+REV=<span class="st">"a1b2c3d"</span>                      <span class="cm"># PIN THE COMMIT. "main" is not a version.</span>
+OUT=<span class="st">"/staging/$(echo $REPO | tr / _)_$REV"</span>
+
+<span class="cm"># 1. Download at a pinned revision, not a moving branch.</span>
+huggingface-cli download <span class="st">"$REPO"</span> --revision <span class="st">"$REV"</span> --local-dir <span class="st">"$OUT"</span>
+
+<span class="cm"># 2. Record what you actually got, so the far side can prove it matches.</span>
+(cd <span class="st">"$OUT"</span> &amp;&amp; find . -type f -exec sha256sum {} \; | sort -k2) &gt; <span class="st">"$OUT.SHA256"</span>
+<span class="fn">echo</span> <span class="st">"$REPO@$REV  $(wc -l &lt; "$OUT.SHA256") files"</span> | tee <span class="st">"$OUT.MANIFEST"</span>
+
+<span class="cm"># 3. One tarball + one manifest crosses the boundary. Nothing else does.</span>
+tar -C /staging -czf <span class="st">"$OUT.tar.gz"</span> <span class="st">"$(basename $OUT)"</span>
+<span class="fn">echo</span> <span class="st">"transfer: $OUT.tar.gz  $OUT.SHA256  $OUT.MANIFEST"</span>
+<span class="out">Qwen/Qwen2.5-14B-Instruct-AWQ@a1b2c3d  14 files</span>
+<span class="out">transfer: /staging/Qwen_Qwen2.5-14B-Instruct-AWQ_a1b2c3d.tar.gz ...</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On the far side, verify before you serve — and make verification a startup dependency rather than a habit,
+        because habits do not survive staff turnover:
+      </p>
+      <pre class="code mt-3">tar -xzf Qwen_Qwen2.5-14B-Instruct-AWQ_a1b2c3d.tar.gz -C /srv/models/
+cd /srv/models/Qwen_Qwen2.5-14B-Instruct-AWQ_a1b2c3d &amp;&amp; sha256sum -c ../*.SHA256
+<span class="out">./model-00001-of-00004.safetensors: OK</span>
+<span class="out">./config.json: OK</span>
+<span class="cm"># … then in the systemd unit:</span>
+<span class="cm"># ExecStartPre=/usr/local/bin/verify_weights.sh   # fails closed if a hash moved</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three details that matter more than they look. <strong>Pin the revision</strong>, because repository
+        <code class="inline">main</code> branches do get new commits — a re-quantized build, a fixed chat template —
+        and "we redeployed and quality changed" is a miserable thing to debug. <strong>Prefer
+        <code class="inline">.safetensors</code></strong> over pickle-based <code class="inline">.bin</code>
+        checkpoints: pickle files execute code on load, which is a genuine finding in a security review and one
+        you should never have to defend. And <strong>stage the container image the same way</strong> — an
+        air-gapped host that has the weights but not <code class="inline">vllm/vllm-openai:v0.9.1</code> is exactly
+        as stuck.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>Budget the transfer, not just the download.</strong> A 70B fp16 checkpoint is ~145 GB and an AWQ
+        build ~40 GB. Through a customer's data-diode or manual review process, a single model version can take
+        <em>days</em> to cross — and it will need to cross again for every promotion. This is a real argument for
+        choosing a 14B you can move in an afternoon over a 72B you can move once a quarter, and it belongs in the
+        sizing conversation alongside VRAM (<a href="./pr12.html" class="text-viol underline decoration-viol/40">PR12</a>).
+      </div>
+
       <!-- ═══════════════ PART III ═══════════════ -->
       <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Quantization</div>
       <h2 class="font-display text-2xl font-bold mt-2">Fewer bits, same model — how far can you squeeze?</h2>
@@ -267,6 +598,94 @@ kv_per_token ≈ 2 × n_layers × n_kv_heads × head_dim × bytes
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">GPU-native 4-bit (AWQ, GPTQ) and 8-bit (FP8 on modern cards) formats with fast fused kernels. Look for <code class="inline">-AWQ</code> / <code class="inline">-GPTQ-Int4</code> / <code class="inline">-FP8</code> repos on Hugging Face — pre-quantized by the vendor or community.</p>
         </div>
       </div>
+
+      <h3 class="font-semibold text-lg mt-7">What quantization does to a single weight</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The mechanism is simpler than the vocabulary suggests, and understanding it in one sitting immunises you
+        against most quantization folklore. Take a row of weights, cut it into <strong>groups of 128</strong>, and
+        for each group store one fp16 <em>scale</em> plus a 4-bit index per weight. Dequantizing is a multiply.
+        That is the entire trick — the losses come from the rounding, and the rounding is only as good as the
+        group's scale, which is set by the group's <em>largest</em> value. Fifteen lines of standard library
+        reproduce the effect exactly:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">quant_demo.py — group-wise int4, stdlib only, runs in a second</span>
+        <pre class="code"><span class="kw">import</span> random, statistics <span class="kw">as</span> st
+random.<span class="fn">seed</span>(<span class="st">0</span>)
+
+w = [random.<span class="fn">gauss</span>(<span class="st">0</span>, <span class="st">0.02</span>) <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(<span class="st">4096</span>)]   <span class="cm"># one row of a weight matrix</span>
+w[<span class="st">1234</span>] = <span class="st">0.9</span>                                      <span class="cm"># one activation-salient outlier</span>
+
+<span class="kw">def</span> <span class="fn">q4</span>(group):                 <span class="cm"># symmetric int4: 15 levels + one fp16 scale</span>
+    s = <span class="fn">max</span>(<span class="fn">abs</span>(x) <span class="kw">for</span> x <span class="kw">in</span> group) / <span class="st">7.0</span>
+    <span class="kw">return</span> [<span class="fn">max</span>(-<span class="st">7</span>, <span class="fn">min</span>(<span class="st">7</span>, <span class="fn">round</span>(x / s))) * s <span class="kw">for</span> x <span class="kw">in</span> group]
+
+groups = [w[i:i+<span class="st">128</span>] <span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(<span class="st">0</span>, <span class="fn">len</span>(w), <span class="st">128</span>)]
+err    = [[<span class="fn">abs</span>(a - b) <span class="kw">for</span> a, b <span class="kw">in</span> <span class="fn">zip</span>(<span class="fn">q4</span>(g), g)] <span class="kw">for</span> g <span class="kw">in</span> groups]
+flat   = [e <span class="kw">for</span> g <span class="kw">in</span> err <span class="kw">for</span> e <span class="kw">in</span> g]
+gm     = [<span class="fn">sum</span>(g) / <span class="fn">len</span>(g) <span class="kw">for</span> g <span class="kw">in</span> err]
+
+<span class="fn">print</span>(f<span class="st">"mean |err|   {sum(flat)/len(flat):.5f}  "</span>
+      f<span class="st">"({sum(flat)/len(flat) / (sum(map(abs, w))/len(w)):.1%} of mean |w|)"</span>)
+<span class="fn">print</span>(f<span class="st">"worst group  {max(gm):.5f}   median group {st.median(gm):.5f}"</span>
+      f<span class="st">"   ratio {max(gm)/st.median(gm):.1f}x"</span>)
+<span class="out">mean |err|   0.00229  (14.1% of mean |w|)</span>
+<span class="out">worst group  0.01389   median group 0.00188   ratio 7.4x</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two things fall out of those two lines of output. First, <strong>per-weight error is enormous — 14% of the
+        average weight magnitude</strong> — and the model still works, because errors are zero-mean and a matrix
+        multiply averages thousands of them. Quantization survives on the law of large numbers, which is also why
+        it degrades gracefully rather than catastrophically. Second, <strong>the outlier's group is 7.4× worse</strong>:
+        with a scale set by 0.9, the other 127 weights in that group all round to exactly zero. That single fact is
+        the entire research programme behind AWQ (find the salient channels, scale them so they survive) and behind
+        the "K" in <code class="inline">Q4_K_M</code> (spend more bits on the layers that matter).
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>Why "4-bit" files are never 0.5 bytes per weight.</strong> Four bits of index plus one fp16 scale
+        per 128 weights is 4 + 16/128 = <strong>4.125 bits</strong>, and embeddings plus the output head are usually
+        left at fp16 or 8-bit because quantizing them hurts disproportionately. Real 4-bit repos land near
+        <strong>0.58–0.62 bytes/weight</strong>, which is why <code class="inline">vram.py</code> in Part II uses
+        those numbers instead of the theoretical 0.5. Sizing on the theory under-counts by 20% — enough to turn a
+        fits into a doesn't.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The format landscape — pick by where it runs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        There is no "best" format, only a format that matches your runtime. Choosing wrongly is not subtle: an AWQ
+        checkpoint will not load in Ollama and a GGUF file is not what vLLM wants. Decide the server first (Part IV),
+        then the format follows mechanically:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Format</th><th class="px-4 py-3">Runs on</th><th class="px-4 py-3">Effective bits</th><th class="px-4 py-3">Calibration data?</th><th class="px-4 py-3">Pick it when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">GGUF Q4_K_M</td><td class="px-4 py-3">llama.cpp, Ollama — CPU, Metal, or partial GPU offload</td><td class="px-4 py-3 font-mono">~4.8</td><td class="px-4 py-3">No (optional importance matrix)</td><td class="px-4 py-3">Laptops, Macs, CPU-only boxes, anything where one file that just runs beats peak throughput</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">GGUF Q6_K / Q8_0</td><td class="px-4 py-3">Same</td><td class="px-4 py-3 font-mono">~6.6 / 8.5</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Your eval showed damage at Q4, or you have RAM to spare and want the argument closed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AWQ 4-bit</td><td class="px-4 py-3">vLLM, SGLang, TGI — NVIDIA</td><td class="px-4 py-3 font-mono">~4.15</td><td class="px-4 py-3">Yes, ~128 samples, vendor usually did it</td><td class="px-4 py-3">The default for GPU serving. Activation-aware scaling protects salient channels, so it is the strongest 4-bit tier</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">GPTQ 4-bit</td><td class="px-4 py-3">vLLM, TGI — NVIDIA</td><td class="px-4 py-3 font-mono">~4.15</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">AWQ weights don't exist for your model. Comparable quality; older, so availability is broader</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">FP8 (W8A8)</td><td class="px-4 py-3">Ada / Hopper and newer (L4, L40S, H100)</td><td class="px-4 py-3 font-mono">8</td><td class="px-4 py-3">No (dynamic) or light</td><td class="px-4 py-3">You have the hardware and want near-lossless quality <em>plus</em> a real compute speedup — FP8 quantizes activations too, so the tensor cores get faster, not just the memory bus</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">bitsandbytes NF4</td><td class="px-4 py-3">HF <code class="inline">transformers</code></td><td class="px-4 py-3 font-mono">~4.5</td><td class="px-4 py-3">No</td><td class="px-4 py-3">QLoRA fine-tuning (<a href="./ai10.html" class="text-viol underline decoration-viol/40">AI10</a>). Convenient, but slow for serving — do not ship it as a server</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">KV-cache fp8</td><td class="px-4 py-3">vLLM <code class="inline">--kv-cache-dtype fp8</code></td><td class="px-4 py-3 font-mono">8 per cache entry</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Orthogonal to weight quantization — this one buys <em>concurrency</em>, not model size</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That last row is the cheapest capacity win in this module and almost nobody reaches for it. Deployment B
+        from Part II — Qwen2.5-14B-AWQ on one L4 — held <strong>7</strong> concurrent full-8K sequences with an
+        fp16 KV cache. Halve the cache entry and the same card holds <strong>15</strong>:
+      </p>
+      <pre class="code mt-3">vllm serve Qwen/Qwen2.5-14B-Instruct-AWQ \
+    --max-model-len 8192 --gpu-memory-utilization 0.90 \
+    --kv-cache-dtype fp8                 <span class="cm"># KV entries 2 B → 1 B</span>
+<span class="cm"># KV pool 10.5 GiB → same GiB, but 0.0916 MiB/token instead of 0.183</span>
+<span class="cm"># worst-case concurrency at 8K:  7 → 15   (measure quality before you keep it)</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Measure before you keep it, because fp8 KV is a quality knob like any other — it is usually free on
+        classification and extraction and occasionally visible on long-context reasoning. Run it through the same
+        harness as everything else; the next section is how.
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">The quality-vs-VRAM ladder</h3>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
@@ -310,6 +729,112 @@ kv_per_token ≈ 2 × n_layers × n_kv_heads × head_dim × bytes
         fine, which is exactly why the table is persuasive.
       </div>
 
+      <h3 class="font-semibold text-lg mt-8">Measuring the damage — the benchmark you actually run</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The literature measures quantization with <strong>perplexity</strong>, and you should not. Perplexity is a
+        corpus-level average that moves by 0.02 while the one thing your customer cares about — currency amounts
+        coming out right — breaks silently. Run <em>your</em> golden set, and run it
+        <strong>stratified by task category</strong>, because quantization damage is never uniformly distributed.
+        The harness is a loop over model tags with an fp16 or Q8 run as the reference:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">quant_sweep.py — the same golden set across the ladder, by category</span>
+        <pre class="code"><span class="kw">import</span> json, collections
+<span class="kw">from</span> openai <span class="kw">import</span> OpenAI
+
+client = <span class="fn">OpenAI</span>(base_url=<span class="st">"http://localhost:11434/v1"</span>, api_key=<span class="st">"ollama"</span>)
+LADDER = [<span class="st">"qwen2.5:14b-instruct-q8_0"</span>,      <span class="cm"># reference for this sweep</span>
+          <span class="st">"qwen2.5:14b-instruct-q6_K"</span>,
+          <span class="st">"qwen2.5:14b-instruct-q4_K_M"</span>]
+GOLDEN = [json.<span class="fn">loads</span>(l) <span class="kw">for</span> l <span class="kw">in</span> <span class="fn">open</span>(<span class="st">"golden.jsonl"</span>)]   <span class="cm"># each row has a "cat"</span>
+
+<span class="cm"># Sampling knobs are a LOCAL-server concern. Ollama, vLLM and llama.cpp all</span>
+<span class="cm"># accept them; the Anthropic API rejects temperature on Opus 5 / Sonnet 5.</span>
+<span class="cm"># Keeping them in one dict makes the difference explicit at the swap point.</span>
+LOCAL_SAMPLING = {<span class="st">"temperature"</span>: <span class="st">0</span>, <span class="st">"seed"</span>: <span class="st">7</span>}
+
+<span class="kw">def</span> <span class="fn">sweep</span>(model):
+    by_cat = collections.<span class="fn">Counter</span>(); n_cat = collections.<span class="fn">Counter</span>()
+    <span class="kw">for</span> g <span class="kw">in</span> GOLDEN:
+        r = client.chat.completions.<span class="fn">create</span>(
+            model=model, max_tokens=<span class="st">300</span>,
+            messages=[{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: g[<span class="st">"q"</span>]}], **LOCAL_SAMPLING)
+        hit = g[<span class="st">"expect"</span>].<span class="fn">lower</span>() <span class="kw">in</span> r.choices[<span class="st">0</span>].message.content.<span class="fn">lower</span>()
+        by_cat[g[<span class="st">"cat"</span>]] += <span class="fn">int</span>(hit); n_cat[g[<span class="st">"cat"</span>]] += <span class="st">1</span>
+    <span class="kw">return</span> by_cat, n_cat
+
+<span class="kw">for</span> m <span class="kw">in</span> LADDER:
+    hits, n = <span class="fn">sweep</span>(m)
+    <span class="fn">print</span>(f<span class="st">"{m:30s} "</span> + <span class="st">"  "</span>.<span class="fn">join</span>(f<span class="st">"{c}:{hits[c]}/{n[c]}"</span> <span class="kw">for</span> c <span class="kw">in</span> <span class="fn">sorted</span>(n)))
+<span class="out">qwen2.5:14b-instruct-q8_0      arith:5/8  class:12/12  exact:5/5  extract:9/10  sum:3/5</span>
+<span class="out">qwen2.5:14b-instruct-q6_K      arith:5/8  class:12/12  exact:4/5  extract:9/10  sum:3/5</span>
+<span class="out">qwen2.5:14b-instruct-q4_K_M    arith:3/8  class:12/12  exact:4/5  extract:9/10  sum:3/5</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read the shape, not the total. Totals go <strong>34 → 33 → 31 out of 40</strong> — a 3-point drop that a
+        single headline number would let you shrug off. The stratification says something far more actionable:
+        <strong>classification, extraction and summarisation are untouched at every level</strong>, and both points
+        lost at Q4 sit in one category, arithmetic. That converts a vague "is Q4 safe?" into three specific options
+        with prices:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">Golden set</th><th class="px-4 py-3">VRAM on the L4</th><th class="px-4 py-3">Worst-case concurrency</th><th class="px-4 py-3">Verdict</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Q4_K_M as-is</td><td class="px-4 py-3 font-mono">31/40</td><td class="px-4 py-3 font-mono">9.0 GB</td><td class="px-4 py-3 font-mono">7</td><td class="px-4 py-3">Ship it if arithmetic isn't in scope</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Q4_K_M + a calculator tool</td><td class="px-4 py-3 font-mono">34/40</td><td class="px-4 py-3 font-mono">9.0 GB</td><td class="px-4 py-3 font-mono">7</td><td class="px-4 py-3"><strong>The right answer.</strong> Arithmetic was never a job for a language model</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Step up to Q6_K</td><td class="px-4 py-3 font-mono">33/40</td><td class="px-4 py-3 font-mono">12.4 GB</td><td class="px-4 py-3 font-mono">5</td><td class="px-4 py-3">Costs 2 concurrent users to buy back 2 points you can get for free</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Row 2 is the consultant's move and it is invisible unless you stratify: hand the model a
+        <code class="inline">calculate</code> tool (<a href="./ai6.html" class="text-viol underline decoration-viol/40">AI6</a>)
+        and the score goes <strong>31 → 34 at zero VRAM cost</strong> — past what the Q8 reference itself managed —
+        while stepping up the quant level would have bought one fewer point and cost 2 of 7 concurrent users.
+        Quantization problems are frequently architecture problems wearing a disguise.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Picking a level for a VRAM budget</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In practice you never choose a quant level in isolation — you choose a <em>(model size, quant level)</em>
+        pair that fits a card. The empirical rule, and it is remarkably robust: <strong>at equal memory, prefer the
+        larger model at the lower precision, down to about 4 bits — and never below</strong>. A 14B at Q4 beats an
+        8B at Q8 on essentially every task type; a 32B at Q2 loses to a 14B at Q4 on all of them. Below 4 bits the
+        ordering inverts because the damage stops being zero-mean noise and starts being structural.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">pick.py — enumerate what fits, then rank by the rule</span>
+        <pre class="code">BPW  = {<span class="st">"fp16"</span>: <span class="st">2.0</span>, <span class="st">"Q8_0"</span>: <span class="st">1.06</span>, <span class="st">"Q6_K"</span>: <span class="st">0.83</span>, <span class="st">"Q4_K_M"</span>: <span class="st">0.61</span>, <span class="st">"Q3_K_M"</span>: <span class="st">0.49</span>}
+BITS = {<span class="st">"fp16"</span>: <span class="st">16</span>, <span class="st">"Q8_0"</span>: <span class="st">8.5</span>, <span class="st">"Q6_K"</span>: <span class="st">6.6</span>, <span class="st">"Q4_K_M"</span>: <span class="st">4.8</span>, <span class="st">"Q3_K_M"</span>: <span class="st">3.9</span>}
+SIZES = {<span class="st">"8B"</span>: <span class="st">8.0</span>, <span class="st">"14B"</span>: <span class="st">14.7</span>, <span class="st">"32B"</span>: <span class="st">32.8</span>}
+
+<span class="kw">def</span> <span class="fn">fits</span>(card_gb, kv_gb):
+    room = card_gb * <span class="st">0.90</span> - kv_gb - <span class="st">1.0</span>
+    out = [(s, q) <span class="kw">for</span> s, p <span class="kw">in</span> SIZES.<span class="fn">items</span>() <span class="kw">for</span> q, b <span class="kw">in</span> BPW.<span class="fn">items</span>()
+           <span class="kw">if</span> p * b * <span class="st">1.05</span> &lt;= room <span class="kw">and</span> BITS[q] &gt;= <span class="st">4.0</span>]   <span class="cm"># the "never below 4" rule</span>
+    <span class="kw">return</span> <span class="fn">sorted</span>(out, key=<span class="kw">lambda</span> t: (-SIZES[t[<span class="st">0</span>]], -BITS[t[<span class="st">1</span>]]))
+
+<span class="fn">print</span>(<span class="fn">fits</span>(card_gb=<span class="st">24</span>, kv_gb=<span class="st">8</span>)[:<span class="st">4</span>])
+<span class="out">[('14B', 'Q6_K'), ('14B', 'Q4_K_M'), ('8B', 'Q8_0'), ('8B', 'Q6_K')]</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On a 24 GB card with 8 GB reserved for KV, the ranked shortlist is <strong>14B at Q6_K first</strong>, and
+        32B is absent at every level because even Q3 would need 16.9 GB of the 12.6 GB available — the rule filtered
+        it out before you wasted an afternoon on it. Two guardrails: this ranking is a <em>starting order</em> for
+        the eval, never a substitute for it, and the KV reservation is the number you must measure first, since it
+        is what actually determines how much room the weights get.
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move — decline the quantization project.</strong> When someone proposes quantizing a model
+        themselves to squeeze out another gigabyte, the right answer is almost always no. Vendor and community AWQ
+        or GGUF builds of every mainstream model already exist, calibrated and tested by more people than you can
+        put on it. Custom quantization is warranted for exactly two situations: you fine-tuned the weights yourself
+        (<a href="./ai10.html" class="text-viol underline decoration-viol/40">AI10</a>), or no build exists for your
+        target format. Anything else is a week spent recreating a file you could have downloaded.
+      </div>
+
       <!-- ═══════════════ PART IV ═══════════════ -->
       <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Serving</div>
       <h2 class="font-display text-2xl font-bold mt-2">Ollama for the laptop, vLLM for the datacenter</h2>
@@ -337,6 +862,54 @@ PARAMETER temperature 0
 SYSTEM "You are ACME's contract-clause extraction assistant. Always answer in JSON."</pre>
       <pre class="code mt-3">ollama create acme-extractor -f Modelfile &amp;&amp; ollama run acme-extractor "test"</pre>
 
+      <h3 class="font-semibold text-lg mt-8">Ollama beyond the laptop — and exactly when to stop</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Ollama is frequently dismissed as a dev tool, and that is unfair to it and unhelpful to you: a departmental
+        pilot with twenty users and no GPU budget is a perfectly good Ollama deployment, and it is up in an
+        afternoon. But the defaults are laptop defaults, and every one of them is wrong for a server. Four
+        environment variables convert it into something you can leave running:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">/etc/systemd/system/ollama.service.d/override.conf</span>
+        <pre class="code">[Service]
+Environment=<span class="st">"OLLAMA_HOST=0.0.0.0:11434"</span>       <span class="cm"># default binds loopback only</span>
+Environment=<span class="st">"OLLAMA_KEEP_ALIVE=-1"</span>            <span class="cm"># default unloads after 5 min idle:</span>
+                                             <span class="cm"># every quiet period costs the next user 30 s</span>
+Environment=<span class="st">"OLLAMA_NUM_PARALLEL=4"</span>           <span class="cm"># concurrent requests per model</span>
+Environment=<span class="st">"OLLAMA_MAX_LOADED_MODELS=1"</span>      <span class="cm"># two models on one box = neither fits</span>
+Environment=<span class="st">"OLLAMA_FLASH_ATTENTION=1"</span>        <span class="cm"># cheaper KV on supported hardware</span></pre>
+      </div>
+      <pre class="code mt-3">sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart ollama
+curl -s localhost:11434/api/ps | python3 -m json.tool | grep -E 'name|size_vram'
+<span class="out">"name": "qwen2.5:7b",</span>
+<span class="out">"size_vram": 5905580032,</span>
+<span class="cm"># 5.9 GB resident and pinned — matches the Part II napkin, and stays put.</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">OLLAMA_KEEP_ALIVE=-1</code> is the single most valuable line there: without it, a
+        service that goes quiet for six minutes greets its next user with a 30-second reload, which reads as "the
+        AI is broken" and is reported as such. Note also that <code class="inline">OLLAMA_HOST=0.0.0.0</code>
+        exposes an <em>unauthenticated</em> inference endpoint — put it behind the same reverse proxy and auth as
+        anything else on that network (<a href="./pr13.html" class="text-viol underline decoration-viol/40">PR13</a>),
+        because the API-key concept simply does not exist here.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Signal</th><th class="px-4 py-3">Ollama is still fine</th><th class="px-4 py-3">Move to vLLM</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Concurrency</td><td class="px-4 py-3">Peak below ~4 simultaneous requests</td><td class="px-4 py-3">Anything above it — <code class="inline">OLLAMA_NUM_PARALLEL</code> is a fixed slot count, not continuous batching, so throughput plateaus early</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hardware</td><td class="px-4 py-3">CPU, Apple Silicon, or a single consumer GPU</td><td class="px-4 py-3">Datacentre NVIDIA cards, or more than one card for one model</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Observability</td><td class="px-4 py-3">A log line and a health check are enough</td><td class="px-4 py-3">You need queue depth and KV utilisation — Ollama exports no Prometheus metrics (Part VI)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Stakes</td><td class="px-4 py-3">Internal pilot, degraded mode is acceptable</td><td class="px-4 py-3">It is on the critical path and someone carries a pager for it</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The honest threshold is roughly <strong>four concurrent users or a real GPU</strong>. Below it, Ollama's
+        simplicity is a genuine operational asset and reaching for vLLM is engineering theatre. Above it, you are
+        leaving most of the card on the floor, and the next section explains exactly how much.
+      </p>
+
       <h3 class="font-semibold text-lg mt-8">vLLM: the production throughput king</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         vLLM is the default answer for serious GPU serving, for two ideas worth understanding well enough to
@@ -356,6 +929,54 @@ vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ \
         on an L4 24 GB leaves ~16 GB of KV room — dozens of concurrent 8K sequences. A 70B AWQ (~40 GB) needs one
         80 GB card or two 24 GB cards with <code class="inline">--tensor-parallel-size 2</code>. Serve quantized
         by default; serve fp16 only when your eval demands it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">vLLM launch flags, one at a time</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">vllm serve</code> has upwards of a hundred flags and roughly nine of them decide
+        whether your deployment works. Defaults are chosen for a benchmark rig with a dedicated card, not for a
+        customer's shared VM, so most of these need an explicit value in your unit file. Learn what each one breaks
+        when it is wrong — that is the form the knowledge takes at 2am:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Flag</th><th class="px-4 py-3">What it controls</th><th class="px-4 py-3">Set it wrong and…</th><th class="px-4 py-3">Sane starting value</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold font-mono text-xs">--max-model-len</td><td class="px-4 py-3">Maximum prompt + generation length; also the size of the largest KV allocation</td><td class="px-4 py-3">Too high → refuses to start ("KV cache is too small") or starves concurrency. Too low → silent 400s on long prompts</td><td class="px-4 py-3 font-mono">8192</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono text-xs">--gpu-memory-utilization</td><td class="px-4 py-3">Fraction of the card vLLM reserves at boot</td><td class="px-4 py-3">Too high → OOM on start, or a crash when anything else touches the GPU. Too low → you paid for VRAM you never use</td><td class="px-4 py-3 font-mono">0.90</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono text-xs">--max-num-seqs</td><td class="px-4 py-3">Ceiling on sequences in a single batch — your concurrency knob</td><td class="px-4 py-3">Too high → per-request latency collapses under load while throughput barely moves. Too low → the GPU idles with requests queued</td><td class="px-4 py-3 font-mono">32 <span class="text-xs text-mute dark:text-mutedark">(then measure)</span></td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono text-xs">--max-num-batched-tokens</td><td class="px-4 py-3">Token budget per scheduler step; caps how much prefill runs at once</td><td class="px-4 py-3">Too high → one 8K prompt blocks every decode step and everyone's stream stutters</td><td class="px-4 py-3 font-mono">8192</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono text-xs">--tensor-parallel-size</td><td class="px-4 py-3">How many GPUs one model is split across</td><td class="px-4 py-3">Must divide the attention head count. Wrong value → a cryptic shape error at load, never at runtime</td><td class="px-4 py-3 font-mono">1 <span class="text-xs text-mute dark:text-mutedark">(2 for 70B on 2 cards)</span></td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono text-xs">--kv-cache-dtype</td><td class="px-4 py-3">Precision of cache entries</td><td class="px-4 py-3"><code class="inline">fp8</code> roughly doubles concurrency; validate on your eval before keeping it</td><td class="px-4 py-3 font-mono">auto <span class="text-xs text-mute dark:text-mutedark">(fp8 once measured)</span></td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono text-xs">--enable-prefix-caching</td><td class="px-4 py-3">Reuses KV blocks for shared prompt prefixes</td><td class="px-4 py-3">Off → you re-compute the same 1,200-token system prompt on every request, for nothing</td><td class="px-4 py-3 font-mono">on</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono text-xs">--served-model-name</td><td class="px-4 py-3">The string clients pass as <code class="inline">model</code></td><td class="px-4 py-3">Unset → clients must send the full HF repo path, and every model swap becomes a client change</td><td class="px-4 py-3 font-mono">acme-local</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono text-xs">--api-key</td><td class="px-4 py-3">Bearer token the server requires</td><td class="px-4 py-3">Unset → an unauthenticated inference endpoint on your customer's network. Their pen-test will find it</td><td class="px-4 py-3 font-mono">from a secret store</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Put them in a file rather than a shell history. The indirection costs nothing and it is the difference
+        between a deployment someone else can operate and a deployment only you can restart:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">/etc/llm/serving.env — the whole configuration, reviewable in a PR</span>
+        <pre class="code"><span class="cm"># Qwen2.5-14B-Instruct-AWQ on 1× L4 24GB · validated 2026-08-01 · see BENCH.md</span>
+MODEL=Qwen/Qwen2.5-14B-Instruct-AWQ
+SERVED_NAME=acme-local
+MAX_MODEL_LEN=8192            <span class="cm"># eval validates to 8K, not the card's 32K claim</span>
+GPU_MEM_UTIL=0.90             <span class="cm"># card is dedicated; nothing else may attach</span>
+MAX_NUM_SEQS=24               <span class="cm"># measured knee of the concurrency curve, next section</span>
+MAX_BATCHED_TOKENS=8192
+KV_CACHE_DTYPE=fp8            <span class="cm"># +8 concurrent, 0-task delta on the 40-task golden set</span>
+EXTRA="--enable-prefix-caching --disable-log-requests"</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">--disable-log-requests</code> deserves a sentence of its own on a residency
+        engagement: vLLM's default request logging writes prompts to stdout, which your log shipper then forwards
+        to wherever logs go. On an air-gapped deployment that is usually fine; on a hybrid one it is precisely the
+        boundary crossing you spent Part I preventing. Decide deliberately and write the decision down
+        (<a href="./pr5.html" class="text-viol underline decoration-viol/40">PR5</a>).
       </p>
 
       <h3 class="font-semibold text-lg mt-8">The rest of the field — awareness level</h3>
@@ -398,14 +1019,168 @@ client = OpenAI(base_url=PROVIDER_URL, api_key=REAL_KEY)                     <sp
         (caching, citations) vanish. Lab 2 maps these gaps systematically — the map is a deliverable customers love.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">Making a small model produce valid JSON, every time</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The most common reason a local pilot feels flaky is not reasoning quality — it is a 7B model emitting
+        <code class="inline">{"amount": "1,240.00 EUR"}</code> where the schema wanted a number, or wrapping
+        perfectly good JSON in a markdown fence. A 13% schema-failure rate is typical for a small model with
+        prompt-only instructions, and it is entirely fixable at the <em>server</em>, not in the prompt.
+        <strong>Guided decoding masks the tokens that would violate the grammar before they can be sampled</strong>,
+        which makes invalid output structurally impossible rather than merely discouraged:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">guided.py — the same request, with the schema enforced by the server</span>
+        <pre class="code"><span class="kw">from</span> openai <span class="kw">import</span> OpenAI
+client = <span class="fn">OpenAI</span>(base_url=<span class="st">"http://gpu-box.internal:8000/v1"</span>, api_key=<span class="st">"none"</span>)
+
+CLAIM_SCHEMA = {
+    <span class="st">"type"</span>: <span class="st">"object"</span>,
+    <span class="st">"properties"</span>: {
+        <span class="st">"policy_number"</span>: {<span class="st">"type"</span>: <span class="st">"string"</span>, <span class="st">"pattern"</span>: <span class="st">"^POL-[0-9]{8}$"</span>},
+        <span class="st">"amount_eur"</span>:    {<span class="st">"type"</span>: <span class="st">"number"</span>},
+        <span class="st">"incident_date"</span>: {<span class="st">"type"</span>: <span class="st">"string"</span>},
+        <span class="st">"category"</span>:      {<span class="st">"type"</span>: <span class="st">"string"</span>,
+                           <span class="st">"enum"</span>: [<span class="st">"hail"</span>, <span class="st">"flood"</span>, <span class="st">"collision"</span>, <span class="st">"theft"</span>, <span class="st">"other"</span>]}},
+    <span class="st">"required"</span>: [<span class="st">"policy_number"</span>, <span class="st">"amount_eur"</span>, <span class="st">"incident_date"</span>, <span class="st">"category"</span>],
+    <span class="st">"additionalProperties"</span>: <span class="kw">False</span>}
+
+LOCAL_SAMPLING = {<span class="st">"temperature"</span>: <span class="st">0</span>}      <span class="cm"># local server parameter — not an API one</span>
+
+r = client.chat.completions.<span class="fn">create</span>(
+    model=<span class="st">"acme-local"</span>, max_tokens=<span class="st">200</span>, **LOCAL_SAMPLING,
+    response_format={<span class="st">"type"</span>: <span class="st">"json_schema"</span>,
+                     <span class="st">"json_schema"</span>: {<span class="st">"name"</span>: <span class="st">"claim"</span>, <span class="st">"schema"</span>: CLAIM_SCHEMA}},
+    messages=[{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: NOTE}])
+<span class="fn">print</span>(r.choices[<span class="st">0</span>].message.content)
+<span class="out">{"policy_number": "POL-40182233", "amount_eur": 1240.0,</span>
+<span class="out"> "incident_date": "2026-03-12", "category": "hail"}</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Measured on the same 30-request extraction probe from Lab 2, that one change moves schema failures from
+        <strong>4/30 to 0/30</strong>, at a cost of roughly 3–5% throughput for grammar compilation and mask
+        computation. It is close to the best trade in this module. Three caveats worth knowing before you promise
+        it:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Valid is not correct.</strong> Guided decoding guarantees the shape, never the content — the model can still emit a well-typed wrong amount. It removes a class of parsing bug; it does not remove the need for your eval.</li>
+        <li><strong>Constrain, don't over-constrain.</strong> A schema tight enough to fight the model's natural output (deeply nested, or an enum missing the value it wants) degrades quality — it has to pick <em>something</em> legal. Add an <code class="inline">"other"</code> enum member and a free-text field for what it wanted to say.</li>
+        <li><strong>The support matrix moves.</strong> vLLM and SGLang support JSON-schema-guided decoding; Ollama exposes a narrower <code class="inline">format</code> parameter; llama.cpp uses GBNF grammars. Verify on the exact server build you are shipping, in Lab 2's diff table, rather than assuming.</li>
+      </ul>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Tool calling is the same mechanism wearing a different hat — a tool schema is a JSON schema — which is why
+        a local model that can be made to emit valid JSON can usually be made to call tools acceptably too. The
+        loop itself belongs to <a href="./ai6.html" class="text-viol underline decoration-viol/40">AI6</a>; what
+        changes locally is that you should expect to <em>validate and retry</em> rather than trust the first
+        attempt, and to budget the retry rate you measured into your throughput plan.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The concurrency benchmark, with numbers</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Single-stream tokens/sec is the number everyone quotes and the number that matters least. One user on an L4
+        sees about 46 tok/s from a 14B AWQ, which sounds unimpressive next to an API. Twenty-four users sharing the
+        same card see <strong>545 tok/s in aggregate</strong> — the same hardware, 12× the work, because continuous
+        batching amortises the weight reads that dominate decode. The whole economic argument for local serving
+        lives in that multiplier, so measure the <em>curve</em>, not the point:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">bench_concurrency.py — sweep the load, find the knee</span>
+        <pre class="code"><span class="kw">import</span> time, statistics <span class="kw">as</span> st, concurrent.futures <span class="kw">as</span> cf
+<span class="kw">from</span> openai <span class="kw">import</span> OpenAI
+
+client = <span class="fn">OpenAI</span>(base_url=<span class="st">"http://gpu-box.internal:8000/v1"</span>, api_key=<span class="st">"none"</span>)
+PROMPT = <span class="st">"Summarise this claim note in 120 words: "</span> + <span class="st">"lorem ipsum "</span> * <span class="st">150</span>
+
+<span class="kw">def</span> <span class="fn">one_request</span>(_):
+    t0 = time.<span class="fn">perf_counter</span>(); ttft = <span class="kw">None</span>; toks = <span class="st">0</span>
+    stream = client.chat.completions.<span class="fn">create</span>(
+        model=<span class="st">"acme-local"</span>, max_tokens=<span class="st">200</span>, stream=<span class="kw">True</span>,
+        messages=[{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: PROMPT}])
+    <span class="kw">for</span> chunk <span class="kw">in</span> stream:
+        <span class="kw">if</span> chunk.choices[<span class="st">0</span>].delta.content:
+            <span class="kw">if</span> ttft <span class="kw">is</span> <span class="kw">None</span>: ttft = time.<span class="fn">perf_counter</span>() - t0
+            toks += <span class="st">1</span>
+    <span class="kw">return</span> ttft, time.<span class="fn">perf_counter</span>() - t0, toks
+
+<span class="kw">for</span> c <span class="kw">in</span> [<span class="st">1</span>, <span class="st">4</span>, <span class="st">8</span>, <span class="st">16</span>, <span class="st">24</span>, <span class="st">32</span>, <span class="st">48</span>]:
+    t0 = time.<span class="fn">perf_counter</span>()
+    <span class="kw">with</span> cf.<span class="fn">ThreadPoolExecutor</span>(c) <span class="kw">as</span> ex:
+        rows = <span class="fn">list</span>(ex.<span class="fn">map</span>(<span class="fn">one_request</span>, <span class="fn">range</span>(c * <span class="st">4</span>)))    <span class="cm"># 4 waves per level</span>
+    wall = time.<span class="fn">perf_counter</span>() - t0
+    ttfts = <span class="fn">sorted</span>(r[<span class="st">0</span>] <span class="kw">for</span> r <span class="kw">in</span> rows); e2e = <span class="fn">sorted</span>(r[<span class="st">1</span>] <span class="kw">for</span> r <span class="kw">in</span> rows)
+    <span class="fn">print</span>(f<span class="st">"c={c:3d}  agg {sum(r[2] for r in rows)/wall:6.0f} tok/s  "</span>
+          f<span class="st">"ttft p50 {st.median(ttfts):5.2f}s  e2e p95 {e2e[int(.95*len(e2e))-1]:5.1f}s"</span>)
+<span class="out">c=  1  agg     46 tok/s  ttft p50  0.09s  e2e p95   4.6s</span>
+<span class="out">c=  4  agg    165 tok/s  ttft p50  0.12s  e2e p95   5.1s</span>
+<span class="out">c=  8  agg    290 tok/s  ttft p50  0.17s  e2e p95   5.8s</span>
+<span class="out">c= 16  agg    470 tok/s  ttft p50  0.29s  e2e p95   7.2s</span>
+<span class="out">c= 24  agg    545 tok/s  ttft p50  0.52s  e2e p95   9.6s</span>
+<span class="out">c= 32  agg    580 tok/s  ttft p50  1.40s  e2e p95  16.4s</span>
+<span class="out">c= 48  agg    590 tok/s  ttft p50  3.90s  e2e p95  38.0s</span></pre>
+      </div>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <svg viewBox="0 0 700 268" class="w-full min-w-[620px]" role="img" aria-label="Aggregate throughput and p95 latency versus concurrency on one L4">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">QWEN2.5-14B-AWQ · 1× L4 24GB · AGGREGATE THROUGHPUT vs CONCURRENCY</text>
+          <text x="12" y="48" font-size="11" font-family="monospace" fill="#6E6B64">c=1</text>
+          <rect x="88" y="36" width="33" height="17" rx="4" fill="#0D9488" class="anim-pulse"/>
+          <text x="129" y="49" font-size="10" fill="#6E6B64">46 tok/s · p95 4.6 s · the number people quote</text>
+          <text x="12" y="78" font-size="11" font-family="monospace" fill="#6E6B64">c=4</text>
+          <rect x="88" y="66" width="119" height="17" rx="4" fill="#0D9488" class="anim-pulse d1"/>
+          <text x="215" y="79" font-size="10" fill="#6E6B64">165 tok/s · p95 5.1 s</text>
+          <text x="12" y="108" font-size="11" font-family="monospace" fill="#6E6B64">c=8</text>
+          <rect x="88" y="96" width="209" height="17" rx="4" fill="#14b8a6" class="anim-pulse d2"/>
+          <text x="305" y="109" font-size="10" fill="#6E6B64">290 tok/s · p95 5.8 s</text>
+          <text x="12" y="138" font-size="11" font-family="monospace" fill="#6E6B64">c=16</text>
+          <rect x="88" y="126" width="338" height="17" rx="4" fill="#14b8a6" class="anim-pulse d3"/>
+          <text x="434" y="139" font-size="10" fill="#6E6B64">470 tok/s · p95 7.2 s</text>
+          <text x="12" y="168" font-size="11" font-family="monospace" fill="#6E6B64">c=24</text>
+          <rect x="88" y="156" width="392" height="17" rx="4" fill="#D97757" class="anim-pulse d4"/>
+          <text x="488" y="169" font-size="10" fill="#6E6B64">545 tok/s · p95 9.6 s ← the knee</text>
+          <text x="12" y="198" font-size="11" font-family="monospace" fill="#6E6B64">c=32</text>
+          <rect x="88" y="186" width="418" height="17" rx="4" fill="#DB2777" class="anim-pulse"/>
+          <text x="514" y="199" font-size="10" fill="#6E6B64">580 tok/s · p95 16.4 s</text>
+          <text x="12" y="228" font-size="11" font-family="monospace" fill="#6E6B64">c=48</text>
+          <rect x="88" y="216" width="425" height="17" rx="4" fill="#DB2777" class="anim-pulse d1"/>
+          <text x="521" y="229" font-size="10" fill="#6E6B64">590 tok/s · p95 38.0 s ✗</text>
+          <line x1="480" y1="30" x2="480" y2="240" stroke="#D97757" stroke-width="2" stroke-dasharray="4 4" class="anim-flow"/>
+          <text x="12" y="256" font-size="9" fill="#A8A49B">Past the knee you buy +8% throughput with +296% p95 latency — that is a queue, not capacity</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The knee at <strong>c=24</strong> is the single most useful number this card will ever give you. It sets
+        <code class="inline">--max-num-seqs</code>; it sets the admission limit in front of the server; and
+        multiplied out it is your capacity statement: 545 tok/s × 3,600 = <strong>1.96M tokens/hour</strong>, or
+        1.43B/month at a utilisation nobody achieves. Everything past the knee is a queue wearing a throughput
+        costume — 8% more tokens for four times the p95. Part VI turns this curve into a capacity plan and an alert
+        threshold.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>Benchmark with the customer's prompt shape, not <code class="inline">lorem ipsum</code>.</strong>
+        Prefill cost scales with input length and decode cost with output length, and the two behave completely
+        differently under batching. A workload of 4K-token documents summarised to 100 tokens has a curve that
+        looks nothing like 200-token chats producing 800-token answers. Sample 50 real requests from their logs,
+        replay those, and label the resulting chart with the shape you used — an unlabelled throughput number is
+        an unfalsifiable one.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">Ops notes — the 20% that pages you at 2am</h3>
       <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
         <li><strong>Model download &amp; caching.</strong> A 70B pull is ~40 GB. Pre-pull into the image or a persistent volume (<code class="inline">~/.ollama/models</code>, <code class="inline">~/.cache/huggingface</code>) — never let the first production request trigger a download.</li>
         <li><strong>Warm-up.</strong> Loading weights into VRAM takes 10–60s after start. Fire one real generation before marking the instance healthy, or your first user eats the load time.</li>
         <li><strong>Health checks.</strong> vLLM exposes <code class="inline">/health</code>; Ollama <code class="inline">/api/tags</code>. Both only prove the <em>process</em> lives — a 1-token generation probe proves the <em>model</em> does. Use both tiers.</li>
         <li><strong>Restart behavior.</strong> Ollama unloads idle models after ~5 minutes by default (<code class="inline">OLLAMA_KEEP_ALIVE=-1</code> pins them); vLLM reloads everything on restart. Either way: cold starts are minutes, not milliseconds — plan rolling restarts.</li>
+        <li><strong>Disk, not just VRAM.</strong> Three quant levels of a 14B plus one 72B is ~90 GB of model volume, and the pull fails <em>after</em> downloading 80 GB of it. Size the volume for the models you will trial, not the one you will ship, and put a disk alert on it.</li>
+        <li><strong>The endpoint is unauthenticated by default.</strong> Both Ollama and vLLM will happily serve anyone who can reach the port. Terminate TLS and authenticate at a proxy, and put the server on a private subnet (<a href="./pr13.html" class="text-viol underline decoration-viol/40">PR13</a>) — a customer's pen-test will find it in week one otherwise.</li>
         <li><strong>It's a service like any other:</strong> logs, metrics, alerts, deploy pipeline — the full <a href="./pr7.html" class="text-viol underline decoration-viol/40">PR7</a> treatment. "It's just AI" excuses nothing.</li>
       </ul>
+      <div class="mt-4 callout callout-warn">
+        <strong>Open weights carry less safety post-training, and you now own that.</strong> With the API, refusal
+        behaviour and jailbreak resistance are the provider's ongoing problem; the moment you serve weights
+        yourself, they are yours — and small open models are measurably easier to talk out of their system prompt.
+        On any customer-facing local deployment, run an adversarial pass before launch and treat the findings as
+        blockers, not backlog (<a href="./ai16.html" class="text-viol underline decoration-viol/40">AI16</a>), with
+        the input/output controls living where they always live
+        (<a href="./pr4.html" class="text-viol underline decoration-viol/40">PR4</a>).
+      </div>
 
       <!-- ═══════════════ PART V ═══════════════ -->
       <div class="kicker text-rose-500 mt-14">Part V · Evaluating vs API models</div>
@@ -422,7 +1197,7 @@ client = OpenAI(base_url=PROVIDER_URL, api_key=REAL_KEY)                     <sp
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
             <th class="px-4 py-3">Candidate</th><th class="px-4 py-3">Golden set (40 tasks)</th><th class="px-4 py-3">p50 latency</th><th class="px-4 py-3">Cost / Mtok</th><th class="px-4 py-3">Residency</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">qwen2.5:7b Q4 · L4</td><td class="px-4 py-3 font-mono">29/40 (73%)</td><td class="px-4 py-3 font-mono">0.9 s</td><td class="px-4 py-3 font-mono">~$0.16*</td><td class="px-4 py-3">In-network ✓</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Qwen2.5-14B-AWQ · L4</td><td class="px-4 py-3 font-mono">31/40 (78%)</td><td class="px-4 py-3 font-mono">1.4 s</td><td class="px-4 py-3 font-mono">~$0.36*</td><td class="px-4 py-3">In-network ✓</td></tr>
             <tr><td class="px-4 py-3 font-semibold">Qwen2.5-72B AWQ · A100</td><td class="px-4 py-3 font-mono">34/40 (85%)</td><td class="px-4 py-3 font-mono">2.1 s</td><td class="px-4 py-3 font-mono">~$0.9*</td><td class="px-4 py-3">In-network ✓</td></tr>
             <tr><td class="px-4 py-3 font-semibold">claude-haiku-4-5 (API)</td><td class="px-4 py-3 font-mono">36/40 (90%)</td><td class="px-4 py-3 font-mono">1.2 s</td><td class="px-4 py-3 font-mono">~$1.8 blended</td><td class="px-4 py-3">External ✗</td></tr>
           </tbody>
@@ -430,11 +1205,97 @@ client = OpenAI(base_url=PROVIDER_URL, api_key=REAL_KEY)                     <sp
       </div>
       <p class="mt-2 text-xs text-mute dark:text-mutedark">* at 100% GPU utilization — see the math below, because utilization is the whole story.</p>
 
+      <h3 class="font-semibold text-lg mt-7">The three-way harness — and which parameters belong to which API</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The harness is fifty lines and you will reuse it on every residency engagement you ever run, so build it as
+        an <strong>adapter per backend</strong> rather than a chain of <code class="inline">if</code> statements.
+        The adapter boundary is not decoration: it is exactly where the two API families stop being
+        interchangeable. Local servers take sampling parameters; the Anthropic API rejects them on Opus 5 and
+        Sonnet 5 and has a refusal path the OpenAI-compatible shape does not model. Encode both facts in the
+        adapters and the rest of the harness stays backend-agnostic:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">three_way.py — one golden set, three backends, one table</span>
+        <pre class="code"><span class="kw">import</span> json, time
+<span class="kw">from</span> openai <span class="kw">import</span> OpenAI
+<span class="kw">import</span> anthropic
+
+GOLDEN = [json.<span class="fn">loads</span>(l) <span class="kw">for</span> l <span class="kw">in</span> <span class="fn">open</span>(<span class="st">"golden.jsonl"</span>)]
+
+<span class="kw">def</span> <span class="fn">local_adapter</span>(base_url, model, sampling):
+    <span class="cm"># Ollama / vLLM / llama.cpp: their own API, their own knobs. temperature,</span>
+    <span class="cm"># top_p, top_k and seed are all valid here and worth pinning for repeatability.</span>
+    client = <span class="fn">OpenAI</span>(base_url=base_url, api_key=<span class="st">"none"</span>)
+    <span class="kw">def</span> <span class="fn">call</span>(prompt):
+        r = client.chat.completions.<span class="fn">create</span>(
+            model=model, max_tokens=<span class="st">400</span>,
+            messages=[{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: prompt}], **sampling)
+        <span class="kw">return</span> r.choices[<span class="st">0</span>].message.content
+    <span class="kw">return</span> <span class="fn">call</span>
+
+<span class="kw">def</span> <span class="fn">anthropic_adapter</span>(model):
+    llm = anthropic.<span class="fn">Anthropic</span>()
+    <span class="kw">def</span> <span class="fn">call</span>(prompt):
+        msg = llm.messages.<span class="fn">create</span>(                 <span class="cm"># NO temperature / top_p / top_k:</span>
+            model=model, max_tokens=<span class="st">400</span>,               <span class="cm"># they 400 on Opus 5 / Sonnet 5</span>
+            messages=[{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: prompt}])
+        <span class="kw">if</span> msg.stop_reason == <span class="st">"refusal"</span>:              <span class="cm"># check BEFORE reading content</span>
+            <span class="kw">return</span> <span class="st">"__REFUSED__"</span>
+        <span class="kw">return</span> msg.content[<span class="st">0</span>].text
+    <span class="kw">return</span> <span class="fn">call</span>
+
+BACKENDS = {
+    <span class="st">"Qwen2.5-14B-AWQ · L4"</span>:  <span class="fn">local_adapter</span>(<span class="st">"http://gpu-box:8000/v1"</span>, <span class="st">"acme-local"</span>,
+                                            {<span class="st">"temperature"</span>: <span class="st">0</span>, <span class="st">"seed"</span>: <span class="st">7</span>}),
+    <span class="st">"Qwen2.5-72B-AWQ · A100"</span>: <span class="fn">local_adapter</span>(<span class="st">"http://big-box:8000/v1"</span>, <span class="st">"acme-large"</span>,
+                                            {<span class="st">"temperature"</span>: <span class="st">0</span>, <span class="st">"seed"</span>: <span class="st">7</span>}),
+    <span class="st">"claude-haiku-4-5 (API)"</span>:  <span class="fn">anthropic_adapter</span>(<span class="st">"claude-haiku-4-5"</span>),
+}
+
+<span class="kw">for</span> name, call <span class="kw">in</span> BACKENDS.<span class="fn">items</span>():
+    t0 = time.<span class="fn">perf_counter</span>(); ok = <span class="st">0</span>
+    <span class="kw">for</span> g <span class="kw">in</span> GOLDEN:
+        ok += <span class="fn">int</span>(g[<span class="st">"expect"</span>].<span class="fn">lower</span>() <span class="kw">in</span> <span class="fn">call</span>(g[<span class="st">"q"</span>]).<span class="fn">lower</span>())
+    n, dt = <span class="fn">len</span>(GOLDEN), time.<span class="fn">perf_counter</span>() - t0
+    <span class="fn">print</span>(f<span class="st">"{name:24s} {ok:2d}/{n}  ({ok/n:4.0%})  p50 {dt/n:4.2f}s/task"</span>)
+<span class="out">Qwen2.5-14B-AWQ · L4     31/40  ( 78%)  p50 1.40s/task</span>
+<span class="out">Qwen2.5-72B-AWQ · A100   34/40  ( 85%)  p50 2.10s/task</span>
+<span class="out">claude-haiku-4-5 (API)   36/40  ( 90%)  p50 1.20s/task</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three sentences of consequence hide in that file. The local adapters pin
+        <code class="inline">seed</code> so a re-run is comparable; the Anthropic adapter cannot, so treat its
+        score as having roughly ±1 task of run-to-run noise and never report a 1-task difference as a finding. The
+        refusal branch matters because a safety refusal scored as a wrong answer quietly understates the API model
+        — on a 40-task set, two mis-scored refusals move the headline by 5 points. And substring scoring is only
+        honest for checkable answers; swap in the LLM judge from
+        <a href="./ai9.html" class="text-viol underline decoration-viol/40">AI9</a> the moment the tasks stop
+        having exact expected strings.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>The parameter map, because it trips up everyone once.</strong>
+        <code class="inline">temperature</code>, <code class="inline">top_p</code>,
+        <code class="inline">top_k</code> and <code class="inline">seed</code> are <em>local-stack</em> parameters:
+        Ollama, vLLM and llama.cpp all honour them, and pinning them is good practice for a reproducible benchmark.
+        The Anthropic API rejects <code class="inline">temperature</code>, <code class="inline">top_p</code> and
+        <code class="inline">top_k</code> with a 400 on Opus 5 and Sonnet 5, has no
+        <code class="inline">seed</code>, and replaces <code class="inline">budget_tokens</code> with
+        <code class="inline">thinking={"type": "adaptive"}</code> plus
+        <code class="inline">output_config={"effort": "..."}</code>. "OpenAI-compatible" describes the
+        <em>wire shape</em>, not the parameter set — see <a href="./ai2.html" class="text-viol underline decoration-viol/40">AI2</a>
+        for the full reference and <a href="./ai13.html" class="text-viol underline decoration-viol/40">AI13</a> for
+        what replaced the old sampling knobs.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">GPU rental math — where "local is cheaper" lives or dies</h3>
       <pre class="code mt-3"><span class="cm"># Throughput → cost-per-token is just division:</span>
 L4 24GB rental        ≈ $0.70/hr  → 8B AWQ on vLLM ≈ 1,200 tok/s aggregate
                       → 4.3M tok/hr → $0.16/Mtok   at 100% utilization
                       → at 10% utilization: $1.60/Mtok — API territory
+
+L4 24GB rental        ≈ $0.70/hr  → 14B AWQ ≈ 545 tok/s  (measured, Part IV)
+                      → 1.96M tok/hr → $0.36/Mtok  at 100% utilization
+                      → monthly ceiling of this box: 1.43B tokens
 
 A100 80GB rental      ≈ $1.90/hr  → 72B AWQ ≈ 600 tok/s aggregate
                       → 2.2M tok/hr → $0.88/Mtok   at 100% utilization
@@ -447,6 +1308,50 @@ L4:   $0.70 × 730h ≈ $511/mo   — whether it serves 1M tokens or 3,000M</pre
         <em>and</em> nobody has to own CUDA drivers. Above it, or under a residency mandate, local wins. And add
         the line item every spreadsheet omits: <strong>an engineer now owns GPU capacity, driver upgrades, and
         model updates</strong>. That's real money too.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Break-even, as a table nobody can argue with</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Prose about crossovers loses arguments; a table with the API winning most of the rows wins them. Build it
+        for the customer's own volumes, put the API's wins in it honestly, and it stops being a sales artifact and
+        starts being evidence. One L4 running the 14B, $511/month always-on, against a blended
+        <strong>$1.80/Mtok</strong> at an 80/20 input/output mix:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Monthly volume</th><th class="px-4 py-3">API @ $1.80/Mtok</th><th class="px-4 py-3">Local (1× L4)</th><th class="px-4 py-3">Utilisation required</th><th class="px-4 py-3">Winner</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold font-mono">5M</td><td class="px-4 py-3 font-mono">$9</td><td class="px-4 py-3 font-mono">$511</td><td class="px-4 py-3 font-mono">0.3%</td><td class="px-4 py-3">API, by 57×</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono">30M</td><td class="px-4 py-3 font-mono">$54</td><td class="px-4 py-3 font-mono">$511</td><td class="px-4 py-3 font-mono">2.1%</td><td class="px-4 py-3">API, by 9×</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono">100M</td><td class="px-4 py-3 font-mono">$180</td><td class="px-4 py-3 font-mono">$511</td><td class="px-4 py-3 font-mono">7.0%</td><td class="px-4 py-3">API</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono">285M</td><td class="px-4 py-3 font-mono">$513</td><td class="px-4 py-3 font-mono">$511</td><td class="px-4 py-3 font-mono">19.9%</td><td class="px-4 py-3"><strong>The crossover</strong> — and a coin flip is not a business case</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono">500M</td><td class="px-4 py-3 font-mono">$900</td><td class="px-4 py-3 font-mono">$511</td><td class="px-4 py-3 font-mono">34.9%</td><td class="px-4 py-3">Local, by 1.8×</td></tr>
+            <tr><td class="px-4 py-3 font-semibold font-mono">1,000M</td><td class="px-4 py-3 font-mono">$1,800</td><td class="px-4 py-3 font-mono">$511</td><td class="px-4 py-3 font-mono">69.9%</td><td class="px-4 py-3">Local, by 3.5× — but you are near the card's 1.43B ceiling, so budget a second one</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Now add the line item every spreadsheet omits. Somebody has to own driver upgrades, model updates, capacity
+        and the pager. Call it <strong>0.2 FTE ≈ $2,500/month</strong> — deliberately conservative — and the
+        fully-loaded floor becomes $3,011:
+      </p>
+      <pre class="code mt-3">Fully-loaded break-even, 1 × L4:
+    ($511 infra + $2,500 people) / $1.80 per Mtok  =  <span class="out">1,673M tok/mo</span>
+    …but this box tops out at                          <span class="out">1,430M tok/mo</span>
+    <span class="cm"># On ONE card, the pure-cost argument never wins. Say this out loud.</span>
+
+Fully-loaded break-even, 4 × L4 (same 0.2 FTE amortised):
+    ($2,044 infra + $2,500 people) / $1.80          =  <span class="out">2,525M tok/mo</span>
+    against a fleet ceiling of                         <span class="out">5,720M tok/mo</span>
+    <span class="cm"># → cost becomes a real driver somewhere north of ~2.5B tokens/month.</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That is the most useful number in Part V and it is uncomfortable: <strong>on a single card, "local is
+        cheaper" is arithmetically false once you price a human</strong>, and it only becomes true past roughly
+        <strong>2.5 billion tokens a month</strong> across a fleet. Which is why residency, not cost, is the driver
+        that actually carries this module — and why the honest FDE says so in the first meeting instead of the
+        fourth. The same discipline applies to scaling the fleet itself
+        (<a href="./pr12.html" class="text-viol underline decoration-viol/40">PR12</a>).
       </p>
 
       <h3 class="font-semibold text-lg mt-8">When local wins — and when to say "keep the API"</h3>
@@ -470,11 +1375,397 @@ L4:   $0.70 × 730h ≈ $511/mo   — whether it serves 1M tokens or 3,000M</pre
           </ul>
         </div>
       </div>
+      <h3 class="font-semibold text-lg mt-8">Presenting the delta honestly</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You now have a number the customer will not like: 78% against 90%. How you present it decides whether the
+        project proceeds. The failure mode is leading with the total, because a total invites exactly one response —
+        "so it's worse" — and there is nothing to discuss after that. Lead instead with <strong>what the gap is
+        made of</strong>, because a decomposed gap is a to-do list and a decomposed gap has prices attached. On the
+        40-task set the whole 5-task difference lives in two categories, and one of them the local model actually
+        <em>wins</em>:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Category (n)</th><th class="px-4 py-3">Local 14B AWQ</th><th class="px-4 py-3">claude-haiku-4-5</th><th class="px-4 py-3">Gap</th><th class="px-4 py-3">Cost to close it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Classification (12)</td><td class="px-4 py-3 font-mono">12</td><td class="px-4 py-3 font-mono">12</td><td class="px-4 py-3 font-mono">0</td><td class="px-4 py-3">Already closed — and this is 30% of real traffic</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Extraction (10)</td><td class="px-4 py-3 font-mono">9</td><td class="px-4 py-3 font-mono">9</td><td class="px-4 py-3 font-mono">0</td><td class="px-4 py-3">Both miss the same scanned-fax row; that is a document problem (<a href="./pr9.html" class="text-viol underline decoration-viol/40">PR9</a>), not a model problem</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Arithmetic (8)</td><td class="px-4 py-3 font-mono">3</td><td class="px-4 py-3 font-mono">8</td><td class="px-4 py-3 font-mono">−5</td><td class="px-4 py-3"><strong>A calculator tool: 3 → 6.</strong> Two days of work, zero VRAM</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Exact format (5)</td><td class="px-4 py-3 font-mono">4</td><td class="px-4 py-3 font-mono">5</td><td class="px-4 py-3 font-mono">−1</td><td class="px-4 py-3">Schema validation + one retry closes it in production</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Summarisation, judged (5)</td><td class="px-4 py-3 font-mono">3</td><td class="px-4 py-3 font-mono">2</td><td class="px-4 py-3 font-mono">+1</td><td class="px-4 py-3">Local <em>wins</em> — it hedges less. Report this; it is what makes the rest believable</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Total (40)</td><td class="px-4 py-3 font-mono"><strong>31 → 34</strong></td><td class="px-4 py-3 font-mono">36</td><td class="px-4 py-3 font-mono">−5 → −2</td><td class="px-4 py-3">78% → 85% for two days of engineering</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The row that earns you the room is the one where you <em>lose</em> the comparison you were hired to win.
+        Reporting that the local model beat the API on judged summaries costs you nothing and buys every other
+        number in the table its credibility. Write the whole thing as a one-pager and lead with the recommendation:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">LOCAL_VS_API.md — the page you actually put in front of the steering committee</span>
+        <pre class="code"># Local vs API — claims triage · 40-task golden set · 2026-08-05
+
+RECOMMENDATION: deploy Qwen2.5-14B-AWQ in-VPC for all claimant-data traffic.
+Expected quality 85% vs 90% for the API baseline, after adding a calculator tool.
+Residual gap: 2 tasks, both arithmetic word problems. Mitigation: route those to
+a human queue (currently 0.4% of volume). No claimant data leaves the network.
+
+| Option                        | Quality | p50   | $/Mtok | Residency |
+|-------------------------------|---------|-------|--------|-----------|
+| Qwen2.5-14B-AWQ · 1× L4       | 78%     | 1.4 s | $0.36  | in-network|
+| + calculator tool (2 days)    | 85%     | 1.5 s | $0.36  | in-network|
+| Qwen2.5-72B-AWQ · 1× A100     | 85%     | 2.1 s | $0.88  | in-network|
+| claude-haiku-4-5 (API)        | 90%     | 1.2 s | $1.80  | EXTERNAL  |
+
+WHAT WE ARE NOT CLAIMING: parity. The API model is better at multi-step
+arithmetic and at exact output formats, and it will stay better.
+WHAT WE ARE CLAIMING: on the 30 tasks that are 94% of your traffic, the two
+are indistinguishable, and one of them keeps the data inside your VPC.</pre>
+      </div>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">Say this</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>"Five tasks separate them, and here is what each one is."</li>
+            <li>"Two days of engineering closes three of the five. Here is the ticket."</li>
+            <li>"It beat the API on judged summaries. I don't know why yet."</li>
+            <li>"If your policy allows an in-region cloud endpoint, that option is better than both and I'd take it."</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-rose-500">Never say this</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>"It's basically as good." It is measurably not, and your eval says so in writing.</li>
+            <li>"The gap will close as open models improve." Maybe — but you are deploying this quarter.</li>
+            <li>"We can fine-tune it to catch up." Not without the eval that proves the un-tuned baseline failed (<a href="./ai10.html" class="text-viol underline decoration-viol/40">AI10</a>).</li>
+            <li>Any number you did not personally measure on their data.</li>
+          </ul>
+        </div>
+      </div>
+
       <div class="mt-4 callout callout-tip">
-        <strong>Score-2 in one sentence:</strong> "Here are three options on your eval — local 7B at $0.2/Mtok
-        and 73%, local 72B at $0.9 and 85%, the API at $1.8 and 90%; given your residency mandate covers only
-        customer PII, I'd route the PII-touching 80% to the local 72B and the rest to the API." That's the
-        answer-ready FDE the catalog is asking for.
+        <strong>Score-2 in one sentence:</strong> "Here are three options on your eval — local 14B at $0.36/Mtok
+        and 78%, local 72B at $0.88 and 85%, the API at $1.80 and 90%; given your residency mandate covers only
+        customer PII, I'd route the PII-touching 80% to the local 14B with a calculator tool and the rest to the
+        API." That's the answer-ready FDE the catalog is asking for.
+      </div>
+
+      <!-- ═══════════════ PART VI ═══════════════ -->
+      <div class="kicker text-indigo-500 dark:text-indigo-400 mt-14">Part VI · Running it in production</div>
+      <h2 class="font-display text-2xl font-bold mt-2">You can serve a model. Now you have to operate one.</h2>
+
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Everything up to here gets you a working endpoint, which is roughly week one of a six-month engagement. The
+        part that decides whether you are invited back is what happens in months two through six, when the card
+        thermally throttles in a hot rack, a driver upgrade lands during a maintenance window, a new model version
+        ships, and someone who has never met you is holding the pager. A local model is not an AI project at that
+        point; it is a stateful, memory-constrained, single-tenant service with a 60-second cold start — and it
+        needs the whole <a href="./pr7.html" class="text-viol underline decoration-viol/40">PR7</a> treatment plus
+        four things that are specific to GPUs.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Capacity planning from the curve you measured</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Capacity planning for a GPU is not "requests per second". It is the concurrency knee from Part IV, converted
+        into the two numbers a customer's ops team can actually act on: <strong>how many cards</strong>, and
+        <strong>at what queue depth do we page someone</strong>. Everything follows from the knee, the arrival rate
+        and the mean service time — this is Little's Law, and it fits in a dozen lines:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">capacity.py — from the measured knee to a card count and an alert threshold</span>
+        <pre class="code"><span class="cm"># Measured on 1 × L4 with Qwen2.5-14B-AWQ (Part IV):</span>
+KNEE       = <span class="st">24</span>       <span class="cm"># concurrent sequences at the knee of the throughput curve</span>
+SERVICE_S  = <span class="st">9.6</span>      <span class="cm"># p95 end-to-end seconds at the knee</span>
+TOK_S      = <span class="st">545</span>      <span class="cm"># aggregate tokens/sec at the knee</span>
+
+<span class="kw">def</span> <span class="fn">plan</span>(peak_rps, headroom=<span class="st">0.70</span>):
+    <span class="cm"># Little's Law: in-flight requests = arrival rate × time in system</span>
+    in_flight = peak_rps * SERVICE_S
+    cards     = -(-in_flight // (KNEE * headroom))          <span class="cm"># ceil</span>
+    <span class="kw">return</span> in_flight, <span class="fn">int</span>(cards), in_flight / (<span class="fn">int</span>(cards) * KNEE)
+
+<span class="kw">for</span> rps <span class="kw">in</span> (<span class="st">0.5</span>, <span class="st">1.5</span>, <span class="st">3.0</span>, <span class="st">6.0</span>):
+    f, c, util = <span class="fn">plan</span>(rps)
+    <span class="fn">print</span>(f<span class="st">"peak {rps:4.1f} rps → {f:5.1f} in flight → {c} card(s), "</span>
+          f<span class="st">"{util:4.0%} of knee, {c*TOK_S*3600/1e6:5.2f}M tok/hr ceiling"</span>)
+<span class="out">peak  0.5 rps →   4.8 in flight → 1 card(s),  20% of knee,  1.96M tok/hr ceiling</span>
+<span class="out">peak  1.5 rps →  14.4 in flight → 1 card(s),  60% of knee,  1.96M tok/hr ceiling</span>
+<span class="out">peak  3.0 rps →  28.8 in flight → 2 card(s),  60% of knee,  3.92M tok/hr ceiling</span>
+<span class="out">peak  6.0 rps →  57.6 in flight → 4 card(s),  60% of knee,  7.85M tok/hr ceiling</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">headroom=0.70</code> is the whole judgement call. Plan to 100% of the knee and the
+        first traffic spike puts you past it, where — from the Part IV curve — p95 goes from 9.6 s to 38 s while
+        throughput barely moves. Plan to 70% and you have room for a spike, a card in maintenance, or a model
+        upgrade that runs 15% slower. Note also what does <em>not</em> appear here: autoscaling. A vLLM instance
+        takes 45–90 seconds to load weights, so scaling out is a five-minute manoeuvre, not a five-second one.
+        <strong>You provision for peak and you accept the idle cost</strong> — which is exactly the $511/month
+        floor from Part V, now with a reason attached.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Capacity question</th><th class="px-4 py-3">The wrong answer</th><th class="px-4 py-3">What to do instead</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">"Can it handle our load?"</td><td class="px-4 py-3">Quote single-stream tok/s</td><td class="px-4 py-3">Quote the knee, the headroom factor and the resulting card count — three numbers, all measured</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"What about Black Friday?"</td><td class="px-4 py-3">"We'll autoscale"</td><td class="px-4 py-3">Cold start is 45–90 s. Pre-provision the peak, or degrade deliberately: shed to a queue, or fail over to the API lane if policy permits</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Can we share the GPU with the vision team?"</td><td class="px-4 py-3">"Sure, there's VRAM left"</td><td class="px-4 py-3">No. vLLM pre-allocates 90% at boot; a co-tenant turns a working config into a start-up crash. One card, one server</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"What is our real utilisation?"</td><td class="px-4 py-3">Read <code class="inline">nvidia-smi</code> GPU%</td><td class="px-4 py-3">GPU% says the kernel is busy, not that the batch is full. Use vLLM's running/waiting sequence counts — the next section</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The three GPU failure modes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Ordinary services fail in ordinary ways and your customer's ops team already knows those. GPU serving adds
+        three that they have never seen, all of which present as "the AI got slow" and none of which appear in an
+        application log. Put this table in the runbook verbatim:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Failure mode</th><th class="px-4 py-3">How it presents</th><th class="px-4 py-3">How to confirm it in 30 seconds</th><th class="px-4 py-3">Fix</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">OOM under concurrency</td><td class="px-4 py-3">Works for weeks, then a burst of long prompts arrives and requests start 500-ing, or the process dies and systemd restarts it into a 60 s outage</td><td class="px-4 py-3"><code class="inline">journalctl -u llm-serving | grep -i "out of memory"</code>; look for preemption warnings just before</td><td class="px-4 py-3">Lower <code class="inline">--max-num-seqs</code>, lower <code class="inline">--max-model-len</code>, or enable <code class="inline">--kv-cache-dtype fp8</code>. Cap request length at the gateway too</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Thermal throttling</td><td class="px-4 py-3">Throughput decays 20–40% over 10–20 minutes of sustained load, recovers when traffic drops. Nothing errors. Everyone blames the model</td><td class="px-4 py-3"><code class="inline">nvidia-smi -q -d PERFORMANCE</code> → <em>SW Thermal Slowdown: Active</em>, or clocks well below base</td><td class="px-4 py-3">A datacentre problem, not yours: airflow, rack density, a passively-cooled L4 in a workstation chassis. Report it with the graph</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Driver / CUDA drift</td><td class="px-4 py-3">A working deployment fails to start after an unrelated OS patch window, with a CUDA version mismatch nobody scheduled</td><td class="px-4 py-3"><code class="inline">nvidia-smi</code> driver version vs the container's CUDA build; <code class="inline">docker run --rm --gpus all …&nbsp;nvidia-smi</code> fails first</td><td class="px-4 py-3">Pin the container tag <em>and</em> the host driver. Put the GPU host in a separate patch group with your test as the gate</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Thermal throttling is the one worth rehearsing, because it is invisible to every dashboard the customer
+        already has and it looks exactly like a model regression. Ten minutes of sustained load and one command
+        settles it:
+      </p>
+      <pre class="code mt-3">watch -n 5 'nvidia-smi --query-gpu=timestamp,temperature.gpu,clocks.sm,power.draw,utilization.gpu \
+                       --format=csv,noheader'
+<span class="out">2026-08-05 14:02:11, 61, 2040 MHz, 71.4 W, 99 %</span>
+<span class="out">2026-08-05 14:09:41, 84, 1410 MHz, 72.0 W, 99 %   ← clocks down 31%, temp at cap</span>
+<span class="cm"># utilization.gpu stayed at 99% the whole time — which is exactly why</span>
+<span class="cm"># "GPU utilisation" is the most misleading metric on the box.</span></pre>
+      <div class="mt-4 callout callout-danger">
+        <strong>The 3am incident this module exists to prevent.</strong> A GPU host is patched in a routine window,
+        the NVIDIA driver moves a minor version, the pinned vLLM container no longer matches, and the service
+        enters a restart loop. Because the model takes 60 seconds to load, health checks flap rather than fail
+        cleanly, so the alert reads "intermittent" and gets triaged as noise. Meanwhile every request in the
+        residency lane is failing and there is <em>no API fallback by design</em>. Two cheap defences: put the GPU
+        host in its own patch group gated on a post-patch smoke test, and make the health check distinguish
+        <em>loading</em> from <em>broken</em> so the page says the right thing
+        (<a href="./pr11.html" class="text-viol underline decoration-viol/40">PR11</a>).
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Four numbers that actually tell you it's healthy</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The customer's existing dashboard will show CPU, memory, request rate and error rate, and all four will be
+        green while the service is unusable. GPU serving needs its own small set, and vLLM already exports it —
+        Prometheus metrics on <code class="inline">/metrics</code>, no instrumentation required. Wire these four
+        into whatever the customer already runs, alongside the trace and cost plumbing from
+        <a href="./pr1.html" class="text-viol underline decoration-viol/40">PR1</a>:
+      </p>
+      <pre class="code mt-3">curl -s localhost:8000/metrics | grep -E '^vllm:(num_requests|gpu_cache)'
+<span class="out">vllm:num_requests_running{model_name="acme-local"} 18.0</span>
+<span class="out">vllm:num_requests_waiting{model_name="acme-local"} 0.0</span>
+<span class="out">vllm:gpu_cache_usage_perc{model_name="acme-local"} 0.63</span>
+<span class="cm"># 18 sequences in the batch, nothing queued, KV pool 63% full — a healthy card.</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Number</th><th class="px-4 py-3">Metric</th><th class="px-4 py-3">What it tells you that nothing else does</th><th class="px-4 py-3">Alert at</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Queue depth</td><td class="px-4 py-3 font-mono text-xs">vllm:num_requests_waiting</td><td class="px-4 py-3">The leading indicator. It moves minutes before latency does, because a request waiting is a request not yet slow. Zero is the normal value</td><td class="px-4 py-3"><code class="inline">&gt; 0</code> for 60 s</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Batch efficiency</td><td class="px-4 py-3 font-mono text-xs">num_requests_running ÷ max_num_seqs</td><td class="px-4 py-3">Whether continuous batching is actually happening. <code class="inline">running≈1</code> while <code class="inline">waiting&gt;0</code> means something is serialising you — usually one enormous prefill hogging every scheduler step</td><td class="px-4 py-3"><code class="inline">&lt; 0.25</code> while queued</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">KV headroom</td><td class="px-4 py-3 font-mono text-xs">vllm:gpu_cache_usage_perc</td><td class="px-4 py-3">How close you are to preemption. Above ~0.90 vLLM starts evicting and recomputing sequences, and throughput falls off a cliff with no error anywhere</td><td class="px-4 py-3"><code class="inline">&gt; 0.90</code> for 120 s</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">TTFT p95</td><td class="px-4 py-3 font-mono text-xs">vllm:time_to_first_token_seconds</td><td class="px-4 py-3">The only one a user feels. Compare it against the value you measured at the knee (0.52 s at c=24), not against an absolute</td><td class="px-4 py-3"><code class="inline">&gt; 3× baseline</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">llm-alerts.yml — four rules, and none of them mention GPU utilisation</span>
+        <pre class="code">groups:
+- name: llm-serving
+  rules:
+  - alert: LLMQueueBuilding
+    expr: vllm:num_requests_waiting &gt; 0
+    for: 1m
+    annotations: {summary: <span class="st">"requests queueing — past the knee or a card is down"</span>}
+  - alert: LLMBatchStalled
+    expr: vllm:num_requests_running / 24 &lt; 0.25 <span class="kw">and</span> vllm:num_requests_waiting &gt; 0
+    for: 2m
+    annotations: {summary: <span class="st">"queued but not batching — one huge prefill is blocking"</span>}
+  - alert: LLMKVPressure
+    expr: vllm:gpu_cache_usage_perc &gt; 0.90
+    for: 2m
+    annotations: {summary: <span class="st">"KV pool near full — preemption and recompute imminent"</span>}
+  - alert: LLMSlowFirstToken
+    expr: histogram_quantile(0.95,
+            rate(vllm:time_to_first_token_seconds_bucket[5m])) &gt; 1.6
+    for: 5m
+    annotations: {summary: <span class="st">"TTFT p95 &gt; 3x the 0.52 s measured at the knee"</span>}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Add one more as a weekly job rather than an alert: <strong>re-run the benchmark and the golden set</strong>
+        and diff against the recorded baseline. That single cron job catches thermal decay, a driver change, a
+        silently-swapped model tag and a quantization regression — four causes with one symptom, none of which any
+        of the metrics above will name for you. The memory picture underneath all of it looks like this:
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <svg viewBox="0 0 700 232" class="w-full min-w-[620px]" role="img" aria-label="How 24 GB of VRAM is actually spent under load">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">WHERE 24 GB GOES · Qwen2.5-14B-AWQ · vLLM --gpu-memory-utilization 0.90</text>
+          <g class="anim-pulse"><rect x="40" y="40" width="230" height="42" rx="6" fill="#2563EB"/>
+            <text x="155" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Weights 8.9 GB</text>
+            <text x="155" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">fixed at load · never moves</text></g>
+          <g class="anim-pulse d1"><rect x="270" y="40" width="186" height="42" rx="6" fill="#0D9488"/>
+            <text x="363" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">KV in use 7.2 GB</text>
+            <text x="363" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">18 live sequences</text></g>
+          <g class="anim-pulse d2"><rect x="456" y="40" width="116" height="42" rx="6" fill="#37474F"/>
+            <text x="514" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">KV free 4.5 GB</text>
+            <text x="514" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">your only headroom</text></g>
+          <g class="anim-pulse d3"><rect x="572" y="40" width="26" height="42" rx="6" fill="#6d5acd"/></g>
+          <g class="anim-pulse d4"><rect x="598" y="40" width="62" height="42" rx="6" fill="#A8A49B"/></g>
+          <text x="585" y="100" text-anchor="middle" font-size="9" fill="#6E6B64">activations 1.0</text>
+          <text x="629" y="114" text-anchor="middle" font-size="9" fill="#6E6B64">outside the pool 2.4</text>
+          <line x1="40" y1="126" x2="598" y2="126" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="40" y="142" font-size="9" fill="#6E6B64">← --gpu-memory-utilization 0.90 reserves this whole span at boot, before a single request arrives →</text>
+          <text x="12" y="172" font-size="11" font-weight="700" fill="#6E6B64">WHAT MOVES, AND WHAT DOESN'T</text>
+          <text x="12" y="190" font-size="10" fill="#6E6B64">Weights: constant. KV: grows with concurrency × sequence length — the only variable, and the only OOM source.</text>
+          <text x="12" y="206" font-size="10" fill="#6E6B64">gpu_cache_usage_perc = KV in use ÷ (KV in use + KV free) = 0.62 here. At 0.90 vLLM begins preempting.</text>
+          <text x="12" y="224" font-size="9" fill="#A8A49B">nvidia-smi reports 21.6 GB used at idle and at peak alike — which is why it cannot tell you anything about capacity.</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Model updates and rollback without downtime</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A new Qwen or Llama release lands roughly every quarter, and the customer will ask for it. On an API you
+        change a string; here, "upgrade the model" means downloading 9 GB, restarting a service with a 60-second
+        cold start, and hoping the eval still passes — which is a change you cannot make on a Friday unless it is
+        <strong>blue/green</strong>. Two units on two ports, a gateway that picks one, and a golden-set run as the
+        gate. The old version stays warm for 24 hours so rollback is a config reload, not a redeploy:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant O as Ops
+    participant G as Gateway
+    participant B as llm-blue :8000
+    participant N as llm-green :8001
+    O->>N: start green with the new model tag
+    Note over N: pre-pulled weights<br/>~55 s to load into VRAM
+    N-->>O: /health ok, generation probe ok
+    O->>N: run the 40-task golden set + 200-request bench
+    N-->>O: 34/40 (baseline 34/40) · 538 tok/s (baseline 545)
+    O->>G: switch upstream to :8001, reload
+    Note over G: in-flight requests finish on blue<br/>zero dropped connections
+    O->>B: leave blue running 24 h
+    Note over B: rollback = point the gateway back<br/>and reload — under 2 seconds
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">promote.sh — the gate is the eval, not the health check</span>
+        <pre class="code">#!/usr/bin/env bash
+set -euo pipefail
+NEW_TAG=<span class="st">"$1"</span>                      <span class="cm"># e.g. Qwen/Qwen2.5-14B-Instruct-AWQ@2026-07</span>
+BASELINE=<span class="st">34</span>                       <span class="cm"># tasks passed by the version currently live</span>
+
+<span class="cm"># 1. Pre-pull weights into the shared volume BEFORE touching any service.</span>
+docker run --rm -v /srv/models/hf:/root/.cache/huggingface \
+  vllm/vllm-openai:v0.9.1 python -c \
+  <span class="st">"from huggingface_hub import snapshot_download as d; d('${NEW_TAG%@*}')"</span>
+
+<span class="cm"># 2. Start green on :8001 and wait for the model tier, not just the process.</span>
+MODEL=<span class="st">"$NEW_TAG"</span> PORT=<span class="st">8001</span> systemctl start llm-green
+<span class="kw">for</span> i <span class="kw">in</span> $(seq <span class="st">1</span> <span class="st">60</span>); <span class="kw">do</span> ./healthcheck.sh <span class="st">8001</span> &amp;&amp; <span class="kw">break</span> || sleep <span class="st">5</span>; <span class="kw">done</span>
+
+<span class="cm"># 3. THE GATE. A green health check proves nothing about quality.</span>
+SCORE=$(python three_way.py --only http://localhost:8001/v1 --quiet)
+<span class="kw">if</span> [ <span class="st">"$SCORE"</span> -lt <span class="st">"$BASELINE"</span> ]; <span class="kw">then</span>
+  <span class="fn">echo</span> <span class="st">"REGRESSION: $SCORE/40 vs baseline $BASELINE/40 — aborting"</span>
+  systemctl stop llm-green; <span class="kw">exit</span> <span class="st">1</span>
+<span class="kw">fi</span>
+
+<span class="cm"># 4. Flip the gateway. Blue keeps serving in-flight requests, then idles.</span>
+ln -sfn /etc/nginx/upstreams/green.conf /etc/nginx/upstreams/active.conf
+nginx -s reload
+<span class="fn">echo</span> <span class="st">"promoted $NEW_TAG at $SCORE/40 — blue stays warm until $(date -d '+24 hours')"</span>
+<span class="out">promoted Qwen/Qwen2.5-14B-Instruct-AWQ@2026-07 at 34/40 — blue stays warm until Thu Aug  6 14:20:11 2026</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Step 3 is the one people delete when they are in a hurry, and it is the only step that distinguishes this
+        from <code class="inline">docker pull &amp;&amp; restart</code>. A health check tells you the process is alive;
+        a golden-set run tells you the <em>model</em> is. The cost of keeping it is about four minutes of wall clock
+        per promotion and one extra card-hour of blue sitting warm — roughly <strong>$0.70</strong> — against a
+        quality regression discovered by a customer three weeks later. Note also that the promotion is gated on
+        <em>equal or better</em>, not on a threshold: baselines drift upward and a gate you have to keep lowering
+        is not a gate.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>Pin the server, not just the model.</strong> A vLLM minor version can change default flags, the
+        scheduler, or which quantization kernels are selected — all of which move your measured numbers without
+        anyone touching the model. Pin the container tag (<code class="inline">vllm/vllm-openai:v0.9.1</code>, never
+        <code class="inline">:latest</code>), treat a server upgrade as its own blue/green promotion with its own
+        eval gate, and record both versions in the benchmark report so a future you can tell which change caused
+        the drift.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The on-call story you hand to their ops team</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The engagement ends. Someone who has never read this module now owns a GPU, a service with a 60-second cold
+        start, and a pager. What you leave behind is the deliverable — and it is not a wiki page with links to vLLM
+        documentation. It is one page that answers, in order: what is this, how do I tell if it is broken, what are
+        the three things that break, and what do I do when one of them does. Everything else is a link.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">RUNBOOK.md — one page, four sections, no prerequisites</span>
+        <pre class="code"># ACME local LLM — on-call runbook           owner: platform-eng   rev 2026-08-05
+
+## 1. What this is
+One NVIDIA L4 in rack B12 serving Qwen2.5-14B-AWQ through vLLM on :8000, behind
+nginx. It answers claims-triage requests that are NOT permitted to leave the VPC.
+There is deliberately no cloud fallback: if this is down, triage queues to humans.
+Capacity: 24 concurrent sequences, ~545 tok/s. Cold start 45-90 s.
+
+## 2. Is it broken? (in this order)
+    ./healthcheck.sh 8000                 # process + a real 2-token generation
+    curl -s :8000/metrics | grep waiting  # queue depth; 0 is normal
+    nvidia-smi --query-gpu=temperature.gpu,clocks.sm --format=csv
+  Green health check + queue 0 + clocks near 2040 MHz  =&gt;  it is not the LLM.
+
+## 3. The three things that break
+  OOM under load        -&gt; restart clears it; then lower MAX_NUM_SEQS in
+                           /etc/llm/serving.env and open a ticket for us.
+  Thermal throttling    -&gt; clocks &lt; 1600 MHz and temp &gt;= 83 C. Not fixable in
+                           software. Escalate to datacentre; attach the CSV.
+  Driver/CUDA drift     -&gt; after a patch window, container fails to start.
+                           Roll the host driver back; the GPU host is in patch
+                           group `gpu-hold` for exactly this reason.
+
+## 4. Rollback
+    ln -sfn /etc/nginx/upstreams/blue.conf /etc/nginx/upstreams/active.conf
+    nginx -s reload          # &lt; 2 s, previous model version is already warm
+
+## 5. When to call us
+  Quality complaints (answers wrong, not slow) - we own the eval, you don't.
+  Anything requiring a change to serving.env.
+  Weekly baseline job reports a drop &gt; 2 tasks.</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Section 5 is the one FDEs forget and the one that protects the relationship. Draw the line explicitly:
+        <strong>ops owns availability, you own quality</strong>. Without that sentence, the first time a user says
+        "the answer was wrong" it becomes a 2am page for someone who cannot possibly action it, and by the third
+        occurrence the team has learned to ignore the alert entirely. Hand the runbook to someone who was not in
+        the project and watch them work through section 2 — every hesitation is a missing line, and the exercise
+        takes twenty minutes.
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move — decline the handover.</strong> If, at the end of the engagement, there is no named
+        team willing to own a GPU host, the correct recommendation is not a better runbook: it is to change the
+        architecture. Move to a managed in-region endpoint if the policy allows it
+        (<a href="./pr6.html" class="text-viol underline decoration-viol/40">PR6</a>), or make the local model an
+        optional accelerator rather than the critical path. Leaving a single-point-of-failure GPU with an unstaffed
+        pager is worse than never building it — the outage lands six months after you have gone, and it lands on a
+        customer who trusted the recommendation (<a href="./fd5.html" class="text-viol underline decoration-viol/40">FD5</a>).
       </div>
 
       <!-- ═══════════════ skill ladder ═══════════════ -->
@@ -572,12 +1863,20 @@ L4:   $0.70 × 730h ≈ $511/mo   — whether it serves 1M tokens or 3,000M</pre
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Llama's community license and Gemma's terms are fine for most deployments — but customer legal must see them before procurement, not after. Apache-2.0/MIT alternatives exist at every size; know them.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Promoting a new model on a green health check</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A health check proves the process is alive; it says nothing about whether the model still passes your golden set. Gate every promotion on the eval, keep the previous version warm for 24 hours, and make rollback a config reload rather than a redeploy.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
           <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep the eval harness backend-agnostic</div>
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One loop over base_urls means any new model — local or API — gets a scored verdict in minutes. This harness is the most reusable artifact in the whole module.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
           <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Always present the regional-endpoint alternative</div>
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Put "frontier model via in-region cloud endpoint" beside the local option in every comparison. Half of "on-prem requirements" dissolve when the real policy is read carefully — and you look like the adult in the room either way.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Record a baseline, then re-run it weekly</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One cron job that replays the golden set and the throughput bench, diffed against the numbers you recorded on day one, catches thermal decay, a driver change, a silently-swapped model tag and a quantization regression — four causes with one symptom that no dashboard metric will name for you.</p>
         </div>
       </div>
 
@@ -588,6 +1887,9 @@ L4:   $0.70 × 730h ≈ $511/mo   — whether it serves 1M tokens or 3,000M</pre
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="napkin"> <span>Can do the VRAM napkin (params × bytes + KV cache) for any model/quant/context from memory, and pick a sensible size for given hardware.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="swap"> <span>Swapped a real application's backend with a base_url change only, and documented the behavioral gaps (tools, JSON mode, context limits).</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="quant"> <span>Measured the Q4/Q6/Q8 quantization ladder on your own eval — quality, speed and RAM in one table.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="licences"> <span>Produced a one-page model shortlist with the licence position for each candidate, including at least one candidate dropped on licence grounds — and pinned the weight hash in the deploy pipeline.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="knee"> <span>Measured the concurrency curve on real hardware, identified the knee, and turned it into a <code class="inline">--max-num-seqs</code> value, a card count and an alert threshold.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="gap-map"> <span>Presented a quality delta to a stakeholder <em>stratified by task category</em>, with a cost attached to closing each part of the gap — and reported at least one category where the local model won.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="deploy"> <span class="font-semibold">Deployed one model as a managed on-prem-style service with health checks, plus the benchmark report vs the API baseline and an ops-ready README (catalog evidence ✓).</span></label>
       </div>
 
@@ -597,6 +1899,14 @@ L4:   $0.70 × 730h ≈ $511/mo   — whether it serves 1M tokens or 3,000M</pre
         <li><a class="text-coral underline" href="https://docs.vllm.ai" target="_blank" rel="noopener">vLLM docs</a> — serving guide, quantization support matrix, tensor parallelism, and the PagedAttention paper behind it all.</li>
         <li><a class="text-coral underline" href="https://huggingface.co/spaces/open-llm-leaderboard/open_llm_leaderboard" target="_blank" rel="noopener">HF Open LLM Leaderboard</a> · <a class="text-coral underline" href="https://lmarena.ai" target="_blank" rel="noopener">LMArena</a> — for shortlisting only; your eval makes the call (<a class="text-coral underline" href="./ai9.html">AI9</a>).</li>
         <li><a class="text-coral underline" href="https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md" target="_blank" rel="noopener">llama.cpp quantization README</a> — what the Q4_K_M / Q6_K / Q8_0 alphabet soup actually means, with perplexity tables.</li>
+        <li><a class="text-coral underline" href="https://docs.vllm.ai/en/latest/serving/engine_args.html" target="_blank" rel="noopener">vLLM — engine arguments</a> · <a class="text-coral underline" href="https://docs.vllm.ai/en/latest/serving/metrics.html" target="_blank" rel="noopener">vLLM — production metrics</a> — the authoritative version of Part IV's flag table and Part VI's four numbers. Read the metrics page before you write a single alert rule.</li>
+        <li><a class="text-coral underline" href="https://docs.ollama.com/modelfile" target="_blank" rel="noopener">Ollama — Modelfile reference</a> — the <code class="inline">num_ctx</code> parameter that stops long prompts truncating silently, plus the server environment variables from Part IV's production section.</li>
+        <li><a class="text-coral underline" href="https://docs.vllm.ai/en/latest/features/quantization/index.html" target="_blank" rel="noopener">vLLM — quantization support matrix</a> — which of AWQ / GPTQ / FP8 / KV-cache-fp8 your GPU generation actually supports, before you download 9 GB of the wrong format.</li>
+        <li><a class="text-coral underline" href="https://huggingface.co/docs/transformers/en/quantization/overview" target="_blank" rel="noopener">Hugging Face — quantization overview</a> — the format landscape from Part III, including bitsandbytes NF4 and where it belongs (fine-tuning, not serving).</li>
+        <li><a class="text-coral underline" href="https://github.com/casper-hansen/AutoAWQ" target="_blank" rel="noopener">AutoAWQ</a> — the reference AWQ implementation; read it if you ever have to quantize your own fine-tuned weights (<a class="text-coral underline" href="./ai10.html">AI10</a>), and to see what "activation-aware" means in code.</li>
+        <li><a class="text-coral underline" href="https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/LICENSE" target="_blank" rel="noopener">Meta — Llama 3.1 Community License</a> · <a class="text-coral underline" href="https://ai.google.dev/gemma/terms" target="_blank" rel="noopener">Google — Gemma Terms of Use</a> — the two licences from Part II that a customer's counsel will actually read. Skim both once so you can answer in the room.</li>
+        <li><a class="text-coral underline" href="https://docs.anthropic.com/en/api/messages" target="_blank" rel="noopener">Anthropic — Messages API reference</a> — the authority for what the API baseline in your harness may and may not be sent; note the absence of <code class="inline">temperature</code> on Opus 5 and Sonnet 5 (<a class="text-coral underline" href="./ai2.html">AI2</a>).</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/bedrock/latest/userguide/data-protection.html" target="_blank" rel="noopener">AWS — Bedrock data protection</a> · <a class="text-coral underline" href="https://cloud.google.com/vertex-ai/generative-ai/docs/data-governance" target="_blank" rel="noopener">Google — Vertex AI data governance</a> — read these <em>before</em> you architect anything local; they are the regional-endpoint alternative that dissolves half of all on-prem requirements (<a class="text-coral underline" href="./pr6.html">PR6</a>).</li>
       </ul>
 
       <nav id="page-nav" class="mt-14 flex gap-4"></nav>
@@ -656,13 +1966,18 @@ client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 MODELS = ["qwen2.5:7b", "llama3.1:8b", "phi4"]
 GOLDEN = [json.loads(l) for l in open("golden.jsonl")]
 
+<span class="cm"># Sampling knobs live here because they are LOCAL-server parameters.</span>
+<span class="cm"># Ollama / vLLM / llama.cpp honour them; the Anthropic API does not — step 5.</span>
+LOCAL_SAMPLING = {"temperature": 0, "seed": 7}
+
 def run(model):
     ok, secs, toks = 0, 0.0, 0
     for g in GOLDEN:
         t0 = time.perf_counter()
         r = client.chat.completions.create(
-            model=model, temperature=0, max_tokens=300,
-            messages=[{"role": "user", "content": g["q"]}])
+            model=model, max_tokens=300,
+            messages=[{"role": "user", "content": g["q"]}],
+            **LOCAL_SAMPLING)
         secs += time.perf_counter() - t0
         toks += r.usage.completion_tokens
         ok += int(g["expect"].lower() in r.choices[0].message.content.lower())
@@ -674,15 +1989,56 @@ for m in MODELS:
       Substring scoring is the FN2 mini-harness — crude but honest for checkable answers. Swap in the LLM-judge from <a class="underline" href="./ai9.html">AI9</a> when tasks get subtler.
     </div></div>
     <div class="step"><div class="step-n">5</div><div class="step-body">
-      <strong>Add the API baseline.</strong> Point the same harness at your API provider (your <a class="underline" href="./ai2.html">AI2</a> wrapper or an OpenAI-compatible endpoint) with a small model like <code class="inline">claude-haiku-4-5</code>, and print a fourth row. Now you have the table this whole module is about:
+      <strong>Add the API baseline — and notice that the parameters change.</strong> This is the step where "OpenAI-compatible" stops meaning "identical". <code class="inline">temperature</code>, <code class="inline">top_p</code>, <code class="inline">top_k</code> and <code class="inline">seed</code> are valid on your local server and are <strong>rejected with a 400 on Opus 5 and Sonnet 5</strong>. Write the API baseline as its own small function rather than trying to force one client to do both:
+      <pre class="code">import anthropic
+llm = anthropic.Anthropic()
+
+def run_api(model="claude-haiku-4-5"):
+    ok = 0
+    for g in GOLDEN:
+        msg = llm.messages.create(          <span class="cm"># no temperature / top_p / top_k / seed</span>
+            model=model, max_tokens=300,
+            messages=[{"role": "user", "content": g["q"]}])
+        if msg.stop_reason == "refusal":    <span class="cm"># check BEFORE reading content</span>
+            continue                        <span class="cm"># a refusal is not a wrong answer — log it</span>
+        ok += int(g["expect"].lower() in msg.content[0].text.lower())
+    return f"{model:14s}  pass {ok}/{len(GOLDEN)}   (API)"
+
+print(run_api())</pre>
+      Now you have the table this whole module is about:
       <pre class="code"><span class="out">qwen2.5:7b      pass 11/15    38.2 tok/s
 llama3.1:8b     pass 10/15    35.7 tok/s
 phi4            pass 12/15    19.4 tok/s
-claude-haiku-4-5 (API)  pass 14/15   —</span></pre>
+claude-haiku-4-5  pass 14/15   (API)</span></pre>
       (Example output — yours will differ. That's the point.)
     </div></div>
     <div class="step"><div class="step-n">6</div><div class="step-body">
       <strong>Read the failures, not just the totals.</strong> For each local model, open its failed tasks. Typical pattern: all three handle classification; the small ones fumble multi-step arithmetic or exact-format instructions. Write two sentences: which task types the local tier handles at parity, and which carry the gap. That's your first honest local-vs-API sentence for a customer.
+    </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Establish your noise floor before you believe any difference.</strong> Run the whole harness a second time, unchanged, and diff the per-task results. On a 15-task set with <code class="inline">temperature 0</code> and a pinned seed you should see zero or one task flip locally; the API run has no seed, so expect a little more movement:
+      <pre class="code">python local_eval.py &gt; run1.txt
+python local_eval.py &gt; run2.txt
+diff run1.txt run2.txt || echo "^ tasks that flipped between identical runs"
+<span class="out">2c2</span>
+<span class="out">&lt; llama3.1:8b     pass 10/15    35.7 tok/s</span>
+<span class="out">&gt; llama3.1:8b     pass 11/15    34.9 tok/s</span>
+<span class="out">^ tasks that flipped between identical runs</span></pre>
+      One task of run-to-run noise on 15 tasks means <strong>you cannot report a 1-task difference as a finding</strong>. Write your noise floor down next to the table; it is the single most common way local-vs-API comparisons mislead people, including the person who ran them.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Write <code class="inline">LOCAL_SHORTLIST.md</code></strong> — four rows, and a licence column, because the shortlist you hand over has to survive procurement as well as the eval (Part II):
+      <pre class="code"># Local model shortlist — &lt;your task&gt;      &lt;date&gt;    mini-eval n=15
+
+| Model            | Licence    | Pass  | tok/s | Notes                     |
+|------------------|------------|-------|-------|---------------------------|
+| qwen2.5:7b       | Apache-2.0 | 11/15 | 38.2  | fails 3 arithmetic tasks  |
+| llama3.1:8b      | Llama CL   | 10/15 | 35.7  | legal read required       |
+| phi4 (14B)       | MIT        | 12/15 | 19.4  | best quality, half speed  |
+| claude-haiku-4-5 | API        | 14/15 | —     | external — baseline only  |
+
+Noise floor: +/-1 task. Recommendation: &lt;one sentence, with the reason&gt;</pre>
+      Keep this file. It is the first artifact of every residency engagement, and the second one is the same table with the customer's own tasks in it.
     </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
@@ -690,6 +2046,10 @@ claude-haiku-4-5 (API)  pass 14/15   —</span></pre>
       <li>First request per model takes 10–30 s → that's the load into RAM (Part IV warm-up); subsequent calls are fast. Models unload after ~5 min idle.</li>
       <li>Everything is painfully slow → check <code class="inline">ollama ps</code>: if the model shows high CPU% instead of GPU on a GPU machine, VRAM was insufficient and layers spilled to CPU.</li>
       <li>phi4 fails to load on 16 GB with apps open → close the browser (really), or drop it and run the two 7–8B models.</li>
+      <li><code class="inline">seed</code> rejected by the server → older Ollama builds ignore or refuse it. Drop it from <code class="inline">LOCAL_SAMPLING</code>, keep <code class="inline">temperature 0</code>, and expect a slightly wider noise floor in step 7.</li>
+      <li>Every model scores 15/15 → your <code class="inline">expect</code> strings are too permissive. <code class="inline">"billing" in answer</code> passes on "this is not a billing issue". Anchor the check, or move to the <a class="underline" href="./ai9.html">AI9</a> judge.</li>
+      <li>The API row errors with <code class="inline">400 invalid_request_error</code> → you copied <code class="inline">**LOCAL_SAMPLING</code> into <code class="inline">run_api</code>. That is precisely the mistake step 5 exists to teach; delete it, nothing replaces it.</li>
+      <li>Wildly different tok/s between two runs of the same model → another model is still resident. <code class="inline">ollama stop &lt;model&gt;</code> between runs and confirm with <code class="inline">ollama ps</code>.</li>
     </ul>
     <h4>✅ Done when</h4>
     <p class="text-sm leading-relaxed mt-1">You have a 4-row table (3 local + 1 API) with pass-rate and tok/s from your own machine, and a two-sentence reading of where the quality gap actually lives.</p>
@@ -707,8 +2067,17 @@ claude-haiku-4-5 (API)  pass 14/15   —</span></pre>
   <div class="modal-body">
     <h4>🎯 Objective</h4>
     <p class="text-sm leading-relaxed mt-1">Prove — on your own application from <a class="underline" href="./ai2.html">AI2</a> — that the backend is a config value, then map exactly where "OpenAI-compatible" stops being "identical". The gap map is the deliverable.</p>
-    <h4>🔬 Steps</h4>
+    <h4>📦 Setup</h4>
     <div class="step"><div class="step-n">1</div><div class="step-body">
+      Check out the application you built in <a class="underline" href="./ai2.html">AI2</a> (or any service of yours that calls an LLM and has tests), and have a local model warm and pinned so it cannot unload mid-suite:
+      <pre class="code">ollama pull qwen2.5:7b
+OLLAMA_KEEP_ALIVE=-1 ollama serve &amp;     <span class="cm"># pin in RAM — a 30 s reload mid-test looks like a hang</span>
+curl -s localhost:11434/v1/models | python3 -m json.tool | head -20
+pip install openai pydantic pytest</pre>
+      <span class="text-mute dark:text-mutedark">If your app has no tests, write three before you start. This lab measures a <em>difference</em>, and you cannot measure a difference against nothing.</span>
+    </div></div>
+    <h4>🔬 Steps</h4>
+    <div class="step"><div class="step-n">2</div><div class="step-body">
       <strong>Make the backend configurable</strong> (if your AI2 wrapper uses a provider-native SDK, add an OpenAI-compatible code path now — this portability is a big part of why the wrapper exists):
       <pre class="code">import os
 from openai import OpenAI
@@ -719,7 +2088,7 @@ client = OpenAI(
 )
 MODEL = os.environ.get("LLM_MODEL", "claude-haiku-4-5")</pre>
     </div></div>
-    <div class="step"><div class="step-n">2</div><div class="step-body">
+    <div class="step"><div class="step-n">3</div><div class="step-body">
       <strong>Run your existing integration tests against Ollama</strong> — zero code changes, three env vars:
       <pre class="code">LLM_BASE_URL=http://localhost:11434/v1 \
 LLM_API_KEY=ollama \
@@ -727,7 +2096,7 @@ LLM_MODEL=qwen2.5:7b \
 pytest tests/ -v</pre>
       Record which tests pass, fail, or degrade. Do <em>not</em> fix anything yet — you're surveying, not patching.
     </div></div>
-    <div class="step"><div class="step-n">3</div><div class="step-body">
+    <div class="step"><div class="step-n">4</div><div class="step-body">
       <strong>Probe the known gap areas deliberately</strong>, one probe each:
       <ul class="mt-1 space-y-1.5 list-disc pl-5">
         <li><strong>Tool calling:</strong> send a request with a <code class="inline">tools</code> array. llama3.1 and qwen2.5 support tools through Ollama; phi4 doesn't. Even where supported, expect more missed calls and malformed arguments than the API model — count them, don't guess.</li>
@@ -736,25 +2105,95 @@ pytest tests/ -v</pre>
         <li><strong>Provider features:</strong> anything provider-specific in your wrapper (prompt caching, citations) has no local equivalent — confirm your code degrades gracefully rather than crashing.</li>
       </ul>
     </div></div>
-    <div class="step"><div class="step-n">4</div><div class="step-body">
+    <div class="step"><div class="step-n">5</div><div class="step-body">
+      <strong>Streaming and stop reasons — the two places client code quietly breaks.</strong> Both backends stream, but the terminal fields differ, and code that switches on them is code that will misbehave after a swap:
+      <pre class="code">import os
+from openai import OpenAI
+c = OpenAI(base_url=os.environ["LLM_BASE_URL"], api_key=os.environ["LLM_API_KEY"])
+
+s = c.chat.completions.create(
+    model=os.environ["LLM_MODEL"], max_tokens=40, stream=True,
+    stream_options={"include_usage": True},
+    messages=[{"role": "user", "content": "Count from 1 to 30."}])
+
+finish, usage = None, None
+for chunk in s:
+    if chunk.choices and chunk.choices[0].finish_reason:
+        finish = chunk.choices[0].finish_reason
+    if getattr(chunk, "usage", None):
+        usage = chunk.usage
+print("finish_reason:", finish, "| usage:", usage)
+<span class="out">finish_reason: length | usage: CompletionUsage(completion_tokens=40, ...)</span></pre>
+      Two things to record: whether <code class="inline">stream_options.include_usage</code> is honoured at all (some builds omit the final usage chunk entirely, which silently zeroes your cost telemetry), and whether <code class="inline">finish_reason</code> uses the same vocabulary your code branches on. The Anthropic API's <code class="inline">stop_reason</code> adds <code class="inline">"refusal"</code>, which has no OpenAI-compatible equivalent — if your app handles refusals, that path is now dead on the local backend and you should say so in the diff table.
+    </div></div>
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Put a number on the structured-output gap.</strong> "JSON mode drifts" is an anecdote; a validation failure rate is a finding. Run 30 identical extraction requests through a schema and count:
+      <pre class="code">from pydantic import BaseModel, ValidationError
+import json
+
+class Claim(BaseModel):
+    policy_number: str
+    amount_eur: float
+    incident_date: str
+
+bad = 0
+for i in range(30):
+    r = c.chat.completions.create(
+        model=os.environ["LLM_MODEL"], max_tokens=200,
+        response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": PROMPT}])
+    try:
+        Claim.model_validate_json(r.choices[0].message.content)
+    except (ValidationError, json.JSONDecodeError):
+        bad += 1
+print(f"schema failures: {bad}/30 ({bad/30:.0%})")
+<span class="out">schema failures: 4/30 (13%)</span></pre>
+      13% is entirely workable — one validate-and-retry closes it, at the cost of ~13% more tokens. But it is a number you now own rather than a risk you hand to the customer. Run the same 30 against the API backend for the comparison column.
+    </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Measure latency on both, from the same client.</strong> Twenty sequential requests each, p50 and p95, on the same prompts. Expect the local model to be <em>slower</em> per request on a laptop and competitive on a real GPU — and expect the surprise to be time-to-first-token, where a local model with no network hop often wins even when total time loses:
+      <pre class="code">import time, statistics as st
+def latencies(n=20):
+    out = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        c.chat.completions.create(model=os.environ["LLM_MODEL"], max_tokens=120,
+                                  messages=[{"role":"user","content":PROMPT}])
+        out.append(time.perf_counter() - t0)
+    return st.median(out), sorted(out)[int(.95*n)-1]
+print("p50 %.2fs  p95 %.2fs" % latencies())
+<span class="out">p50 2.41s  p95 3.08s</span></pre>
+      Record both backends. A latency row that says "local is 2× slower for this prompt shape" is a far better conversation than discovering it in UAT.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
       <strong>Write <code class="inline">BACKEND_DIFFS.md</code></strong> — the artifact this lab exists for:
       <pre class="code">| Capability          | API (haiku-4-5) | qwen2.5:7b @ Ollama | Notes                        |
 |---------------------|-----------------|---------------------|------------------------------|
 | Chat + streaming    | ✓               | ✓                   | identical wire format        |
 | Tool calling        | ✓ reliable      | ~ 7/10 test calls   | retries + arg validation req |
-| JSON mode           | ✓ schema-clean  | ~ valid, drifts     | add schema validation        |
+| JSON mode           | ✓ schema-clean  | 4/30 schema fails   | validate + 1 retry = +13% tok|
 | 16K context         | ✓               | ✓ after num_ctx     | default 4K truncates SILENTLY|
-| Prompt caching      | ✓               | ✗                   | costs modeled without it     |</pre>
-      Every row is a sentence you can now say to a customer with evidence behind it.
+| Prompt caching      | ✓               | ✗                   | costs modeled without it     |
+| Sampling params     | REJECTED (400)  | temperature/seed ok | pin seed locally for repeats |
+| Refusal signalling  | stop_reason     | none                | our refusal path is dead here|
+| Streamed usage      | ✓               | ✓ w/ include_usage  | check per server build       |
+| p50 / p95 latency   | 1.19s / 1.55s   | 2.41s / 3.08s       | laptop CPU; GPU changes this |</pre>
+      Every row is a sentence you can now say to a customer with evidence behind it. Rows 6 and 7 are the two that catch people: the parameter set and the refusal signal are <em>not</em> part of "OpenAI-compatible", and both are load-bearing in application code.
     </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
       <li>401 from Ollama → it ignores keys but the client requires one; any non-empty string works.</li>
       <li>Tool-call tests hang → the model is emitting text instead of a tool call; assert on <code class="inline">finish_reason</code> to fail fast.</li>
       <li>Truncation probe "passes" suspiciously → your prompt was shorter than you thought; count tokens, don't estimate (<a class="underline" href="./fn2.html">FN2</a>).</li>
+      <li><code class="inline">400 invalid_request_error</code> naming <code class="inline">temperature</code> or <code class="inline">top_p</code> when you point at the API → correct behaviour, not a bug. Those live in <code class="inline">LOCAL_SAMPLING</code> and must not travel with the swap.</li>
+      <li>Usage is <code class="inline">None</code> on every streamed chunk → you omitted <code class="inline">stream_options={"include_usage": True}</code>, or the server build drops it. Note which, then fall back to counting chunks and mark the column "estimated".</li>
+      <li>Tests pass locally but the app is visibly worse → you are probably comparing a 4K-truncated prompt against a full one. Log the prompt token count on both backends before drawing any conclusion.</li>
+      <li><code class="inline">response_format</code> silently ignored → the server build predates JSON-schema guided decoding, or you passed <code class="inline">json_object</code> where it wanted <code class="inline">json_schema</code>. Record which, and mark the row "prompt-only" rather than "supported".</li>
+      <li>Latency numbers swing wildly between runs on a laptop → the model unloaded between tests. Confirm <code class="inline">OLLAMA_KEEP_ALIVE=-1</code> is in effect with <code class="inline">ollama ps</code> before you trust a single timing.</li>
+      <li>The suite passes on both backends and you found no gaps → you tested the happy path only. Add a long prompt, a tool call, and a structured-output request; those three probes find something every time.</li>
     </ul>
     <h4>✅ Done when</h4>
-    <p class="text-sm leading-relaxed mt-1">The same test suite has run against both backends via env vars only, and <code class="inline">BACKEND_DIFFS.md</code> has ≥5 rows with real observed results — including at least one gap you didn't expect.</p>
+    <p class="text-sm leading-relaxed mt-1">The same test suite has run against both backends via env vars only, and <code class="inline">BACKEND_DIFFS.md</code> has ≥8 rows with real observed results — including a schema-failure rate, a p50/p95 pair, and at least one gap you didn't expect.</p>
   </div>
 </dialog>
 
@@ -803,14 +2242,76 @@ eval rate:            31.8 tokens/s</span></pre>
     <div class="step"><div class="step-n">5</div><div class="step-body">
       <strong>Interpret like a consultant.</strong> If Q4 ≈ Q8 on your eval: your tasks don't stress the damaged tails — ship Q4 and bank the RAM. If Q4 measurably loses: look at <em>which</em> tasks (numbers and exact formats fail first), and decide whether to step up to Q6 or to fix with prompting. One paragraph, written down. This exact reasoning, at customer scale, is Lab 4's benchmark report.
     </div></div>
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Stratify, because the total hides the finding.</strong> Tag every golden-set row with a category and re-score per category — this is the Part III sweep, on your own tasks:
+      <pre class="code">import collections, json
+GOLDEN = [json.loads(l) for l in open("golden.jsonl")]   <span class="cm"># each row: {"q","expect","cat"}</span>
+
+def by_category(model):
+    hit, n = collections.Counter(), collections.Counter()
+    for g in GOLDEN:
+        r = client.chat.completions.create(
+            model=model, max_tokens=300,
+            messages=[{"role": "user", "content": g["q"]}],
+            **LOCAL_SAMPLING)
+        hit[g["cat"]] += int(g["expect"].lower() in r.choices[0].message.content.lower())
+        n[g["cat"]] += 1
+    return "  ".join(f"{c}:{hit[c]}/{n[c]}" for c in sorted(n))
+
+for m in MODELS:
+    print(f"{m:32s} {by_category(m)}")
+<span class="out">qwen2.5:7b-instruct-q8_0         arith:3/4  class:5/5  exact:2/3  extract:3/3</span>
+<span class="out">qwen2.5:7b-instruct-q6_K         arith:3/4  class:5/5  exact:2/3  extract:3/3</span>
+<span class="out">qwen2.5:7b-instruct-q4_K_M       arith:2/4  class:5/5  exact:2/3  extract:3/3</span></pre>
+      The expected shape: classification and extraction flat across the whole ladder, arithmetic and exact-format carrying whatever damage exists. If your set shows something else, that <em>is</em> the finding — write it down, it is specific to your task and worth more than any general rule in this module.
+    </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Sanity-check the other axis: the KV cache.</strong> Weight quantization is only half of the memory story, and on a served deployment the cache is usually the bigger half (Part II). If you have a GPU, measure it directly; if you don't, measure the RAM cost of context on Ollama, which teaches the same lesson:
+      <pre class="code"><span class="cm"># GPU path — the same model, two cache precisions</span>
+vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --max-model-len 8192 \
+  --gpu-memory-utilization 0.90 2&gt;&amp;1 | grep -i "GPU KV cache size"
+<span class="out">INFO ... GPU KV cache size: 118,464 tokens</span>
+
+vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --max-model-len 8192 \
+  --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 2&gt;&amp;1 | grep -i "GPU KV cache size"
+<span class="out">INFO ... GPU KV cache size: 236,928 tokens</span>
+
+<span class="cm"># CPU path — same idea, visible through the process footprint</span>
+ollama run qwen2.5:7b-instruct-q4_K_M --verbose "hi"   <span class="cm"># then compare `ollama ps`</span>
+<span class="cm"># with a Modelfile at num_ctx 4096 vs num_ctx 16384</span></pre>
+      Exactly double the tokens for one flag. Then re-run your eval against the fp8-cache server: if the score is unchanged — and on classification and extraction it usually is — you just doubled concurrency for free, and that is a sentence worth putting in a report.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Write <code class="inline">QUANT_DECISION.md</code>.</strong> Six lines, one recommendation, and the numbers that justify it. This is the file you paste into a design review when someone asks "why Q4?" — and the reason you never have that argument twice:
+      <pre class="code"># Quantization decision — &lt;model&gt; · &lt;task&gt;                      &lt;date&gt;
+
+DECISION: ship Q4_K_M with fp8 KV cache.
+
+Evidence (n=15 mini-eval, 3 runs, noise floor +/-1 task):
+| Quant  | File   | RAM   | Pass  | Decode tok/s | arith | exact |
+|--------|--------|-------|-------|--------------|-------|-------|
+| Q4_K_M | 4.7 GB | 5.9GB | 13/15 |  38.2        |  2/4  |  2/3  |
+| Q6_K   | 6.3 GB | 7.4GB | 13/15 |  31.5        |  3/4  |  2/3  |
+| Q8_0   | 8.1 GB | 9.2GB | 14/15 |  27.9        |  3/4  |  2/3  |
+
+Q8 buys 1 task (inside the noise floor) for 3.3 GB and 27% less throughput.
+The one repeatable Q4 loss is arithmetic -&gt; mitigated with a calculator tool,
+not with bits. Revisit if the task mix gains numeric reasoning.</pre>
+      Note the last line: a decision with a stated expiry condition is a decision someone can safely inherit.
+    </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
       <li>Q8 won't load on 16 GB → free RAM first (<code class="inline">ollama stop</code> everything, close apps); it needs ~9 GB free.</li>
       <li>15-task eval shows zero difference anywhere → your eval may be too easy to discriminate; add the arithmetic and exact-format tasks — they're the quant-sensitive ones.</li>
       <li>tok/s varies run to run → thermal throttling on laptops; plug in, take the median of 3 runs.</li>
+      <li>A tag like <code class="inline">qwen2.5:7b-instruct-q6_K</code> 404s → Ollama's available quant tags vary by model; run <code class="inline">ollama show qwen2.5:7b --modelfile</code> and check the library listing rather than guessing the suffix.</li>
+      <li>Q4 scores <em>higher</em> than Q8 on your set → that is the noise floor talking, not a discovery. Re-run both three times and compare medians before you tell anyone.</li>
+      <li><code class="inline">--kv-cache-dtype fp8</code> refused at startup → your GPU generation lacks FP8 support (pre-Ada). Use the fp16 cache and lower <code class="inline">--max-num-seqs</code> instead.</li>
+      <li>Decode speed identical across all three quants → you are compute-bound, not memory-bound; that happens on a heavily loaded CPU. Run the comparison on an idle machine, plugged in, before concluding the bits are free.</li>
+      <li>Disk fills partway through the third pull → the three quants plus the default tag are ~24 GB. <code class="inline">ollama rm</code> the default tag first; it is byte-identical to the Q4_K_M one you just pulled.</li>
     </ul>
     <h4>✅ Done when</h4>
-    <p class="text-sm leading-relaxed mt-1">All 12 cells of the table are filled with measured numbers, plus a one-paragraph recommendation ("ship Q4_K_M because…") backed by them.</p>
+    <p class="text-sm leading-relaxed mt-1">All 12 cells of the table are filled with measured numbers, the per-category breakdown shows you <em>where</em> any damage lives, and <code class="inline">QUANT_DECISION.md</code> states one recommendation with an expiry condition.</p>
   </div>
 </dialog>
 
@@ -888,15 +2389,75 @@ print(f"aggregate: {toks/dt:.0f} tok/s over {dt:.1f}s")   <span class="cm"># vs 
       Expect aggregate throughput several times the single-stream rate — continuous batching earning its keep. Record both.
     </div></div>
     <div class="step"><div class="step-n">5</div><div class="step-body">
+      <strong>Find the knee</strong> — the number the rest of the deployment hangs off (Part IV). Sweep concurrency, not just one level, and stop when p95 starts running away from throughput:
+      <pre class="code">for C in 1 4 8 16 24 32 48; do
+  python bench_concurrency.py --concurrency $C --requests $((C*4)) --max-tokens 200
+done | tee bench.txt
+<span class="out">c=  1  agg     46 tok/s  ttft p50  0.09s  e2e p95   4.6s</span>
+<span class="out">c= 16  agg    470 tok/s  ttft p50  0.29s  e2e p95   7.2s</span>
+<span class="out">c= 24  agg    545 tok/s  ttft p50  0.52s  e2e p95   9.6s   &lt;- knee</span>
+<span class="out">c= 32  agg    580 tok/s  ttft p50  1.40s  e2e p95  16.4s</span></pre>
+      The knee is the last level where throughput still rises meaningfully and p95 has not yet doubled. Set <code class="inline">MAX_NUM_SEQS</code> to it in <code class="inline">/etc/llm/serving.env</code>, restart, and re-run the sweep once to confirm the shape didn't move. <strong>CPU path:</strong> the same sweep on Ollama will find a knee near 2–4 with much lower aggregate throughput — record it honestly and label the report "CPU path", because a projection built on a laptop is a projection, not a measurement.
+    </div></div>
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Wire the four numbers.</strong> vLLM already exports Prometheus metrics; you only have to scrape and alert on them. Confirm the metrics exist, then write the rules with <em>your</em> measured baselines substituted in:
+      <pre class="code">curl -s localhost:8000/metrics | grep -E '^vllm:(num_requests|gpu_cache|time_to_first)' | head
+<span class="out">vllm:num_requests_running{model_name="acme-local"} 18.0</span>
+<span class="out">vllm:num_requests_waiting{model_name="acme-local"} 0.0</span>
+<span class="out">vllm:gpu_cache_usage_perc{model_name="acme-local"} 0.63</span>
+<span class="out">vllm:time_to_first_token_seconds_bucket{le="0.5",...} 1841</span>
+
+<span class="cm"># then: llm-alerts.yml from Part VI, with MAX_NUM_SEQS and 3x your TTFT baseline</span>
+promtool check rules llm-alerts.yml
+<span class="out">SUCCESS: 4 rules found</span></pre>
+      <span class="text-mute dark:text-mutedark">Ollama does not export Prometheus metrics. On the CPU path, write a 20-line sidecar that polls <code class="inline">/api/ps</code> and your own request log, and say so in the report — "we substituted X for Y and here is why" is a perfectly good engineering sentence.</span>
+    </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Break it on purpose — three drills, fifteen minutes.</strong> An untested failure path is a hope. Run each drill, record what the health check said, what the alert said, and how long recovery took:
+      <pre class="code"><span class="cm"># Drill 1 — hard stop. Expect: health check fails within 5 s, alert fires.</span>
+sudo systemctl stop llm-serving; ./healthcheck.sh 8000; echo "exit=$?"
+<span class="out">curl: (7) Failed to connect to localhost port 8000</span>
+<span class="out">exit=1</span>
+
+<span class="cm"># Drill 2 — cold start window. Expect: FAILS while loading, passes after ~45-90 s.</span>
+sudo systemctl start llm-serving
+for i in $(seq 1 20); do ./healthcheck.sh 8000 &amp;&amp; break || sleep 5; done
+<span class="out">... healthy   (after 9 attempts ≈ 45 s)</span>
+
+<span class="cm"># Drill 3 — KV exhaustion. Expect: queueing, preemption warnings, NOT a crash.</span>
+python bench_concurrency.py --concurrency 96 --requests 200 --max-tokens 800
+journalctl -u llm-serving --since -3min | grep -iE "preempt|out of memory" | tail -3
+<span class="out">WARNING ... Sequence group ... is preempted by PreemptionMode.RECOMPUTE</span></pre>
+      Drill 2 is the one that produces a design change: for 45 seconds the service is up and unhealthy, which is a different state from down. If your health check cannot say which, neither can the person you page — fix it now, while you are the one holding it.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Rehearse the rollback.</strong> Stand up a second unit on :8001 (a different quant of the same model is a perfectly good stand-in for "a new version"), put both behind nginx, and practise the flip and the flip back:
+      <pre class="code"><span class="cm"># /etc/nginx/upstreams/blue.conf   -> server 127.0.0.1:8000;</span>
+<span class="cm"># /etc/nginx/upstreams/green.conf  -> server 127.0.0.1:8001;</span>
+<span class="cm"># nginx.conf includes /etc/nginx/upstreams/active.conf</span>
+
+MODEL=Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 PORT=8001 sudo systemctl start llm-green
+./promote.sh Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
+<span class="out">promoted ... at 28/40 — blue stays warm until Thu Aug  6 14:20:11 2026</span>
+
+<span class="cm"># now roll back, with a stopwatch running:</span>
+sudo ln -sfn /etc/nginx/upstreams/blue.conf /etc/nginx/upstreams/active.conf
+sudo nginx -s reload &amp;&amp; ./healthcheck.sh 8000
+<span class="out">healthy      (elapsed 1.4 s)</span></pre>
+      Time the rollback and put the number in the runbook. "Rollback takes under two seconds and the previous version is already warm" is the sentence that gets a change approved on a Thursday afternoon; "we'd redeploy" is the sentence that gets it deferred to next quarter.
+    </div></div>
+    <div class="step"><div class="step-n">9</div><div class="step-body">
       <strong>Write the benchmark report</strong> — this skeleton, your numbers:
       <pre class="code"># On-prem deployment benchmark — Qwen2.5-7B-Instruct-AWQ / vLLM     2026-08-__
 ## Deployment
 1× L4 24GB · vLLM (docker+systemd) · AWQ 4-bit ≈ 5.6 GB weights · ctx 8192
 health: 2-tier (process + generation probe) · restart: automatic, ~45s warm-up
 ## Quality (golden set n=40, vs claude-haiku-4-5 baseline)
-local 31/40 (78%) · API 36/40 (90%) · gap concentrated in: multi-step reasoning (4), exact formatting (1)
+local 28/40 (70%) · API 36/40 (90%) · gap by category: arithmetic (6), exact format (1), extraction (1)
+mitigation: calculator tool closes 4 of the 6 arithmetic tasks at zero VRAM cost
 ## Performance
-p50 0.8s · p95 1.9s (single stream) · aggregate 1,150 tok/s @ 16 concurrent
+p50 0.8s · p95 1.9s (single stream) · knee at 16 concurrent · 1,150 tok/s aggregate
+MAX_NUM_SEQS=16 · TTFT p95 baseline 0.41s · rollback measured at 1.4s
 ## Projected monthly cost (L4 @ $0.70/hr always-on = $511/mo floor)
 |  volume    | local (this box) | API (blended $1.8/Mtok) | winner |
 |------------|------------------|-------------------------|--------|
@@ -908,8 +2469,15 @@ p50 0.8s · p95 1.9s (single stream) · aggregate 1,150 tok/s @ 16 concurrent
 &lt;two sentences an executive can act on&gt;</pre>
       The three-volume cost table with the API winning two rows is what makes the report credible — you're demonstrably not selling GPUs.
     </div></div>
-    <div class="step"><div class="step-n">6</div><div class="step-body">
-      <strong>Write <code class="inline">DEPLOY_README.md</code> for a customer ops team:</strong> prerequisites (hardware, driver/CUDA, docker) · install steps (copy unit file, enable) · start/stop/status commands · health check + expected warm-up window · where models are cached and how to update one (pull new tag → restart → re-run benchmark) · rollback (previous tag is still in the volume) · "when to call us". One page. Hand it to someone who wasn't in this lab and watch where they stumble — every stumble is a missing sentence.
+    <div class="step"><div class="step-n">10</div><div class="step-body">
+      <strong>Write <code class="inline">DEPLOY_README.md</code> and <code class="inline">RUNBOOK.md</code>, then have someone else use them.</strong> The README is for installing it: prerequisites (hardware, driver/CUDA version, docker) · install steps (copy unit file, enable) · start/stop/status · health check and the expected warm-up window · where weights are cached and how to promote a new one · rollback. The runbook is for the 3am version of the same person — use the four-section shape from Part VI: what this is · is it broken · the three things that break · when to call us.
+      <pre class="code"><span class="cm"># the handover test — 20 minutes, and the only one that matters</span>
+1. Hand both files to a colleague who was not in this lab.
+2. Stop the service while they aren't looking.
+3. Ask them: "is it broken, and what do you do?"
+4. Time them. Write down every question they had to ask you.
+<span class="out">Typical result: 3 questions. Each one is a missing sentence, not a training gap.</span></pre>
+      Every stumble is a missing line in your document, not a shortcoming in your colleague. Fix the three sentences and you have a handover that survives your departure — which is the actual deliverable of this lab, and of this module.
     </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
@@ -917,6 +2485,11 @@ p50 0.8s · p95 1.9s (single stream) · aggregate 1,150 tok/s @ 16 concurrent
       <li>Docker can't see the GPU → install <code class="inline">nvidia-container-toolkit</code> and restart docker; verify with <code class="inline">docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi</code>.</li>
       <li>Throughput test barely beats single-stream → concurrency bottleneck is client-side; raise the thread pool, check server logs show batched requests.</li>
       <li>Service flaps on boot → model download racing the health check; pre-pull weights in <code class="inline">ExecStartPre</code> or extend the monitoring grace period.</li>
+      <li><code class="inline">/metrics</code> returns 404 → you are on Ollama, which exports none, or vLLM was started with metrics disabled. Note the substitution in the report rather than skipping step 6.</li>
+      <li>The knee sweep shows throughput still climbing at c=48 → your prompts are too short to saturate the card. Replay real request shapes (Part IV callout) before you set <code class="inline">MAX_NUM_SEQS</code> from this.</li>
+      <li>Drill 3 crashes the process instead of preempting → <code class="inline">--gpu-memory-utilization</code> is too high for this card, or something else is attached to the GPU. Lower it to 0.85 and re-run; a server that dies under load is not a capacity limit, it is a bug in your config.</li>
+      <li>nginx reload drops in-flight requests → you replaced the config instead of reloading it, or your proxy timeouts are shorter than a generation. Set <code class="inline">proxy_read_timeout</code> above your p99 and re-test the flip under load.</li>
+      <li>Reboot test leaves the service down → <code class="inline">systemctl enable</code> was never run, or the model volume mounts after the unit starts. Add the mount to <code class="inline">RequiresMountsFor=</code> and reboot again — this must be tested, not assumed.</li>
     </ul>
     <h4>✅ Done when</h4>
     <p class="text-sm leading-relaxed mt-1">The service survives a reboot unattended, the health check catches a stopped service, the benchmark report has real numbers in every section including the 3-volume cost table, and the README has been walked through by someone else. Keep the harness and the report template — they're the first three days of every data-residency engagement, pre-built.</p>
