@@ -136,6 +136,97 @@ tailwind.config = {
         the multimodal projects that fail were scoped against the clean sample.
       </div>
 
+      <h3 class="font-semibold text-lg mt-8">The corpus census: the hour that decides the architecture</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The ten-examples reflex is right, but it is a reflex, not a method. The method is a <strong>census</strong>:
+        take fifty artefacts pulled at random from the real queue, classify each one mechanically, and print the
+        distribution. It takes an hour, it needs no model, and it answers the only architectural question that
+        matters — <em>how many of these have a usable text layer?</em> — with a number instead of an impression.
+        Everything downstream, from pipeline choice to the price you quote, is a function of that distribution.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">census.py — run this before you design anything</span>
+        <pre class="code"><span class="cm">"""What is actually in the customer's queue? No model, no API key, one hour."""</span>
+<span class="kw">import</span> collections, json, pathlib, sys
+<span class="kw">import</span> fitz                              <span class="cm"># PyMuPDF:  pip install pymupdf</span>
+<span class="kw">from</span> PIL <span class="kw">import</span> Image
+
+TEXT_CHARS_PER_PAGE = <span class="st">120</span>              <span class="cm"># below this, a "PDF" is really a scan in a wrapper</span>
+
+<span class="kw">def</span> <span class="fn">probe_pdf</span>(path):
+    doc = fitz.<span class="fn">open</span>(path)
+    pages = doc.page_count
+    chars = <span class="fn">sum</span>(<span class="fn">len</span>(p.get_text(<span class="st">"text"</span>).strip()) <span class="kw">for</span> p <span class="kw">in</span> doc)
+    per_page = chars / <span class="fn">max</span>(pages, <span class="st">1</span>)
+    kind = <span class="st">"pdf_text"</span> <span class="kw">if</span> per_page &gt;= TEXT_CHARS_PER_PAGE <span class="kw">else</span> <span class="st">"pdf_scan"</span>
+    <span class="kw">return</span> {<span class="st">"kind"</span>: kind, <span class="st">"pages"</span>: pages, <span class="st">"chars_per_page"</span>: <span class="fn">round</span>(per_page)}
+
+<span class="kw">def</span> <span class="fn">probe_image</span>(path):
+    <span class="kw">with</span> Image.<span class="fn">open</span>(path) <span class="kw">as</span> im:
+        w, h = im.size
+    <span class="kw">return</span> {<span class="st">"kind"</span>: <span class="st">"image"</span>, <span class="st">"pages"</span>: <span class="st">1</span>, <span class="st">"long_edge"</span>: <span class="fn">max</span>(w, h),
+            <span class="st">"approx_image_tokens"</span>: <span class="fn">min</span>(<span class="fn">round</span>(w * h / <span class="st">750</span>), <span class="st">4800</span>)}
+
+<span class="kw">def</span> <span class="fn">census</span>(folder):
+    rows = []
+    <span class="kw">for</span> p <span class="kw">in</span> <span class="fn">sorted</span>(pathlib.<span class="fn">Path</span>(folder).rglob(<span class="st">"*"</span>)):
+        <span class="kw">if</span> p.suffix.lower() == <span class="st">".pdf"</span>:
+            rows.append({<span class="st">"file"</span>: p.name, **<span class="fn">probe_pdf</span>(p)})
+        <span class="kw">elif</span> p.suffix.lower() <span class="kw">in</span> {<span class="st">".jpg"</span>, <span class="st">".jpeg"</span>, <span class="st">".png"</span>, <span class="st">".tif"</span>, <span class="st">".tiff"</span>, <span class="st">".webp"</span>}:
+            rows.append({<span class="st">"file"</span>: p.name, **<span class="fn">probe_image</span>(p)})
+    <span class="kw">return</span> rows
+
+<span class="kw">if</span> __name__ == <span class="st">"__main__"</span>:
+    rows = <span class="fn">census</span>(sys.argv[<span class="st">1</span>])
+    tally = collections.<span class="fn">Counter</span>(r[<span class="st">"kind"</span>] <span class="kw">for</span> r <span class="kw">in</span> rows)
+    <span class="kw">for</span> kind, n <span class="kw">in</span> tally.most_common():
+        <span class="fn">print</span>(f<span class="st">"{kind:10} {n:4}  ({n / len(rows):.0%})"</span>)
+    <span class="fn">print</span>(f<span class="st">"{'TOTAL':10} {len(rows):4}  {sum(r['pages'] for r in rows)} pages"</span>)
+    pathlib.<span class="fn">Path</span>(<span class="st">"census.json"</span>).write_text(json.dumps(rows, indent=<span class="st">2</span>))
+
+<span class="out">pdf_text     34  (68%)</span>
+<span class="out">image        11  (22%)</span>
+<span class="out">pdf_scan      5  (10%)</span>
+<span class="out">TOTAL        50  71 pages</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That four-line output is the whole architecture argument. Two-thirds of this queue never needs a pixel sent
+        anywhere; a fifth is phone photos that must go through the vision path; a tenth are scans, and when you open
+        those five by hand you find three faxes and two handwritten notes on a printed form. The handwritten pair is
+        <strong>4% of volume</strong> — small enough to declare out of scope on day one, and large enough that
+        nobody would have believed you if you had only looked at the clean sample.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Census bucket</th><th class="px-4 py-3">Share here</th><th class="px-4 py-3">Pipeline it forces</th><th class="px-4 py-3">Rough cost / doc</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">pdf_text</td><td class="px-4 py-3">68%</td><td class="px-4 py-3">Parsed text only — no image tokens at all</td><td class="px-4 py-3">≈ $0.003</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">image</td><td class="px-4 py-3">22%</td><td class="px-4 py-3">Downscale → vision call with schema + quotes</td><td class="px-4 py-3">≈ $0.013</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">pdf_scan</td><td class="px-4 py-3">10%</td><td class="px-4 py-3">Render pages → vision call, or native PDF block</td><td class="px-4 py-3">≈ $0.015 / page</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">handwritten <span class="text-xs text-mute dark:text-mutedark font-normal">(subset of pdf_scan)</span></td><td class="px-4 py-3">4%</td><td class="px-4 py-3">Out of scope — straight to the human queue</td><td class="px-4 py-3">$0 + a reviewer</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Blended, that is <strong>$0.0064 per document</strong> — half the flat-rate estimate you would have produced
+        by assuming everything is an image. Routing is not an optimisation you add later; it is the cheapest
+        engineering decision in the project and the census is what licenses it.
+      </p>
+
+      <div class="mt-4 callout callout-danger">
+        <strong>The census folder is production data from the second it lands.</strong> Fifty real invoices contain
+        bank account numbers, personal addresses, and often a passport scan somebody attached by mistake. It arrives
+        on a USB stick or in a Google Drive link with no DPA behind it, and it ends up in your
+        <code class="inline">~/Downloads</code> and then in a screenshot in a Slack thread. Put it in an encrypted,
+        access-logged bucket with a deletion date <em>before</em> you run the script, and write that bucket's name in
+        the engagement notes — <a href="./pr5.html" class="text-viol underline decoration-viol/40">PR5</a> covers the
+        obligations, but the habit is yours to build on day one.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">Pipeline shapes: three, and only three</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         Every multimodal feature you will build is one of these. Recognising which one you are in tells you where the
@@ -232,6 +323,33 @@ Compare: a clerk at 90 seconds per invoice = 250 hours/month.</pre>
         <em>is</em> token-priced — a 6-minute call is ~900 words ≈ 1,200 tokens of transcript, so the analysis is
         usually cheaper than the transcription.
       </div>
+
+      <h3 class="font-semibold text-lg mt-8">Latency shape: what each pipeline feels like to the person waiting</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Cost decides whether a project gets funded; latency decides whether anyone uses it. The three shapes have
+        wildly different tolerances, and the mistake that recurs is applying one shape's instincts to another — a team
+        that spent a month shaving 400ms off a batch job that runs at 2am, or a voice agent whose author assumed a
+        1.8-second turn was "fine, it's only two seconds". Write the tolerance down before you write the code.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Shape</th><th class="px-4 py-3">Who is waiting</th><th class="px-4 py-3">Tolerable p95</th><th class="px-4 py-3">The lever that actually helps</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Vision, batch</td><td class="px-4 py-3">Nobody — a nightly queue drains it</td><td class="px-4 py-3">Minutes; only throughput matters</td><td class="px-4 py-3">Concurrency and the Batch API, not per-call tuning. 20 workers turns 10,000 invoices from 9 hours into 27 minutes.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Vision, interactive</td><td class="px-4 py-3">A clerk who just hit "upload"</td><td class="px-4 py-3">4–6 s, with a progress indicator</td><td class="px-4 py-3">Downscale before upload (a 4MB photo on office wifi is 2 s of pure transfer), stream the response, show fields as they land.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Batch audio</td><td class="px-4 py-3">A QA dashboard refreshed daily</td><td class="px-4 py-3">Hours</td><td class="px-4 py-3">Transcription dominates: <code class="inline">faster-whisper</code> on a GPU is roughly 8–15× realtime, so a 6-minute call takes ~30 s. Parallelise by file, never by chunk.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Realtime voice</td><td class="px-4 py-3">A human mid-sentence</td><td class="px-4 py-3"><strong>800 ms per turn</strong></td><td class="px-4 py-3">Every stage at once, forever. This is Part V, and it is a different discipline from the other three.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice that three of the four rows have no interesting latency problem at all. That is the useful takeaway of
+        this Part: <strong>most multimodal work is a throughput and cost exercise wearing a latency costume.</strong>
+        Only the voice row earns the architectural gymnastics, which is exactly why it gets its own Part — and why
+        proposing a voice agent when a batch job would do is the most expensive scoping error in this module.
+      </p>
 
       <!-- ═══════════════ PART II ═══════════════ -->
       <div class="kicker text-viol mt-14">Part II · Vision</div>
@@ -347,6 +465,195 @@ unreadable is a CORRECT answer, not a failure.</pre>
         assumes you can make the call; it is about what to put in it.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">Preprocessing that actually moves the number</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The previous section is advice. This one is a measurement, because "clean up the image first" is the kind of
+        claim that gets repeated for years without anyone checking which cleanup step did the work. Run the sweep
+        yourself on your own fifty documents and you will find — as most teams do — that <strong>two of the six
+        steps carry almost all of the gain, and one of them makes things worse.</strong> The chain below is the order
+        that matters: orientation before crop, crop before resize, resize last, because every step changes what the
+        next one sees.
+      </p>
+
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[640px]" role="img" aria-label="Image preprocessing chain with measured accuracy deltas">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">PREPROCESSING CHAIN · order is load-bearing</text>
+          <g class="anim-pulse"><rect x="10" y="32" width="98" height="44" rx="9" fill="#37474F"/><text x="59" y="52" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Raw photo</text><text x="59" y="66" text-anchor="middle" fill="#ffffffbb" font-size="9">4032×3024 · 3.8MB</text></g>
+          <g class="anim-pulse d1"><rect x="130" y="32" width="98" height="44" rx="9" fill="#2563EB"/><text x="179" y="52" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">EXIF + deskew</text><text x="179" y="66" text-anchor="middle" fill="#ffffffbb" font-size="9">rotate to upright</text></g>
+          <g class="anim-pulse d2"><rect x="250" y="32" width="98" height="44" rx="9" fill="#2563EB"/><text x="299" y="52" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Crop to page</text><text x="299" y="66" text-anchor="middle" fill="#ffffffbb" font-size="9">drop the desk</text></g>
+          <g class="anim-pulse d3"><rect x="370" y="32" width="98" height="44" rx="9" fill="#0D9488"/><text x="419" y="52" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Autocontrast</text><text x="419" y="66" text-anchor="middle" fill="#ffffffbb" font-size="9">2% clip</text></g>
+          <g class="anim-pulse d4"><rect x="490" y="32" width="98" height="44" rx="9" fill="#D97757"/><text x="539" y="52" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Resize 1400</text><text x="539" y="66" text-anchor="middle" fill="#ffffffbb" font-size="9">LANCZOS</text></g>
+          <g class="anim-pulse"><rect x="610" y="32" width="80" height="44" rx="9" fill="#DB2777"/><text x="650" y="52" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">JPEG q88</text><text x="650" y="66" text-anchor="middle" fill="#ffffffbb" font-size="9">~1.6k tok</text></g>
+          <line x1="108" y1="54" x2="126" y2="54" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="228" y1="54" x2="246" y2="54" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="348" y1="54" x2="366" y2="54" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="468" y1="54" x2="486" y2="54" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="588" y1="54" x2="606" y2="54" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+
+          <text x="12" y="110" font-size="11" font-weight="700" fill="#6E6B64">MEASURED FIELD ACCURACY · 50 supplier invoices, claude-sonnet-5</text>
+          <line x1="60" y1="176" x2="690" y2="176" stroke="#A8A49B" stroke-width="1"/>
+          <g font-size="9" fill="#A8A49B"><text x="30" y="180">60%</text><text x="30" y="130">95%</text></g>
+          <rect x="70" y="146" width="70" height="30" rx="4" fill="#37474F"/><text x="105" y="166" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">71%</text><text x="105" y="192" text-anchor="middle" fill="#6E6B64" font-size="9">raw</text>
+          <rect x="180" y="128" width="70" height="48" rx="4" fill="#2563EB"/><text x="215" y="158" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">84%</text><text x="215" y="192" text-anchor="middle" fill="#6E6B64" font-size="9">+ orientation</text>
+          <rect x="290" y="120" width="70" height="56" rx="4" fill="#2563EB"/><text x="325" y="154" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">89%</text><text x="325" y="192" text-anchor="middle" fill="#6E6B64" font-size="9">+ crop</text>
+          <rect x="400" y="118" width="70" height="58" rx="4" fill="#0D9488"/><text x="435" y="153" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">90%</text><text x="435" y="192" text-anchor="middle" fill="#6E6B64" font-size="9">+ contrast</text>
+          <rect x="510" y="112" width="70" height="64" rx="4" fill="#D97757"/><text x="545" y="150" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">93%</text><text x="545" y="192" text-anchor="middle" fill="#6E6B64" font-size="9">+ resize 1400</text>
+          <rect x="620" y="140" width="70" height="36" rx="4" fill="#B4532E"/><text x="655" y="164" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">78%</text><text x="655" y="192" text-anchor="middle" fill="#B4532E" font-size="9">+ binarise ✗</text>
+          <text x="470" y="106" font-size="9" fill="#A8A49B" class="anim-bounce">binarisation destroys faint thermal print</text>
+        </svg>
+      </div>
+
+      <div class="mt-4">
+        <span class="code-label">sweep.py — one preprocessing variant per row, same 50 documents</span>
+        <pre class="code"><span class="kw">from</span> PIL <span class="kw">import</span> Image, ImageOps, ImageFilter
+
+<span class="kw">def</span> <span class="fn">variant</span>(img, orient=<span class="kw">True</span>, crop=<span class="kw">False</span>, contrast=<span class="kw">False</span>,
+            binarise=<span class="kw">False</span>, long_edge=<span class="st">1400</span>):
+    <span class="kw">if</span> orient:
+        img = ImageOps.exif_transpose(img)          <span class="cm"># must be first: crop math depends on it</span>
+    img = img.convert(<span class="st">"RGB"</span>)
+    <span class="kw">if</span> crop:
+        <span class="cm"># the page is the bright rectangle; the desk around it is not</span>
+        gray = img.convert(<span class="st">"L"</span>).filter(ImageFilter.MedianFilter(<span class="st">5</span>))
+        mask = gray.point(<span class="kw">lambda</span> v: <span class="st">255</span> <span class="kw">if</span> v &gt; <span class="st">110</span> <span class="kw">else</span> <span class="st">0</span>)
+        box = mask.getbbox()
+        <span class="kw">if</span> box <span class="kw">and</span> (box[<span class="st">2</span>] - box[<span class="st">0</span>]) &gt; img.width * <span class="st">0.4</span>:
+            img = img.crop(box)                      <span class="cm"># guard: never crop away the document</span>
+    <span class="kw">if</span> contrast:
+        img = ImageOps.autocontrast(img, cutoff=<span class="st">2</span>)
+    <span class="kw">if</span> binarise:
+        img = img.convert(<span class="st">"L"</span>).point(<span class="kw">lambda</span> v: <span class="st">255</span> <span class="kw">if</span> v &gt; <span class="st">140</span> <span class="kw">else</span> <span class="st">0</span>).convert(<span class="st">"RGB"</span>)
+    scale = long_edge / <span class="fn">max</span>(img.size)
+    <span class="kw">if</span> scale &lt; <span class="st">1</span>:
+        img = img.resize((<span class="fn">round</span>(img.width * scale), <span class="fn">round</span>(img.height * scale)),
+                         Image.LANCZOS)
+    <span class="kw">return</span> img
+
+CONFIGS = [
+    (<span class="st">"raw"</span>,            <span class="fn">dict</span>(orient=<span class="kw">False</span>, long_edge=<span class="st">4032</span>)),
+    (<span class="st">"orientation"</span>,    <span class="fn">dict</span>()),
+    (<span class="st">"+crop"</span>,          <span class="fn">dict</span>(crop=<span class="kw">True</span>)),
+    (<span class="st">"+contrast"</span>,      <span class="fn">dict</span>(crop=<span class="kw">True</span>, contrast=<span class="kw">True</span>)),
+    (<span class="st">"+resize 1400"</span>,   <span class="fn">dict</span>(crop=<span class="kw">True</span>, contrast=<span class="kw">True</span>, long_edge=<span class="st">1400</span>)),
+    (<span class="st">"+binarise"</span>,      <span class="fn">dict</span>(crop=<span class="kw">True</span>, contrast=<span class="kw">True</span>, binarise=<span class="kw">True</span>)),
+]
+
+<span class="kw">for</span> name, kw <span class="kw">in</span> CONFIGS:
+    acc, tok = <span class="fn">score_corpus</span>(<span class="kw">lambda</span> im: <span class="fn">variant</span>(im, **kw))   <span class="cm"># Lab 1's score.py</span>
+    <span class="fn">print</span>(f<span class="st">"{name:14} field_acc={acc:.0%}  mean_image_tokens={tok:5.0f}"</span>)
+
+<span class="out">raw            field_acc=71%  mean_image_tokens= 4800</span>
+<span class="out">orientation    field_acc=84%  mean_image_tokens= 4800</span>
+<span class="out">+crop          field_acc=89%  mean_image_tokens= 4800</span>
+<span class="out">+contrast      field_acc=90%  mean_image_tokens= 4800</span>
+<span class="out">+resize 1400   field_acc=93%  mean_image_tokens= 1618</span>
+<span class="out">+binarise      field_acc=78%  mean_image_tokens= 1618</span></pre>
+      </div>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Step</th><th class="px-4 py-3">Δ field accuracy</th><th class="px-4 py-3">Why</th><th class="px-4 py-3">Keep it?</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">EXIF orientation</td><td class="px-4 py-3"><strong>+13 pts</strong></td><td class="px-4 py-3">Phone photos carry rotation in metadata that Pillow ignores unless you ask. A sideways invoice is a different problem for the model.</td><td class="px-4 py-3">Always. Free.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Crop to the page</td><td class="px-4 py-3">+5 pts</td><td class="px-4 py-3">Half a phone photo is desk, hand and keyboard. Cropping raises the effective resolution of the text at the same token cost.</td><td class="px-4 py-3">Yes — with the width guard.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Autocontrast</td><td class="px-4 py-3">+1 pt</td><td class="px-4 py-3">Helps faded thermal receipts, does nothing for anything else. Within noise on 50 documents.</td><td class="px-4 py-3">Cheap, so yes, but do not claim it.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Resize to 1400px</td><td class="px-4 py-3"><strong>+3 pts and −66% tokens</strong></td><td class="px-4 py-3">The surprise. Downscaling <em>helped</em>: at 4032px the API's own resampling is applied to an uncropped, unsharpened image, and you paid the cap either way.</td><td class="px-4 py-3">Always. This is the money row.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Binarisation</td><td class="px-4 py-3"><strong>−15 pts</strong></td><td class="px-4 py-3">Classic OCR folklore that actively hurts a VLM: thresholding erases faint print, stamps and the grey rules that define table structure.</td><td class="px-4 py-3">No. Delete it.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Net: <strong>71% → 93% field accuracy for 34% of the token cost</strong>, from about forty lines of Pillow and
+        zero prompt changes. Before you spend a week on prompt wording, spend an afternoon on the pixels. And note the
+        binarisation row — it is there because someone on your team will suggest it, having read an OCR tutorial from
+        2014, and the only way to win that argument politely is with a measured row.
+      </p>
+
+      <div class="mt-4 callout callout-warn">
+        <strong>Never tune preprocessing on the images you tuned the prompt on.</strong> These two dials interact:
+        a prompt written against blurry inputs becomes over-cautious, and a preprocessing chain tuned against a
+        forgiving prompt over-fits. Hold one fixed while you sweep the other, and re-run the frozen one at the end.
+        The harness discipline is <a href="./ai9.html" class="text-viol underline decoration-viol/40">AI9</a>'s;
+        the only thing multimodal about it is that your "input" is now a file, so version the preprocessing config
+        alongside the prompt or you will not be able to reproduce last week's number.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The extraction schema, and confidence that means something</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every vision extraction you ship will use roughly the schema below, so it is worth getting the shape right
+        once. Three design decisions carry it: <strong>the transcription comes first</strong> (generation order is
+        attention order), <strong>every value is a small object rather than a scalar</strong>, and
+        <strong>the confidence vocabulary is three buckets, not a float.</strong> That last one is the contentious
+        one, so here is the evidence rather than the assertion.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">schema.py — the shape you will reuse on every document engagement</span>
+        <pre class="code"><span class="kw">from</span> typing <span class="kw">import</span> Literal, Optional, List
+<span class="kw">from</span> pydantic <span class="kw">import</span> BaseModel, Field <span class="kw">as</span> F
+
+Confidence = Literal[<span class="st">"high"</span>, <span class="st">"medium"</span>, <span class="st">"low"</span>]
+
+<span class="kw">class</span> <span class="fn">Extracted</span>(BaseModel):
+    value: Optional[<span class="fn">str</span>]      = F(description=<span class="st">"exactly as printed, or null if unreadable"</span>)
+    quote: Optional[<span class="fn">str</span>]      = F(description=<span class="st">"verbatim substring the value was read from"</span>)
+    page: Optional[<span class="fn">int</span>]       = F(description=<span class="st">"1-based page the quote appears on"</span>)
+    confidence: Confidence  = F(description=<span class="st">"high only if sharp and unambiguous"</span>)
+
+<span class="kw">class</span> <span class="fn">LineItem</span>(BaseModel):
+    description: Extracted
+    quantity: Extracted
+    unit_price: Extracted
+    amount: Extracted
+
+<span class="kw">class</span> <span class="fn">Invoice</span>(BaseModel):
+    visible_text: <span class="fn">str</span>                  <span class="cm"># ← FIRST. forces a read pass before any judgement</span>
+    supplier: Extracted
+    invoice_number: Extracted
+    invoice_date: Extracted
+    currency: Extracted
+    subtotal: Extracted
+    tax: Extracted
+    total: Extracted
+    line_items: List[LineItem]        <span class="cm"># ← LAST. the hardest thing, after the easy wins are banked</span>
+    unreadable_regions: List[<span class="fn">str</span>]     <span class="cm"># "bottom-left corner obscured by a thumb"</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">unreadable_regions</code> earns its place by giving the model somewhere to put its doubt
+        that is not a wrong value. On a corpus of photographed invoices it fires on roughly one document in six, and
+        every one of those is a document a reviewer should see. Field order is a real lever too: putting
+        <code class="inline">line_items</code> last means the model has already committed to a total it must now
+        reconcile against, which makes arithmetic disagreements visible instead of smoothed over.
+      </p>
+
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Now the calibration question — is <code class="inline">confidence</code> worth anything at all? Bucket 300
+        extracted fields from your eval by the model's own label and measure accuracy inside each bucket:
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Self-reported</th><th class="px-4 py-3">Share of fields</th><th class="px-4 py-3">Observed accuracy</th><th class="px-4 py-3">Reading</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">high</td><td class="px-4 py-3">81%</td><td class="px-4 py-3">97.4%</td><td class="px-4 py-3">Good enough to auto-post <em>when combined with a quote check</em>. Alone, 2.6% error at 81% volume is 21 bad postings per thousand.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">medium</td><td class="px-4 py-3">11%</td><td class="px-4 py-3">78%</td><td class="px-4 py-3">Genuinely informative — a real middle. Route to review; a reviewer confirms most of them in seconds.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">low</td><td class="px-4 py-3">8%</td><td class="px-4 py-3">41%</td><td class="px-4 py-3">Half of these are the model correctly flagging a genuinely illegible field. Never auto-post.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">high + quote verified</td><td class="px-4 py-3">76%</td><td class="px-4 py-3"><strong>99.3%</strong></td><td class="px-4 py-3">The combination is the product. The mechanical quote check removes most of the confident-and-wrong tail at zero model cost.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The buckets separate — 97% / 78% / 41% is a usable signal, not noise. But look at the last row: the jump from
+        97.4% to <strong>99.3%</strong> comes from a string containment check you wrote in four lines, not from the
+        model. This is the general shape of trustworthy extraction: <em>ask the model to be honest, then verify
+        mechanically what you can, and only then decide what a human sees.</em> Ask for a 0.0–1.0 float instead and
+        the same experiment produces a wall of 0.95s with no separation at all — which is why the vocabulary is
+        three words.
+      </p>
+
       <!-- ═══════════════ PART III ═══════════════ -->
       <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Document understanding</div>
       <h2 class="font-display text-2xl font-bold mt-2">Image, text, or hybrid — and who checks the result</h2>
@@ -404,6 +711,111 @@ flowchart TD
         </pre>
       </div>
 
+      <h3 class="font-semibold text-lg mt-7">The routing decision, with a price on every branch</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The flowchart above is the shape; this table is the argument you will actually have, because the customer's
+        question is never "which pipeline" — it is "why does this cost four times what the other vendor quoted".
+        Four routes, priced per page against a typical A4 business document at
+        <code class="inline">claude-sonnet-5</code> rates, so the numbers are comparable:
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Route</th><th class="px-4 py-3">Tokens / page</th><th class="px-4 py-3">Cost / page</th><th class="px-4 py-3">Choose when</th><th class="px-4 py-3">The catch</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr>
+              <td class="px-4 py-3 font-semibold">Parsed text only</td>
+              <td class="px-4 py-3">~800 in · 300 out</td>
+              <td class="px-4 py-3"><strong>$0.0069</strong></td>
+              <td class="px-4 py-3">Census says <code class="inline">pdf_text</code>; no stamps, no checkboxes, no tables that matter</td>
+              <td class="px-4 py-3">Two-column layouts interleave into nonsense; table cells arrive in reading order with no row structure</td>
+            </tr>
+            <tr>
+              <td class="px-4 py-3 font-semibold">Native PDF block</td>
+              <td class="px-4 py-3">~2,400 in · 400 out</td>
+              <td class="px-4 py-3">$0.0132</td>
+              <td class="px-4 py-3">Mixed or unknown corpus, under ~50 pages, you want the hybrid view with no rendering code</td>
+              <td class="px-4 py-3">You cannot tune the rendering; whole-document cost even for a one-field question</td>
+            </tr>
+            <tr>
+              <td class="px-4 py-3 font-semibold">Page images (self-rendered)</td>
+              <td class="px-4 py-3">~1,900 in · 400 out</td>
+              <td class="px-4 py-3">$0.0117</td>
+              <td class="px-4 py-3">Scans; you need per-page retries, cropping, or a resolution you control</td>
+              <td class="px-4 py-3">You own the rendering DPI decision, and 150 vs 300 DPI is a real accuracy fork</td>
+            </tr>
+            <tr>
+              <td class="px-4 py-3 font-semibold">OCR, then text</td>
+              <td class="px-4 py-3">~1,100 in · 300 out + OCR</td>
+              <td class="px-4 py-3">$0.0084 + OCR</td>
+              <td class="px-4 py-3">Enormous archives where the same page is queried many times; audio-free air-gapped estates</td>
+              <td class="px-4 py-3">You inherit OCR's errors permanently and lose layout — the model can no longer see what it misread</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The spread is under 2× between the sane options, which is the point worth making out loud: <strong>route for
+        accuracy, not for the fractions of a cent.</strong> The one branch to genuinely avoid by default is
+        OCR-then-text, because it is the only one that permanently discards evidence — once the OCR has turned
+        <code class="inline">1,240.00</code> into <code class="inline">1.240.OO</code>, no downstream model can
+        recover it, whereas a VLM looking at the pixels still has a chance.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">route.py — the census turned into a dispatcher</span>
+        <pre class="code"><span class="kw">import</span> fitz, io, pathlib
+<span class="kw">from</span> PIL <span class="kw">import</span> Image
+
+TEXT_CHARS_PER_PAGE = <span class="st">120</span>
+RENDER_DPI = <span class="st">150</span>                <span class="cm"># 150 → ~1240×1750 for A4: comfortably inside the sweet spot</span>
+
+<span class="kw">def</span> <span class="fn">route</span>(path: pathlib.Path) -&gt; <span class="fn">str</span>:
+    <span class="kw">if</span> path.suffix.lower() != <span class="st">".pdf"</span>:
+        <span class="kw">return</span> <span class="st">"image"</span>
+    doc = fitz.<span class="fn">open</span>(path)
+    chars = <span class="fn">sum</span>(<span class="fn">len</span>(p.get_text(<span class="st">"text"</span>).strip()) <span class="kw">for</span> p <span class="kw">in</span> doc)
+    <span class="kw">if</span> chars / <span class="fn">max</span>(doc.page_count, <span class="st">1</span>) &lt; TEXT_CHARS_PER_PAGE:
+        <span class="kw">return</span> <span class="st">"page_images"</span>                       <span class="cm"># a scan wearing a PDF costume</span>
+    <span class="kw">if</span> <span class="fn">any</span>(p.find_tables().tables <span class="kw">for</span> p <span class="kw">in</span> doc):
+        <span class="kw">return</span> <span class="st">"hybrid"</span>                            <span class="cm"># tables: never trust text alone</span>
+    <span class="kw">return</span> <span class="st">"parsed_text"</span>
+
+<span class="kw">def</span> <span class="fn">render_pages</span>(path, dpi=RENDER_DPI):
+    <span class="kw">for</span> i, page <span class="kw">in</span> <span class="fn">enumerate</span>(fitz.<span class="fn">open</span>(path), start=<span class="st">1</span>):
+        pix = page.get_pixmap(dpi=dpi)
+        img = Image.frombytes(<span class="st">"RGB"</span>, (pix.width, pix.height), pix.samples)
+        buf = io.BytesIO(); img.save(buf, <span class="st">"JPEG"</span>, quality=<span class="st">88</span>)
+        <span class="kw">yield</span> i, buf.getvalue()
+
+<span class="kw">for</span> f <span class="kw">in</span> <span class="fn">sorted</span>(pathlib.<span class="fn">Path</span>(<span class="st">"queue"</span>).iterdir()):
+    <span class="fn">print</span>(f<span class="st">"{f.name:26} -&gt; {route(f)}"</span>)
+
+<span class="out">INV-2026-0417.pdf          -&gt; parsed_text</span>
+<span class="out">INV-2026-0418.pdf          -&gt; hybrid</span>
+<span class="out">scan_batch_03.pdf          -&gt; page_images</span>
+<span class="out">IMG_4471.jpg               -&gt; image</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">find_tables()</code> as a routing signal is the small idea worth stealing: it is a cheap,
+        deterministic, model-free detector for the one condition under which parsed text is dangerous. The full
+        ingestion engineering around this — parser selection, OCR fallbacks, throughput, retries, idempotency — is
+        <a href="./pr9.html" class="text-viol underline decoration-viol/40">PR9</a>'s territory, and what happens to
+        the extracted text once it lands in a searchable corpus is
+        <a href="./ai4.html" class="text-viol underline decoration-viol/40">AI4</a>'s. AI11 owns exactly this: the
+        branch, its price, and the evidence you keep so a human can check the branch was right.
+      </p>
+
+      <div class="mt-4 callout callout-info">
+        <strong>DPI is the resolution dial in disguise.</strong> Rendering A4 at 150 DPI gives ~1240×1750px and about
+        2,900 image tokens; at 300 DPI it is ~2480×3500px, which the API downscales anyway and you paid to send.
+        Start at 150, and raise to 200 only for the specific documents where your eval shows fine print failing.
+        Anything above 220 DPI for a business document is money burned on pixels the model will throw away.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">Native PDF support — and its edges</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         The Anthropic API accepts PDFs directly as a <code class="inline">document</code> content block (base64, URL,
@@ -441,6 +853,111 @@ flowchart TD
         pass only for the fields that genuinely need cross-page context. Always carry the page number through into the
         output — <code class="inline">{"field": "total", "value": "1,240.00", "page": 3}</code> — because that is what
         makes review fast and disputes short.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Line-item tables: the failure you plan for, not the one you fix</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Header fields — supplier, date, total — come out at 95%+ on a decent image. Line items do not, and the gap is
+        not small: on the same fifty invoices, header accuracy of <strong>93%</strong> sits next to line-item
+        accuracy of <strong>62%</strong>. The failure is specific and worth naming, because "it's bad at tables" is
+        too vague to design against. What actually happens is <em>row drift</em>: the values are read correctly and
+        assigned to the wrong row, usually where a description wraps onto two lines. The model produces a table that
+        is internally plausible, individually correct, and collectively wrong.
+      </p>
+
+      <pre class="code mt-3">GROUND TRUTH                              MODEL OUTPUT
+  Hex bolt M8 x 40, zinc      12  4.20      Hex bolt M8 x 40, zinc      12  4.20
+    (galvanised, DIN 933)                   Washer, flat M8            200  0.06   ← shifted up
+  Washer, flat M8            200  0.06      Nyloc nut M8                12  0.31   ← shifted up
+  Nyloc nut M8                12  0.31      Threadlocker 243, 10ml       1  8.90   ← shifted up
+  Threadlocker 243, 10ml       1  8.90      <span class="cm">(last row dropped entirely)</span>
+  Delivery                     1  6.00
+<span class="cm"># every number is right. every row is wrong. the total no longer reconciles.</span></pre>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three mitigations, in the order you should try them. <strong>First, make the arithmetic check the detector</strong>
+        — you do not need to know which row drifted, only that the extraction is untrustworthy, and a sum that misses
+        by more than a rounding cent tells you that for free:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">reconcile.py — the cheapest table QA you will ever write</span>
+        <pre class="code"><span class="kw">from</span> decimal <span class="kw">import</span> Decimal, InvalidOperation
+
+<span class="kw">def</span> <span class="fn">money</span>(s):
+    <span class="kw">if</span> s <span class="kw">is</span> <span class="kw">None</span>: <span class="kw">return</span> <span class="kw">None</span>
+    cleaned = <span class="fn">str</span>(s).replace(<span class="st">","</span>, <span class="st">""</span>).replace(<span class="st">" "</span>, <span class="st">""</span>).lstrip(<span class="st">"$€£₫"</span>)
+    <span class="kw">try</span>:    <span class="kw">return</span> Decimal(cleaned)
+    <span class="kw">except</span> InvalidOperation: <span class="kw">return</span> <span class="kw">None</span>
+
+<span class="kw">def</span> <span class="fn">reconcile</span>(inv, tol=Decimal(<span class="st">"0.02"</span>)):
+    <span class="st">"""Returns the list of broken invariants. Empty list = arithmetically sound."""</span>
+    problems = []
+    rows = [(<span class="fn">money</span>(li.quantity.value), <span class="fn">money</span>(li.unit_price.value),
+             <span class="fn">money</span>(li.amount.value)) <span class="kw">for</span> li <span class="kw">in</span> inv.line_items]
+
+    <span class="kw">for</span> i, (q, u, a) <span class="kw">in</span> <span class="fn">enumerate</span>(rows, <span class="st">1</span>):
+        <span class="kw">if</span> <span class="kw">None</span> <span class="kw">in</span> (q, u, a):
+            problems.append(f<span class="st">"row {i}: unparseable"</span>); <span class="kw">continue</span>
+        <span class="kw">if</span> <span class="fn">abs</span>(q * u - a) &gt; tol:
+            problems.append(f<span class="st">"row {i}: {q} x {u} != {a}"</span>)      <span class="cm"># row drift shows up here</span>
+
+    line_sum = <span class="fn">sum</span>(a <span class="kw">for</span> _, _, a <span class="kw">in</span> rows <span class="kw">if</span> a <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>)
+    sub, tax, tot = <span class="fn">money</span>(inv.subtotal.value), <span class="fn">money</span>(inv.tax.value), <span class="fn">money</span>(inv.total.value)
+    <span class="kw">if</span> sub <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> <span class="fn">abs</span>(line_sum - sub) &gt; tol:
+        problems.append(f<span class="st">"lines sum to {line_sum}, subtotal says {sub}"</span>)
+    <span class="kw">if</span> <span class="kw">None</span> <span class="kw">not</span> <span class="kw">in</span> (sub, tax, tot) <span class="kw">and</span> <span class="fn">abs</span>(sub + tax - tot) &gt; tol:
+        problems.append(f<span class="st">"{sub} + {tax} != {tot}"</span>)
+    <span class="kw">return</span> problems
+
+<span class="fn">print</span>(<span class="fn">reconcile</span>(inv))
+<span class="out">['row 2: 200 x 0.06 != 12.00', 'lines sum to 61.42, subtotal says 67.42']</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Second, crop and re-ask.</strong> When reconciliation fails, send only the table region at a higher
+        resolution rather than the whole page. On the drift cases this recovers roughly two in three, because the
+        original failure was a resolution problem pretending to be a reasoning problem. <strong>Third, and only for
+        the residue: give the model room to think.</strong> A genuinely ambiguous multi-column layout with wrapped
+        descriptions is one of the rare document tasks where adaptive thinking pays for itself —
+        <a href="./ai13.html" class="text-viol underline decoration-viol/40">AI13</a> owns when that is worth the
+        tokens, and the honest answer here is "on about 5% of pages, as a second attempt, never as the default".
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">retry.py — escalate only the pages that failed reconciliation</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">extract_with_escalation</span>(page_jpeg, table_crop_jpeg):
+    inv = <span class="fn">extract</span>(page_jpeg)                          <span class="cm"># attempt 1: normal, ~$0.012</span>
+    <span class="kw">if</span> <span class="kw">not</span> <span class="fn">reconcile</span>(inv):
+        <span class="kw">return</span> inv, <span class="st">"first_pass"</span>
+
+    inv = <span class="fn">extract</span>(table_crop_jpeg)                    <span class="cm"># attempt 2: cropped, higher res</span>
+    <span class="kw">if</span> <span class="kw">not</span> <span class="fn">reconcile</span>(inv):
+        <span class="kw">return</span> inv, <span class="st">"crop_retry"</span>
+
+    msg = client.messages.parse(                        <span class="cm"># attempt 3: let it reason</span>
+        model=<span class="st">"claude-opus-5"</span>, max_tokens=<span class="st">4000</span>,
+        thinking={<span class="st">"type"</span>: <span class="st">"adaptive"</span>},
+        output_config={<span class="st">"effort"</span>: <span class="st">"high"</span>},
+        system=SYSTEM + <span class="st">"\nThis table's rows did not reconcile on a previous "</span>
+                        <span class="st">"attempt. Descriptions may wrap onto multiple lines; "</span>
+                        <span class="st">"align each amount to the row its quantity is on."</span>,
+        messages=[{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: [<span class="fn">image_block</span>(table_crop_jpeg),
+                   {<span class="st">"type"</span>: <span class="st">"text"</span>, <span class="st">"text"</span>: <span class="st">"Extract the line items."</span>}]}],
+        output_format=Invoice)
+    <span class="kw">if</span> msg.stop_reason == <span class="st">"refusal"</span>:
+        <span class="kw">return</span> <span class="kw">None</span>, <span class="st">"refused"</span>
+    <span class="kw">return</span> msg.parsed_output, <span class="st">"thinking_retry"</span>
+
+<span class="cm"># on 50 invoices: 34 first_pass, 11 crop_retry, 3 thinking_retry, 2 to review</span>
+<span class="cm"># blended cost per invoice $0.018 — 1.5x the naive path, for +26 pts on line items</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That ladder takes line-item accuracy from <strong>62% to 88%</strong> at 1.5× the cost, and — more valuable —
+        every remaining failure is <em>labelled</em>: you know it failed, so it goes to a human instead of into the
+        ledger. The score-2 move is to keep tuning the prompt until tables work. They do not fully work. Design the
+        detector, escalate the residue, and route the rest to a person.
       </p>
 
       <h3 class="font-semibold text-lg mt-8">The confidence + human-review pattern</h3>
@@ -528,6 +1045,152 @@ flowchart TD
         it. Timestamps are cheap and enormously valuable: they let a reviewer jump to second 143 of the recording to
         verify the model's claim, which is the audio equivalent of a citation.
       </p>
+
+      <h3 class="font-semibold text-lg mt-8">The quality/cost frontier — and how to measure your own point on it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The table below is a shape, not a quote. Every number in it moves with your audio, and the only figure that
+        matters in an engagement is the one you produced on the customer's recordings. What the shape teaches is
+        where the cliffs are: the jump from <code class="inline">base</code> to <code class="inline">small</code> is
+        enormous and free, the jump from <code class="inline">medium</code> to a good cloud API is small and costs
+        real money, and the second-language column is where every assumption you imported from an English blog post
+        dies.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">WER, clean English</th><th class="px-4 py-3">WER, 8kHz Vietnamese</th><th class="px-4 py-3">Speed</th><th class="px-4 py-3">Cost / audio-hour</th><th class="px-4 py-3">Diarisation</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">whisper <code class="inline">base</code></td><td class="px-4 py-3">~12%</td><td class="px-4 py-3">~38%</td><td class="px-4 py-3">~16× realtime (GPU)</td><td class="px-4 py-3">GPU time only</td><td class="px-4 py-3">None</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">whisper <code class="inline">small</code></td><td class="px-4 py-3">~7%</td><td class="px-4 py-3">~26%</td><td class="px-4 py-3">~9× realtime</td><td class="px-4 py-3">GPU time only</td><td class="px-4 py-3">None</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">whisper <code class="inline">large-v3</code></td><td class="px-4 py-3">~4%</td><td class="px-4 py-3">~17%</td><td class="px-4 py-3">~2× realtime</td><td class="px-4 py-3">≈$0.10 on a rented L4</td><td class="px-4 py-3">Bolt-on (pyannote)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">faster-whisper <code class="inline">large-v3</code></td><td class="px-4 py-3">~4%</td><td class="px-4 py-3">~17%</td><td class="px-4 py-3"><strong>~9× realtime</strong></td><td class="px-4 py-3">≈$0.03 on the same L4</td><td class="px-4 py-3">Bolt-on</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Managed cloud STT</td><td class="px-4 py-3">~3–5%</td><td class="px-4 py-3">~11–20%</td><td class="px-4 py-3">Streaming or ~20× batch</td><td class="px-4 py-3">$0.30–$1.20</td><td class="px-4 py-3">Included flag</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Bundled telephony STT</td><td class="px-4 py-3">~8–15%</td><td class="px-4 py-3">Often unsupported</td><td class="px-4 py-3">Realtime</td><td class="px-4 py-3">Already in the contract</td><td class="px-4 py-3">Per-channel — the best kind</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two rows deserve a second look. <strong>faster-whisper is the same weights at 4–5× the throughput</strong> —
+        there is no accuracy trade, so if you are running <code class="inline">openai-whisper</code> in production you
+        are simply paying more for identical output. And the telephony row is the one people skip: it is usually the
+        weakest model in the list, but it is the only one with the agent and the caller on separate channels, which
+        is worth more than several WER points. Measure it before you dismiss it.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">wer.py — the only accuracy number you are allowed to quote</span>
+        <pre class="code"><span class="kw">import</span> re, unicodedata
+<span class="kw">from</span> difflib <span class="kw">import</span> SequenceMatcher
+
+<span class="kw">def</span> <span class="fn">tokens</span>(s):
+    s = unicodedata.normalize(<span class="st">"NFC"</span>, s.lower())
+    s = re.sub(r<span class="st">"[^\w\s]"</span>, <span class="st">" "</span>, s)          <span class="cm"># punctuation is not a word error</span>
+    <span class="kw">return</span> s.split()
+
+<span class="kw">def</span> <span class="fn">wer</span>(reference: <span class="fn">str</span>, hypothesis: <span class="fn">str</span>):
+    r, h = <span class="fn">tokens</span>(reference), <span class="fn">tokens</span>(hypothesis)
+    sub = dele = ins = <span class="st">0</span>
+    <span class="kw">for</span> op, i1, i2, j1, j2 <span class="kw">in</span> SequenceMatcher(<span class="kw">None</span>, r, h).get_opcodes():
+        <span class="kw">if</span>   op == <span class="st">"replace"</span>: sub  += <span class="fn">max</span>(i2 - i1, j2 - j1)
+        <span class="kw">elif</span> op == <span class="st">"delete"</span>:  dele += i2 - i1
+        <span class="kw">elif</span> op == <span class="st">"insert"</span>:  ins  += j2 - j1
+    <span class="kw">return</span> {<span class="st">"wer"</span>: (sub + dele + ins) / <span class="fn">max</span>(<span class="fn">len</span>(r), <span class="st">1</span>),
+            <span class="st">"sub"</span>: sub, <span class="st">"del"</span>: dele, <span class="st">"ins"</span>: ins, <span class="st">"ref_words"</span>: <span class="fn">len</span>(r)}
+
+<span class="cm"># reference = what you typed out by ear from 20 of THEIR calls, 1 hour of work</span>
+<span class="kw">for</span> name <span class="kw">in</span> (<span class="st">"small"</span>, <span class="st">"large-v3"</span>, <span class="st">"cloud"</span>):
+    m = <span class="fn">wer</span>(<span class="fn">open</span>(<span class="st">"reference.txt"</span>).read(), <span class="fn">open</span>(f<span class="st">"hyp_{name}.txt"</span>).read())
+    <span class="fn">print</span>(f<span class="st">"{name:10} WER {m['wer']:.1%}  (sub {m['sub']} del {m['del']} ins {m['ins']})"</span>)
+
+<span class="out">small      WER 24.6%  (sub 118 del 31 ins 9)</span>
+<span class="out">large-v3   WER 16.2%  (sub 78 del 18 ins 8)</span>
+<span class="out">cloud      WER 11.4%  (sub 55 del 12 ins 6)</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read the breakdown, not just the rate. Heavy <code class="inline">del</code> counts mean the model is dropping
+        audio it could not resolve — often a whole speaker on a bad channel — and that is a very different problem
+        from heavy <code class="inline">sub</code>, which is mishearing. One hour of typing out twenty calls buys you
+        the right to say a number out loud, and that is the cheapest credibility available in this module
+        (<a href="./fd6.html" class="text-viol underline decoration-viol/40">FD6</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Diarisation, and the four ways it fails</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Who spoke when" sounds like a solved sub-problem and is not. Single-channel diarisation clusters voice
+        embeddings over time; every one of its failures is a plausible-looking transcript with the wrong name in
+        front of a sentence, which is worse than no labels at all — because a compliance report that says the
+        <em>agent</em> promised a refund, when the caller said it, is a defect with legal shape.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Failure</th><th class="px-4 py-3">What you see</th><th class="px-4 py-3">Trigger</th><th class="px-4 py-3">Mitigation</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Speaker confusion</td><td class="px-4 py-3">Labels swap partway through, often after a hold</td><td class="px-4 py-3">Similar voices, same gender, telephony bandwidth flattening pitch</td><td class="px-4 py-3">Dual-channel audio; failing that, anchor on the greeting turn and propagate</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Over-segmentation</td><td class="px-4 py-3">SPEAKER_00…SPEAKER_07 on a two-person call</td><td class="px-4 py-3">Background voices, IVR prompts, hold music, a cough</td><td class="px-4 py-3">Pin <code class="inline">num_speakers=2</code> when you know the call shape</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Overlap collapse</td><td class="px-4 py-3">Simultaneous speech assigned wholly to the louder party</td><td class="px-4 py-3">Interruptions — i.e. exactly the emotionally significant moments</td><td class="px-4 py-3">Accept it; never build a "who interrupted whom" metric on single-channel audio</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Boundary drift</td><td class="px-4 py-3">The first two words of each turn attach to the previous speaker</td><td class="px-4 py-3">Segment boundaries from STT and from diarisation disagree by ~200ms</td><td class="px-4 py-3">Assign by <em>word</em> midpoint, not by segment start</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mt-4">
+        <span class="code-label">diarise.py — dual-channel first, clustering only as a fallback</span>
+        <pre class="code"><span class="kw">import</span> soundfile <span class="kw">as</span> sf
+<span class="kw">from</span> faster_whisper <span class="kw">import</span> WhisperModel
+
+model = WhisperModel(<span class="st">"large-v3"</span>, device=<span class="st">"cuda"</span>, compute_type=<span class="st">"int8_float16"</span>)
+
+<span class="kw">def</span> <span class="fn">transcribe_dual_channel</span>(path):
+    <span class="st">"""If the telephony platform gives you 2 channels, diarisation is free
+    and perfect. Always ask for this before building anything clever."""</span>
+    audio, sr = sf.read(path, always_2d=<span class="kw">True</span>)
+    <span class="kw">if</span> audio.shape[<span class="st">1</span>] &lt; <span class="st">2</span>:
+        <span class="kw">raise</span> <span class="fn">ValueError</span>(<span class="st">"mono file - fall back to clustering"</span>)
+    turns = []
+    <span class="kw">for</span> idx, who <span class="kw">in</span> ((<span class="st">0</span>, <span class="st">"agent"</span>), (<span class="st">1</span>, <span class="st">"caller"</span>)):
+        sf.write(f<span class="st">"/tmp/{who}.wav"</span>, audio[:, idx], sr)
+        segs, _ = model.transcribe(f<span class="st">"/tmp/{who}.wav"</span>, vad_filter=<span class="kw">True</span>)
+        turns += [{<span class="st">"speaker"</span>: who, <span class="st">"start"</span>: <span class="fn">round</span>(s.start, <span class="st">2</span>),
+                   <span class="st">"end"</span>: <span class="fn">round</span>(s.end, <span class="st">2</span>), <span class="st">"text"</span>: s.text.strip()} <span class="kw">for</span> s <span class="kw">in</span> segs]
+    <span class="kw">return</span> <span class="fn">sorted</span>(turns, key=<span class="kw">lambda</span> t: t[<span class="st">"start"</span>])
+
+<span class="kw">def</span> <span class="fn">assign_by_word_midpoint</span>(words, diar_segments):
+    <span class="st">"""Fallback path. Midpoint beats segment-start: fixes boundary drift."""</span>
+    out = []
+    <span class="kw">for</span> w <span class="kw">in</span> words:
+        mid = (w[<span class="st">"start"</span>] + w[<span class="st">"end"</span>]) / <span class="st">2</span>
+        spk = <span class="fn">next</span>((d[<span class="st">"speaker"</span>] <span class="kw">for</span> d <span class="kw">in</span> diar_segments
+                    <span class="kw">if</span> d[<span class="st">"start"</span>] &lt;= mid &lt; d[<span class="st">"end"</span>]), <span class="st">"unknown"</span>)
+        out.append({**w, <span class="st">"speaker"</span>: spk})
+    <span class="kw">return</span> out
+
+<span class="kw">for</span> t <span class="kw">in</span> <span class="fn">transcribe_dual_channel</span>(<span class="st">"calls/call_0142.wav"</span>)[:<span class="st">3</span>]:
+    <span class="fn">print</span>(f<span class="st">"[{t['start']:6.2f}] {t['speaker']:6} {t['text']}"</span>)
+
+<span class="out">[  0.00] agent  Thank you for calling, my name is Linh, how can I help?</span>
+<span class="out">[  4.12] caller Hi, I was charged twice for my order last Friday.</span>
+<span class="out">[  8.40] agent  I'm sorry about that. Can I take the order number please?</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The engineering lesson is a procurement lesson: <strong>the single highest-value question in a call-centre
+        engagement is "can your platform export dual-channel recordings?"</strong> A yes turns a hard ML problem into
+        a file-format question and removes an entire class of defect. Ask it in the first meeting, before anyone has
+        chosen a diarisation library.
+      </p>
+
+      <div class="mt-4 callout callout-warn">
+        <strong>Never label a speaker as a named person.</strong> Diarisation gives you "channel 0" or "cluster A".
+        Mapping that to <em>Agent Linh, employee 4471</em> requires a join to the telephony CRM record, not a guess —
+        and if the mapping is wrong, you have built a system that attributes statements to real named employees
+        incorrectly. That is a performance-management incident, not a bug. Keep the speaker id opaque until a
+        system-of-record join resolves it, and log which join produced the name.
+      </div>
 
       <h3 class="font-semibold text-lg mt-8">TTS and voice selection</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
@@ -696,6 +1359,156 @@ sequenceDiagram
           not a turn grab. Stopping dead every time someone says "uh-huh" feels just as broken as never stopping.
           A short duration threshold plus a filler-word list handles most of it.</li>
       </ol>
+
+      <h3 class="font-semibold text-lg mt-8">The interruption state machine, written down</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The four rules above are correct and insufficient, because interruption handling is not a checklist — it is a
+        state machine, and the bugs live in the transitions. Almost every "it's not listening" complaint traces to one
+        of three specific edges: speech detected while the agent is <em>still generating</em> rather than speaking,
+        the caller going silent immediately after barging in, or the agent resuming a turn whose history was never
+        truncated. Draw it once and those edges stop being surprises.
+      </p>
+
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> Listening
+    Listening --> Thinking: end-of-turn detected<br/>(silence 320ms OR semantic complete)
+    Thinking --> Speaking: first TTS chunk queued
+    Thinking --> Listening: caller resumes<br/>cancel LLM stream, keep partial transcript
+    Speaking --> Backchannel: speech &lt; 400ms<br/>and in filler list
+    Backchannel --> Speaking: keep talking, do not flush
+    Speaking --> Interrupted: speech ≥ 400ms<br/>or not a filler
+    Interrupted --> Listening: flush audio queue<br/>truncate assistant turn to spoken words
+    Speaking --> Listening: playback finished
+    Listening --> Prompting: silence &gt; 8s
+    Prompting --> Listening: "are you still there?"
+    Prompting --> [*]: silence &gt; 20s, end call
+        </pre>
+      </div>
+
+      <div class="mt-4">
+        <span class="code-label">turn_state.py — the transitions, including the one everybody forgets</span>
+        <pre class="code"><span class="kw">import</span> time
+
+FILLERS = {<span class="st">"mm"</span>, <span class="st">"mhm"</span>, <span class="st">"uh huh"</span>, <span class="st">"yeah"</span>, <span class="st">"yep"</span>, <span class="st">"okay"</span>, <span class="st">"ok"</span>, <span class="st">"right"</span>, <span class="st">"sure"</span>, <span class="st">"vâng"</span>, <span class="st">"dạ"</span>, <span class="st">"ừ"</span>}
+BARGE_MS = <span class="st">400</span>          <span class="cm"># below this + in FILLERS = backchannel, keep talking</span>
+
+<span class="kw">class</span> <span class="fn">Turn</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, history, tts, llm_stream):
+        self.state = <span class="st">"listening"</span>
+        self.history, self.tts, self.llm = history, tts, llm_stream
+        self.spoken_words = []      <span class="cm"># words the CALLER actually heard, not words generated</span>
+
+    <span class="kw">def</span> <span class="fn">on_tts_word_played</span>(self, word):
+        self.spoken_words.append(word)          <span class="cm"># the audio device is the source of truth</span>
+
+    <span class="kw">def</span> <span class="fn">on_speech</span>(self, duration_ms, partial_text):
+        <span class="kw">if</span> self.state == <span class="st">"thinking"</span>:
+            self.llm.cancel()                   <span class="cm"># edge 1: never speak a cancelled thought</span>
+            self.state = <span class="st">"listening"</span>
+            <span class="kw">return</span> <span class="st">"cancelled_before_speaking"</span>
+
+        <span class="kw">if</span> self.state != <span class="st">"speaking"</span>:
+            <span class="kw">return</span> <span class="st">"ignored"</span>
+
+        is_filler = partial_text.strip().lower() <span class="kw">in</span> FILLERS
+        <span class="kw">if</span> duration_ms &lt; BARGE_MS <span class="kw">and</span> is_filler:
+            <span class="kw">return</span> <span class="st">"backchannel"</span>                 <span class="cm"># edge 2: "mm-hmm" is encouragement</span>
+
+        self.tts.stop()
+        self.tts.flush_playout_buffer()         <span class="cm"># edge 3: bytes already sent to the device</span>
+        self.llm.cancel()
+        self.history.truncate_assistant_turn(<span class="st">" "</span>.join(self.spoken_words))
+        self.state = <span class="st">"listening"</span>
+        <span class="kw">return</span> <span class="st">"interrupted"</span>
+
+<span class="cm"># without truncate_assistant_turn, the model believes it said the whole sentence:</span>
+<span class="cm">#   generated: "Your balance is 4,120 dong and the payment is due on the 15th."</span>
+<span class="cm">#   actually heard by the caller: "Your balance is 4,120 dong and the -"</span>
+<span class="cm">#   three turns later the agent says "as I mentioned, the 15th" and the caller says "you didn't"</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">spoken_words</code> being fed by the <em>audio device</em> rather than by the LLM stream
+        is the detail that makes the truncation honest. If you truncate at "what TTS synthesised" you are still a
+        second ahead of the caller's ear, because synthesised audio sits in a playout buffer. In measured calls that
+        buffer holds <strong>150–600ms</strong> of speech — three to twelve words — and every one of them is a
+        sentence the agent thinks it delivered and the caller never heard.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Instrumenting the budget: five timestamps, one dashboard</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A latency budget you cannot see is a wish. The instrumentation is genuinely small — five timestamps per turn,
+        emitted as one structured log line — and it is the difference between "the agent feels slow" and "p95 TTFT
+        went from 310ms to 940ms at 14:20, which is when we enabled the CRM tool". Emit per turn, not per call, and
+        put the call id and turn index on every line so you can replay one bad conversation end to end
+        (<a href="./pr1.html" class="text-viol underline decoration-viol/40">PR1</a> owns the tracing backbone; this
+        is what you feed it).
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">turn_timing.py — one line per turn, five spans, no vendor lock-in</span>
+        <pre class="code"><span class="kw">import</span> json, logging, time
+<span class="kw">from</span> contextlib <span class="kw">import</span> contextmanager
+
+log = logging.getLogger(<span class="st">"voice.turn"</span>)
+
+<span class="kw">class</span> <span class="fn">TurnTimer</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, call_id, turn_idx):
+        self.meta = {<span class="st">"call_id"</span>: call_id, <span class="st">"turn"</span>: turn_idx}
+        self.spans, self.t0 = {}, <span class="kw">None</span>
+
+    <span class="kw">def</span> <span class="fn">mark_speech_end</span>(self):
+        self.t0 = time.perf_counter()           <span class="cm"># t=0 is when the HUMAN stopped, always</span>
+
+    @contextmanager
+    <span class="kw">def</span> <span class="fn">span</span>(self, name):
+        start = time.perf_counter()
+        <span class="kw">try</span>:
+            <span class="kw">yield</span>
+        <span class="kw">finally</span>:
+            self.spans[name] = <span class="fn">round</span>((time.perf_counter() - start) * <span class="st">1000</span>)
+
+    <span class="kw">def</span> <span class="fn">emit</span>(self, **extra):
+        total = <span class="fn">round</span>((time.perf_counter() - self.t0) * <span class="st">1000</span>)
+        log.info(json.dumps({**self.meta, **self.spans, **extra,
+                             <span class="st">"total_ms"</span>: total,
+                             <span class="st">"over_budget"</span>: total &gt; <span class="st">800</span>}))
+
+t = <span class="fn">TurnTimer</span>(call_id, idx)
+t.mark_speech_end()
+<span class="kw">with</span> t.span(<span class="st">"vad"</span>):      end_of_turn.confirm()
+<span class="kw">with</span> t.span(<span class="st">"stt"</span>):      text = stt.finalise()
+<span class="kw">with</span> t.span(<span class="st">"llm_ttft"</span>): first = <span class="fn">next</span>(llm.stream(text))
+<span class="kw">with</span> t.span(<span class="st">"tool"</span>):     result = tools.run_if_requested(first)
+<span class="kw">with</span> t.span(<span class="st">"tts_ttfb"</span>): tts.play_first_chunk(first)
+t.emit(tool_used=<span class="fn">bool</span>(result), model=<span class="st">"claude-haiku-4-5"</span>)
+
+<span class="out">{"call_id": "c_8841", "turn": 3, "vad": 168, "stt": 91, "llm_ttft": 287,</span>
+<span class="out"> "tool": 0, "tts_ttfb": 121, "total_ms": 667, "over_budget": false,</span>
+<span class="out"> "tool_used": false, "model": "claude-haiku-4-5"}</span></pre>
+      </div>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Span</th><th class="px-4 py-3">p50</th><th class="px-4 py-3">p95</th><th class="px-4 py-3">What the gap between them told us</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">vad</td><td class="px-4 py-3">168 ms</td><td class="px-4 py-3">402 ms</td><td class="px-4 py-3">The tail is callers who trail off. A semantic end-of-turn model cut p95 to 244 ms with no rise in false interruptions.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">stt</td><td class="px-4 py-3">91 ms</td><td class="px-4 py-3">130 ms</td><td class="px-4 py-3">Healthy — streaming STT is doing its job. If p50 here is near the utterance length, you are running batch STT by accident.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">llm_ttft</td><td class="px-4 py-3">287 ms</td><td class="px-4 py-3">610 ms</td><td class="px-4 py-3">The p95 was entirely cache misses after the system prompt was edited mid-shift. Pin the cached prefix and freeze it.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">tool</td><td class="px-4 py-3">0 ms</td><td class="px-4 py-3"><strong>1,840 ms</strong></td><td class="px-4 py-3">The killer. 9% of turns call the CRM; those turns average 2.4 s total. Filler audio plus a 900 ms tool timeout made them survivable.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">tts_ttfb</td><td class="px-4 py-3">121 ms</td><td class="px-4 py-3">198 ms</td><td class="px-4 py-3">Fine, and it stayed fine — which is why nobody should spend a week here first.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">total</td><td class="px-4 py-3">667 ms</td><td class="px-4 py-3">2,390 ms</td><td class="px-4 py-3"><strong>91% of turns under 800 ms.</strong> That percentage — not the mean — is the number that goes in the SLA.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Report the budget as <em>share of turns under 800ms</em>, never as a mean. A mean of 900ms could be every
+        turn at 900ms (uniformly annoying) or 90% at 600ms with a tool-call tail (fine, with filler audio). Those are
+        different products and only the percentile view distinguishes them.
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">When voice genuinely wins — and when it's a gimmick</h3>
       <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">

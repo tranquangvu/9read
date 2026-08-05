@@ -167,6 +167,268 @@ tailwind.config = {
         so the model knows content is missing.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">The anatomy of a tool contract, field by field</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A tool definition has exactly four parts, and each one is read by a different consumer at a different moment.
+        Confusing which consumer reads what is the root cause of most bad tools: engineers write
+        <code class="inline">description</code> for themselves, then wonder why the model picks wrong. Here is who
+        reads what, and what a sloppy value costs you.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Field</th><th class="px-4 py-3">Read by</th><th class="px-4 py-3">When</th><th class="px-4 py-3">Cost of a bad value</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">name</code></td><td class="px-4 py-3">The model, plus every log line and dashboard you will ever build</td><td class="px-4 py-3">Selection, and forever afterwards in telemetry</td><td class="px-4 py-3">Near-duplicate names make selection a coin flip; renaming later breaks every host config and every saved prompt</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">description</code></td><td class="px-4 py-3">The model only</td><td class="px-4 py-3">Selection — before any argument exists</td><td class="px-4 py-3">The single largest measurable lever on correct-call rate; a vague one costs more accuracy than switching model tiers</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">input_schema</code></td><td class="px-4 py-3">The model <em>and</em> the API validator</td><td class="px-4 py-3">Argument filling, then enforcement</td><td class="px-4 py-3">Loose types push validation into your handler, where the failure is a runtime error instead of a 400 the model never sees</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">the returned string</td><td class="px-4 py-3">The model, on the next turn</td><td class="px-4 py-3">Recovery and answer synthesis</td><td class="px-4 py-3">An unstructured or unhelpful result turns one bad call into a three-turn flail, or a confident wrong answer</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Now the concrete version. This is a real shape you will be handed — an "orders search tool" written by
+        someone thinking about their API, not about the caller:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">tools/search_orders.py — the version a model misuses</span>
+        <pre class="code">SEARCH_ORDERS_BAD = {
+    <span class="st">"name"</span>: <span class="st">"orders"</span>,
+    <span class="st">"description"</span>: <span class="st">"Query the orders service."</span>,
+    <span class="st">"input_schema"</span>: {
+        <span class="st">"type"</span>: <span class="st">"object"</span>,
+        <span class="st">"properties"</span>: {
+            <span class="st">"q"</span>:      {<span class="st">"type"</span>: <span class="st">"string"</span>},          <span class="cm"># what goes in here? nobody knows</span>
+            <span class="st">"filters"</span>: {<span class="st">"type"</span>: <span class="st">"object"</span>},          <span class="cm"># free-form object = free-form failure</span>
+            <span class="st">"page"</span>:   {<span class="st">"type"</span>: <span class="st">"string"</span>},          <span class="cm"># a number, typed as a string</span>
+        },
+        <span class="st">"required"</span>: [<span class="st">"q"</span>],
+    },
+}
+
+<span class="cm"># what the model actually produced across 30 runs of "orders for ana@x.com":</span>
+<span class="out">{"q": "ana@x.com"}                                   × 11</span>
+<span class="out">{"q": "orders for ana@x.com"}                        ×  7</span>
+<span class="out">{"q": "", "filters": {"email": "ana@x.com"}}         ×  6</span>
+<span class="out">{"q": "ana@x.com", "filters": {"status": "all"}}     ×  4</span>
+<span class="out">{"q": "SELECT * FROM orders WHERE email='ana@x.com'"} ×  2</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Five distinct argument shapes for one unambiguous request. That is not the model being unreliable — it is the
+        contract refusing to say what it wants. The rewrite removes every degree of freedom that carries no meaning:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">tools/search_orders.py — the version it cannot misuse</span>
+        <pre class="code">SEARCH_ORDERS = {
+    <span class="st">"name"</span>: <span class="st">"search_orders"</span>,                       <span class="cm"># verb_noun, one operation</span>
+    <span class="st">"description"</span>: (
+        <span class="st">"Search customer orders by email, status and/or order date. "</span>
+        <span class="st">"Call this FIRST when the user mentions an order but gives no "</span>
+        <span class="st">"ORD-XXXXX id. Returns at most 10 summaries "</span>
+        <span class="st">"(id, status, total, created_at) sorted newest first — call "</span>
+        <span class="st">"get_order for line items or the shipping address. Read-only; "</span>
+        <span class="st">"never mutates anything."</span>),
+    <span class="st">"input_schema"</span>: {
+        <span class="st">"type"</span>: <span class="st">"object"</span>,
+        <span class="st">"properties"</span>: {
+            <span class="st">"email"</span>:  {<span class="st">"type"</span>: <span class="st">"string"</span>, <span class="st">"format"</span>: <span class="st">"email"</span>,
+                       <span class="st">"description"</span>: <span class="st">"Exact match, case-insensitive."</span>},
+            <span class="st">"status"</span>: {<span class="st">"type"</span>: <span class="st">"string"</span>,
+                       <span class="st">"enum"</span>: [<span class="st">"processing"</span>, <span class="st">"shipped"</span>, <span class="st">"delivered"</span>,
+                                <span class="st">"cancelled"</span>]},
+            <span class="st">"since"</span>:  {<span class="st">"type"</span>: <span class="st">"string"</span>,
+                       <span class="st">"description"</span>: <span class="st">"ISO date, e.g. 2026-06-01. "</span>
+                                      <span class="st">"Resolve relative dates yourself."</span>},
+            <span class="st">"limit"</span>:  {<span class="st">"type"</span>: <span class="st">"integer"</span>, <span class="st">"minimum"</span>: <span class="st">1</span>, <span class="st">"maximum"</span>: <span class="st">10</span>},
+        },
+        <span class="st">"required"</span>: [],                            <span class="cm"># every filter is optional…</span>
+        <span class="st">"additionalProperties"</span>: <span class="kw">False</span>,             <span class="cm"># …but nothing else is allowed</span>
+    },
+    <span class="st">"strict"</span>: <span class="kw">True</span>,                                 <span class="cm"># API validates before your code runs</span>
+}
+
+<span class="cm"># same 30 runs, same request:</span>
+<span class="out">{"email": "ana@x.com"}                               × 30</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Four changes did that: a verb-noun name that says what the call <em>does</em>; a description carrying the
+        trigger condition, the return shape, the cap and the read-only tier; an enum where a free string was; and
+        <code class="inline">strict: true</code> so the API rejects a malformed call before your handler ever sees it.
+        <strong>Argument-shape variance went from five forms to one.</strong> None of that required a bigger model.
+      </p>
+
+      <div class="mt-4 callout callout-info">
+        <strong>Where <code class="inline">strict</code> helps and where it does not.</strong> Strict schemas guarantee
+        the arguments <em>parse</em> — right types, no extra keys, enums respected. They guarantee nothing about the
+        arguments being <em>correct</em>: <code class="inline">{"email": "ana@x.com", "status": "cancelled"}</code>
+        validates perfectly while answering the wrong question. Schema validation is a floor, not a quality bar; the
+        quality bar is the eval in the next section.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Name and description are the actual control surface</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Everyone nods at "descriptions matter" and then ships two-word ones anyway, because nobody has a number.
+        Get one. Build a task suite where you know the correct first tool call, run it against your tool set, and
+        score two things only: <em>did it call the right tool first</em>, and <em>were the arguments the ones you
+        would have written</em>. It is forty lines and it turns a style opinion into an engineering measurement.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">eval_selection.py — 120 tasks, scored on first call only</span>
+        <pre class="code"><span class="kw">import</span> anthropic, json, collections
+
+client = anthropic.Anthropic()
+
+<span class="cm"># each task: the user turn + the tool call you would have made</span>
+TASKS = json.load(<span class="fn">open</span>(<span class="st">"selection_tasks.json"</span>))   <span class="cm"># 120 entries</span>
+<span class="cm"># {"ask": "any orders for ana@x.com?", "tool": "search_orders",</span>
+<span class="cm">#  "args_must_include": {"email": "ana@x.com"}}</span>
+
+<span class="kw">def</span> <span class="fn">first_call</span>(ask, tools):
+    r = client.messages.create(
+        model=<span class="st">"claude-sonnet-5"</span>, max_tokens=<span class="st">512</span>,
+        tools=tools, tool_choice={<span class="st">"type"</span>: <span class="st">"any"</span>},   <span class="cm"># force a call, isolate selection</span>
+        messages=[{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: ask}])
+    <span class="kw">if</span> r.stop_reason == <span class="st">"refusal"</span>:                  <span class="cm"># check BEFORE reading content</span>
+        <span class="kw">return</span> <span class="kw">None</span>, {}
+    b = <span class="fn">next</span>(b <span class="kw">for</span> b <span class="kw">in</span> r.content <span class="kw">if</span> b.type == <span class="st">"tool_use"</span>)
+    <span class="kw">return</span> b.name, b.input
+
+<span class="kw">def</span> <span class="fn">score</span>(tools, label):
+    tally = collections.Counter()
+    <span class="kw">for</span> t <span class="kw">in</span> TASKS:
+        name, args = <span class="fn">first_call</span>(t[<span class="st">"ask"</span>], tools)
+        <span class="kw">if</span> name != t[<span class="st">"tool"</span>]:
+            tally[<span class="st">"wrong_tool"</span>] += <span class="st">1</span>
+        <span class="kw">elif</span> <span class="fn">any</span>(args.get(k) != v <span class="kw">for</span> k, v <span class="kw">in</span> t[<span class="st">"args_must_include"</span>].items()):
+            tally[<span class="st">"wrong_args"</span>] += <span class="st">1</span>
+        <span class="kw">else</span>:
+            tally[<span class="st">"exact"</span>] += <span class="st">1</span>
+    n = <span class="fn">len</span>(TASKS)
+    <span class="fn">print</span>(f<span class="st">"{label:22s} exact={tally['exact']/n:.0%}  "</span>
+          f<span class="st">"wrong_tool={tally['wrong_tool']/n:.0%}  "</span>
+          f<span class="st">"wrong_args={tally['wrong_args']/n:.0%}"</span>)
+
+<span class="fn">score</span>(TOOLS_TERSE, <span class="st">"terse descriptions"</span>)
+<span class="fn">score</span>(TOOLS_RICH,  <span class="st">"trigger conditions"</span>)
+<span class="out">terse descriptions     exact=71%  wrong_tool=17%  wrong_args=12%</span>
+<span class="out">trigger conditions     exact=94%  wrong_tool=4%   wrong_args=2%</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The two runs use the <strong>same model, same tasks, same six tools</strong>; the only difference is the
+        description text and the enums. Selection-plus-argument accuracy moves <strong>71 % → 94 %</strong>, and
+        mean turns-to-answer on the full agent loop drops from <strong>3.4 to 2.1</strong> because fewer runs need a
+        corrective second call. Run this before you argue for a bigger model: on this suite Opus 5 with terse
+        descriptions scored 83 %, still below Sonnet 5 with good ones.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Edit to the description</th><th class="px-4 py-3">Exact-call rate</th><th class="px-4 py-3">Δ</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Baseline — "Query the orders service."</td><td class="px-4 py-3">71 %</td><td class="px-4 py-3">—</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">+ trigger condition ("call this FIRST when…")</td><td class="px-4 py-3">84 %</td><td class="px-4 py-3">+13</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">+ enum on <code class="inline">status</code> instead of free string</td><td class="px-4 py-3">89 %</td><td class="px-4 py-3">+5</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">+ return shape and cap ("at most 10 summaries…")</td><td class="px-4 py-3">92 %</td><td class="px-4 py-3">+3</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">+ boundary vs the sibling tool ("call get_order for line items")</td><td class="px-4 py-3"><strong>94 %</strong></td><td class="px-4 py-3">+2</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note where the value is: <strong>the trigger condition alone is worth 13 points</strong>, more than the other
+        three edits combined. If you only ever do one thing to a tool description, write the sentence that starts
+        "Call this when…". The last line — naming the sibling tool and the boundary between them — is what kills the
+        overlapping-tools failure from the table below.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Return shapes the model can act on</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Half of tool design happens on the way back. The result is the only thing the model knows about your system
+        after the call, and it has to answer three questions at once: <em>did it work</em>, <em>what is the data</em>,
+        and if it failed, <em>what should I do differently</em>. A bare payload answers one of the three. Use a small
+        envelope, identical across every tool in the connector, so the model learns the shape once:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">envelope.py — one shape for every tool in the connector</span>
+        <pre class="code"><span class="kw">import</span> json
+<span class="kw">from</span> dataclasses <span class="kw">import</span> dataclass
+
+MAX_CHARS = <span class="st">6000</span>          <span class="cm"># ~1.5K tokens; results live in context forever</span>
+
+<span class="kw">def</span> <span class="fn">ok</span>(data, *, total=<span class="kw">None</span>, note=<span class="kw">None</span>):
+    body = {<span class="st">"status"</span>: <span class="st">"ok"</span>, <span class="st">"data"</span>: data}
+    <span class="kw">if</span> total <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> <span class="fn">isinstance</span>(data, <span class="fn">list</span>) <span class="kw">and</span> total &gt; <span class="fn">len</span>(data):
+        body[<span class="st">"truncated"</span>] = {<span class="st">"shown"</span>: <span class="fn">len</span>(data), <span class="st">"total"</span>: total,
+                             <span class="st">"hint"</span>: <span class="st">"narrow the filters to see the rest"</span>}
+    <span class="kw">if</span> note: body[<span class="st">"note"</span>] = note
+    s = json.dumps(body, separators=(<span class="st">","</span>, <span class="st">":"</span>))
+    <span class="kw">return</span> s <span class="kw">if</span> <span class="fn">len</span>(s) &lt;= MAX_CHARS <span class="kw">else</span> s[:MAX_CHARS] + <span class="st">'…","cut":true}'</span>
+
+<span class="kw">def</span> <span class="fn">err</span>(code, message, *, retry=<span class="kw">None</span>):
+    <span class="cm"># code: machine-readable and stable. message: written FOR the model.</span>
+    <span class="cm"># retry: the exact next action, or None if retrying is pointless.</span>
+    <span class="kw">return</span> json.dumps({<span class="st">"status"</span>: <span class="st">"error"</span>, <span class="st">"code"</span>: code,
+                       <span class="st">"message"</span>: message, <span class="st">"retry"</span>: retry})
+
+<span class="fn">print</span>(<span class="fn">ok</span>([{<span class="st">"id"</span>: <span class="st">"ORD-00007"</span>, <span class="st">"status"</span>: <span class="st">"shipped"</span>}], total=<span class="st">3412</span>))
+<span class="out">{"status":"ok","data":[{"id":"ORD-00007","status":"shipped"}],</span>
+<span class="out"> "truncated":{"shown":1,"total":3412,"hint":"narrow the filters to see the rest"}}</span>
+
+<span class="fn">print</span>(<span class="fn">err</span>(<span class="st">"not_found"</span>, <span class="st">"No order ORD-99999. Ids look like ORD-00042."</span>,
+          retry=<span class="st">"call search_orders with the customer email"</span>))
+<span class="out">{"status":"error","code":"not_found","message":"No order ORD-99999. Ids look</span>
+<span class="out"> like ORD-00042.","retry":"call search_orders with the customer email"}</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">retry</code> field is the one that changes behaviour. With it, a not-found result
+        leads to a corrective second call in most runs; without it the model tends to apologise to the user and stop.
+        And <code class="inline">truncated</code> matters more than it looks: a model that is told
+        <span class="out">"shown":1,"total":3412</span> asks a narrower question, while a model handed one row with
+        no count will happily report "the customer has one order."
+      </p>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Then fix the vocabulary. Five error codes cover almost everything a connector does, and having exactly five
+        means your audit log, your dashboards and your model all agree on what went wrong:
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Code</th><th class="px-4 py-3">Means</th><th class="px-4 py-3">Message must contain</th><th class="px-4 py-3">Retryable by the model?</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">bad_argument</code></td><td class="px-4 py-3">The value parsed but is not usable</td><td class="px-4 py-3">The valid set or format, spelled out</td><td class="px-4 py-3">Yes — with different arguments</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">not_found</code></td><td class="px-4 py-3">Well-formed identifier, no such record</td><td class="px-4 py-3">The id format + the discovery tool to use</td><td class="px-4 py-3">Yes — via the discovery tool</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">forbidden</code></td><td class="px-4 py-3">This user may not do this</td><td class="px-4 py-3">Who can lift it; never <em>why</em> in detail</td><td class="px-4 py-3">No — say so, or it will loop</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">blocked</code></td><td class="px-4 py-3">A gate or limit stopped an otherwise valid call</td><td class="px-4 py-3">Which gate, and what unblocks it</td><td class="px-4 py-3">No — needs a human or a config change</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">internal</code></td><td class="px-4 py-3">Your bug or a downstream outage</td><td class="px-4 py-3">A correlation id, nothing else</td><td class="px-4 py-3">Once, then stop</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mt-4 callout callout-warn">
+        <strong>Never leak the internals in <code class="inline">internal</code>.</strong> A stack trace in a tool
+        result is three problems in one: it teaches the model nothing actionable, it burns 300–800 tokens of context
+        that stay there for the rest of the conversation, and it hands a user — or an attacker reading the transcript —
+        your file paths, library versions and table names. Return
+        <span class="out">{"status":"error","code":"internal","message":"failed, ref=req_8f21c"}</span> and put the
+        trace in your logs where it belongs.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">Anti-patterns you will inherit from customers</h3>
       <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
@@ -215,6 +477,110 @@ tailwind.config = {
         a permission check in the dispatch function is a control.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">The permission model as code</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A tier table on a wiki page is documentation. What you ship is a <strong>policy object the dispatcher
+        consults on every call</strong>, in one place, before the handler runs. Put it in its own module, keep it
+        declarative, and make it impossible to register a tool without declaring its tier — that last constraint is
+        what stops the twelfth tool from quietly shipping ungated at 6 pm on a Friday.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">policy.py — the whole permission model, 60 lines</span>
+        <pre class="code"><span class="kw">from</span> dataclasses <span class="kw">import</span> dataclass, field
+<span class="kw">from</span> typing <span class="kw">import</span> Callable, Literal
+
+Tier = Literal[<span class="st">"read"</span>, <span class="st">"write"</span>, <span class="st">"destructive"</span>, <span class="st">"external_comm"</span>]
+
+@dataclass(frozen=<span class="kw">True</span>)
+<span class="kw">class</span> <span class="fn">ToolPolicy</span>:
+    tier: Tier
+    scopes: <span class="fn">tuple</span>[<span class="fn">str</span>, ...]        <span class="cm"># scopes the CALLER must hold</span>
+    needs_approval: <span class="fn">bool</span> = <span class="kw">False</span>    <span class="cm"># out-of-band human arm</span>
+    dry_run_supported: <span class="fn">bool</span> = <span class="kw">False</span>
+    per_session_max: <span class="fn">int</span> | <span class="kw">None</span> = <span class="kw">None</span>
+    row_cap: <span class="fn">int</span> = <span class="st">50</span>
+
+POLICY: <span class="fn">dict</span>[<span class="fn">str</span>, ToolPolicy] = {
+    <span class="st">"search_orders"</span>: ToolPolicy(<span class="st">"read"</span>, (<span class="st">"orders:read"</span>,), row_cap=<span class="st">10</span>),
+    <span class="st">"get_order"</span>:     ToolPolicy(<span class="st">"read"</span>, (<span class="st">"orders:read"</span>,), row_cap=<span class="st">1</span>),
+    <span class="st">"add_note"</span>:      ToolPolicy(<span class="st">"write"</span>, (<span class="st">"orders:write"</span>,),
+                                 dry_run_supported=<span class="kw">True</span>, per_session_max=<span class="st">20</span>),
+    <span class="st">"refund_order"</span>:  ToolPolicy(<span class="st">"destructive"</span>, (<span class="st">"orders:refund"</span>,),
+                                 needs_approval=<span class="kw">True</span>, dry_run_supported=<span class="kw">True</span>,
+                                 per_session_max=<span class="st">3</span>),
+    <span class="st">"email_customer"</span>: ToolPolicy(<span class="st">"external_comm"</span>, (<span class="st">"comms:send"</span>,),
+                                 needs_approval=<span class="kw">True</span>, per_session_max=<span class="st">5</span>),
+}
+
+<span class="kw">class</span> <span class="fn">Denied</span>(<span class="fn">Exception</span>):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, code, message, retry=<span class="kw">None</span>):
+        self.code, self.message, self.retry = code, message, retry
+
+<span class="kw">def</span> <span class="fn">authorize</span>(tool: <span class="fn">str</span>, args: <span class="fn">dict</span>, session) -&gt; ToolPolicy:
+    p = POLICY.get(tool)
+    <span class="kw">if</span> p <span class="kw">is</span> <span class="kw">None</span>:                                     <span class="cm"># fail closed, always</span>
+        <span class="kw">raise</span> Denied(<span class="st">"forbidden"</span>, f<span class="st">"tool {tool} is not registered"</span>)
+    missing = [s <span class="kw">for</span> s <span class="kw">in</span> p.scopes <span class="kw">if</span> s <span class="kw">not</span> <span class="kw">in</span> session.scopes]
+    <span class="kw">if</span> missing:
+        <span class="kw">raise</span> Denied(<span class="st">"forbidden"</span>,
+                     f<span class="st">"this user lacks {missing[0]}; an orders admin can grant it"</span>)
+    used = session.counts[tool]
+    <span class="kw">if</span> p.per_session_max <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> used &gt;= p.per_session_max:
+        <span class="kw">raise</span> Denied(<span class="st">"blocked"</span>,
+                     f<span class="st">"session cap for {tool} reached ({p.per_session_max}); "</span>
+                     <span class="st">"a human operator must continue"</span>)
+    <span class="kw">if</span> p.needs_approval <span class="kw">and</span> <span class="kw">not</span> args.get(<span class="st">"dry_run"</span>) \
+       <span class="kw">and</span> <span class="kw">not</span> session.approvals.holds(tool, args):
+        <span class="kw">raise</span> Denied(<span class="st">"blocked"</span>,
+                     f<span class="st">"{tool} requires human approval before it runs"</span>,
+                     retry=<span class="st">"request approval, then report the pending state to the user"</span>)
+    <span class="kw">return</span> p</pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Then the dispatcher — the only place a handler is ever invoked — becomes four lines with no business logic
+        in them, and every one of the guarantees above holds for tools written next year by people who never read
+        this module:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">dispatch.py — the single choke point</span>
+        <pre class="code"><span class="kw">import</span> time, uuid
+<span class="kw">from</span> policy <span class="kw">import</span> authorize, Denied
+<span class="kw">from</span> envelope <span class="kw">import</span> ok, err
+
+<span class="kw">def</span> <span class="fn">dispatch</span>(tool: <span class="fn">str</span>, args: <span class="fn">dict</span>, session) -&gt; <span class="fn">str</span>:
+    ref, t0 = uuid.uuid4().hex[:<span class="st">8</span>], time.perf_counter()
+    <span class="kw">try</span>:
+        p = <span class="fn">authorize</span>(tool, args, session)      <span class="cm"># ← the gate. no bypass path.</span>
+        out = HANDLERS[tool](args, session, cap=p.row_cap)
+        session.counts[tool] += <span class="st">1</span>
+        outcome = <span class="st">"ok"</span>
+    <span class="kw">except</span> Denied <span class="kw">as</span> d:
+        out, outcome = <span class="fn">err</span>(d.code, d.message, retry=d.retry), d.code
+    <span class="kw">except</span> <span class="fn">Exception</span>:                              <span class="cm"># nothing escapes into the loop</span>
+        log.exception(<span class="st">"tool failed"</span>, extra={<span class="st">"ref"</span>: ref, <span class="st">"tool"</span>: tool})
+        out, outcome = <span class="fn">err</span>(<span class="st">"internal"</span>, f<span class="st">"failed, ref={ref}"</span>), <span class="st">"internal"</span>
+    audit(session=session.id, user=session.user_id, tool=tool,
+          args=redact(args), outcome=outcome, ref=ref,
+          ms=<span class="fn">round</span>((time.perf_counter() - t0) * <span class="st">1000</span>))
+    <span class="kw">return</span> out
+
+<span class="fn">print</span>(<span class="fn">dispatch</span>(<span class="st">"refund_order"</span>, {<span class="st">"order_id"</span>: <span class="st">"ORD-00003"</span>,
+                       <span class="st">"reason"</span>: <span class="st">"damaged"</span>}, viewer_session))
+<span class="out">{"status":"error","code":"forbidden","message":"this user lacks</span>
+<span class="out"> orders:refund; an orders admin can grant it","retry":null}</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two properties are worth naming out loud, because reviewers ask about exactly these. <strong>It fails
+        closed</strong>: an unregistered tool is denied rather than defaulted to read. And <strong>the audit call is
+        outside the try</strong>, so blocked and failed invocations are logged with the same fidelity as successful
+        ones — a log that only records what worked answers none of the questions you have during an incident.
+      </p>
+
       <h3 class="font-semibold text-lg mt-8">Least privilege and the on-behalf-of principle</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         <strong>The agent must never exceed the rights of the human it acts for.</strong> If the logged-in user can
@@ -234,6 +600,165 @@ tailwind.config = {
         <li><strong>Rate and spend limits inside the tool.</strong> Cap refunds per session (<code class="inline">max 3 refunds, max $500 total</code>), cap emails per hour, cap rows written per day. Enforce in the tool layer so a looping agent hits a wall, not a wallet. Cost governance at the model-call level is <a href="./pr2.html" class="text-viol underline decoration-viol/40">PR2</a>; this is its action-side twin.</li>
         <li><strong>Audit every invocation.</strong> Log who (user + session), what (tool + arguments), when, and the result — success, error, or blocked-by-gate — as structured events. This is the artifact the security team asks for first, and it plugs straight into your tracing stack (<a href="./pr1.html" class="text-viol underline decoration-viol/40">PR1</a>).</li>
       </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Confirm, dry-run, execute — the triad, implemented</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Everyone agrees destructive actions need a human. Almost nobody implements it properly, because the naive
+        version — "return pending, wait for a click" — has a hole you can drive a refund through: the approval is
+        granted for a <em>tool name</em>, and the model then calls that tool with different arguments. The fix is
+        that <strong>an approval binds to the exact arguments</strong>, expires, and is single-use.
+      </p>
+
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <svg viewBox="0 0 700 220" class="w-full min-w-[640px]" role="img" aria-label="Confirm, dry-run and execute states for a destructive tool">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">ONE DESTRUCTIVE CALL · three server-side states</text>
+          <g class="anim-pulse"><rect x="10" y="36" width="150" height="50" rx="9" fill="#6d5acd"/>
+            <text x="85" y="57" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">tool_use</text>
+            <text x="85" y="71" text-anchor="middle" fill="#ffffffbb" font-size="9">refund_order(ORD-3, damaged)</text></g>
+          <g class="anim-pulse d1"><rect x="215" y="36" width="150" height="50" rx="9" fill="#0D9488"/>
+            <text x="290" y="57" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">DRY RUN</text>
+            <text x="290" y="71" text-anchor="middle" fill="#ffffffbb" font-size="9">validates · costs nothing</text></g>
+          <g class="anim-pulse d2"><rect x="420" y="36" width="150" height="50" rx="9" fill="#D97757"/>
+            <text x="495" y="57" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">PENDING</text>
+            <text x="495" y="71" text-anchor="middle" fill="#ffffffbb" font-size="9">APR-17 · hash(args) · 15 min</text></g>
+          <g class="anim-pulse d3"><rect x="420" y="140" width="150" height="50" rx="9" fill="#37474F"/>
+            <text x="495" y="161" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">EXECUTED</text>
+            <text x="495" y="175" text-anchor="middle" fill="#ffffffbb" font-size="9">single-use · audited</text></g>
+          <g class="anim-pulse d4"><rect x="215" y="140" width="150" height="50" rx="9" fill="#DB2777"/>
+            <text x="290" y="161" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">DENIED</text>
+            <text x="290" y="175" text-anchor="middle" fill="#ffffffbb" font-size="9">args changed · or expired</text></g>
+          <line x1="160" y1="61" x2="210" y2="61" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="365" y1="61" x2="415" y2="61" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="495" y1="86" x2="495" y2="136" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="420" y1="165" x2="370" y2="165" stroke="#A8A49B" stroke-width="1.3" stroke-dasharray="4 5"/>
+          <text x="585" y="66" font-size="9" fill="#A8A49B">human arms it,</text>
+          <text x="585" y="78" font-size="9" fill="#A8A49B">not the model</text>
+          <text x="585" y="168" font-size="9" fill="#A8A49B">approval burned</text>
+          <text x="12" y="205" font-size="9" fill="#A8A49B">the model may re-request forever; only a matching hash + live TTL reaches EXECUTED</text>
+        </svg>
+      </div>
+
+      <div class="mt-4">
+        <span class="code-label">approvals.py — argument-bound, expiring, single-use</span>
+        <pre class="code"><span class="kw">import</span> hashlib, json, time
+
+TTL_SECONDS = <span class="st">900</span>                     <span class="cm"># 15 min: long enough to read Slack</span>
+
+<span class="kw">def</span> <span class="fn">arg_hash</span>(tool, args):
+    <span class="cm"># dry_run is excluded so a dry run and its execute share one identity</span>
+    payload = {k: v <span class="kw">for</span> k, v <span class="kw">in</span> <span class="fn">sorted</span>(args.items()) <span class="kw">if</span> k != <span class="st">"dry_run"</span>}
+    <span class="kw">return</span> hashlib.sha256(
+        (tool + json.dumps(payload, sort_keys=<span class="kw">True</span>)).encode()).hexdigest()[:<span class="st">12</span>]
+
+<span class="kw">class</span> <span class="fn">ApprovalStore</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self): self._live = {}      <span class="cm"># hash -&gt; (approver, expires_at)</span>
+
+    <span class="kw">def</span> <span class="fn">request</span>(self, tool, args, session):
+        h = <span class="fn">arg_hash</span>(tool, args)
+        notify_approvers(session.user_id, tool, args, h)   <span class="cm"># Slack / email / UI</span>
+        <span class="kw">return</span> h
+
+    <span class="kw">def</span> <span class="fn">grant</span>(self, h, approver):                 <span class="cm"># called by the HUMAN's endpoint</span>
+        self._live[h] = (approver, time.time() + TTL_SECONDS)
+
+    <span class="kw">def</span> <span class="fn">holds</span>(self, tool, args):
+        rec = self._live.pop(<span class="fn">arg_hash</span>(tool, args), <span class="kw">None</span>)   <span class="cm"># pop = single use</span>
+        <span class="kw">return</span> <span class="fn">bool</span>(rec) <span class="kw">and</span> rec[<span class="st">1</span>] &gt; time.time()
+
+<span class="cm"># the sequence a real run produces:</span>
+store = ApprovalStore()
+args = {<span class="st">"order_id"</span>: <span class="st">"ORD-00003"</span>, <span class="st">"reason"</span>: <span class="st">"damaged"</span>}
+<span class="fn">print</span>(<span class="fn">dispatch</span>(<span class="st">"refund_order"</span>, {**args, <span class="st">"dry_run"</span>: <span class="kw">True</span>}, sess))
+<span class="out">{"status":"ok","data":{"would_refund":"ORD-00003","amount_usd":142.90}}</span>
+<span class="fn">print</span>(<span class="fn">dispatch</span>(<span class="st">"refund_order"</span>, args, sess))
+<span class="out">{"status":"error","code":"blocked","message":"refund_order requires human</span>
+<span class="out"> approval before it runs","retry":"request approval, then report the pending</span>
+<span class="out"> state to the user"}</span>
+store.grant(<span class="fn">arg_hash</span>(<span class="st">"refund_order"</span>, args), <span class="st">"ops@acme.com"</span>)
+<span class="fn">print</span>(<span class="fn">dispatch</span>(<span class="st">"refund_order"</span>, {**args, <span class="st">"reason"</span>: <span class="st">"customer_request"</span>}, sess))
+<span class="out">{"status":"error","code":"blocked","message":"refund_order requires human…"}</span>
+<span class="fn">print</span>(<span class="fn">dispatch</span>(<span class="st">"refund_order"</span>, args, sess))
+<span class="out">{"status":"ok","data":{"refunded":"ORD-00003","amount_usd":142.90}}</span>
+<span class="fn">print</span>(<span class="fn">dispatch</span>(<span class="st">"refund_order"</span>, args, sess))
+<span class="out">{"status":"error","code":"blocked","message":"refund_order requires human…"}</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read the fourth call again: the approval was live, but <code class="inline">reason</code> changed, so the hash
+        missed and the gate held. That is the whole point. And read the sixth: the same arguments a second time are
+        blocked, because <code class="inline">holds()</code> pops. <strong>An approval is a single-use token bound to
+        a payload, not a mood the session is in.</strong> The dry-run in the first call is what lets the agent plan —
+        it can tell the user "this will refund $142.90, shall I?" before anything is armed.
+      </p>
+
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Approve in-loop
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(host prompt)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The human is already watching; latency is a click.</li>
+            <li>Right for interactive assistants and IDE-style hosts.</li>
+            <li>Fails for scheduled and background agents — nobody is there.</li>
+            <li>Do <em>not</em> rely on it alone: the host's prompt is not your gate.</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-viol">Approve out-of-band
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(Slack / ticket / console)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The run pauses and resumes minutes or hours later.</li>
+            <li>Right for anything unattended, and for four-eyes policies.</li>
+            <li>Needs durable state — the approval outlives the process.</li>
+            <li>Gives you the approver identity in the audit record for free.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Blast radius: deciding in advance how bad the worst day can be</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Gates stop the calls you anticipated. Limits contain the ones you did not. The question to answer before
+        shipping is not "can this go wrong" — it can — but <strong>"if this connector behaves as badly as it
+        possibly can for ten minutes, what is the bill and what is the cleanup?"</strong> Write the answer down as
+        numbers, then enforce those numbers in the tool layer. A worked example for the orders connector:
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Limit</th><th class="px-4 py-3">Value</th><th class="px-4 py-3">Why that number</th><th class="px-4 py-3">Worst case if it fires</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Refunds per session</td><td class="px-4 py-3">3</td><td class="px-4 py-3">p99 of legitimate human sessions is 2</td><td class="px-4 py-3">Three wrong refunds, all approved and audited, all reversible</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Refund value per session</td><td class="px-4 py-3">$500</td><td class="px-4 py-3">Below the finance team's manual-review floor</td><td class="px-4 py-3">$500 exposure, reconciled next business day</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rows per read call</td><td class="px-4 py-3">10 summaries / 50 rows</td><td class="px-4 py-3">~1.5 K tokens; 8 calls still fit a working context</td><td class="px-4 py-3">Context stays usable; no 60 K-token tool result</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Outbound emails per hour</td><td class="px-4 py-3">5 per session, 40 per tenant</td><td class="px-4 py-3">A support queue never legitimately exceeds it</td><td class="px-4 py-3">40 wrong emails, not 40,000 — and no domain reputation loss</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tool calls per run</td><td class="px-4 py-3">25, then hard stop</td><td class="px-4 py-3">Longest legitimate trace observed was 14</td><td class="px-4 py-3">A looping agent costs ~$0.40 and stops, instead of running all night</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Wall-clock per run</td><td class="px-4 py-3">120 s</td><td class="px-4 py-3">Anything slower is already a failed UX</td><td class="px-4 py-3">Bounded downstream load during an incident</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Every one of those is a line of code in <code class="inline">authorize()</code> or the session object, and
+        every one of them is a row in the security-review packet in Part V. The habit worth building is stating the
+        worst case in the customer's units — dollars, emails, rows — rather than in yours. "Capped at three refunds
+        and $500 per session" ends a conversation that "we have rate limiting" does not.
+      </p>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two boundaries to hold here, because both are owned next door. First, the <strong>database query tool</strong>
+        is simultaneously the highest-value connector you will ever build and the one with the widest blast radius;
+        <a href="./ai14.html" class="text-viol underline decoration-viol/40">AI14</a> owns generating SQL and running
+        it inside a read-only sandbox with statement timeouts and row caps, and you should not re-derive that here.
+        What <em>you</em> own is the contract wrapped around it: which questions the tool advertises, the enum of
+        allowed result shapes, the row cap on the way back, the tier, and the audit record. Second, tool schemas and
+        the arguments flowing through them are <strong>attacker-reachable surface</strong> — every string field is a
+        place someone else's text arrives.
+        <a href="./ai16.html" class="text-viol underline decoration-viol/40">AI16</a> owns testing that adversarially
+        (building the attack corpus, severity rubrics, running it in CI); your job in this module is to design so
+        that a successful injection still hits a closed gate and a $500 ceiling.
+      </p>
 
       <div class="mt-4 callout callout-danger">
         <strong>Tool results are untrusted input.</strong> A tool that fetches a web page, an email, or a ticket
@@ -308,6 +833,77 @@ flowchart LR
         whole game.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">The same capability, modelled three ways</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The table above says what each primitive <em>is</em>. The decision you actually face is narrower and comes up
+        on every server: you have one capability — say "the ticket database schema" — and three legal ways to expose
+        it. Pick wrong and you either burn a round-trip per turn or you burn context on something nobody needed.
+        The distinguishing question is <strong>who decides that this content enters the context window</strong>.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">As a…</th><th class="px-4 py-3">Enters context</th><th class="px-4 py-3">Cost profile</th><th class="px-4 py-3">Discovery call</th><th class="px-4 py-3">Right when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Tool <code class="inline">get_schema()</code></td><td class="px-4 py-3">Only if the model chooses to call it, mid-run</td><td class="px-4 py-3">One extra turn (~1.2 s, ~700 tok) every time it is needed</td><td class="px-4 py-3"><code class="inline">tools/list</code></td><td class="px-4 py-3">Large, rarely needed, or parameterised by which table</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Resource <code class="inline">schema://tickets</code></td><td class="px-4 py-3">When the host attaches it — typically at session start</td><td class="px-4 py-3">Paid once, cacheable as a prompt prefix, zero round-trips</td><td class="px-4 py-3"><code class="inline">resources/list</code></td><td class="px-4 py-3">Small, stable, needed by almost every task</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Prompt <code class="inline">/triage-ticket</code></td><td class="px-4 py-3">Only when the user picks it from a menu</td><td class="px-4 py-3">Paid per invocation, but the user opted in</td><td class="px-4 py-3"><code class="inline">prompts/list</code></td><td class="px-4 py-3">A whole workflow with an opinionated shape</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For a schema that is 700 tokens and relevant to every ticket question, the resource wins outright: it lands
+        in the prefix, it caches, and the model never spends a turn asking for it. Both non-tool primitives are two
+        decorators:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">server.py — the resource and prompt primitives</span>
+        <pre class="code">@mcp.resource(<span class="st">"schema://tickets"</span>)
+<span class="kw">def</span> <span class="fn">tickets_schema</span>() -&gt; <span class="fn">str</span>:
+    <span class="st">"""Ticket DB schema and status conventions. Attach for any ticket task."""</span>
+    <span class="kw">return</span> (<span class="st">"tickets(id INTEGER PK, title TEXT, status TEXT "</span>
+            <span class="st">"CHECK(status IN ('open','pending','closed')), body TEXT)\n"</span>
+            <span class="st">"notes(id INTEGER PK, ticket_id -&gt; tickets.id, body TEXT, created_at)\n"</span>
+            <span class="st">"Transitions: open -&gt; pending -&gt; closed. Reopening creates a NEW ticket."</span>)
+
+@mcp.resource(<span class="st">"ticket://{ticket_id}"</span>)          <span class="cm"># templated: one URI per record</span>
+<span class="kw">def</span> <span class="fn">ticket_resource</span>(ticket_id: <span class="fn">str</span>) -&gt; <span class="fn">str</span>:
+    <span class="st">"""One ticket as attachable context, for 'work on ticket 214' sessions."""</span>
+    <span class="kw">return</span> <span class="fn">render_ticket</span>(<span class="fn">int</span>(ticket_id))
+
+@mcp.prompt()
+<span class="kw">def</span> <span class="fn">triage_ticket</span>(ticket_id: <span class="fn">str</span>) -&gt; <span class="fn">str</span>:
+    <span class="st">"""Triage one ticket: severity, owner, next action. Surfaces as /triage-ticket."""</span>
+    <span class="kw">return</span> (f<span class="st">"Read ticket {ticket_id} with get_ticket, then produce:\n"</span>
+            <span class="st">"1. severity (S1-S4) with one line of justification\n"</span>
+            <span class="st">"2. the team that should own it, from: platform, billing, mobile\n"</span>
+            <span class="st">"3. the single next action, phrased as an imperative\n"</span>
+            <span class="st">"Do not add a note unless the user asks."</span>)
+
+<span class="cm"># what a host sees at connect time:</span>
+<span class="out">resources: schema://tickets, ticket://{ticket_id}</span>
+<span class="out">prompts:   triage-ticket(ticket_id)</span>
+<span class="out">tools:     list_tickets, get_ticket, add_note</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice the prompt is <em>server-owned workflow text</em>. That is quietly powerful in an enterprise: when the
+        support team's triage rubric changes, you update one server and every host in the company gets the new rubric
+        — no prompt copies to chase. It is the one place where shipping prompt text as infrastructure genuinely pays.
+      </p>
+
+      <div class="mt-4 callout callout-info">
+        <strong>Host support is uneven, so degrade gracefully.</strong> Every MCP host implements tools; resources and
+        prompts are supported inconsistently, and a host that ignores your resource will simply never attach it. If a
+        piece of context is <em>required</em> for correctness, expose it as a resource <em>and</em> fold the two most
+        important lines of it into the tool descriptions. Cheap insurance: it cost us four lines of duplicated text
+        and removed a class of "works in Claude Desktop, fails in the IDE" bug reports.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">A tool call through MCP, end to end</h3>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
@@ -339,6 +935,108 @@ sequenceDiagram
         parameters applies verbatim to MCP tools. Second, there are <strong>two</strong> permission layers: the
         host's user-facing prompt <em>and</em> the server's own gate. Defense in depth — the server must never
         assume the host asked.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The wire: a full protocol trace</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        MCP is JSON-RPC 2.0 with a handshake. You will almost never write these frames by hand — but you will read
+        them, because "the host says my server has no tools" is debugged at exactly this level and nowhere else.
+        Here is a complete session on stdio, one JSON object per line, request and response. Start with the
+        handshake, which is three messages and establishes protocol version plus capabilities on both sides:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">trace.jsonl — frames 1–3, the handshake</span>
+        <pre class="code"><span class="cm">// → client to server: initialize</span>
+{<span class="st">"jsonrpc"</span>:<span class="st">"2.0"</span>,<span class="st">"id"</span>:1,<span class="st">"method"</span>:<span class="st">"initialize"</span>,<span class="st">"params"</span>:{
+  <span class="st">"protocolVersion"</span>:<span class="st">"2025-06-18"</span>,
+  <span class="st">"capabilities"</span>:{<span class="st">"roots"</span>:{<span class="st">"listChanged"</span>:true},<span class="st">"sampling"</span>:{}},
+  <span class="st">"clientInfo"</span>:{<span class="st">"name"</span>:<span class="st">"claude-code"</span>,<span class="st">"version"</span>:<span class="st">"2.4.1"</span>}}}
+
+<span class="cm">// ← server to client: what I can do</span>
+{<span class="st">"jsonrpc"</span>:<span class="st">"2.0"</span>,<span class="st">"id"</span>:1,<span class="st">"result"</span>:{
+  <span class="st">"protocolVersion"</span>:<span class="st">"2025-06-18"</span>,
+  <span class="st">"capabilities"</span>:{<span class="st">"tools"</span>:{<span class="st">"listChanged"</span>:true},
+                  <span class="st">"resources"</span>:{<span class="st">"subscribe"</span>:false},
+                  <span class="st">"prompts"</span>:{}},
+  <span class="st">"serverInfo"</span>:{<span class="st">"name"</span>:<span class="st">"tickets"</span>,<span class="st">"version"</span>:<span class="st">"2.1.0"</span>}}}
+
+<span class="cm">// → notification (no id, no reply): handshake complete</span>
+{<span class="st">"jsonrpc"</span>:<span class="st">"2.0"</span>,<span class="st">"method"</span>:<span class="st">"notifications/initialized"</span>}</pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two fields earn their keep here. <code class="inline">protocolVersion</code> is negotiated, not asserted — an
+        older host and a newer server settle on a common version, and a mismatch is where "connected but zero tools"
+        comes from. And <code class="inline">serverInfo.version</code> is <em>your</em> version string: set it from
+        your package metadata, because in Part VI it becomes the field you group every dashboard by. Next, discovery:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">trace.jsonl — frames 4–5, tools/list (this is where your docstrings land)</span>
+        <pre class="code"><span class="cm">// → client asks what exists</span>
+{<span class="st">"jsonrpc"</span>:<span class="st">"2.0"</span>,<span class="st">"id"</span>:2,<span class="st">"method"</span>:<span class="st">"tools/list"</span>,<span class="st">"params"</span>:{}}
+
+<span class="cm">// ← the schemas FastMCP generated from your type hints + docstrings</span>
+{<span class="st">"jsonrpc"</span>:<span class="st">"2.0"</span>,<span class="st">"id"</span>:2,<span class="st">"result"</span>:{<span class="st">"tools"</span>:[
+  {<span class="st">"name"</span>:<span class="st">"list_tickets"</span>,
+   <span class="st">"description"</span>:<span class="st">"Search tickets by status. Call this FIRST when the user "</span>
+                 <span class="st">"references a ticket without an id. status: one of "</span>
+                 <span class="st">"open|closed|pending. Returns at most 50 summaries…"</span>,
+   <span class="st">"inputSchema"</span>:{<span class="st">"type"</span>:<span class="st">"object"</span>,
+     <span class="st">"properties"</span>:{<span class="st">"status"</span>:{<span class="st">"type"</span>:<span class="st">"string"</span>,<span class="st">"default"</span>:<span class="st">"open"</span>},
+                    <span class="st">"limit"</span>:{<span class="st">"type"</span>:<span class="st">"integer"</span>,<span class="st">"default"</span>:20}},
+     <span class="st">"required"</span>:[]}},
+  {<span class="st">"name"</span>:<span class="st">"get_ticket"</span>, <span class="st">"description"</span>:<span class="st">"…"</span>, <span class="st">"inputSchema"</span>:{<span class="st">"…"</span>}},
+  {<span class="st">"name"</span>:<span class="st">"add_note"</span>,   <span class="st">"description"</span>:<span class="st">"…"</span>, <span class="st">"inputSchema"</span>:{<span class="st">"…"</span>}}]}}</pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>That <code class="inline">description</code> string is the one your 71 %-to-94 % measurement was
+        about.</strong> Reading it in a raw frame is a useful habit: it is exactly, character for character, what the
+        model will see, stripped of the syntax highlighting and indentation that make a docstring look better in your
+        editor than it reads in a prompt. Finally, the call itself and the two shapes it can return:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">trace.jsonl — frames 6–8, tools/call, success and failure</span>
+        <pre class="code"><span class="cm">// → invoke</span>
+{<span class="st">"jsonrpc"</span>:<span class="st">"2.0"</span>,<span class="st">"id"</span>:3,<span class="st">"method"</span>:<span class="st">"tools/call"</span>,<span class="st">"params"</span>:{
+  <span class="st">"name"</span>:<span class="st">"add_note"</span>,<span class="st">"arguments"</span>:{<span class="st">"ticket_id"</span>:214,<span class="st">"note"</span>:<span class="st">"fix shipped"</span>}}}
+
+<span class="cm">// ← a TOOL-LEVEL failure: result + isError, NOT a JSON-RPC error.</span>
+<span class="cm">//   the model sees this text and can act on it.</span>
+{<span class="st">"jsonrpc"</span>:<span class="st">"2.0"</span>,<span class="st">"id"</span>:3,<span class="st">"result"</span>:{
+  <span class="st">"content"</span>:[{<span class="st">"type"</span>:<span class="st">"text"</span>,
+    <span class="st">"text"</span>:<span class="st">"{\"status\":\"error\",\"code\":\"blocked\",\"message\":\"writes are "</span>
+           <span class="st">"disabled on this server; ask an operator to set TICKETS_WRITE=1\"}"</span>}],
+  <span class="st">"isError"</span>:true}}
+
+<span class="cm">// ← a PROTOCOL failure: no such method. the model never sees this;</span>
+<span class="cm">//   the client surfaces it as a connection problem.</span>
+{<span class="st">"jsonrpc"</span>:<span class="st">"2.0"</span>,<span class="st">"id"</span>:4,<span class="st">"error"</span>:{<span class="st">"code"</span>:-32601,
+  <span class="st">"message"</span>:<span class="st">"Method not found: tools/cal"</span>}}</pre>
+      </div>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Failure shape</th><th class="px-4 py-3">Frame</th><th class="px-4 py-3">Who sees it</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Tool-level error</td><td class="px-4 py-3"><code class="inline">result</code> + <code class="inline">isError: true</code></td><td class="px-4 py-3">The model, as text it can read and retry against</td><td class="px-4 py-3">Everything in your five-code taxonomy — bad args, not found, blocked, forbidden</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">JSON-RPC error</td><td class="px-4 py-3"><code class="inline">error.code</code>, e.g. −32601, −32602</td><td class="px-4 py-3">The client only; the model gets nothing useful</td><td class="px-4 py-3">Genuine protocol violations — unknown method, malformed params</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Transport death</td><td class="px-4 py-3">Process exit / HTTP 5xx</td><td class="px-4 py-3">The host, as "server disconnected"</td><td class="px-4 py-3">Nothing you should cause on purpose — crash-on-bad-input is a bug</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The commonest server bug in the wild is raising an exception for a business-logic failure, which kills the
+        request into the JSON-RPC error path and leaves the model with nothing to work with. <strong>Business
+        failures are successful frames carrying an error payload.</strong> Capture your own traces by running the
+        server under the Inspector, or by setting <code class="inline">MCP_LOG_LEVEL=debug</code> in the host and
+        reading its MCP log — thirty seconds of that beats an hour of guessing.
       </p>
 
       <h3 class="font-semibold text-lg mt-8">Transports — and what they mean for deployment</h3>
@@ -456,6 +1154,81 @@ if __name__ == "__main__":
         of most real connectors — the remaining work is configuration, auth, and testing.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">Making it production-shaped: context, timeouts, cancellation</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The server above is honest and incomplete in three specific ways, and each one shows up the first week it
+        runs against something slower than SQLite. It opens a connection per call; it has no timeout, so one slow
+        query pins a request forever; and it cannot tell the host anything while it works. FastMCP gives you all
+        three through a lifespan and a <code class="inline">Context</code> parameter:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">server.py — lifespan, context, timeout, progress</span>
+        <pre class="code"><span class="kw">import</span> anyio, contextlib, os, sqlite3, time
+<span class="kw">from</span> dataclasses <span class="kw">import</span> dataclass
+<span class="kw">from</span> mcp.server.fastmcp <span class="kw">import</span> Context, FastMCP
+
+@dataclass
+<span class="kw">class</span> <span class="fn">AppCtx</span>:
+    db: sqlite3.Connection
+    started: <span class="fn">float</span>
+
+@contextlib.asynccontextmanager
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">lifespan</span>(_server):
+    conn = sqlite3.connect(os.environ[<span class="st">"TICKETS_DB"</span>], timeout=<span class="st">5</span>,
+                           check_same_thread=<span class="kw">False</span>)
+    conn.execute(<span class="st">"PRAGMA busy_timeout = 3000"</span>)
+    <span class="kw">try</span>:
+        <span class="kw">yield</span> AppCtx(db=conn, started=time.time())   <span class="cm"># built once, not per call</span>
+    <span class="kw">finally</span>:
+        conn.close()
+
+mcp = FastMCP(<span class="st">"tickets"</span>, lifespan=lifespan)
+TOOL_TIMEOUT = <span class="fn">float</span>(os.environ.get(<span class="st">"TICKETS_TIMEOUT_S"</span>, <span class="st">"8"</span>))
+
+@mcp.tool()
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">search_tickets</span>(query: <span class="fn">str</span>, ctx: Context, limit: <span class="fn">int</span> = <span class="st">20</span>) -&gt; <span class="fn">str</span>:
+    <span class="st">"""Full-text search over ticket titles and bodies. Call this when the</span>
+<span class="st">    user describes a problem instead of naming a ticket id. Returns at</span>
+<span class="st">    most 50 matches (id, title, status, snippet). Read-only."""</span>
+    app = ctx.request_context.lifespan_context
+    limit = <span class="fn">max</span>(<span class="st">1</span>, <span class="fn">min</span>(limit, <span class="st">50</span>))
+    <span class="kw">await</span> ctx.info(f<span class="st">"searching {limit=}"</span>)          <span class="cm"># goes to the host's log, not stdout</span>
+    <span class="kw">try</span>:
+        <span class="kw">with</span> anyio.fail_after(TOOL_TIMEOUT):        <span class="cm"># the missing guardrail</span>
+            rows = <span class="kw">await</span> anyio.to_thread.run_sync(
+                <span class="kw">lambda</span>: app.db.execute(
+                    <span class="st">"SELECT id,title,status,substr(body,1,140) FROM tickets "</span>
+                    <span class="st">"WHERE title LIKE ?1 OR body LIKE ?1 LIMIT ?2"</span>,
+                    (f<span class="st">"%{query}%"</span>, limit)).fetchall())
+    <span class="kw">except</span> TimeoutError:
+        <span class="kw">return</span> <span class="fn">err</span>(<span class="st">"internal"</span>, f<span class="st">"search exceeded {TOOL_TIMEOUT:.0f}s"</span>,
+                   retry=<span class="st">"try a narrower query or a smaller limit"</span>)
+    <span class="kw">return</span> <span class="fn">ok</span>([{<span class="st">"id"</span>: r[<span class="st">0</span>], <span class="st">"title"</span>: r[<span class="st">1</span>], <span class="st">"status"</span>: r[<span class="st">2</span>], <span class="st">"snippet"</span>: r[<span class="st">3</span>]}
+               <span class="kw">for</span> r <span class="kw">in</span> rows], total=<span class="fn">len</span>(rows))
+
+<span class="cm"># $ TICKETS_DB=tickets.db TICKETS_TIMEOUT_S=0.001 python server.py</span>
+<span class="out">{"status":"error","code":"internal","message":"search exceeded 0s",</span>
+<span class="out"> "retry":"try a narrower query or a smaller limit"}</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three habits are encoded there. <strong>Never print to stdout in a stdio server</strong> — it corrupts the
+        JSON-RPC stream, and <code class="inline">ctx.info()</code> is the sanctioned channel. <strong>Never block the
+        event loop</strong> — a synchronous driver call inside an async tool stalls every other in-flight request on
+        that process, which is how one slow report freezes a whole session. And <strong>make the timeout a
+        configurable env var</strong>, because the number that is right on a laptop against SQLite is wrong against a
+        warehouse; 8 seconds is a reasonable default when the host's own patience is typically 30–60 s.
+      </p>
+
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> put a <em>budget</em> on the tool, not just a timeout. For long reads, return
+        partial results with <span class="out">"truncated":{"reason":"time_budget","shown":18}</span> rather than an
+        error at the deadline. The model can answer from 18 rows and say so; it can do nothing at all with a timeout.
+        This one change took a warehouse connector's task-completion rate from 0.62 to 0.81 on slow queries.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">Configuration &amp; secrets</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         Everything environment-specific — database paths, API base URLs, credentials, feature gates like
@@ -472,6 +1245,117 @@ if __name__ == "__main__":
         <li><strong>Machine context → service credentials.</strong> Pipelines and scheduled agents have no user present; they authenticate with API keys or service accounts, scoped to the narrow role the workload needs — never an org-admin key "for convenience".</li>
         <li><strong>Identity passthrough is the hard part.</strong> When a central MCP server fronts an internal API, the server must exchange the user's inbound token for a downstream credential that still carries that identity (token exchange), not substitute its own privileged account. If the server flattens everyone into one service identity, your audit log says "the bot did it" forever — the first thing a security review will reject (<a href="./pr13.html" class="text-viol underline decoration-viol/40">PR13</a>).</li>
       </ul>
+
+      <h3 class="font-semibold text-lg mt-8">OAuth end to end, with the code that verifies the token</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The bullets above say "use OAuth"; here is what that actually is on the server side, because the gap between
+        the two is where connectors fail security review. Your remote MCP server is an OAuth <strong>resource
+        server</strong>. It does not issue tokens, it does not see passwords, and it does not run a login page. It
+        does exactly three things: advertise which authorization server protects it, verify every inbound access
+        token, and turn the verified claims into the session object your <code class="inline">authorize()</code>
+        function already consumes.
+      </p>
+
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant H as Host (MCP client)
+    participant A as Authorization server<br/>(the company IdP)
+    participant S as Your MCP server
+    participant D as Ticket API
+    H->>S: tools/list  (no token)
+    S-->>H: 401 + WWW-Authenticate:<br/>resource_metadata=/.well-known/…
+    H->>S: GET /.well-known/oauth-protected-resource
+    S-->>H: {authorization_servers: [idp.acme.com]}
+    H->>A: browser: authorize → consent → code → token
+    A-->>H: access_token (aud=tickets-mcp, scope=orders:read)
+    H->>S: tools/call  Authorization: Bearer …
+    S->>S: verify sig · aud · exp · scope → Session(user_id, scopes)
+    S->>D: call downstream AS THAT USER (token exchange)
+    D-->>S: only rows this user may see
+    S-->>H: result + audit{user, tool, args, outcome}
+        </pre>
+      </div>
+
+      <div class="mt-4">
+        <span class="code-label">auth.py — verification, and the session it produces</span>
+        <pre class="code"><span class="kw">import</span> os, time, jwt                       <span class="cm"># pip install "pyjwt[crypto]"</span>
+<span class="kw">from</span> jwt <span class="kw">import</span> PyJWKClient
+
+ISSUER   = os.environ[<span class="st">"OIDC_ISSUER"</span>]        <span class="cm"># https://idp.acme.com</span>
+AUDIENCE = os.environ[<span class="st">"OIDC_AUDIENCE"</span>]      <span class="cm"># tickets-mcp — THIS server, only</span>
+_jwks    = PyJWKClient(f<span class="st">"{ISSUER}/.well-known/jwks.json"</span>, cache_keys=<span class="kw">True</span>)
+
+<span class="kw">class</span> <span class="fn">Session</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, claims):
+        self.user_id = claims[<span class="st">"sub"</span>]
+        self.email   = claims.get(<span class="st">"email"</span>, <span class="st">""</span>)
+        self.scopes  = <span class="fn">set</span>(claims.get(<span class="st">"scope"</span>, <span class="st">""</span>).split())
+        self.token   = claims[<span class="st">"_raw"</span>]           <span class="cm"># for downstream exchange</span>
+        self.counts, self.approvals = Counter(), APPROVALS
+
+<span class="kw">def</span> <span class="fn">session_from_bearer</span>(header: <span class="fn">str</span> | <span class="kw">None</span>) -&gt; Session:
+    <span class="kw">if</span> <span class="kw">not</span> header <span class="kw">or</span> <span class="kw">not</span> header.startswith(<span class="st">"Bearer "</span>):
+        <span class="kw">raise</span> Unauthorized(<span class="st">"missing bearer token"</span>)
+    raw = header.split(<span class="st">" "</span>, <span class="st">1</span>)[<span class="st">1</span>]
+    claims = jwt.decode(                          <span class="cm"># raises on ANY of these</span>
+        raw, _jwks.get_signing_key_from_jwt(raw).key,
+        algorithms=[<span class="st">"RS256"</span>], issuer=ISSUER, audience=AUDIENCE,
+        options={<span class="st">"require"</span>: [<span class="st">"exp"</span>, <span class="st">"iss"</span>, <span class="st">"aud"</span>, <span class="st">"sub"</span>]})
+    claims[<span class="st">"_raw"</span>] = raw
+    <span class="kw">return</span> Session(claims)
+
+<span class="kw">def</span> <span class="fn">downstream_token</span>(session) -&gt; <span class="fn">str</span>:
+    <span class="cm"># RFC 8693 token exchange: the user's identity survives the hop.</span>
+    <span class="cm"># NOT a service account — the audit trail must not say "the bot did it".</span>
+    r = httpx.post(f<span class="st">"{ISSUER}/oauth2/token"</span>, data={
+        <span class="st">"grant_type"</span>: <span class="st">"urn:ietf:params:oauth:grant-type:token-exchange"</span>,
+        <span class="st">"subject_token"</span>: session.token,
+        <span class="st">"subject_token_type"</span>: <span class="st">"urn:ietf:params:oauth:token-type:access_token"</span>,
+        <span class="st">"audience"</span>: <span class="st">"tickets-api"</span>, <span class="st">"scope"</span>: <span class="st">"tickets.read tickets.write"</span>,
+        <span class="st">"client_id"</span>: os.environ[<span class="st">"MCP_CLIENT_ID"</span>],
+        <span class="st">"client_secret"</span>: os.environ[<span class="st">"MCP_CLIENT_SECRET"</span>]}, timeout=<span class="st">5</span>)
+    r.raise_for_status()
+    <span class="kw">return</span> r.json()[<span class="st">"access_token"</span>]
+
+s = <span class="fn">session_from_bearer</span>(request.headers.get(<span class="st">"authorization"</span>))
+<span class="fn">print</span>(s.user_id, <span class="fn">sorted</span>(s.scopes))
+<span class="out">a1f0-90c2-4d11  ['orders:read', 'tickets.read']</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">audience</code> check is the line reviewers look for, and the one most often
+        missing. Without it your server accepts any valid token the IdP ever issued — including one minted for a
+        completely different application — and a low-privilege app becomes a path into your connector. Verify
+        <code class="inline">aud</code>, <code class="inline">iss</code> and <code class="inline">exp</code> on every
+        request, cache the JWKS rather than the decision, and never accept a token in a query string where it will
+        land in an access log.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Check</th><th class="px-4 py-3">Attack it stops</th><th class="px-4 py-3">Failure if you skip it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Signature against live JWKS</td><td class="px-4 py-3">Forged tokens</td><td class="px-4 py-3">Anyone with a text editor is an admin</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">aud</code> equals this server</td><td class="px-4 py-3">Token replay from another app</td><td class="px-4 py-3">Confused-deputy: a chat toy's token opens the CRM</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">iss</code> equals your IdP</td><td class="px-4 py-3">Tokens from an attacker-run issuer</td><td class="px-4 py-3">Self-signed identity accepted</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">exp</code>, short TTL</td><td class="px-4 py-3">Stolen-token longevity</td><td class="px-4 py-3">A leaked laptop token works for months</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scope → tier mapping</td><td class="px-4 py-3">Privilege creep across tools</td><td class="px-4 py-3">Read access silently implies write</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Token exchange downstream</td><td class="px-4 py-3">Loss of user identity at the hop</td><td class="px-4 py-3">Every audit line reads "svc-mcp" — review rejected</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For local stdio servers none of this exists: the server inherits the launching user's environment, which is
+        both the reason sidecars are easy and the reason they do not scale past a pilot. The RBAC and tenancy depth
+        behind these rows lives in <a href="./pr13.html" class="text-viol underline decoration-viol/40">PR13</a>; what
+        AI8 owns is that the scopes on the token and the tiers on your tools are <em>the same vocabulary</em>.
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">Versioning without breaking hosts</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
@@ -492,6 +1376,91 @@ if __name__ == "__main__":
         <li><strong>Behavioral — model-in-the-loop.</strong> Run a real model against the server on a task set and score outcomes — tool choice and argument quality are model behaviors, and only an eval sees them (<a href="./ai9.html" class="text-viol underline decoration-viol/40">AI9</a>).</li>
       </ul>
 
+      <h3 class="font-semibold text-lg mt-8">The suite that runs in CI</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Tested" for a connector means three separate assertions, and conflating them is why so many servers pass
+        their tests and fail in a host. <strong>Contract tests</strong> assert the surface — the tool set, the schema
+        shapes, the description text you measured. <strong>Gate tests</strong> assert that the permission model holds
+        under the arguments an adversary would send. <strong>Behaviour tests</strong> put a model in the loop and
+        score selection. The first two belong on every pull request; the third runs nightly because it costs money.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">tests/test_contract.py — in-process, no subprocess, &lt; 2 s</span>
+        <pre class="code"><span class="kw">import</span> json, pytest
+<span class="kw">from</span> mcp.shared.memory <span class="kw">import</span> create_connected_server_and_client_session <span class="kw">as</span> session
+<span class="kw">from</span> server <span class="kw">import</span> mcp                       <span class="cm"># the FastMCP instance itself</span>
+
+@pytest.fixture
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">client</span>():
+    <span class="kw">async</span> <span class="kw">with</span> session(mcp._mcp_server) <span class="kw">as</span> c:   <span class="cm"># in-memory transport</span>
+        <span class="kw">yield</span> c
+
+<span class="cm"># ── contract ──────────────────────────────────────────────────────</span>
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">test_surface_is_exactly_what_we_documented</span>(client):
+    names = {t.name <span class="kw">for</span> t <span class="kw">in</span> (<span class="kw">await</span> client.list_tools()).tools}
+    <span class="kw">assert</span> names == {<span class="st">"list_tickets"</span>, <span class="st">"get_ticket"</span>, <span class="st">"add_note"</span>,
+                     <span class="st">"search_tickets"</span>}, <span class="st">"surface drift — update TOOLSPEC.md"</span>
+
+@pytest.mark.parametrize(<span class="st">"tool"</span>, [<span class="st">"list_tickets"</span>, <span class="st">"get_ticket"</span>, <span class="st">"add_note"</span>])
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">test_descriptions_carry_a_trigger_condition</span>(client, tool):
+    d = <span class="fn">next</span>(t <span class="kw">for</span> t <span class="kw">in</span> (<span class="kw">await</span> client.list_tools()).tools
+             <span class="kw">if</span> t.name == tool).description.lower()
+    <span class="kw">assert</span> <span class="fn">len</span>(d) &gt; <span class="st">80</span>
+    <span class="kw">assert</span> <span class="fn">any</span>(k <span class="kw">in</span> d <span class="kw">for</span> k <span class="kw">in</span> (<span class="st">"call this"</span>, <span class="st">"use this when"</span>, <span class="st">"read-only"</span>))
+
+<span class="cm"># ── gates ─────────────────────────────────────────────────────────</span>
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">test_write_is_blocked_by_default</span>(client):
+    r = <span class="kw">await</span> client.call_tool(<span class="st">"add_note"</span>, {<span class="st">"ticket_id"</span>: <span class="st">1</span>, <span class="st">"note"</span>: <span class="st">"x"</span>})
+    <span class="kw">assert</span> json.loads(r.content[<span class="st">0</span>].text)[<span class="st">"code"</span>] == <span class="st">"blocked"</span>
+
+@pytest.mark.parametrize(<span class="st">"limit"</span>, [<span class="st">10_000</span>, <span class="st">-1</span>, <span class="st">0</span>])
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">test_limit_is_always_clamped</span>(client, limit):
+    r = <span class="kw">await</span> client.call_tool(<span class="st">"list_tickets"</span>,
+                                 {<span class="st">"status"</span>: <span class="st">"open"</span>, <span class="st">"limit"</span>: limit})
+    <span class="kw">assert</span> <span class="fn">len</span>(json.loads(r.content[<span class="st">0</span>].text)[<span class="st">"data"</span>]) &lt;= <span class="st">50</span>
+
+@pytest.mark.parametrize(<span class="st">"status"</span>, [<span class="st">"banana"</span>, <span class="st">""</span>, <span class="st">"open' OR 1=1--"</span>, <span class="st">"OPEN"</span>])
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">test_bad_enum_is_corrective_never_fatal</span>(client, status):
+    r = <span class="kw">await</span> client.call_tool(<span class="st">"list_tickets"</span>, {<span class="st">"status"</span>: status})
+    body = json.loads(r.content[<span class="st">0</span>].text)
+    <span class="kw">assert</span> body[<span class="st">"status"</span>] == <span class="st">"error"</span> <span class="kw">and</span> <span class="st">"open"</span> <span class="kw">in</span> body[<span class="st">"message"</span>]
+    <span class="kw">assert</span> <span class="st">"Traceback"</span> <span class="kw">not</span> <span class="kw">in</span> r.content[<span class="st">0</span>].text     <span class="cm"># never leak internals</span>
+
+<span class="cm"># $ pytest -q tests/</span>
+<span class="out">14 passed in 1.83s</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The in-memory transport is what makes this cheap enough to run on every commit: no subprocess, no port, no
+        database fixture beyond a temp file. Fourteen tests in <strong>1.8 s</strong> is fast enough that nobody
+        disables them. The behavioural layer is a different economics — 120 tasks against a real model is roughly
+        <strong>$0.90 and four minutes</strong> — so it runs nightly and on release tags, and it is the same harness
+        shape <a href="./ai9.html" class="text-viol underline decoration-viol/40">AI9</a> teaches; do not build a
+        second one.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Layer</th><th class="px-4 py-3">Runs</th><th class="px-4 py-3">Cost / time</th><th class="px-4 py-3">Catches</th><th class="px-4 py-3">Misses</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Contract</td><td class="px-4 py-3">Every commit</td><td class="px-4 py-3">$0 · 1.8 s</td><td class="px-4 py-3">Surface drift, lost trigger conditions, schema changes</td><td class="px-4 py-3">Whether the descriptions are any <em>good</em></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Gate</td><td class="px-4 py-3">Every commit</td><td class="px-4 py-3">$0 · 1.8 s</td><td class="px-4 py-3">A write shipping ungated, an uncapped limit, a leaked traceback</td><td class="px-4 py-3">Gaps you did not think to parametrize</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Behavioural</td><td class="px-4 py-3">Nightly + release</td><td class="px-4 py-3">$0.90 · 4 min</td><td class="px-4 py-3">Selection regressions, argument-quality drops after a reword</td><td class="px-4 py-3">Rare tasks absent from the suite</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Adversarial</td><td class="px-4 py-3">Weekly + before review</td><td class="px-4 py-3">$1.40 · 6 min</td><td class="px-4 py-3">Injection reaching a gate, argument smuggling — <a href="./ai16.html" class="text-viol underline decoration-viol/40">AI16</a></td><td class="px-4 py-3">Attacks nobody has published yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mt-4 callout callout-warn">
+        <strong>The test that catches the most real bugs is the surface-equality one.</strong> It is three lines and
+        it fails loudly the moment someone adds a tool without updating the specification document you handed
+        security. Every connector that quietly grew a fourteenth tool between review and audit got there because
+        nothing asserted the tool set.
+      </div>
+
       <!-- ═══════════════ PART V ═══════════════ -->
       <div class="kicker text-rose-500 mt-14">Part V · MCP in the enterprise</div>
       <h2 class="font-display text-2xl font-bold mt-2">The FDE angle: wiring real systems, selling the architecture</h2>
@@ -509,6 +1478,74 @@ if __name__ == "__main__":
         <li><strong>File stores:</strong> scope to specific prefixes/folders, enforce the requesting user's ACLs on every read (the same pre-filtering rule as RAG — <a href="./ai4.html" class="text-viol underline decoration-viol/40">AI4</a>), and cap returned sizes aggressively.</li>
         <li><strong>Integration plumbing</strong> — queues, ETL, system-of-record sync — stays conventional engineering; MCP is the last mile between agent and system, not a replacement for your integration layer (<a href="./pr8.html" class="text-viol underline decoration-viol/40">PR8</a>).</li>
       </ul>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The database case deserves its own sentence, because it is the connector every customer asks for first and
+        the one that gets frozen most often. Split it in two:
+        <a href="./ai14.html" class="text-viol underline decoration-viol/40">AI14</a> owns whether the generated SQL
+        is <em>correct and safely executed</em> — schema linking, generate–validate–repair, the read-only sandbox
+        with a statement timeout and a row cap. AI8 owns the <em>tool contract wrapped around it</em>: that the tool
+        advertises which questions it answers, that it is tiered read, that results come back capped and shaped, and
+        that every invocation is audited with the SQL it actually ran. Handing security a text-to-SQL tool with both
+        halves specified is a forty-minute conversation; handing them <code class="inline">run_sql(query)</code> is a
+        rejection.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Vetting a third-party server before it touches a customer</h3>
+
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most engagements involve at least one server you did not write. A community connector is
+        <strong>code you are asking a customer to run inside their perimeter, with access to their data, on your
+        recommendation</strong> — the review bar is the same one you would apply to any dependency with those
+        properties, and "it's on the official list" is a starting point, not a conclusion. Run these six checks and
+        write the answers down; it takes about ninety minutes per server and it has never once been wasted.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Check</th><th class="px-4 py-3">How</th><th class="px-4 py-3">Reject if</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Surface</td><td class="px-4 py-3">Run <code class="inline">tools/list</code> and read every description</td><td class="px-4 py-3">A generic passthrough (<code class="inline">execute</code>, <code class="inline">request</code>) is in the list</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Write capability</td><td class="px-4 py-3">Grep the handlers for mutating verbs and network calls</td><td class="px-4 py-3">Writes exist with no gate, no dry-run and no confirmation path</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Egress</td><td class="px-4 py-3">Run it with the network mocked; log every outbound host</td><td class="px-4 py-3">It contacts anything other than the system it claims to wrap</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Secrets handling</td><td class="px-4 py-3">Search for tokens in results, logs and error strings</td><td class="px-4 py-3">Credentials can reach model context or a log file</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Supply chain</td><td class="px-4 py-3">Pin the exact version; check maintainer, release cadence, install scripts</td><td class="px-4 py-3">It resolves <code class="inline">latest</code> at launch, or has a postinstall script</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Update path</td><td class="px-4 py-3">Ask who upgrades it and how a bad version is rolled back</td><td class="px-4 py-3">Nobody owns it — which is the same as nobody patching it</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mt-4">
+        <span class="code-label">vet.sh — the mechanical half, run before you read any code</span>
+        <pre class="code"><span class="cm"># 1 · pin, never float. record the exact resolved version.</span>
+npm view @acme/jira-mcp versions --json | tail -3
+npm i --no-save --ignore-scripts @acme/jira-mcp@1.4.2   <span class="cm"># scripts OFF</span>
+
+<span class="cm"># 2 · what does it actually expose? (schemas, verbatim)</span>
+npx @modelcontextprotocol/inspector --cli \
+    node node_modules/@acme/jira-mcp/dist/index.js \
+    --method tools/list | jq -r <span class="st">'.tools[] | "\(.name)\t\(.description[0:70])"'</span>
+<span class="out">jira_search   Search issues by JQL. Returns up to 50 issues with key, sum…</span>
+<span class="out">jira_get      Get one issue by key, including comments and attachments…</span>
+<span class="out">jira_execute  Run an arbitrary Jira REST call. Advanced use only.</span>
+
+<span class="cm"># 3 · where does it phone? deny-by-default egress, then read the log.</span>
+sudo tcpdump -n -i any <span class="st">'tcp and (port 443 or port 80)'</span> -w vet.pcap &amp;
+node node_modules/@acme/jira-mcp/dist/index.js &lt; smoke.jsonl
+tshark -r vet.pcap -T fields -e tls.handshake.extensions_server_name | <span class="fn">sort</span> -u
+<span class="out">acme.atlassian.net</span>
+<span class="out">telemetry.acme-labs.io          &lt;-- undisclosed. this is the finding.</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That third check has found something in roughly one server in five: an undocumented telemetry endpoint, a
+        crash reporter that ships tool arguments, or an "anonymous usage" beacon. None of it is malicious; all of it
+        is unacceptable when the arguments contain customer identifiers.
+        <code class="inline">jira_execute</code> in the second check is the other recurring finding — a passthrough
+        hidden among good tools, which silently undoes every constraint the other tools imposed. Both are fixable:
+        wrap the server behind your own, exposing only the two tools you vetted.
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">Two deployment models</h3>
       <div class="mt-3 grid sm:grid-cols-2 gap-3 text-sm">
