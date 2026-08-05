@@ -18,7 +18,7 @@ User decisions, already made — do not re-litigate:
 4. External links: **official vendor docs and company engineering blogs only** — not papers, not
    practitioner blogs, not courses. Pre-existing links are grandfathered.
 
-## Progress: 14 of 16 modules complete
+## Progress: COMPLETE — 16 of 16 modules
 
 | Module | Lines | Status |
 |---|---|---|
@@ -36,51 +36,25 @@ User decisions, already made — do not re-litigate:
 | AI15 · Multi-agent Systems | 2,928 | ✅ committed (new) |
 | AI16 · Red-teaming & Adversarial Evaluation | 2,901 | ✅ committed (new) |
 | AI8 · Tool Calling & MCP | 3,053 | ✅ committed |
-| **AI1 · Prompt Engineering** | 2,501 | ⚠️ **7 gates open** |
-| **AI5 · Vector Databases** | 2,550 | ⚠️ **5 gates open** |
+| AI1 · Prompt Engineering | 2,645 | ✅ committed |
+| AI5 · Vector Databases | 2,603 | ✅ committed |
 
-## What is left — all of it is lab-modal work
+## What is left
 
-Run this to see the live list:
+Nothing in the expansion itself. All 16 AI modules pass `--density` with zero fails and zero warns;
+all 48 modules pass the structural/registry/link/data-key checks.
+
+**Final AI-track totals: 45,665 lines · 352,956 words · averaging 2,854 lines / 22,059 words per
+module** — up from 1,137 / 7,488. The AI track is now the thickest of the four, as intended.
+
+Remaining: merge `feat/ai-track-deep-expansion` into `main` when you're ready.
+
+Verification commands:
 ```sh
-python3 .claude/authoring/qa.py aifde/modules/ai1.html aifde/modules/ai5.html aifde/modules/ai8.html --density
+python3 .claude/authoring/qa.py --all                                  # structure, 48 modules
+python3 .claude/authoring/qa.py aifde/modules/ai{1..16}.html --density --table
+python3 -m http.server 8899                                            # browser spot-check
 ```
-
-At time of writing:
-
-**ai1** — `temperature=` still in live code (rejected on Opus 5 / Sonnet 5, would 400); lab3 step
-numbers are `[1,2,2,3,4]` (must be 1..N, no repeats) and needs ≥8 steps and ≥4 troubleshooting
-bullets; lab4 is missing the `📦 Setup` and `🧯 Troubleshooting` sections and needs ≥10 steps.
-
-**ai5** — lab4 missing `🧯 Troubleshooting`, step numbers `[1,2,3,4,4,5]`, needs ≥10 steps,
-≥5 `<pre>`, ≥4 troubleshooting bullets.
-
-**ai8** — lab4 missing `🧯 Troubleshooting`, step numbers `[1,2,3,3,4,5]`, needs ≥10 steps,
-≥5 `<pre>`, ≥4 troubleshooting bullets.
-
-Note the recurring pattern: **Lab 4 is where agents run out of steam.** It is the evidence-artifact
-lab with the highest bar (≥10 steps) and it sits last in the file.
-
-## How to finish
-
-Three near-identical jobs. For each, launch one agent (or do it inline — it is small) with:
-
-> RESUME an interrupted expansion of `aifde/modules/aiN.html`. Do NOT restart or regenerate — the
-> file is valid and nearly complete. Read `.claude/authoring/SPEC.md` and `PATTERNS.md`, then fix
-> exactly the gates that `python3 .claude/authoring/qa.py aifde/modules/aiN.html --density` reports.
-> All remaining work is inside the `<dialog>` lab modals near the end of the file.
-> Rules: no tool call emits >400 lines or >30 KB; every edit ends on a closed tag; step numbers
-> across `📦 Setup` + `🔬 Steps` must run 1..N with no gaps or repeats; the five modal `<h4>`
-> sections are `🎯 Objective`, `📦 Setup`, `🔬 Steps`, `🧯 Troubleshooting`, `✅ Done when` in that
-> order, once each. Do not change lab titles, ids, accents or `--lab-color`. Touch exactly one file.
-
-Then **Wave 4 — integration** (the last task):
-1. `python3 .claude/authoring/qa.py --all` → expect zero FAILs across all 48.
-2. `python3 .claude/authoring/qa.py aifde/modules/ai{1..16}.html --density --table` → zero fails, zero warns.
-3. Browser spot-check: serve with `python3 -m http.server 8899`, open 2–3 modules at 375 px and
-   1440 px, light and dark, toggle theme mid-page (mermaid must re-render), open all 4 modals,
-   walk prev/next AI12 → AI13 → AI14 → AI15 → AI16 → PR1.
-4. Commit per module, then merge to `main`.
 
 ## Hard-won gotchas — read before touching anything
 
