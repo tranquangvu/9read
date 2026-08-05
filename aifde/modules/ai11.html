@@ -459,9 +459,34 @@ unreadable is a CORRECT answer, not a failure.</pre>
         <li><strong>Orientation and skew still matter.</strong> Models handle mild rotation fine and 90° rotation
           poorly. A cheap EXIF-orientation fix plus a deskew step removes a whole class of mystery failures.</li>
       </ul>
+      <div class="mt-4">
+        <span class="code-label">tile.py — the fix for the 600×4000 thermal receipt</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">tiles</span>(img, target_h=<span class="st">1100</span>, overlap=<span class="st">0.15</span>):
+    <span class="st">"""Overlapping horizontal strips. 15% overlap so no line is ever cut."""</span>
+    <span class="kw">if</span> img.height &lt;= target_h * <span class="st">1.4</span>:
+        <span class="kw">return</span> [img]
+    step = <span class="fn">int</span>(target_h * (<span class="st">1</span> - overlap))
+    <span class="kw">return</span> [img.crop((<span class="st">0</span>, y, img.width, <span class="fn">min</span>(y + target_h, img.height)))
+            <span class="kw">for</span> y <span class="kw">in</span> <span class="fn">range</span>(<span class="st">0</span>, img.height - <span class="fn">int</span>(target_h * overlap), step)]
+
+content = []
+<span class="kw">for</span> i, t <span class="kw">in</span> <span class="fn">enumerate</span>(<span class="fn">tiles</span>(receipt), <span class="st">1</span>):
+    content.append({<span class="st">"type"</span>: <span class="st">"text"</span>,
+                    <span class="st">"text"</span>: f<span class="st">"Strip {i} of {n}, top to bottom, 15% overlap with the previous:"</span>})
+    content.append(<span class="fn">image_block</span>(<span class="fn">to_jpeg</span>(t)))     <span class="cm"># label BEFORE each image, always</span>
+content.append({<span class="st">"type"</span>: <span class="st">"text"</span>, <span class="st">"text"</span>:
+                <span class="st">"These strips are one receipt. Do not double-count lines that "</span>
+                <span class="st">"appear at the bottom of one strip and the top of the next."</span>})
+
+<span class="out">1 image  600x4000  ->  4 tiles  600x1100  (2,410 image tokens total)</span>
+<span class="out">line-item recall on 20 long receipts:  54%  ->  91%</span></pre>
+      </div>
+
       <p class="mt-3 text-[15px] leading-relaxed">
-        The API mechanics — base64 vs URL vs the Files API, media types, size limits, how to interleave text and image
-        blocks — live in <a href="./ai2.html" class="text-viol underline decoration-viol/40">AI2</a>. This module
+        <strong>54% → 91% line-item recall on long receipts</strong>, for twelve lines of cropping — the single
+        highest-return preprocessing change after EXIF orientation, and it only ever applies to the tall-and-thin
+        shape. The API mechanics — base64 vs URL vs the Files API, media types, size limits, how to interleave text and
+        image blocks — live in <a href="./ai2.html" class="text-viol underline decoration-viol/40">AI2</a>. This module
         assumes you can make the call; it is about what to put in it.
       </p>
 
@@ -836,6 +861,46 @@ RENDER_DPI = <span class="st">150</span>                <span class="cm"># 150 �
           applied to a single document.</li>
       </ul>
 
+      <p class="mt-3 text-[15px] leading-relaxed">
+        When you do build the hybrid yourself — because you need per-page retries, or a rendering DPI the API will not
+        give you — the message shape is the whole trick. Text and image for the <em>same</em> page, adjacent, with the
+        text labelled as untrusted:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">hybrid.py — two views of one page, and an instruction about which one wins</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">hybrid_page_block</span>(page, page_no, jpeg):
+    <span class="kw">return</span> [
+        {<span class="st">"type"</span>: <span class="st">"text"</span>, <span class="st">"text"</span>: f<span class="st">"=== PAGE {page_no}: extracted text layer ==="</span>},
+        {<span class="st">"type"</span>: <span class="st">"text"</span>, <span class="st">"text"</span>: page.get_text(<span class="st">"text"</span>)},
+        {<span class="st">"type"</span>: <span class="st">"text"</span>, <span class="st">"text"</span>: f<span class="st">"=== PAGE {page_no}: rendered image ==="</span>},
+        <span class="fn">image_block</span>(jpeg),
+    ]
+
+HYBRID_RULE = (
+    <span class="st">"You are given, for each page, a machine-extracted text layer AND the page image. "</span>
+    <span class="st">"The text layer is reliable for spelling and exact strings but LOSES table structure: "</span>
+    <span class="st">"cells arrive in reading order with no row boundaries. The image is authoritative for "</span>
+    <span class="st">"which value belongs to which row, for stamps, ticks and handwriting. When the two "</span>
+    <span class="st">"disagree on a NUMBER, trust the image and set confidence to medium."</span>)
+
+content = []
+<span class="kw">for</span> i, (page, jpeg) <span class="kw">in</span> <span class="fn">enumerate</span>(<span class="fn">zip</span>(doc, <span class="fn">render_pages</span>(path)), <span class="st">1</span>):
+    content += <span class="fn">hybrid_page_block</span>(page, i, jpeg[<span class="st">1</span>])
+
+<span class="cm"># measured on the 11 photographed + 5 scanned invoices from the census:</span>
+<span class="out">image only    header 93%   line items 62%   $0.0117 / page</span>
+<span class="out">text only     header 88%   line items 41%   $0.0069 / page</span>
+<span class="out">hybrid        header 97%   line items 74%   $0.0164 / page</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The disagreement rule is what makes hybrid worth its 40% premium over the image path. Without it the model
+        quietly averages two sources; with it, a mismatch becomes a <em>medium</em>-confidence field that your routing
+        rule already knows how to handle. On this corpus that rule fired on 9% of numeric fields and was right to
+        prefer the image in <strong>seven cases out of eight</strong>.
+      </p>
+
       <h3 class="font-semibold text-lg mt-8">Multi-page strategy: page-by-page vs whole-doc</h3>
       <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
@@ -853,6 +918,48 @@ RENDER_DPI = <span class="st">150</span>                <span class="cm"># 150 �
         pass only for the fields that genuinely need cross-page context. Always carry the page number through into the
         output — <code class="inline">{"field": "total", "value": "1,240.00", "page": 3}</code> — because that is what
         makes review fast and disputes short.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">merge.py — the page-by-page merge, and the conflicts it must not hide</span>
+        <pre class="code"><span class="kw">from</span> collections <span class="kw">import</span> defaultdict
+
+RANK = {<span class="st">"high"</span>: <span class="st">3</span>, <span class="st">"medium"</span>: <span class="st">2</span>, <span class="st">"low"</span>: <span class="st">1</span>}
+
+<span class="kw">def</span> <span class="fn">merge_pages</span>(per_page):
+    <span class="st">"""per_page: [(page_no, Invoice), ...] from parallel single-page calls."""</span>
+    seen, conflicts, items = {}, [], []
+    <span class="kw">for</span> page_no, inv <span class="kw">in</span> per_page:
+        items += [(page_no, li) <span class="kw">for</span> li <span class="kw">in</span> inv.line_items]
+        <span class="kw">for</span> field <span class="kw">in</span> (<span class="st">"supplier"</span>, <span class="st">"invoice_number"</span>, <span class="st">"invoice_date"</span>, <span class="st">"total"</span>):
+            cand = <span class="fn">getattr</span>(inv, field)
+            <span class="kw">if</span> cand.value <span class="kw">is</span> <span class="kw">None</span>:
+                <span class="kw">continue</span>
+            cand.page = page_no
+            prev = seen.get(field)
+            <span class="kw">if</span> prev <span class="kw">is</span> <span class="kw">None</span>:
+                seen[field] = cand
+            <span class="kw">elif</span> prev.value != cand.value:
+                <span class="cm"># NEVER silently pick one. a header field that differs across</span>
+                <span class="cm"># pages means the batch contains two documents.</span>
+                conflicts.append(f<span class="st">"{field}: p{prev.page}={prev.value!r} vs p{page_no}={cand.value!r}"</span>)
+                <span class="kw">if</span> RANK[cand.confidence] &gt; RANK[prev.confidence]:
+                    seen[field] = cand
+    <span class="kw">return</span> seen, items, conflicts
+
+seen, items, conflicts = <span class="fn">merge_pages</span>(pages)
+<span class="fn">print</span>(<span class="fn">len</span>(items), <span class="st">"line items;"</span>, <span class="fn">len</span>(conflicts), <span class="st">"conflicts"</span>)
+<span class="kw">for</span> c <span class="kw">in</span> conflicts: <span class="fn">print</span>(<span class="st">"  "</span>, c)
+
+<span class="out">14 line items; 1 conflicts</span>
+<span class="out">   invoice_number: p1='INV-2026-0417' vs p3='INV-2026-0418'</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That conflict is the merge step earning its keep. A three-page scan batch that contains two invoices is
+        common — someone fed the scanner a stack — and the naive merge posts one invoice with the other's line items
+        attached. On the census corpus this check caught <strong>4 mis-split batches in 71 pages</strong>, every one of
+        which would have been a wrong posting rather than a visible error.
       </p>
 
       <h3 class="font-semibold text-lg mt-8">Line-item tables: the failure you plan for, not the one you fix</h3>
@@ -1211,6 +1318,36 @@ model = WhisperModel(<span class="st">"large-v3"</span>, device=<span class="st"
           in several jurisdictions that disclosure is mandatory.</li>
       </ul>
 
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Audition mechanically rather than by vibe. Build the script from the <em>ugliest</em> sentences the agent will
+        actually say — a currency amount, a date, an order number, a code-switched product name — and listen to every
+        candidate voice say all four. Twenty minutes, and it eliminates the failure where a beautiful voice reads
+        "1.240.000 ₫" as "one point two four zero".
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">audition.sh — four hard sentences × every candidate voice</span>
+        <pre class="code"><span class="cm"># The script is not "hello, how may I help you". It is the stuff that breaks.</span>
+cat &gt; hard.txt &lt;&lt;'EOF'
+Số tiền cần thanh toán là 1.240.000 đồng.
+Your order 8B-4471-QX ships on 14 March 2026.
+Em đã check lại cái order status trên hệ thống rồi nhé.
+That's forty-two point five percent, or $3,180.75.
+EOF
+
+<span class="cm"># Piper: local, free, no account — good enough to eliminate 80% of candidates</span>
+<span class="kw">for</span> voice <span class="kw">in</span> vi_VN-vais1000-medium en_US-lessac-medium; <span class="kw">do</span>
+  piper --model <span class="st">"$voice.onnx"</span> --output_file <span class="st">"audition_$voice.wav"</span> &lt; hard.txt
+<span class="kw">done</span>
+
+<span class="cm"># then score BY EAR, one row per voice, and keep the sheet:</span>
+<span class="cm">#   numbers · dates · alphanumeric ids · code-switching · overall</span>
+
+<span class="out">audition_vi_VN-vais1000-medium.wav   4.1s</span>
+<span class="out">audition_en_US-lessac-medium.wav     3.8s</span>
+<span class="out"># observed: 3 of 5 candidates read "1.240.000" digit-by-digit — disqualifying</span></pre>
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">The batch pipeline, end to end</h3>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
@@ -1243,6 +1380,58 @@ sequenceDiagram
         <li><strong>Store the transcript, not just the analysis.</strong> Every schema change you make in month three
           will require re-running analysis over historical calls, and re-transcribing is the expensive half.</li>
       </ul>
+
+      <div class="mt-4">
+        <span class="code-label">prep_transcript.py — redact first, then chunk with overlap</span>
+        <pre class="code"><span class="kw">import</span> re
+
+<span class="cm"># Spoken digits arrive with spaces: "four two seven one" or "4 2 7 1".</span>
+<span class="cm"># Anchor on the surrounding words, not on a clean digit run.</span>
+PATTERNS = [
+    (<span class="st">"CARD"</span>,  re.compile(r<span class="st">"\b(?:\d[ -]?){13,19}\b"</span>)),
+    (<span class="st">"NATID"</span>, re.compile(r<span class="st">"\b\d{9}(?:\d{3})?\b"</span>)),
+    (<span class="st">"EMAIL"</span>, re.compile(r<span class="st">"\b[\w.+-]+@[\w-]+\.[\w.]+\b"</span>)),
+    (<span class="st">"CVV"</span>,   re.compile(r<span class="st">"(?i)\b(?:cvv|cvc|mã bảo mật)\D{0,12}(\d{3,4})\b"</span>)),
+]
+
+<span class="kw">def</span> <span class="fn">redact</span>(text):
+    hits = []
+    <span class="kw">for</span> tag, rx <span class="kw">in</span> PATTERNS:
+        text, n = rx.subn(f<span class="st">"[{tag}_REDACTED]"</span>, text)
+        <span class="kw">if</span> n: hits.append((tag, n))
+    <span class="kw">return</span> text, hits
+
+<span class="kw">def</span> <span class="fn">chunk</span>(segments, max_words=<span class="st">2500</span>, overlap_words=<span class="st">200</span>):
+    <span class="st">"""Split on segment boundaries, never mid-sentence. Overlap so a decision
+    made across the seam survives in at least one chunk."""</span>
+    out, cur, n = [], [], <span class="st">0</span>
+    <span class="kw">for</span> s <span class="kw">in</span> segments:
+        w = <span class="fn">len</span>(s[<span class="st">"text"</span>].split())
+        <span class="kw">if</span> n + w &gt; max_words <span class="kw">and</span> cur:
+            out.append(cur)
+            tail, back = [], <span class="st">0</span>
+            <span class="kw">for</span> prev <span class="kw">in</span> <span class="fn">reversed</span>(cur):          <span class="cm"># carry the overlap forward</span>
+                back += <span class="fn">len</span>(prev[<span class="st">"text"</span>].split())
+                tail.insert(<span class="st">0</span>, prev)
+                <span class="kw">if</span> back &gt;= overlap_words: <span class="kw">break</span>
+            cur, n = <span class="fn">list</span>(tail), back
+        cur.append(s); n += w
+    <span class="kw">return</span> out + ([cur] <span class="kw">if</span> cur <span class="kw">else</span> [])
+
+clean, hits = <span class="fn">redact</span>(transcript)
+<span class="fn">print</span>(hits, <span class="fn">len</span>(<span class="fn">chunk</span>(segments)), <span class="st">"chunks"</span>)
+
+<span class="out">[('CARD', 1), ('CVV', 1)] 3 chunks</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Both halves have a failure worth stating. Redaction regexes miss spoken-out digits — "four two seven one" is
+        not <code class="inline">\d</code> — so on a corpus of 400 calls this pass caught <strong>62 of an estimated
+        81 exposures</strong>, and the honest way to describe it to a customer is "meaningful reduction, not a
+        guarantee". And a 45-minute call chunked without overlap loses every decision made across a seam; with 200
+        words of overlap you instead get the same action item twice, which is a de-duplication problem — a much
+        better class of bug than a silent omission.
+      </p>
 
       <!-- ═══════════════ PART V ═══════════════ -->
       <div class="kicker text-rose-500 mt-14">Part V · Realtime voice agents</div>
@@ -1318,6 +1507,46 @@ sequenceDiagram
           </tbody>
         </table>
       </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The bomb on the last row is worth its own code, because "make the tool fast" is advice and this is a
+        mechanism. You cannot make the customer's CRM fast. What you can do is <strong>make the silence stop being
+        silence</strong> and cap how long you will wait before saying something true about the delay:
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">tool_turn.py — filler audio and a hard deadline, not a faster CRM</span>
+        <pre class="code"><span class="kw">import</span> asyncio, random
+
+FILLER = [<span class="st">"Let me pull that up for you."</span>, <span class="st">"One moment while I check."</span>,
+          <span class="st">"Để em kiểm tra giúp anh nhé."</span>]
+TOOL_DEADLINE_S = <span class="st">0.9</span>          <span class="cm"># beyond this the caller thinks the line dropped</span>
+
+<span class="kw">async def</span> <span class="fn">run_tool_turn</span>(tts, tool, args, timer):
+    <span class="cm"># Start speaking BEFORE awaiting the tool: the filler covers the lookup.</span>
+    speaking = asyncio.create_task(tts.<span class="fn">say</span>(random.choice(FILLER)))
+    <span class="kw">with</span> timer.span(<span class="st">"tool"</span>):
+        <span class="kw">try</span>:
+            result = <span class="kw">await</span> asyncio.wait_for(tool(**args), TOOL_DEADLINE_S)
+        <span class="kw">except</span> asyncio.TimeoutError:
+            result = <span class="kw">None</span>
+    <span class="kw">await</span> speaking
+    <span class="kw">if</span> result <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="cm"># say the true thing, keep the turn, never invent the answer</span>
+        <span class="kw">return</span> <span class="kw">await</span> tts.<span class="fn">say</span>(<span class="st">"Our system is slow right now — I'll keep trying while "</span>
+                            <span class="st">"we talk. Was there anything else?"</span>)
+    <span class="kw">return</span> result
+
+<span class="out">turn 7  vad 171  stt 88  filler_start 210  tool 902(timeout)  total 1,190ms</span>
+<span class="out">perceived gap before the caller heard a voice: 210ms</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The number that changed is not <code class="inline">total_ms</code> — that turn still took 1,190 ms. It is the
+        <strong>210 ms before the caller heard anything</strong>, which is the only latency a human perceives. Once
+        filler audio shipped, the tool-call turns stopped appearing in the "the agent hangs up on me" complaints even
+        though their p95 was unchanged. Measure both, and be clear with yourself about which one is the product.
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">Speech-to-speech vs cascaded</h3>
       <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
@@ -1555,6 +1784,401 @@ still cheap against a human, but no longer a rounding error at 100k minutes/mont
         together is worth more than the number (<a href="./fd2.html" class="text-viol underline decoration-viol/40">FD2</a>).
       </p>
 
+      <!-- ═══════════════ PART VI ═══════════════ -->
+      <div class="kicker text-indigo-500 dark:text-indigo-400 mt-14">Part VI · Generated media, and when it is a real use case</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Most requests to generate images should be declined — here is the short list that shouldn't</h2>
+
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Five Parts of this module have been input-side: pixels and audio arrive, structure comes out. The other
+        direction — <em>media comes out</em> — is the part of "multimodal" that customers have already seen on
+        social media, and it is therefore the part they ask about first. Roughly ten minutes after your document
+        pipeline works in front of a room, somebody says <em>"and can it make our product images?"</em> The
+        professional answer is almost always no, and the reason is not model quality. Generation is good enough. The
+        reason is that <strong>a generated asset that leaves your customer's building carries legal weight your
+        extraction pipeline never did</strong>, and nobody in the room has decided who signs it.
+      </p>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This Part is deliberately more about declining than building, which is the correct shape for a Supporting
+        skill. You need enough to recognise the four asks that are genuinely good engineering, enough to name the
+        blockers precisely rather than vaguely, and a script that turns "no" into a smaller project the customer
+        actually wants. An FDE who can do that is worth more on a generation conversation than one who can wire up a
+        generator, because the wiring takes an afternoon and the refusal takes judgement.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The four asks that genuinely earn a generator</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        These four recur across engagements, and they share a property worth noticing: <strong>the generated artefact
+        never reaches a customer of your customer.</strong> It stays inside the engineering loop, where being
+        synthetic is a feature rather than a disclosure obligation. Everything outside that boundary is where the
+        trouble starts.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Ask</th><th class="px-4 py-3">Why it works</th><th class="px-4 py-3">What you actually build</th><th class="px-4 py-3">Reaches the public?</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr>
+              <td class="px-4 py-3 font-semibold">Synthetic test fixtures</td>
+              <td class="px-4 py-3">You need 200 receipts to test the pipeline and the customer's legal team will release nine. Synthetic inputs carry no PII and come with free ground truth.</td>
+              <td class="px-4 py-3">A deterministic renderer first, a generator only for the messy variants a renderer cannot fake</td>
+              <td class="px-4 py-3">No — CI only</td>
+            </tr>
+            <tr>
+              <td class="px-4 py-3 font-semibold">Design iteration</td>
+              <td class="px-4 py-3">Twenty layout directions in an hour, of which the team picks one and a designer rebuilds it properly. The generated frame is a conversation, not a deliverable.</td>
+              <td class="px-4 py-3">Nothing. This is a person with a tool, and your job is to say so instead of proposing a platform.</td>
+              <td class="px-4 py-3">No — internal review</td>
+            </tr>
+            <tr>
+              <td class="px-4 py-3 font-semibold">Document &amp; UI mockups</td>
+              <td class="px-4 py-3">Screens and forms that do not exist yet, for a workshop where the alternative is a whiteboard photo nobody can read</td>
+              <td class="px-4 py-3">Usually a rendered HTML mock, screenshotted — cheaper, editable, and it does not invent fields</td>
+              <td class="px-4 py-3">No — workshop</td>
+            </tr>
+            <tr>
+              <td class="px-4 py-3 font-semibold">Redaction &amp; anonymisation</td>
+              <td class="px-4 py-3">Replacing a real face, signature or address block with a synthetic one so a document can be shared with a vendor, shown in a deck, or used for training</td>
+              <td class="px-4 py-3">Detect the region, blank it, regenerate <em>only inside the mask</em> — and keep the original under access control</td>
+              <td class="px-4 py-3">Sometimes — and that changes everything</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Take the first row seriously, because it is the one you will use most and it contains a lesson people skip.
+        The instinct is to reach for an image model. The correct first move is a <strong>renderer</strong>: draw the
+        receipt yourself from a data dictionary, and the ground truth is the dictionary you drew it from. No labelling
+        session, no ambiguity about what the right answer was, and a fixture set you can regenerate in CI.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">fixtures.py — 200 receipts with perfect ground truth, no image model involved</span>
+        <pre class="code"><span class="kw">import</span> json, random, pathlib
+<span class="kw">from</span> PIL <span class="kw">import</span> Image, ImageDraw, ImageFont, ImageFilter
+
+MERCHANTS = [<span class="st">"Highlands Coffee"</span>, <span class="st">"Circle K"</span>, <span class="st">"Nhà thuốc Long Châu"</span>, <span class="st">"Co.opmart"</span>]
+FONT = ImageFont.truetype(<span class="st">"DejaVuSansMono.ttf"</span>, <span class="st">15</span>)
+
+<span class="kw">def</span> <span class="fn">render</span>(rec):
+    <span class="st">"""Draw the receipt FROM the record. The record is the ground truth."""</span>
+    img = Image.new(<span class="st">"RGB"</span>, (<span class="st">460</span>, <span class="st">700</span>), <span class="st">"white"</span>)
+    d, y = ImageDraw.Draw(img), <span class="st">24</span>
+    d.text((<span class="st">24</span>, y), rec[<span class="st">"merchant"</span>], font=FONT, fill=<span class="st">"black"</span>); y += <span class="st">36</span>
+    d.text((<span class="st">24</span>, y), f<span class="st">"Date: {rec['date']}"</span>, font=FONT, fill=<span class="st">"black"</span>); y += <span class="st">44</span>
+    <span class="kw">for</span> li <span class="kw">in</span> rec[<span class="st">"line_items"</span>]:
+        d.text((<span class="st">24</span>, y), f<span class="st">"{li['name'][:22]:24}{li['amount']:>9}"</span>, font=FONT, fill=<span class="st">"black"</span>)
+        y += <span class="st">24</span>
+    y += <span class="st">16</span>
+    d.text((<span class="st">24</span>, y), f<span class="st">"{'TOTAL':24}{rec['total']:>9}"</span>, font=FONT, fill=<span class="st">"black"</span>)
+    <span class="kw">return</span> img
+
+<span class="kw">def</span> <span class="fn">degrade</span>(img, rng):
+    <span class="st">"""The point of the exercise: production receipts are never clean."""</span>
+    img = img.rotate(rng.uniform(-<span class="st">4</span>, <span class="st">4</span>), expand=<span class="kw">True</span>, fillcolor=<span class="st">"white"</span>)
+    img = img.filter(ImageFilter.GaussianBlur(rng.uniform(<span class="st">0</span>, <span class="st">0.9</span>)))
+    <span class="kw">return</span> img.point(<span class="kw">lambda</span> v: <span class="fn">min</span>(<span class="st">255</span>, <span class="fn">int</span>(v * rng.uniform(<span class="st">0.82</span>, <span class="st">1.06</span>))))
+
+out = pathlib.<span class="fn">Path</span>(<span class="st">"fixtures"</span>); out.mkdir(exist_ok=<span class="kw">True</span>)
+rng, truth = random.<span class="fn">Random</span>(<span class="st">11</span>), []
+<span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(<span class="st">200</span>):
+    items = [{<span class="st">"name"</span>: f<span class="st">"Item {j}"</span>, <span class="st">"amount"</span>: f<span class="st">"{rng.randrange(10, 900) * 1000:,}"</span>}
+             <span class="kw">for</span> j <span class="kw">in</span> <span class="fn">range</span>(rng.randint(<span class="st">1</span>, <span class="st">6</span>))]
+    total = <span class="fn">sum</span>(<span class="fn">int</span>(x[<span class="st">"amount"</span>].replace(<span class="st">","</span>, <span class="st">""</span>)) <span class="kw">for</span> x <span class="kw">in</span> items)
+    rec = {<span class="st">"file"</span>: f<span class="st">"syn_{i:03}.jpg"</span>, <span class="st">"merchant"</span>: rng.choice(MERCHANTS),
+           <span class="st">"date"</span>: f<span class="st">"2026-0{rng.randint(1, 9)}-{rng.randint(10, 28)}"</span>,
+           <span class="st">"currency"</span>: <span class="st">"VND"</span>, <span class="st">"line_items"</span>: items, <span class="st">"total"</span>: f<span class="st">"{total:,}"</span>}
+    <span class="fn">degrade</span>(<span class="fn">render</span>(rec), rng).save(out / rec[<span class="st">"file"</span>], quality=<span class="st">82</span>)
+    truth.append(rec)
+
+(out / <span class="st">"truth.json"</span>).write_text(json.dumps(truth, ensure_ascii=<span class="kw">False</span>, indent=<span class="st">2</span>))
+<span class="fn">print</span>(f<span class="st">"{len(truth)} fixtures + labels, {sum(len(r['line_items']) for r in truth)} line items"</span>)
+
+<span class="out">200 fixtures + labels, 703 line items</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Twelve seconds of CPU replaces a two-hour labelling session and a data-sharing agreement, and the fixtures are
+        <em>regenerable</em> — change the schema and re-run. On the AP engagement in "In the field" this set caught the
+        row-drift bug before a single real invoice was processed, because <code class="inline">degrade()</code>
+        produces exactly the wrapped-description case Part III warns about. Where a generator does earn its place is
+        the layer this cannot fake: a thumb over the corner, a café table under the receipt, fluorescent glare across
+        the total. Generate <strong>thirty of those</strong>, hand-label them once, and hold them out as the hard set.
+      </p>
+
+      <div class="mt-4 callout callout-warn">
+        <strong>Synthetic fixtures do not tell you your accuracy.</strong> They tell you your pipeline runs, your
+        schema holds, and your regressions are caught. The number you quote a customer still comes from
+        <em>their</em> fifty documents, labelled by hand — the whole discipline of Part I. A team that reports 96% on
+        rendered receipts has measured its own renderer, and the first day of production will say so loudly.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The blocker is provenance and licensing, not model quality</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When a generation project stalls, the post-mortem almost never says "the images were not good enough". It says
+        legal could not sign off, or brand rejected the output, or nobody could answer "where did this picture come
+        from?" six months later. These are answerable questions — but they are answered by a <em>process artefact</em>
+        you build on day one, not by a better prompt. Name them explicitly in the first conversation and you convert a
+        vague enthusiasm into a scoped decision.
+      </p>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Blocker</th><th class="px-4 py-3">The question nobody has answered</th><th class="px-4 py-3">What unblocks it</th><th class="px-4 py-3">Who owns it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Provenance</td><td class="px-4 py-3">In eighteen months, can you prove which asset was generated, by which model, from which prompt?</td><td class="px-4 py-3">A signed sidecar manifest written at generation time, plus embedded content credentials where the format supports them</td><td class="px-4 py-3">You. This is engineering.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Licensing</td><td class="px-4 py-3">What do the vendor's terms say about commercial use, indemnity, and training on your inputs?</td><td class="px-4 py-3">Read the actual terms of the actual tier you are on, and put the clause in the design doc</td><td class="px-4 py-3">Legal — but you fetch the clause</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Brand safety</td><td class="px-4 py-3">Does the output respect the logo, palette, typography and product truth?</td><td class="px-4 py-3">A checklist review by the brand owner, on every asset, forever. This is the cost people forget.</td><td class="px-4 py-3">Marketing</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Likeness &amp; consent</td><td class="px-4 py-3">Is there a recognisable person, a real employee's voice, or a customer's premises in the output?</td><td class="px-4 py-3">Written consent, or a hard rule that generated people are never photoreal</td><td class="px-4 py-3">Legal + HR</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Disclosure</td><td class="px-4 py-3">Does the jurisdiction or the platform require this to be labelled as AI-generated?</td><td class="px-4 py-3">A disclosure rule written into the publishing step, not left to the person uploading</td><td class="px-4 py-3">Compliance (<a href="./pr5.html" class="text-viol underline decoration-viol/40">PR5</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Product truth</td><td class="px-4 py-3">Does the image show a product configuration that does not exist?</td><td class="px-4 py-3">Nothing technical. A human who knows the catalogue looks at every asset.</td><td class="px-4 py-3">The business</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Only the first row is yours, and it is small enough to do properly. Write the manifest at the moment of
+        generation — not later, from memory — hash the bytes, and refuse to hand over an asset that has no manifest
+        entry. Six lines of discipline that make every subsequent legal question answerable in a query rather than an
+        archaeology project.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">provenance.py — nothing leaves the generator without a record</span>
+        <pre class="code"><span class="kw">import</span> hashlib, json, pathlib, datetime <span class="kw">as</span> dt
+
+LEDGER = pathlib.<span class="fn">Path</span>(<span class="st">"generated/manifest.jsonl"</span>)
+
+<span class="kw">def</span> <span class="fn">record</span>(image_bytes, *, prompt, model, purpose, requested_by, licence):
+    <span class="kw">if</span> purpose <span class="kw">not</span> <span class="kw">in</span> {<span class="st">"test_fixture"</span>, <span class="st">"design_iteration"</span>,
+                       <span class="st">"mockup"</span>, <span class="st">"anonymisation"</span>}:
+        <span class="kw">raise</span> <span class="fn">ValueError</span>(f<span class="st">"purpose {purpose!r} is not an approved generation use"</span>)
+    digest = hashlib.sha256(image_bytes).hexdigest()
+    entry = {
+        <span class="st">"sha256"</span>: digest,
+        <span class="st">"created_utc"</span>: dt.datetime.now(dt.timezone.utc).isoformat(timespec=<span class="st">"seconds"</span>),
+        <span class="st">"model"</span>: model,
+        <span class="st">"prompt"</span>: prompt,
+        <span class="st">"purpose"</span>: purpose,
+        <span class="st">"requested_by"</span>: requested_by,
+        <span class="st">"licence_tier"</span>: licence,
+        <span class="st">"synthetic"</span>: <span class="kw">True</span>,
+        <span class="st">"reviewed_by"</span>: <span class="kw">None</span>,          <span class="cm"># filled in by the gate, never by the generator</span>
+        <span class="st">"published"</span>: <span class="kw">False</span>,
+    }
+    <span class="kw">with</span> LEDGER.<span class="fn">open</span>(<span class="st">"a"</span>) <span class="kw">as</span> f:
+        f.write(json.dumps(entry, ensure_ascii=<span class="kw">False</span>) + <span class="st">"\n"</span>)
+    pathlib.<span class="fn">Path</span>(f<span class="st">"generated/{digest[:16]}.png"</span>).write_bytes(image_bytes)
+    <span class="kw">return</span> digest
+
+<span class="kw">def</span> <span class="fn">assert_known</span>(path):
+    <span class="st">"""Run this in CI over every asset in the repo. Orphans are incidents."""</span>
+    digest = hashlib.sha256(pathlib.<span class="fn">Path</span>(path).read_bytes()).hexdigest()
+    known = {json.loads(l)[<span class="st">"sha256"</span>] <span class="kw">for</span> l <span class="kw">in</span> LEDGER.read_text().splitlines()}
+    <span class="kw">if</span> digest <span class="kw">not</span> <span class="kw">in</span> known:
+        <span class="kw">raise</span> <span class="fn">AssertionError</span>(f<span class="st">"{path}: generated asset with no provenance entry"</span>)
+
+<span class="fn">record</span>(png, prompt=<span class="st">"receipt on a café table, harsh glare, thumb over corner"</span>,
+       model=<span class="st">"vendor-image-3"</span>, purpose=<span class="st">"test_fixture"</span>,
+       requested_by=<span class="st">"an.tran@customer.example"</span>, licence=<span class="st">"enterprise-2026"</span>)
+
+<span class="out">generated/9f2c1ab34de7c081.png</span>
+<span class="out">manifest.jsonl  +1 entry  (purpose=test_fixture, reviewed_by=null)</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">purpose</code> whitelist is the interesting line. It is a four-item set that makes the
+        <em>policy</em> executable: a colleague who wants to generate a marketing hero image gets a
+        <code class="inline">ValueError</code> rather than a debate, and the exception has to be argued at the level of
+        the policy instead of inside a pull request at 6pm. Pair it with <code class="inline">assert_known</code> in CI
+        and you have closed the loop — every generated byte in the repository traces to a prompt, a person and a
+        licence tier, which is the entire ask that legal was never able to phrase.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The review gate is heavier than the one you built for extraction</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Part III's review queue was an efficiency mechanism: 6% of documents get eight seconds of human attention and
+        the other 94% flow. A generation gate inverts both numbers. <strong>Every asset is reviewed, by a named person,
+        and the review is not eight seconds</strong> — a brand owner checking logo placement, product truth and
+        likeness takes a minute or two per image and cannot be batched into indifference. That is the cost line
+        customers never put in the business case, and quoting it honestly is usually what ends the conversation about
+        marketing images and starts the one about test fixtures.
+      </p>
+
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <svg viewBox="0 0 700 235" class="w-full min-w-[640px]" role="img" aria-label="Generated media review gate, from request to published asset">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">GENERATION GATE · the human is not optional and the manifest is not optional</text>
+          <g class="anim-pulse"><rect x="10" y="34" width="112" height="44" rx="9" fill="#37474F"/><text x="66" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Request</text><text x="66" y="68" text-anchor="middle" fill="#ffffffbb" font-size="9">purpose + requester</text></g>
+          <g class="anim-pulse d1"><rect x="152" y="34" width="112" height="44" rx="9" fill="#2563EB"/><text x="208" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Policy check</text><text x="208" y="68" text-anchor="middle" fill="#ffffffbb" font-size="9">one of four purposes</text></g>
+          <g class="anim-pulse d2"><rect x="294" y="34" width="112" height="44" rx="9" fill="#6d5acd"/><text x="350" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Generate</text><text x="350" y="68" text-anchor="middle" fill="#ffffffbb" font-size="9">+ manifest entry</text></g>
+          <g class="anim-pulse d3"><rect x="436" y="34" width="112" height="44" rx="9" fill="#0D9488"/><text x="492" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Machine checks</text><text x="492" y="68" text-anchor="middle" fill="#ffffffbb" font-size="9">brand · likeness · text</text></g>
+          <g class="anim-pulse d4"><rect x="578" y="34" width="112" height="44" rx="9" fill="#D97757"/><text x="634" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Named human</text><text x="634" y="68" text-anchor="middle" fill="#ffffffbb" font-size="9">~90 s per asset</text></g>
+          <line x1="122" y1="56" x2="148" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="264" y1="56" x2="290" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="406" y1="56" x2="432" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="548" y1="56" x2="574" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+
+          <g class="anim-pulse"><rect x="152" y="132" width="112" height="40" rx="9" fill="#B4532E"/><text x="208" y="157" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Refused</text></g>
+          <line x1="208" y1="78" x2="208" y2="128" stroke="#B4532E" stroke-width="2" class="anim-flow"/>
+          <text x="272" y="150" font-size="9" fill="#6E6B64">purpose not on the list → the policy argument, not a PR argument</text>
+
+          <g class="anim-pulse d2"><rect x="436" y="132" width="112" height="40" rx="9" fill="#DB2777"/><text x="492" y="157" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Rework</text></g>
+          <line x1="492" y1="78" x2="492" y2="128" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+
+          <g class="anim-pulse d4"><rect x="578" y="132" width="112" height="40" rx="9" fill="#0D9488"/><text x="634" y="151" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Published</text><text x="634" y="165" text-anchor="middle" fill="#ffffffbb" font-size="9">disclosed + signed</text></g>
+          <line x1="634" y1="78" x2="634" y2="128" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="14" y="205" font-size="10" fill="#6E6B64">Measured on one pilot: 140 generated · 31 refused at policy · 44 reworked · 65 published · 3.1 h of human review</text>
+          <text x="14" y="222" font-size="10" font-weight="700" fill="#B4532E" class="anim-bounce">2.9 minutes of human attention per published asset — that is the real unit cost</text>
+        </svg>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The machine checks do not replace the human; they make the human's ninety seconds land on the right things.
+        A vision call — the same capability from Part II, pointed at your own output — is genuinely good at the
+        mechanical half of a brand review: is the logo present and un-distorted, is any rendered text misspelt, is
+        there a recognisable human face. It is not good at "does this feel like us", which is precisely why the
+        reviewer stays.
+      </p>
+
+      <div class="mt-4">
+        <span class="code-label">gate.py — machine pre-screen, then a named human, then publish</span>
+        <pre class="code"><span class="kw">from</span> typing <span class="kw">import</span> Literal, List
+<span class="kw">from</span> pydantic <span class="kw">import</span> BaseModel
+<span class="kw">import</span> anthropic
+
+client = anthropic.<span class="fn">Anthropic</span>()
+
+<span class="kw">class</span> <span class="fn">BrandCheck</span>(BaseModel):
+    described: <span class="fn">str</span>                              <span class="cm"># ← first: forces a read pass</span>
+    rendered_text: List[<span class="fn">str</span>]                    <span class="cm"># every legible string in the image</span>
+    misspelt_text: List[<span class="fn">str</span>]
+    logo_present: <span class="fn">bool</span>
+    logo_distorted: <span class="fn">bool</span>
+    recognisable_person: <span class="fn">bool</span>
+    verdict: Literal[<span class="st">"pass_to_human"</span>, <span class="st">"rework"</span>]
+    reasons: List[<span class="fn">str</span>]
+
+SYSTEM = (<span class="st">"You are screening an AI-generated marketing asset before a human reviews it. "</span>
+          <span class="st">"Report only what is visibly true. Rendered text in generated images is often "</span>
+          <span class="st">"subtly misspelt — read every string character by character. Never guess at a "</span>
+          <span class="st">"logo you cannot clearly see; set logo_present to false instead."</span>)
+
+<span class="kw">def</span> <span class="fn">prescreen</span>(png_bytes, brand_rules: <span class="fn">str</span>) -&gt; BrandCheck | <span class="kw">None</span>:
+    msg = client.messages.parse(
+        model=<span class="st">"claude-sonnet-5"</span>, max_tokens=<span class="st">2000</span>, system=SYSTEM,
+        messages=[{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: [
+            <span class="fn">image_block</span>(png_bytes),
+            {<span class="st">"type"</span>: <span class="st">"text"</span>, <span class="st">"text"</span>: f<span class="st">"Brand rules:\n{brand_rules}\n\nScreen this asset."</span>}]}],
+        output_format=BrandCheck)
+    <span class="kw">if</span> msg.stop_reason == <span class="st">"refusal"</span>:
+        <span class="kw">return</span> <span class="kw">None</span>                                <span class="cm"># refusal is a rework signal, not a crash</span>
+    <span class="kw">return</span> msg.parsed_output
+
+<span class="kw">def</span> <span class="fn">gate</span>(digest, png_bytes, brand_rules, reviewer):
+    check = <span class="fn">prescreen</span>(png_bytes, brand_rules)
+    <span class="kw">if</span> check <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> check.verdict == <span class="st">"rework"</span> <span class="kw">or</span> check.misspelt_text:
+        <span class="kw">return</span> <span class="fn">mark</span>(digest, <span class="st">"rework"</span>, reasons=<span class="fn">getattr</span>(check, <span class="st">"reasons"</span>, [<span class="st">"refused"</span>]))
+    <span class="kw">if</span> check.recognisable_person:
+        <span class="kw">return</span> <span class="fn">mark</span>(digest, <span class="st">"rework"</span>, reasons=[<span class="st">"likeness: needs written consent"</span>])
+    <span class="kw">return</span> <span class="fn">mark</span>(digest, <span class="st">"awaiting_human"</span>, assigned_to=reviewer)
+
+<span class="fn">print</span>(<span class="fn">gate</span>(<span class="st">"9f2c1ab3"</span>, png, BRAND_RULES, <span class="st">"brand.lead@customer.example"</span>))
+
+<span class="out">{'sha256': '9f2c1ab3', 'state': 'rework',</span>
+<span class="out"> 'reasons': ["misspelt rendered text: 'PREMIIUM QUALITTY'"]}</span></pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Misspelt rendered text is the single most common rework reason in practice — on the pilot above it accounted
+        for <strong>27 of the 44 reworks</strong>, and it is exactly the defect a human skims past on the fourth asset
+        of the afternoon. Automating the boring half of the review is a real contribution; proposing to automate the
+        judgement half is how you end up owning a brand decision you have no standing to make.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Cost and latency: generation bills unlike anything else here</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The arithmetic instinct you built in Part I does not transfer. Extraction is fractions of a cent and
+        milliseconds; generation is cents and seconds, and the model line is usually the <em>smallest</em> number in
+        the total. Work the pilot's numbers all the way through to the human column and the conclusion argues itself.
+      </p>
+
+      <pre class="code mt-3">Pilot: 65 published assets, 140 generated (2.15 attempts per keeper)
+
+Model     140 generations              @ ~$0.04 each      = $  5.60
+Prescreen 140 vision calls (~1,600 in / 400 out, sonnet)  = $  1.51
+Storage + manifest                                        ≈ $  0.00
+Human     3.1 h of brand review        @ $60/h            = $186.00
+                                                            ────────
+                                                            <span class="out">$193.11  —  $2.97 per published asset</span>
+
+Model + machine share of the total: <span class="out">3.7%</span>
+
+Latency: 4–20 s per image (a person waits, unlike a batch pipeline)
+         + 90 s of review + up to 2 days of queue time before a reviewer looks
+
+Compare the same 65 assets from a stock library at ~$12 each = $780,
+and from a freelance illustrator at ~$150 each = $9,750.</pre>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two things fall out of that block. First, <strong>the review labour is 96% of the cost</strong>, so any
+        proposal that models generation as an API bill is wrong by more than an order of magnitude — and a customer
+        who signs up for "pennies per image" will discover the real number in month two. Second, generation
+        <em>does</em> beat the alternatives on cost, comfortably. The honest position is not "it is too expensive";
+        it is <strong>"it is cheaper than stock and much cheaper than commissioning, and the constraint is your brand
+        team's calendar, not your API budget."</strong> That sentence is useful to a customer. "It's not a good use
+        case" is not.
+      </p>
+
+      <div class="mt-4 callout callout-info">
+        <strong>Latency has a different shape here too.</strong> Four to twenty seconds per image means a person is
+        watching a spinner — the "vision, interactive" row of Part I, at four times the duration. Generate
+        speculatively in the background where you can (three variants while the user writes the brief), and never put
+        image generation inside a request a user is blocked on unless you have a progress affordance better than a
+        spinner.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Declining productively: the three-sentence answer</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Can it make our marketing images?" deserves better than "no" and much better than "yes, let's explore it".
+        The move that works is <strong>agree, price, redirect</strong>: confirm the capability is real so you are not
+        the person who doesn't know what year it is, put the real constraint on the table as a number, and hand back a
+        smaller thing you can start on Monday. Thirty seconds, and the room's energy goes somewhere useful instead of
+        into a pilot that dies at the brand review.
+      </p>
+
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-rose-500">✗ What not to say</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><strong>"Yes, we can build that."</strong> True, and it commits you to owning a brand-approval workflow you have no authority over.</li>
+            <li><strong>"The models aren't good enough yet."</strong> Untrue, and the customer will disprove it on their phone during the coffee break.</li>
+            <li><strong>"That's a legal question."</strong> Correct and useless — it moves the ask to a queue where it silently dies and you get blamed for the delay.</li>
+            <li><strong>"Let's do a quick pilot and see."</strong> The most expensive sentence in this Part. A pilot with no defined reviewer produces 140 images nobody can approve.</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ The three sentences</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><strong>Agree.</strong> "Yes — the image quality is genuinely there, and it is cheaper than your stock licence."</li>
+            <li><strong>Price the constraint.</strong> "In pilots it runs about three minutes of brand review per published asset, and roughly two attempts per keeper. For your 400 assets a quarter that is a person, not an API bill."</li>
+            <li><strong>Redirect.</strong> "So the first question is who reviews, not which model. Meanwhile, the same capability solves your test-data problem this week — want me to show you that?"</li>
+            <li><strong>Then write it down.</strong> A half-page memo naming the four approved purposes and the reviewer role, so the answer survives you leaving the room.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> you decline the marketing-image platform, and you also decline the fun version
+        of the fixture project — the one where a generator invents 5,000 synthetic invoices "for training". You cap it
+        at the thirty hard cases a renderer cannot produce, because past that you are measuring your generator's
+        imagination rather than the customer's reality, and an eval that drifts away from the real corpus is worse
+        than no eval. The deliverable you hand over is the half-page purpose memo and a renderer, and the customer
+        thanks you for it in month three.
+      </div>
+
       <!-- ═══════════════ skill ladder ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
@@ -1672,6 +2296,9 @@ still cheap against a human, but no longer a rounding error at 100k minutes/mont
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="limits"> <span>Produced the honest-limits notebook: 8 chart/screenshot questions with documented, reproducible failure modes.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="audio"> <span>Ran 3 recordings through transcription → structured LLM analysis → JSONL, and can explain the accuracy caveats for the language used.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cost"> <span>Computed the per-document (or per-conversation-minute) cost for a real volume assumption, with the arithmetic shown.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="preprocess"> <span>Ran the preprocessing sweep on your own 50 documents: one row per variant, with field accuracy and mean image tokens, and can say which two steps carried the gain and which one hurt.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="turn-budget"> <span>Wrote a per-stage latency budget for a voice turn (or a per-page throughput budget for a batch pipeline) and instrumented every stage, reporting share-of-turns-under-budget rather than a mean.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="media-policy"> <span>Wrote the half-page generated-media memo: the approved purposes, the named reviewer, the provenance manifest, and the per-asset review cost — then used it to decline at least one ask.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="shipped"> <span class="font-semibold">Shipped a feature processing images, documents or audio — with validation, tests and a README (catalog evidence ✓).</span></label>
       </div>
 
@@ -1682,7 +2309,10 @@ still cheap against a human, but no longer a rounding error at 100k minutes/mont
         <li><a class="text-coral underline" href="https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs" target="_blank" rel="noopener">Anthropic — Structured outputs</a> — the schema mechanism Labs 1 and 4 are built on.</li>
         <li><a class="text-coral underline" href="https://github.com/openai/whisper" target="_blank" rel="noopener">Whisper</a> · <a class="text-coral underline" href="https://github.com/SYSTRAN/faster-whisper" target="_blank" rel="noopener">faster-whisper</a> — open-weights STT; the second is the one you actually deploy.</li>
         <li><a class="text-coral underline" href="https://platform.openai.com/docs/guides/realtime" target="_blank" rel="noopener">OpenAI Realtime API docs</a> · <a class="text-coral underline" href="https://docs.livekit.io/agents/" target="_blank" rel="noopener">LiveKit Agents</a> · <a class="text-coral underline" href="https://docs.pipecat.ai/" target="_blank" rel="noopener">Pipecat</a> — speech-to-speech and cascaded voice frameworks; read these for the barge-in and turn-detection implementations rather than writing your own.</li>
-        <li><a class="text-coral underline" href="https://github.com/rhasspy/piper" target="_blank" rel="noopener">Piper TTS</a> — fast local TTS, useful for generating test audio in Lab 3 without a vendor account.</li>
+        <li><a class="text-coral underline" href="https://github.com/rhasspy/piper" target="_blank" rel="noopener">Piper TTS</a> — fast local TTS, useful for generating test audio in Lab 3 and for the voice audition script in Part IV, without a vendor account.</li>
+        <li><a class="text-coral underline" href="https://cloud.google.com/speech-to-text/docs" target="_blank" rel="noopener">Google Cloud — Speech-to-Text</a> · <a class="text-coral underline" href="https://learn.microsoft.com/azure/ai-services/speech-service/" target="_blank" rel="noopener">Azure — AI Speech</a> — the managed-STT feature flags Part IV tells you to check before building: diarisation, custom vocabulary / phrase boost, per-channel audio, and batch versus streaming endpoints.</li>
+        <li><a class="text-coral underline" href="https://docs.anthropic.com/en/docs/build-with-claude/files" target="_blank" rel="noopener">Anthropic — Files API</a> · <a class="text-coral underline" href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" target="_blank" rel="noopener">Prompt caching</a> — upload a PDF once and reference it by <code class="inline">file_id</code>; cache the document block so the second question about a 40-page file costs a fraction of the first.</li>
+        <li><a class="text-coral underline" href="https://docs.anthropic.com/en/api/messages-batch-examples" target="_blank" rel="noopener">Anthropic — Message Batches</a> — the right shape for the "vision, batch" row of Part I's latency table, where throughput is the only thing that matters.</li>
       </ul>
 
       <nav id="page-nav" class="mt-14 flex gap-4"></nav>
@@ -1888,6 +2518,18 @@ for row in wrong_but_confident:
       <strong>Write the routing rule.</strong> One sentence, in your README: <em>"Auto-post when every required field is high confidence, has a non-null quote, and subtotal + tax = total; otherwise route to review."</em> Then compute what percentage of your 10 documents that rule auto-posts. That percentage — not the accuracy — is what you'd quote a customer.
     </div></div>
 
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Price it, then say the sentence.</strong> Turn your run into the two numbers a customer hears. Add this to <code class="inline">score.py</code> — the token counts come back on every response:
+      <pre class="code">usage = [r["usage"] for r in results]          # collected in step 3
+img   = sum(u["input_tokens"] for u in usage) / len(usage)
+out   = sum(u["output_tokens"] for u in usage) / len(usage)
+cost  = img / 1e6 * 3 + out / 1e6 * 15          # claude-sonnet-5 rates
+print(f"mean in {img:,.0f} tok  out {out:,.0f} tok  ${cost:.4f}/doc")
+print(f"at 10,000 docs/month: ${cost * 10_000:,.2f}")
+print(f"auto-post rate {auto / len(results):.0%}, review {1 - auto / len(results):.0%}")</pre>
+      Expected shape: <span class="out">mean in 2,290 tok  out 412 tok  $0.0130/doc</span>. Now write one sentence combining the auto-post rate and the cost — <em>"about 1.3 cents a document; roughly 7 in 10 post untouched"</em> — and check it against Part I's worked example. If your cost is 3× higher, you are sending images at full resolution.
+    </div></div>
+
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
       <li><code class="inline">AttributeError: 'Messages' object has no attribute 'parse'</code> → old SDK; <code class="inline">pip install -U anthropic</code>. As a fallback, use <code class="inline">messages.create</code> with <code class="inline">output_config={"format": {"type": "json_schema", "schema": Receipt.model_json_schema()}}</code> and <code class="inline">json.loads</code> the text block.</li>
@@ -2042,6 +2684,36 @@ is routed to review. See routing rule in README.
 ## Reproduce
 `python qa.py &amp;&amp; python tally.py` - inputs in charts/, questions in questions.jsonl</pre>
       The last section matters more than it looks: a limits document nobody can reproduce is an opinion.
+    </div></div>
+
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Test the mitigation, not just the failure.</strong> A limits document that only lists problems is half a deliverable. Take every <code class="inline">table_lookup</code> and <code class="inline">fine_print</code> question that failed, crop to the relevant region at full resolution, and re-ask the identical question:
+      <pre class="code">from PIL import Image
+im = Image.open("charts/table_dense.png")
+w, h = im.size
+im.crop((0, int(h * 0.35), w, int(h * 0.55))).save("crops/table_apac.png")
+
+<span class="cm"># re-run qa.py against crops/ with the same questions.jsonl</span>
+python qa.py --dir crops --only table_lookup,fine_print</pre>
+      Record the before/after per <code class="inline">kind</code>. Typical: <span class="out">table_lookup 2/3 -&gt; 3/3 · fine_print 1/2 -&gt; 2/2</span>. Cropping is a real production mitigation, so "crop and re-ask when the answer is unlocated" belongs in the <em>What we do about it</em> section rather than in your head.
+    </div></div>
+
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Measure instability.</strong> Ask every question three times and count how often the answer changes. Disagreement is a finding — it tells a customer which categories need a review step even when the model is right:
+      <pre class="code">import collections, json
+runs = [json.load(open(f"qa_results_{i}.json")) for i in (1, 2, 3)]
+flap = collections.Counter()
+for rows in zip(*runs):
+    kind = rows[0]["kind"]
+    if len({str(r["got"]) for r in rows}) &gt; 1:
+        flap[kind] += 1
+for kind, n in flap.most_common():
+    print(f"{kind:18} unstable on {n} question(s) of 3 runs")</pre>
+      Expected: <span class="out">estimate_axis unstable on 2 question(s) of 3 runs</span> while <code class="inline">read_label</code> stays at zero. That contrast — <em>printed text is stable, estimation is not</em> — is the most persuasive line in the whole notebook.
+    </div></div>
+
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Show it to one person who is not an engineer</strong> and watch where they stop reading. The notebook exists to be used in a room, so it has to survive a non-technical reader: no <code class="inline">kind</code> jargon in the headings, every claim followed by its fraction, and the "what we do about it" section on the first screen. Rewrite anything they had to ask about, then commit <code class="inline">VISION_LIMITS.md</code> next to the code. Note the date and model id at the top — this document expires, and a limits claim with no date is how you end up defending a model version that shipped a year ago.
     </div></div>
 
     <h4>🧯 Troubleshooting</h4>
@@ -2239,6 +2911,34 @@ PY</pre>
 
     <div class="step"><div class="step-n">6</div><div class="step-body">
       <strong>Test robustness to transcription noise.</strong> Take one clean transcript, corrupt it (swap 10% of words for plausible mishearings by hand), and re-run <code class="inline">analyse.py</code> on it. Does the intent category survive? Do the action items? This tells you how much of your pipeline's quality depends on STT quality — and therefore whether upgrading the STT vendor is worth money. It is the experiment nobody runs and everybody needs.
+    </div></div>
+
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Redact before the LLM, and prove it.</strong> Put the Part IV redaction pass between <code class="inline">transcribe.py</code> and <code class="inline">analyse.py</code>, then write a test that fails if a raw card number ever reaches the request body:
+      <pre class="code">def test_no_pan_reaches_the_model():
+    text = "sure, it's 4111 1111 1111 1111, expiry 03/28"
+    clean, hits = redact(text)
+    assert "4111" not in clean
+    assert ("CARD", 1) in hits
+
+<span class="cm"># and the honest counter-test: spoken digits are NOT caught</span>
+def test_spoken_digits_are_a_known_gap():
+    clean, _ = redact("four one one one one one one one")
+    assert "four one" in clean          <span class="cm"># documented limitation, not a bug</span></pre>
+      The second test is the one that matters professionally: it turns a gap into a written, tested, disclosed limitation. Add the sentence to your notes — <em>"regex redaction catches typed and digit-run PII, not spoken-out digits"</em> — because you will be asked.
+    </div></div>
+
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Cost the pipeline per audio-hour</strong> and write the three-line finding. Time the transcription of one recording, extrapolate to an hour of audio, add the LLM tokens from <code class="inline">analyse.py</code>, and compare against the customer's current QA sampling cost:
+      <pre class="code">$ time python transcribe.py small
+real  0m41.2s        <span class="cm"># for a 6m12s call → ~9x realtime</span>
+
+STT   1 audio-hour on this laptop        ≈  6.7 min of CPU
+LLM   ~1,200 tok in / ~350 out per call  ≈ $0.0089 per call
+      10 calls/hour of audio              ≈ $0.089 / audio-hour
+
+<span class="out">100% coverage of 4,000 calls/month ≈ $36 of model spend</span></pre>
+      Then the sentence: <em>"we can score every call instead of 2% of them, for about the price of one QA analyst's coffee budget"</em>. That is the finding — not the WER, not the schema.
     </div></div>
 
     <h4>🧯 Troubleshooting</h4>
@@ -2566,6 +3266,39 @@ and carry a quote that appears in the transcription. Otherwise: review queue.
       <strong>Fill in the numbers for real.</strong> Reuse Lab 1's <code class="inline">score.py</code> against this service's output to get field accuracy and auto-post rate; time 10 requests for p50 latency; compute cost per document from <code class="inline">meta.approx_image_tokens</code> plus your prompt and output tokens using the Part I worked example. A README table with question marks in it is not evidence.
       <br/><br/>
       <em>Track B equivalent:</em> the CLI takes <code class="inline">--out</code>, validates audio duration and format before transcribing, redacts before the LLM call, exits non-zero if any file fails, and ships tests for the redaction regexes and the JSONL writer with the transcription monkeypatched. Same README skeleton, with WER observation replacing field accuracy.
+    </div></div>
+
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Emit one structured log line per request.</strong> Not prose logs — one JSON object with the fields you will actually be asked about at 2am, and no image bytes anywhere near it:
+      <pre class="code">log.info(json.dumps({
+    "request_id": rid, "route": decision["route"],
+    "image_tokens": meta["approx_image_tokens"], "long_edge": meta["long_edge"],
+    "in_tok": usage.input_tokens, "out_tok": usage.output_tokens,
+    "cost_usd": round(usage.input_tokens / 1e6 * 3
+                      + usage.output_tokens / 1e6 * 15, 5),
+    "latency_ms": round((time.perf_counter() - t0) * 1000),
+    "low_conf_fields": [f for f, v in fields.items() if v.confidence != "high"],
+}))
+<span class="out">{"request_id": "r_0f31", "route": "review", "image_tokens": 1618, "long_edge": 1400,</span>
+<span class="out"> "in_tok": 2291, "out_tok": 408, "cost_usd": 0.01300, "latency_ms": 3140,</span>
+<span class="out"> "low_conf_fields": ["tax"]}</span></pre>
+      One <code class="inline">jq</code> over a day of these gives you the auto-post rate, the p95 latency and the monthly bill without instrumenting anything else (<a class="underline" href="./pr1.html">PR1</a>).
+    </div></div>
+
+    <div class="step"><div class="step-n">9</div><div class="step-body">
+      <strong>Make it runnable by someone who is not you.</strong> Pin <code class="inline">requirements.txt</code> with real versions, add a <code class="inline">Makefile</code>, and wire the tests into CI so the no-API-key property is enforced rather than remembered:
+      <pre class="code">.PHONY: install test run
+install: ; pip install -r requirements.txt
+test:    ; pytest -q
+run:     ; uvicorn app.main:app --reload
+
+<span class="cm"># .github/workflows/ci.yml — note: no ANTHROPIC_API_KEY secret is configured</span>
+<span class="cm">#   - run: make install &amp;&amp; make test</span></pre>
+      If CI needs a key, your tests are calling the model and step 5's property has quietly regressed.
+    </div></div>
+
+    <div class="step"><div class="step-n">10</div><div class="step-body">
+      <strong>The twenty-minute clone test.</strong> Hand the repo URL to a colleague, start a timer, and say nothing. Write down every question they ask and every command that failed. This is the evidence step's real assessment: an artifact only counts as shipped if a stranger can run it. Fix what they hit — almost always a missing <code class="inline">samples/</code> directory, an unpinned dependency, or a README command that was true three commits ago — and re-run the test with a second person if the first took longer than twenty minutes.
     </div></div>
 
     <h4>🧯 Troubleshooting</h4>
