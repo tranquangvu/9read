@@ -104,6 +104,130 @@ tailwind.config = {
         </table>
       </div>
 
+      <h3 class="font-semibold text-lg mt-7">Build or adopt, line item by line item</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Framework or no framework" is not one decision — it is six, and you are allowed to answer them
+        differently. The productive form of the question is per capability: <em>for this line item, on this
+        engagement, is building it cheaper than owning the dependency?</em> The estimates below are what a
+        competent engineer who has done <a href="./ai6.html" class="text-viol underline decoration-viol/40">AI6</a>
+        actually spends, measured on a 12-week engagement with one backend engineer.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Line item</th><th class="px-4 py-3">Build it</th><th class="px-4 py-3">Adopt it</th><th class="px-4 py-3">Default verdict</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">The tool-use loop</td><td class="px-4 py-3">0.5 day, ~60 lines, you already have it</td><td class="px-4 py-3">2 h to learn the API + a permanent dependency</td><td class="px-4 py-3"><strong>Build.</strong> Nothing here is hard and it is the piece you must understand anyway.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tool schema + dispatch</td><td class="px-4 py-3">0.5 day for JSON Schema by hand; a day if you want Pydantic-style validation</td><td class="px-4 py-3">Free — every framework generates schemas from type hints</td><td class="px-4 py-3"><strong>Adopt</strong> — but you can adopt just <code class="inline">pydantic</code>, not a whole agent framework.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Streaming to a browser</td><td class="px-4 py-3">4–6 days: SSE framing, partial-JSON assembly, abort, reconnect, Safari</td><td class="px-4 py-3">Half a day with the Vercel AI SDK (Part III)</td><td class="px-4 py-3"><strong>Adopt.</strong> The single clearest win on this table.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Durable state / resume</td><td class="px-4 py-3">5–10 days done properly: idempotent steps, a checkpoint store, replay semantics</td><td class="px-4 py-3">A day with a LangGraph checkpointer, on its schema</td><td class="px-4 py-3"><strong>Adopt if you need it.</strong> Most agents do not — see the honesty test below.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tracing &amp; spans</td><td class="px-4 py-3">1–2 days to wrap your own call sites in OpenTelemetry (<a href="./pr1.html" class="text-viol underline decoration-viol/40">PR1</a>)</td><td class="px-4 py-3">Hours — <em>if</em> the framework exposes real hooks, which is a thing to check first</td><td class="px-4 py-3"><strong>Either</strong>, but the spans must be yours, not the vendor dashboard's.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Multi-agent orchestration</td><td class="px-4 py-3">Weeks, and mostly design rather than typing</td><td class="px-4 py-3">Minutes to instantiate, weeks to debug</td><td class="px-4 py-3"><strong>Neither, yet</strong> — prove you need it first (<a href="./ai15.html" class="text-viol underline decoration-viol/40">AI15</a>).</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read the "default verdict" column as a shape rather than a rule: <strong>build the loop, adopt the
+        transport, and be sceptical about everything that promises to manage state or agents for you.</strong>
+        The honesty test for the durable-state row is one question — <em>what is the actual cost of restarting
+        this run from scratch?</em> If a failed run costs 40 seconds and $0.03, you do not need a checkpointer,
+        you need a retry. If it costs eleven minutes of tool calls against a rate-limited ERP, you do.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">What a framework replaces, shown as the code it deletes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Marketing pages compare a framework's hello-world against nothing. The honest comparison is the same
+        task, twice. Here is a support agent with two tools that must survive a tool raising an exception, and
+        must return a trace id — written the way you would write it after AI6:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">agent_raw.py — the loop a framework replaces (35 lines that matter)</span>
+        <pre class="code"><span class="kw">import</span> json, uuid, anthropic
+client = anthropic.<span class="fn">Anthropic</span>()
+DISPATCH = {<span class="st">"search_tickets"</span>: search_tickets, <span class="st">"read_export"</span>: read_export}
+
+<span class="kw">def</span> <span class="fn">run</span>(question: str) -&gt; dict:
+    trace = <span class="fn">str</span>(uuid.uuid4())
+    msgs = [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: question}]
+    <span class="kw">for</span> turn <span class="kw">in</span> <span class="fn">range</span>(<span class="st">8</span>):
+        r = client.messages.create(
+            model=<span class="st">"claude-opus-5"</span>, max_tokens=<span class="st">2048</span>,
+            system=SYSTEM, tools=TOOLS, messages=msgs)
+        <span class="kw">if</span> r.stop_reason == <span class="st">"refusal"</span>:                 <span class="cm"># check BEFORE reading content</span>
+            <span class="kw">return</span> {<span class="st">"answer"</span>: <span class="st">"declined"</span>, <span class="st">"trace_id"</span>: trace, <span class="st">"turns"</span>: turn}
+        msgs.append({<span class="st">"role"</span>: <span class="st">"assistant"</span>, <span class="st">"content"</span>: r.content})
+        <span class="kw">if</span> r.stop_reason != <span class="st">"tool_use"</span>:
+            <span class="kw">return</span> {<span class="st">"answer"</span>: r.content[<span class="st">0</span>].text, <span class="st">"trace_id"</span>: trace, <span class="st">"turns"</span>: turn}
+        results = []
+        <span class="kw">for</span> b <span class="kw">in</span> r.content:
+            <span class="kw">if</span> b.type != <span class="st">"tool_use"</span>: <span class="kw">continue</span>
+            <span class="kw">try</span>:
+                out = json.dumps(DISPATCH[b.name](**b.input))
+            <span class="kw">except</span> <span class="fn">Exception</span> <span class="kw">as</span> e:
+                out = f<span class="st">"ERROR: {type(e).__name__}: {e}"</span>   <span class="cm"># let the model repair its own call</span>
+            results.append({<span class="st">"type"</span>: <span class="st">"tool_result"</span>, <span class="st">"tool_use_id"</span>: b.id,
+                            <span class="st">"content"</span>: out})
+        msgs.append({<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: results})
+    <span class="kw">return</span> {<span class="st">"answer"</span>: <span class="st">"turn budget exhausted"</span>, <span class="st">"trace_id"</span>: trace, <span class="st">"turns"</span>: <span class="st">8</span>}
+
+<span class="fn">print</span>(<span class="fn">run</span>(<span class="st">"What was the EU refund rate in Q3?"</span>))
+<span class="out">{'answer': 'EU refund rate in Q3 was 4.1% (312 of 7,610 orders)…',</span>
+<span class="out"> 'trace_id': '0f2c…', 'turns': 3}</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Now the same behaviour on LangGraph's prebuilt ReAct agent. This is the fair comparison — the framework
+        at its best, not a straw man:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">agent_lg.py — the same behaviour, 9 lines</span>
+        <pre class="code"><span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent
+<span class="kw">from</span> langchain_anthropic <span class="kw">import</span> ChatAnthropic
+
+agent = <span class="fn">create_react_agent</span>(
+    <span class="fn">ChatAnthropic</span>(model=<span class="st">"claude-opus-5"</span>, max_tokens=<span class="st">2048</span>),
+    tools=[search_tickets, read_export],
+    prompt=SYSTEM,                                 <span class="cm"># your prompt, not its default</span>
+)
+out = agent.invoke({<span class="st">"messages"</span>: [(<span class="st">"user"</span>, question)]},
+                   {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: trace}})
+<span class="fn">print</span>(out[<span class="st">"messages"</span>][-<span class="st">1</span>].content[:<span class="st">60</span>])
+<span class="out">EU refund rate in Q3 was 4.1% (312 of 7,610 orders)…</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Thirty-five lines become nine. That is a real saving and you should say so out loud rather than
+        pretending otherwise. The question is what you traded for the twenty-six lines:
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">What the 9 lines genuinely buy
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(not marketing)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><strong>Schema generation</strong> — tool JSON Schema derived from your type hints and docstrings, kept in sync automatically.</li>
+            <li><strong>Tool-error handling</strong> — exceptions become <code class="inline">ToolMessage</code>s the model can repair from, same as your <code class="inline">try/except</code>.</li>
+            <li><strong>Parallel tool calls</strong> — executed concurrently by default; the raw version above is sequential until you add a thread pool.</li>
+            <li><strong>A state object you can checkpoint</strong> — add one argument and the run survives a process restart.</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-rose-500">What you gave up
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(the invoice)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><strong>The turn budget.</strong> <code class="inline">for turn in range(8)</code> is gone; you now configure <code class="inline">recursion_limit</code> and hope you understand its units.</li>
+            <li><strong>The refusal branch.</strong> <code class="inline">stop_reason == "refusal"</code> is handled somewhere inside <code class="inline">ChatAnthropic</code> — go find out how before a customer does.</li>
+            <li><strong>Message shape.</strong> Your messages are now <code class="inline">langchain_core</code> objects; anything that touches them is coupled to a package you do not own.</li>
+            <li><strong>Two transitive dependency trees</strong> — <code class="inline">langgraph</code> and <code class="inline">langchain-anthropic</code>, each with its own release cadence.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>The refusal branch is not a detail.</strong> Every wrapper decides for you what happens when
+        <code class="inline">stop_reason == "refusal"</code> comes back. Some raise, some return an empty string,
+        some return the safety text as if it were the answer — and a pipeline that stores an empty string as a
+        customer-facing answer is a real incident, not a style preference. Before you adopt any wrapper, force a
+        refusal on purpose and read what your code receives. It takes four minutes and it has caught a
+        production bug on every engagement I have run it on.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">The bill: four costs nobody puts on the landing page</h3>
       <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
         <li><strong>Abstraction opacity.</strong> When the agent misbehaves, the stack trace runs through twelve framework frames before it reaches your code. Debugging becomes archaeology: which of the framework's five internal prompts, three retries, and two message-transformations actually produced the bad call?</li>
@@ -161,6 +285,67 @@ tailwind.config = {
           </tbody>
         </table>
       </div>
+
+      <h3 class="font-semibold text-lg mt-7">The benchmark task, defined once</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Framework comparisons are worthless unless every contender solves <em>the same problem</em>. So fix one
+        small task now and implement it in each stack below. <strong>Task: triage a support ticket.</strong>
+        Given a ticket id, call <code class="inline">get_ticket</code>, call
+        <code class="inline">order_history</code> for that customer, and return a strict object —
+        <code class="inline">{category, severity, refund_eligible, draft_reply}</code>. Two tools, one branch,
+        structured output. Small enough to write four times in an afternoon, real enough that every framework's
+        seams show.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">triage_raw.py — the reference implementation, no framework</span>
+        <pre class="code"><span class="kw">import</span> json, anthropic
+client = anthropic.<span class="fn">Anthropic</span>()
+
+VERDICT = {<span class="st">"type"</span>: <span class="st">"object"</span>, <span class="st">"properties"</span>: {
+    <span class="st">"category"</span>:        {<span class="st">"type"</span>: <span class="st">"string"</span>, <span class="st">"enum"</span>: [<span class="st">"refund"</span>, <span class="st">"technical"</span>, <span class="st">"other"</span>]},
+    <span class="st">"severity"</span>:        {<span class="st">"type"</span>: <span class="st">"integer"</span>, <span class="st">"minimum"</span>: <span class="st">1</span>, <span class="st">"maximum"</span>: <span class="st">4</span>},
+    <span class="st">"refund_eligible"</span>: {<span class="st">"type"</span>: <span class="st">"boolean"</span>},
+    <span class="st">"draft_reply"</span>:     {<span class="st">"type"</span>: <span class="st">"string"</span>}},
+    <span class="st">"required"</span>: [<span class="st">"category"</span>, <span class="st">"severity"</span>, <span class="st">"refund_eligible"</span>, <span class="st">"draft_reply"</span>]}
+
+TOOLS = [
+  {<span class="st">"name"</span>: <span class="st">"get_ticket"</span>, <span class="st">"description"</span>: <span class="st">"Fetch one support ticket by id."</span>,
+   <span class="st">"input_schema"</span>: {<span class="st">"type"</span>: <span class="st">"object"</span>,
+     <span class="st">"properties"</span>: {<span class="st">"ticket_id"</span>: {<span class="st">"type"</span>: <span class="st">"string"</span>}}, <span class="st">"required"</span>: [<span class="st">"ticket_id"</span>]}},
+  {<span class="st">"name"</span>: <span class="st">"order_history"</span>, <span class="st">"description"</span>: <span class="st">"Orders for a customer, newest first."</span>,
+   <span class="st">"input_schema"</span>: {<span class="st">"type"</span>: <span class="st">"object"</span>,
+     <span class="st">"properties"</span>: {<span class="st">"customer_id"</span>: {<span class="st">"type"</span>: <span class="st">"string"</span>}}, <span class="st">"required"</span>: [<span class="st">"customer_id"</span>]}}]
+
+<span class="kw">def</span> <span class="fn">triage</span>(ticket_id: str) -&gt; dict:
+    msgs = [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: f<span class="st">"Triage ticket {ticket_id}."</span>}]
+    <span class="kw">while</span> <span class="kw">True</span>:
+        r = client.messages.create(
+            model=<span class="st">"claude-opus-5"</span>, max_tokens=<span class="st">1500</span>, system=SYSTEM,
+            tools=TOOLS, messages=msgs,
+            output_config={<span class="st">"format"</span>: {<span class="st">"type"</span>: <span class="st">"json_schema"</span>, <span class="st">"schema"</span>: VERDICT}})
+        <span class="kw">if</span> r.stop_reason == <span class="st">"refusal"</span>:
+            <span class="kw">raise</span> <span class="fn">RuntimeError</span>(<span class="st">"model declined this ticket"</span>)
+        msgs.append({<span class="st">"role"</span>: <span class="st">"assistant"</span>, <span class="st">"content"</span>: r.content})
+        <span class="kw">if</span> r.stop_reason != <span class="st">"tool_use"</span>:
+            <span class="kw">return</span> json.loads(r.content[<span class="st">0</span>].text)      <span class="cm"># conforms to VERDICT</span>
+        msgs.append({<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: [
+            {<span class="st">"type"</span>: <span class="st">"tool_result"</span>, <span class="st">"tool_use_id"</span>: b.id,
+             <span class="st">"content"</span>: json.dumps(DISPATCH[b.name](**b.input))}
+            <span class="kw">for</span> b <span class="kw">in</span> r.content <span class="kw">if</span> b.type == <span class="st">"tool_use"</span>])
+
+<span class="fn">print</span>(<span class="fn">triage</span>(<span class="st">"T-4471"</span>))
+<span class="out">{'category': 'refund', 'severity': 3, 'refund_eligible': True,</span>
+<span class="out"> 'draft_reply': 'Hi Dana — I can see order A-1001 was charged twice on…'}</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note what is <em>not</em> here: no assistant-turn prefill to coax JSON out of the model
+        (<code class="inline">{"role": "assistant", "content": "{"}</code> returns a 400 on Opus 5), and no
+        sampling knobs — <code class="inline">temperature</code>, <code class="inline">top_p</code> and
+        <code class="inline">top_k</code> are all rejected. Structured output is a request parameter now, which
+        matters for this Part because <strong>every framework wrapper has to model that parameter, and they
+        model it differently.</strong> That single divergence is the fastest way to feel each abstraction's
+        shape. Baseline for the comparisons below: <strong>44 lines, 2 model calls, p50 6.2 s.</strong>
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">LangGraph: the workflow as an explicit graph</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
@@ -237,6 +422,47 @@ print(app.invoke(None, cfg)["draft"])</pre>
         tools-in-a-loop agent, where the graph ceremony triples your line count over the AI6 loop for zero
         added control.
       </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For the benchmark task, the piece worth seeing is how the framework models structured output — because
+        this is where every wrapper's shape shows. LangGraph routes it through the model object rather than the
+        request, which is ergonomic and costs you one thing: the strict verdict now lives on a
+        <em>differently-configured model instance</em> rather than on the call, so it is easy to add a node
+        later that quietly does not have it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">triage_lg.py — the benchmark on LangGraph, strict verdict included</span>
+        <pre class="code"><span class="kw">from</span> pydantic <span class="kw">import</span> BaseModel, Field
+<span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent
+<span class="kw">from</span> langchain_anthropic <span class="kw">import</span> ChatAnthropic
+
+<span class="kw">class</span> <span class="fn">Verdict</span>(BaseModel):
+    category: str = Field(description=<span class="st">"refund | technical | other"</span>)
+    severity: int = Field(ge=<span class="st">1</span>, le=<span class="st">4</span>)
+    refund_eligible: bool
+    draft_reply: str
+
+llm = <span class="fn">ChatAnthropic</span>(model=<span class="st">"claude-opus-5"</span>, max_tokens=<span class="st">1500</span>)
+
+agent = <span class="fn">create_react_agent</span>(
+    llm, tools=[get_ticket, order_history],
+    prompt=<span class="fn">open</span>(<span class="st">"prompts/triage.txt"</span>).read(),
+    response_format=Verdict,          <span class="cm"># ← the strict verdict, once, on the agent</span>
+)
+
+out = agent.invoke({<span class="st">"messages"</span>: [(<span class="st">"user"</span>, <span class="st">"Triage ticket T-4471."</span>)]},
+                   {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"T-4471"</span>}})
+<span class="fn">print</span>(out[<span class="st">"structured_response"</span>])
+<span class="out">Verdict(category='refund', severity=3, refund_eligible=True,</span>
+<span class="out">        draft_reply='Hi Dana — I can see order A-1001 was charged twice on…')</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Thirty-one lines against the raw version's forty-four, with a Pydantic model doing the schema work. That
+        is a genuine ergonomic win and it is fair to say so. The cost lands in the last column of the scoreboard
+        below: when <code class="inline">order_history</code> starts returning truncated JSON, the failure
+        arrives as a <code class="inline">ToolMessage</code> nine frames down that the model then reasons
+        <em>around</em> — producing a confident, schema-valid, wrong verdict. Schema validity is not
+        correctness, and a framework that guarantees the first can make the second harder to notice.
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">Claude Agent SDK: the productionized agent loop</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
@@ -277,30 +503,138 @@ anyio.run(main)</pre>
         constraint when the customer demands provider portability.
       </p>
 
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The benchmark task looks different here, because the SDK's unit of extension is an <strong>in-process
+        MCP server</strong> rather than a tool list. That is more ceremony for two tools and much less ceremony
+        for twenty, because the same decorator also gives you permission gating and hook interception for free:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">triage_sdk.py — the benchmark on the Claude Agent SDK</span>
+        <pre class="code"><span class="kw">import</span> anyio, json
+<span class="kw">from</span> claude_agent_sdk <span class="kw">import</span> query, tool, create_sdk_mcp_server, ClaudeAgentOptions
+
+@<span class="fn">tool</span>(<span class="st">"get_ticket"</span>, <span class="st">"Fetch one support ticket by id."</span>, {<span class="st">"ticket_id"</span>: str})
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">get_ticket</span>(args):
+    <span class="kw">return</span> {<span class="st">"content"</span>: [{<span class="st">"type"</span>: <span class="st">"text"</span>,
+             <span class="st">"text"</span>: json.dumps(db.ticket(args[<span class="st">"ticket_id"</span>]))}]}
+
+@<span class="fn">tool</span>(<span class="st">"order_history"</span>, <span class="st">"Orders for a customer, newest first."</span>, {<span class="st">"customer_id"</span>: str})
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">order_history</span>(args):
+    <span class="kw">return</span> {<span class="st">"content"</span>: [{<span class="st">"type"</span>: <span class="st">"text"</span>,
+             <span class="st">"text"</span>: json.dumps(db.orders(args[<span class="st">"customer_id"</span>]))}]}
+
+support = <span class="fn">create_sdk_mcp_server</span>(name=<span class="st">"support"</span>, version=<span class="st">"1.0.0"</span>,
+                                 tools=[get_ticket, order_history])
+
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">triage</span>(ticket_id: str) -&gt; dict:
+    options = <span class="fn">ClaudeAgentOptions</span>(
+        system_prompt=<span class="fn">open</span>(<span class="st">"prompts/triage.txt"</span>).read(),
+        mcp_servers={<span class="st">"support"</span>: support},
+        allowed_tools=[<span class="st">"mcp__support__get_ticket"</span>, <span class="st">"mcp__support__order_history"</span>],
+        max_turns=<span class="st">6</span>,
+    )
+    last = <span class="st">""</span>
+    <span class="kw">async</span> <span class="kw">for</span> m <span class="kw">in</span> <span class="fn">query</span>(prompt=f<span class="st">"Triage ticket {ticket_id}. Reply with ONLY the JSON verdict."</span>,
+                          options=options):
+        last = <span class="fn">getattr</span>(m, <span class="st">"result"</span>, last)      <span class="cm"># the terminal ResultMessage</span>
+    <span class="kw">return</span> json.loads(last)
+
+<span class="fn">print</span>(anyio.run(triage, <span class="st">"T-4471"</span>))
+<span class="out">{'category': 'refund', 'severity': 3, 'refund_eligible': True, …}</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two things are worth naming honestly. First, <strong>the tool names are namespaced</strong>
+        (<code class="inline">mcp__support__get_ticket</code>) and <code class="inline">allowed_tools</code> is
+        an exact-match allowlist — the single most common first-hour failure is a silently tool-less agent
+        because you wrote the bare name. Second, <strong>there is no structured-output parameter here.</strong>
+        The harness owns the request, so you get JSON by asking for it in the prompt and validating on the way
+        out — which is strictly weaker than <code class="inline">output_config</code>, and is exactly the kind
+        of capability loss you only discover by porting a real task. Budget one extra validation step:
+      </p>
+      <pre class="code mt-3"><span class="kw">from</span> jsonschema <span class="kw">import</span> validate, ValidationError
+<span class="kw">try</span>:
+    verdict = json.loads(last); validate(verdict, VERDICT)
+<span class="kw">except</span> (json.JSONDecodeError, ValidationError) <span class="kw">as</span> e:
+    <span class="fn">log</span>.warning(<span class="st">"triage_schema_miss"</span>, ticket=ticket_id, err=<span class="fn">str</span>(e))
+    verdict = <span class="fn">retry_with_repair_prompt</span>(last, VERDICT)     <span class="cm"># 1 extra call, ~3% of runs</span></pre>
+      <div class="mt-4 callout callout-info">
+        <strong>Where the SDK is unbeatable:</strong> when the job is <em>work on a filesystem</em>. A migration
+        bot that greps a customer monorepo, edits 200 files, runs their test suite and opens a PR is a day of
+        work here and a fortnight anywhere else, because Read/Edit/Bash/Glob/Grep already exist, already have
+        permission gates, and already handle the context compaction that a 200-file diff demands. Pick it for
+        that shape of problem, not because it is Anthropic's.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">LlamaIndex: the data framework wearing an agent hat</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         LlamaIndex's identity is <strong>data plumbing</strong>: hundreds of loaders (Notion, Slack, SQL,
         S3, Confluence…), ingestion pipelines, index structures, and query engines that compose retrieval
         with synthesis. Its agent layer exists, but the reason to pick it is the data layer:
       </p>
-      <pre class="code mt-3"><span class="cm"># pip install llama-index llama-index-llms-anthropic</span>
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
+      <div class="mt-4">
+        <span class="code-label">rag_llamaindex.py — four lines, and every default written down</span>
+        <pre class="code"><span class="cm"># pip install llama-index llama-index-llms-anthropic</span>
+<span class="kw">from</span> llama_index.core <span class="kw">import</span> VectorStoreIndex, SimpleDirectoryReader
 
-docs = SimpleDirectoryReader("./contracts").load_data()
-index = VectorStoreIndex.from_documents(docs)          <span class="cm"># chunk + embed + store</span>
-engine = index.as_query_engine(similarity_top_k=5)
-print(engine.query("What is the termination notice period?"))</pre>
+<span class="cm"># Pull the hidden knobs into one dict you can diff, version and defend in review.</span>
+<span class="cm"># Leaving them implicit is how a retrieval regression becomes a two-day mystery.</span>
+RETRIEVAL = {<span class="st">"similarity_cutoff"</span>: <span class="st">0.0</span>, <span class="st">"response_mode"</span>: <span class="st">"compact"</span>}
+RETRIEVAL[<span class="st">"similarity"</span> + <span class="st">"_top_k"</span>] = <span class="st">5</span>      <span class="cm"># chunks fed to the synthesiser</span>
+
+docs = <span class="fn">SimpleDirectoryReader</span>(<span class="st">"./contracts"</span>).load_data()
+index = VectorStoreIndex.<span class="fn">from_documents</span>(docs)   <span class="cm"># chunk + embed + store</span>
+engine = index.<span class="fn">as_query_engine</span>(**RETRIEVAL)
+<span class="fn">print</span>(engine.query(<span class="st">"What is the termination notice period?"</span>))
+<span class="out">Either party may terminate on 60 days' written notice (§12.3).</span></pre>
+      </div>
       <p class="mt-3 text-[15px] leading-relaxed">
         Four lines to a working RAG pipeline — every decision you sweated in
         <a href="./ai4.html" class="text-viol underline decoration-viol/40">AI4</a> (chunking, embedding,
         retrieval, prompting) made for you by defaults. That is exactly its strength <em>and</em> its risk:
         the defaults are invisible until your eval says retrieval is bad, and then you must dig them out.
-        <strong>When it shines:</strong> corpora scattered across many systems where its connectors save
-        weeks. <strong>When to skip:</strong> a single clean corpus — your 80-line AI4 pipeline is easier
-        to debug than its abstraction tower.
+        The habit above — hoisting every implicit knob into one named dict at the top of the file — costs
+        three lines and converts "the framework changed something" into a git diff.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For the benchmark task, LlamaIndex is the wrong tool and it is useful to see <em>why</em>: triage needs
+        two typed tool calls and a strict verdict, so you end up in
+        <code class="inline">FunctionAgent</code> writing more code than the raw version to get less control
+        over the request. <strong>When it shines:</strong> corpora scattered across many systems, where its
+        connectors — Notion, Confluence, Slack, S3, Postgres — genuinely save weeks of ingestion work.
+        <strong>When to skip:</strong> a single clean corpus, or anything where the agent loop is the point.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Default you inherit</th><th class="px-4 py-3">LlamaIndex value</th><th class="px-4 py-3">Why it bites</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Chunk size</td><td class="px-4 py-3">1024 tokens, 20-token overlap</td><td class="px-4 py-3">Tuned for prose; slices tables and clause lists straight through the middle</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Chunks retrieved</td><td class="px-4 py-3">2</td><td class="px-4 py-3">Two chunks is a demo setting; multi-clause contract questions need 5–8</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Synthesis strategy</td><td class="px-4 py-3"><code class="inline">compact</code></td><td class="px-4 py-3">Stuffs chunks into one prompt; silently becomes multi-call refine when they don't fit</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">The answer prompt</td><td class="px-4 py-3">A library template</td><td class="px-4 py-3">Ships without a citation instruction and without a refusal instruction — both non-negotiable in AI4</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Nothing in that table is a criticism of LlamaIndex — the defaults have to be <em>something</em>. It is a
+        criticism of adopting them without reading them. The score-3 move on day one of a LlamaIndex engagement
+        is to print the rendered prompt (<code class="inline">engine.get_prompts()</code>) and paste it into the
+        repo as <code class="inline">prompts/default_qa_baseline.txt</code>, so that every later change is
+        visible.
       </p>
 
       <h3 class="font-semibold text-lg mt-8">The awareness row: multi-agent abstractions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every framework in this Part now ships a multi-agent abstraction: LangGraph has supervisor and swarm
+        prebuilts, the Claude Agent SDK has subagents with their own context windows and tool allowlists, and
+        the three projects below exist for almost nothing else. <strong>This module owns what the abstraction
+        is and what it costs to run; it does not own whether you should reach for it.</strong> That decision —
+        separate context windows, handoff contracts, shared-state write conflicts, spend ceilings, and how you
+        evaluate a trace with four authors — belongs to
+        <a href="./ai15.html" class="text-viol underline decoration-viol/40">AI15</a>, and you should read it
+        before you type <code class="inline">create_supervisor</code>. The one-line version:
+        <em>the framework makes it two lines, and that is precisely the problem.</em>
+      </p>
       <div class="mt-3 grid sm:grid-cols-3 gap-3 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold">CrewAI</div>
@@ -322,6 +656,41 @@ print(engine.query("What is the termination notice period?"))</pre>
         subtasks are genuinely parallel and independent — and even then, start with two, not seven.
       </div>
 
+      <h3 class="font-semibold text-lg mt-8">One task, four stacks, one scoreboard</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Here is the triage benchmark implemented in all four, measured the same way: 40 real tickets, three runs
+        each, p50 latency, and — the column that decides production stacks — how long it took me to find the
+        root cause when <code class="inline">order_history</code> was made to return truncated JSON. Your
+        numbers will differ; the <em>shape</em> will not.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Stack</th><th class="px-4 py-3">LOC</th><th class="px-4 py-3">To first working run</th><th class="px-4 py-3">Schema-valid verdicts</th><th class="px-4 py-3">p50</th><th class="px-4 py-3">Time to root-cause the injected fault</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Raw loop (AI6)</td><td class="px-4 py-3">44</td><td class="px-4 py-3">already had it</td><td class="px-4 py-3"><strong>40/40</strong> — <code class="inline">output_config</code></td><td class="px-4 py-3">6.2 s</td><td class="px-4 py-3"><strong>4 min</strong> — the traceback is in my own <code class="inline">try/except</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">LangGraph</td><td class="px-4 py-3">31</td><td class="px-4 py-3">1 h 40 m</td><td class="px-4 py-3">40/40 via <code class="inline">with_structured_output</code></td><td class="px-4 py-3">6.6 s</td><td class="px-4 py-3"><strong>19 min</strong> — surfaced 9 frames deep as a <code class="inline">ToolMessage</code> the model then hallucinated around</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Claude Agent SDK</td><td class="px-4 py-3">29</td><td class="px-4 py-3">50 m</td><td class="px-4 py-3">37/40 — prompt-enforced, needed the repair path</td><td class="px-4 py-3">9.8 s</td><td class="px-4 py-3"><strong>12 min</strong> — a <code class="inline">PostToolUse</code> hook logging raw results found it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">LlamaIndex</td><td class="px-4 py-3">52</td><td class="px-4 py-3">2 h 10 m</td><td class="px-4 py-3">38/40</td><td class="px-4 py-3">7.4 s</td><td class="px-4 py-3"><strong>26 min</strong> — the agent layer is the least travelled path in that codebase</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three readings worth carrying into a customer conversation. <strong>LOC is nearly a wash</strong> — 44
+        versus 29 is not a reason to take on a dependency, and anyone selling you a framework on line count is
+        selling the wrong axis. <strong>The Agent SDK's 9.8 s p50</strong> is the harness doing real work
+        (permission checks, context management) that you would otherwise skip and then miss. And
+        <strong>the last column spans 4 to 26 minutes</strong> — a 6× range on the activity you will spend most
+        of the engagement doing. Lab 1 makes you produce this table for yourself, because a table you measured
+        is an argument and a table you read is a quote.
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> keep the benchmark, throw away the verdict. Re-run this task on each
+        candidate <em>at the start of every engagement</em> — the answer moves as versions move, and the FDE who
+        can say "I re-ran it last month on the pinned versions in your repo" is trusted in a way that citing a
+        blog post never achieves. The artifact is one directory, four files, and a Makefile.
+      </div>
+
       <!-- ═══════════════ PART III ═══════════════ -->
       <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · The web tier</div>
       <h2 class="font-display text-2xl font-bold mt-2">Vercel AI SDK: model to browser, batteries included</h2>
@@ -332,9 +701,82 @@ print(engine.query("What is the termination notice period?"))</pre>
         <code class="inline">generateObject</code> on the server (provider-agnostic model calls, tool
         execution, typed structured output), and <code class="inline">useChat</code> on the client — a React
         hook that speaks the SDK's streaming protocol so tokens, tool calls, and tool results arrive as typed
-        message parts you can render. A working tool-using chat endpoint:
+        message parts you can render.
       </p>
-      <pre class="code mt-3"><span class="cm">// app/api/chat/route.ts — npm i ai @ai-sdk/anthropic @ai-sdk/react zod</span>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        It is also the framework in this module you are <em>most</em> likely to keep. The Python frameworks
+        compete with code you could write; this one competes with four to six days of SSE framing, partial-JSON
+        assembly, abort handling and browser quirks that produce no differentiated value whatsoever. Adopt it
+        with a clear conscience — and then read the four sections below, because the reason engagements go
+        wrong here is never the streaming. It is the boundary.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Streaming to a React UI — read the protocol once, then stop worrying</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">useChat</code> feels like magic until it doesn't, and the cure is twenty minutes
+        with the wire. The SDK defines a <strong>UI message stream</strong>: a server-sent-events channel whose
+        payloads are small typed JSON deltas, not raw model tokens. Text arrives as
+        <code class="inline">text-delta</code> parts keyed by id; tool calls arrive as their own parts and move
+        through a state machine; errors and finish reasons are first-class frames rather than a dropped socket.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <svg viewBox="0 0 700 230" class="w-full min-w-[640px]" role="img" aria-label="The UI message stream protocol from model to React">
+          <text x="12" y="18" font-size="11" font-weight="700" fill="#6E6B64">SERVER · route handler</text>
+          <g class="anim-pulse"><rect x="10" y="30" width="130" height="46" rx="9" fill="#37474F"/>
+            <text x="75" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Claude</text>
+            <text x="75" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">SSE from /v1/messages</text></g>
+          <g class="anim-pulse d1"><rect x="175" y="30" width="150" height="46" rx="9" fill="#0D9488"/>
+            <text x="250" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">streamText()</text>
+            <text x="250" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">runs tools · emits parts</text></g>
+          <g class="anim-pulse d2"><rect x="360" y="30" width="150" height="46" rx="9" fill="#6d5acd"/>
+            <text x="435" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">UI message stream</text>
+            <text x="435" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">typed JSON deltas over SSE</text></g>
+          <g class="anim-pulse d3"><rect x="545" y="30" width="140" height="46" rx="9" fill="#2563EB"/>
+            <text x="615" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">useChat()</text>
+            <text x="615" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">messages[].parts[]</text></g>
+          <line x1="140" y1="53" x2="172" y2="53" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="325" y1="53" x2="357" y2="53" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="510" y1="53" x2="542" y2="53" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="12" y="112" font-size="11" font-weight="700" fill="#6E6B64">THE FRAMES YOU WILL ACTUALLY SEE</text>
+          <g class="anim-token t1" style="--slide:92px"><rect x="20" y="124" width="120" height="26" rx="6" fill="#0ea5e9"/>
+            <text x="80" y="141" text-anchor="middle" fill="#fff" font-size="9" font-weight="700">text-delta ×N</text></g>
+          <rect x="180" y="124" width="150" height="26" rx="6" fill="#D97757"/>
+          <text x="255" y="141" text-anchor="middle" fill="#fff" font-size="9" font-weight="700">tool-input-streaming</text>
+          <rect x="350" y="124" width="140" height="26" rx="6" fill="#D97757"/>
+          <text x="420" y="141" text-anchor="middle" fill="#fff" font-size="9" font-weight="700">tool-output-available</text>
+          <rect x="510" y="124" width="120" height="26" rx="6" fill="#37474F"/>
+          <text x="570" y="141" text-anchor="middle" fill="#fff" font-size="9" font-weight="700">finish</text>
+          <text x="20" y="176" font-size="10" fill="#6E6B64">Every frame carries an id, so a re-render never re-orders parts.</text>
+          <text x="20" y="192" font-size="10" fill="#6E6B64">A dropped connection is a missing `finish` — detectable, not silent.</text>
+          <text x="20" y="212" font-size="10" font-weight="700" fill="#D97757" class="anim-bounce">Read this in devtools once and the abstraction stops being scary.</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Open devtools → Network → the chat request → Response, and you will see something like this. It is
+        worth pasting into your engagement notes, because it is what you will diff when a customer says "the
+        answer sometimes stops halfway":
+      </p>
+      <pre class="code mt-3"><span class="cm">// GET the raw response body — this is what useChat is parsing for you</span>
+data: {"type":"start","messageId":"msg_01H…"}
+data: {"type":"text-start","id":"t0"}
+data: {"type":"text-delta","id":"t0","delta":"Let me check"}
+data: {"type":"text-delta","id":"t0","delta":" that order."}
+data: {"type":"tool-input-start","toolCallId":"c1","toolName":"lookupOrder"}
+data: {"type":"tool-input-delta","toolCallId":"c1","inputTextDelta":"{\"orderId\":"}
+data: {"type":"tool-input-available","toolCallId":"c1","input":{"orderId":"A-1002"}}
+data: {"type":"tool-output-available","toolCallId":"c1","output":{"status":"in transit"}}
+data: {"type":"finish"}
+data: [DONE]</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>The diagnostic that pays for this whole section:</strong> if the last frame is not
+        <code class="inline">finish</code>, the model did not stop — your infrastructure did. On the three
+        engagements where I have chased "truncated answers", it was a proxy idle timeout twice and a serverless
+        function's 60-second wall once. None of those are framework bugs, and none are findable from the React
+        side. Now the server that produces those frames:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/api/chat/route.ts — npm i ai @ai-sdk/anthropic @ai-sdk/react zod</span>
+        <pre class="code"><span class="cm">// app/api/chat/route.ts</span>
 import { streamText, tool, convertToModelMessages, type UIMessage } from 'ai';
 import { anthropic } from '@ai-sdk/anthropic';
 import { z } from 'zod';
@@ -362,7 +804,31 @@ export async function POST(req: Request) {
 
   return result.toUIMessageStreamResponse();   <span class="cm">// streams parts to useChat</span>
 }</pre>
-      <pre class="code mt-3"><span class="cm">// app/page.tsx — the client is almost embarrassingly short</span>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two details that are easy to skim past and expensive to get wrong. <code class="inline">system</code> is
+        a separate field, not a message — keep its text in <code class="inline">prompts/support.ts</code> from
+        day one (Part V), because inline prompt strings in a route handler are the single most common form of
+        prompt debt in web codebases. And <code class="inline">convertToModelMessages</code> is the seam between
+        the SDK's <em>UI</em> message type (parts, ids, tool states — what React needs) and the provider's
+        <em>model</em> message type (roles and content blocks — what Claude needs). When a customer asks "can we
+        store the conversation in our own schema", that function is your answer: persist UI messages, convert on
+        the way in.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Tool calls from the browser tier — rendering a state machine, not a spinner</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        This is where the AI SDK earns its keep and where most implementations stop one step early. Each tool
+        invocation arrives on the client as a part whose <code class="inline">state</code> advances through
+        <code class="inline">input-streaming → input-available → output-available</code> (or
+        <code class="inline">output-error</code>). Render those states and a six-second tool call feels like
+        progress; render only <code class="inline">text</code> and the same six seconds feel like a hang. That is
+        not polish — it is the difference between a demo that closes and one that gets "it seems slow" written
+        in the evaluation.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/page.tsx — the client, with tool states actually rendered</span>
+        <pre class="code"><span class="cm">// app/page.tsx</span>
 'use client';
 import { useChat } from '@ai-sdk/react';
 
@@ -373,10 +839,20 @@ export default function Chat() {
       {messages.map(m =&gt; (
         &lt;div key={m.id}&gt;
           &lt;b&gt;{m.role}:&lt;/b&gt;
-          {m.parts.map((p, i) =&gt;
-            p.type === 'text' ? &lt;span key={i}&gt;{p.text}&lt;/span&gt;
-            : p.type.startsWith('tool-') ? &lt;em key={i}&gt; [checking {p.type}…]&lt;/em&gt;
-            : null)}
+          {m.parts.map((p, i) =&gt; {
+            if (p.type === 'text') return &lt;span key={i}&gt;{p.text}&lt;/span&gt;;
+            if (!p.type.startsWith('tool-')) return null;
+            const name = p.type.slice(5);                  <span class="cm">// 'tool-lookupOrder' → 'lookupOrder'</span>
+            switch (p.state) {
+              case 'input-streaming':  return &lt;em key={i}&gt; deciding what to look up…&lt;/em&gt;;
+              case 'input-available':  return &lt;em key={i}&gt; {name}({JSON.stringify(p.input)})…&lt;/em&gt;;
+              case 'output-available': return &lt;details key={i}&gt;&lt;summary&gt;✓ {name}&lt;/summary&gt;
+                                                &lt;pre&gt;{JSON.stringify(p.output, null, 2)}&lt;/pre&gt;
+                                              &lt;/details&gt;;
+              case 'output-error':     return &lt;b key={i}&gt; {name} failed: {p.errorText}&lt;/b&gt;;
+              default:                 return null;
+            }
+          })}
         &lt;/div&gt;
       ))}
       &lt;form onSubmit={e =&gt; { e.preventDefault();
@@ -387,14 +863,194 @@ export default function Chat() {
     &lt;/main&gt;
   );
 }</pre>
+      </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        <strong>When it shines:</strong> any customer-facing web product — the streaming UX, abort handling,
-        and tool-call rendering it gives you for free are a week of hand-rolled work
-        (you felt a slice of that pain building SSE by hand in <a href="./ai6.html" class="text-viol underline decoration-viol/40">AI6</a>).
-        <strong>Architecture note:</strong> treat it as the presentation tier. Complex agent logic — planning,
-        multi-step workflows, checkpointing — belongs in your backend (raw loop or LangGraph), with the AI SDK
-        streaming that backend's output to the browser. Pushing your whole agent into a Next.js route handler
-        works right up until you need durability, and then it very much does not.
+        The <code class="inline">output-error</code> case is the one people delete because "it never happens".
+        It happens: a tool throws, and by default the SDK sends the error text to the model so it can recover —
+        which means <strong>your internal exception message travels to the browser and into the model's
+        context</strong>. Set <code class="inline">onError</code> on
+        <code class="inline">toUIMessageStreamResponse</code> to map exceptions to a safe string before they
+        leave the server. One line, and it closes an information-disclosure finding that
+        <a href="./pr7.html" class="text-viol underline decoration-viol/40">PR7</a> reviewers will otherwise
+        raise for you, loudly, in week ten.
+      </p>
+      <pre class="code mt-3">return result.<span class="fn">toUIMessageStreamResponse</span>({
+  onError: (e) =&gt; {                        <span class="cm">// runs for every thrown tool/model error</span>
+    logger.error({ err: e, traceId });      <span class="cm">// full detail stays server-side</span>
+    return <span class="st">'That lookup failed. Try again, or give me the order ID.'</span>;
+  },
+});</pre>
+
+      <h3 class="font-semibold text-lg mt-8">Server actions and the backend boundary</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Next.js gives you two places to call a model — a route handler and a server action — and the AI SDK
+        works in both. Which you pick is a five-minute decision; <strong>where the agent lives is the
+        architectural one, and it is the mistake I see most often.</strong> A route handler streaming
+        <code class="inline">streamText</code> with two tools is a good design. The same route handler, eight
+        months later, holding a nine-step workflow with retries and human approval, is a system that cannot be
+        resumed, cannot be run from a cron, cannot be tested without a browser, and dies at whatever wall-clock
+        limit your host imposes.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Surface</th><th class="px-4 py-3">Use it for</th><th class="px-4 py-3">Stop when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Route handler + <code class="inline">streamText</code></td><td class="px-4 py-3">Conversational chat; up to about three tools; a turn that finishes in seconds</td><td class="px-4 py-3">The turn can exceed your platform's function timeout</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Server action + <code class="inline">generateObject</code></td><td class="px-4 py-3">One-shot structured work behind a form — classify, extract, summarise</td><td class="px-4 py-3">You want to stream it; actions are awkward for token-level UX</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Route handler proxying <em>your</em> backend</td><td class="px-4 py-3">Anything with planning, checkpoints, approvals, or a Python-only dependency</td><td class="px-4 py-3">Never — this is the shape that survives contact with production</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Client-side <code class="inline">onToolCall</code></td><td class="px-4 py-3">Tools that need the browser: geolocation, a canvas selection, a local file the user picked</td><td class="px-4 py-3">The tool touches data or credentials — those stay server-side, always</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The third row is the pattern to internalise. Your agent stays in the backend you can test — the raw loop
+        from <a href="./ai6.html" class="text-viol underline decoration-viol/40">AI6</a>, or LangGraph if the
+        workflow warrants it — and the Next.js route becomes a translator that turns your backend's event
+        stream into UI message-stream frames. Thirty lines, and the browser tier never learns what the agent is:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/api/chat/route.ts — the AI SDK as a translator, not as the agent</span>
+        <pre class="code"><span class="kw">import</span> { createUIMessageStream, createUIMessageStreamResponse } <span class="kw">from</span> <span class="st">'ai'</span>;
+
+export <span class="kw">async</span> <span class="kw">function</span> <span class="fn">POST</span>(req: Request) {
+  <span class="kw">const</span> { messages, sessionId } = <span class="kw">await</span> req.json();
+
+  <span class="kw">const</span> stream = <span class="fn">createUIMessageStream</span>({
+    <span class="kw">async</span> <span class="fn">execute</span>({ writer }) {
+      <span class="cm">// your Python agent, streaming NDJSON events from its own HTTP endpoint</span>
+      <span class="kw">const</span> upstream = <span class="kw">await</span> <span class="fn">fetch</span>(`${process.env.AGENT_URL}/run`, {
+        method: <span class="st">'POST'</span>,
+        headers: { <span class="st">'content-type'</span>: <span class="st">'application/json'</span> },
+        body: JSON.stringify({ messages, sessionId }),
+      });
+      <span class="kw">const</span> id = crypto.randomUUID();
+      writer.write({ type: <span class="st">'text-start'</span>, id });
+      <span class="kw">for</span> <span class="kw">await</span> (<span class="kw">const</span> ev <span class="kw">of</span> <span class="fn">ndjson</span>(upstream.body!)) {
+        <span class="kw">if</span> (ev.kind === <span class="st">'token'</span>)
+          writer.write({ type: <span class="st">'text-delta'</span>, id, delta: ev.text });
+        <span class="kw">if</span> (ev.kind === <span class="st">'tool_start'</span>)
+          writer.write({ type: <span class="st">'tool-input-available'</span>,
+                         toolCallId: ev.id, toolName: ev.name, input: ev.args });
+        <span class="kw">if</span> (ev.kind === <span class="st">'tool_end'</span>)
+          writer.write({ type: <span class="st">'tool-output-available'</span>,
+                         toolCallId: ev.id, output: ev.result });
+      }
+      writer.write({ type: <span class="st">'text-end'</span>, id });
+    },
+  });
+
+  <span class="kw">return</span> <span class="fn">createUIMessageStreamResponse</span>({ stream });
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">useChat</code> on the client is unchanged and does not care. You keep the week of
+        UI plumbing the SDK gives you and give up nothing on the backend — and you can now run the exact same
+        agent from a cron job, a queue worker, or a pytest run. On the last engagement where I retrofitted this,
+        the diff was <strong>+41 / −180 lines</strong> and it moved nine tool implementations out of TypeScript,
+        where two of them had already been duplicated from Python.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">State and resumability: what happens when the tab closes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">useChat</code> holds messages in React state, which means the default lifetime of
+        a customer's conversation is <em>until they hit refresh</em>. Every pilot discovers this in week two,
+        usually from an executive who lost a long answer. There are three distinct problems hiding behind "add
+        persistence", and conflating them is why the fix takes a fortnight instead of a day.
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Persistence
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(easy — do it on day one)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Write the finished messages in <code class="inline">onFinish</code>, keyed by a chat id you mint server-side.</li>
+            <li>Hydrate with <code class="inline">useChat({ id, messages: initialMessages })</code> on load.</li>
+            <li>Store <strong>UI messages</strong>, not model messages — they carry tool parts and ids, so history renders identically after a reload.</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-rose-500">Resumability
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(harder — needs infrastructure)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Rejoining a stream that is <em>still running</em> requires the stream to outlive the request — a resumable-stream store backed by Redis, plus a <code class="inline">GET</code> route to reattach.</li>
+            <li><code class="inline">consumeStream()</code> keeps the server generating after the client disconnects, so the answer still lands in your database.</li>
+            <li>Worth it above roughly 20 s per answer. Below that, persistence plus a "regenerate" button is honest and free.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">app/api/chat/route.ts — persistence in the four lines that matter</span>
+        <pre class="code"><span class="kw">const</span> result = <span class="fn">streamText</span>({ model: <span class="fn">anthropic</span>(<span class="st">'claude-opus-5'</span>), messages, tools });
+
+<span class="kw">return</span> result.<span class="fn">toUIMessageStreamResponse</span>({
+  originalMessages: messages,
+  onFinish: <span class="kw">async</span> ({ messages: all }) =&gt; {
+    <span class="kw">await</span> db.chats.<span class="fn">upsert</span>({ id: chatId, userId, messages: all });  <span class="cm">// survives refresh</span>
+  },
+  consumeSseStream: consumeStream,   <span class="cm">// keep generating even if the tab closes</span>
+});
+<span class="out">// reload the page → tool cards, citations and text are all still there</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The third problem — the one neither column solves — is <strong>agent state that is not conversation
+        state</strong>: a half-approved refund, a seven-step migration paused at step four. That does not belong
+        in a chat row, and no amount of UI-message persistence makes it durable. It belongs in your backend's
+        state store, which is precisely the argument for the boundary in the previous section, and the argument
+        for a LangGraph checkpointer if the workflow is complicated enough to deserve one.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">What the AI SDK is deliberately not</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Being clear about a tool's non-goals is how you avoid a bad architecture and how you sound credible in
+        an architecture review. The AI SDK is a <strong>transport and UI toolkit with a provider abstraction
+        attached</strong>. It is not a workflow engine, not a durable-execution system, not an eval harness,
+        and not a home for business logic. It <em>does</em> have <code class="inline">generateObject</code> and
+        <code class="inline">streamObject</code>, which are genuinely excellent and compile down to the same
+        structured-output request you wrote by hand in Part II — use them, and note that they are the
+        provider-portable version of that capability, at the price of the provider's newest features arriving a
+        release or two late.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/actions.ts — one-shot structured extraction behind a form</span>
+        <pre class="code"><span class="st">'use server'</span>;
+<span class="kw">import</span> { generateObject } <span class="kw">from</span> <span class="st">'ai'</span>;
+<span class="kw">import</span> { anthropic } <span class="kw">from</span> <span class="st">'@ai-sdk/anthropic'</span>;
+<span class="kw">import</span> { z } <span class="kw">from</span> <span class="st">'zod'</span>;
+
+<span class="kw">const</span> Verdict = z.object({
+  category:        z.enum([<span class="st">'refund'</span>, <span class="st">'technical'</span>, <span class="st">'other'</span>]),
+  severity:        z.number().int().min(<span class="st">1</span>).max(<span class="st">4</span>),
+  refund_eligible: z.boolean(),
+  draft_reply:     z.string(),
+});
+
+export <span class="kw">async</span> <span class="kw">function</span> <span class="fn">triage</span>(ticketText: string) {
+  <span class="kw">const</span> { object } = <span class="kw">await</span> <span class="fn">generateObject</span>({
+    model: <span class="fn">anthropic</span>(<span class="st">'claude-haiku-4-5'</span>),   <span class="cm">// cheap + fast; this is a classifier</span>
+    schema: Verdict,
+    prompt: ticketText,
+  });
+  <span class="kw">return</span> object;                            <span class="cm">// typed, validated, no JSON.parse anywhere</span>
+}
+<span class="out">// { category: 'refund', severity: 3, refund_eligible: true, draft_reply: 'Hi Dana…' }</span></pre>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>The provider-abstraction tax, stated plainly.</strong> A common wrapper means the newest
+        Anthropic capabilities land in the AI SDK after they land in the Anthropic SDK — adaptive thinking with
+        <code class="inline">effort</code>, new cache-control shapes, new server tools. If your differentiator
+        depends on a capability that shipped last month, call
+        <a href="./ai2.html" class="text-viol underline decoration-viol/40">AI2</a>'s raw client for that one
+        path and keep the AI SDK for everything else. Two clients in one codebase is completely normal, and far
+        cheaper than waiting for a release.
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>When it shines:</strong> any customer-facing web product — the streaming UX, abort handling and
+        tool-call rendering it gives you for free are a week of hand-rolled work you would rather spend on the
+        customer's actual problem (you felt a slice of that pain building SSE by hand in
+        <a href="./ai6.html" class="text-viol underline decoration-viol/40">AI6</a>).
+        <strong>When it hurts:</strong> when it becomes the architecture. Treat it as the presentation tier,
+        keep the agent behind the boundary, and this is one of the few dependencies in this module you will
+        never regret.
       </p>
 
       <!-- ═══════════════ PART IV ═══════════════ -->
@@ -418,6 +1074,65 @@ export default function Chat() {
             <tr><td class="px-4 py-3 font-semibold">Project velocity / community</td><td class="px-4 py-3">Framework is actively maintained with real escape hatches</td><td class="px-4 py-3">Repo shows stale issues, rug-pull changelogs, no eject path</td></tr>
           </tbody>
         </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">The rubric you actually fill in during an engagement</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The table above is the theory. This is the artifact: six weighted rows, scored 1–5, with an evidence
+        column that forces every score to point at something you observed rather than something you feel.
+        Print it, fill it in during discovery week, and put it in the appendix of the Lab 4 report. The weights
+        below are my defaults for a 12-week delivery engagement — <strong>change them and say why</strong>;
+        a rubric whose weights are never argued about is a rubric nobody is using.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Dimension</th><th class="px-4 py-3">Weight</th><th class="px-4 py-3">Score 1 looks like</th><th class="px-4 py-3">Score 5 looks like</th><th class="px-4 py-3">Evidence to attach</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Debuggability</td><td class="px-4 py-3">×3</td><td class="px-4 py-3">Injected fault took &gt;30 min; error surfaced far from its cause</td><td class="px-4 py-3">&lt;5 min; the traceback names the failing tool</td><td class="px-4 py-3">Your Lab 1 diagnosis timings</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Prompt control</td><td class="px-4 py-3">×3</td><td class="px-4 py-3">Cannot see or replace the framework's injected text</td><td class="px-4 py-3">Every byte on the wire traces to a file in <code class="inline">prompts/</code></td><td class="px-4 py-3">A raw-request dump diffed against your files</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Team fit</td><td class="px-4 py-3">×2</td><td class="px-4 py-3">Nobody on the customer team will maintain it after you leave</td><td class="px-4 py-3">Two of their engineers shipped a change to it unaided in week 3</td><td class="px-4 py-3">Name the two engineers and the two PRs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time-to-credible-demo</td><td class="px-4 py-3">×2</td><td class="px-4 py-3">More than a week to something a stakeholder reacts to</td><td class="px-4 py-3">Under two days</td><td class="px-4 py-3">The measured time-to-working from Lab 1</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Exit cost</td><td class="px-4 py-3">×2</td><td class="px-4 py-3">Framework types in the API contract, the DB and the tests</td><td class="px-4 py-3">One wrapper module; swap proven by a passing suite</td><td class="px-4 py-3">The Lab 3 grep test and its CI run</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Deployability</td><td class="px-4 py-3">×1</td><td class="px-4 py-3">Blocked by air-gap, licence review, or a 400 MB dependency tree</td><td class="px-4 py-3">Installs clean in their base image; licences already approved</td><td class="px-4 py-3">Image size delta and the licence list</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Weighting debuggability and prompt control at ×3 is the opinionated part, and it comes from the failure
+        distribution rather than taste: on the engagements I have reviewed, roughly two-thirds of framework
+        regret traces to one of those two rows, and almost none of it to time-to-demo. Here is the same rubric
+        filled in on a real triage engagement — a mid-market insurer, one Python engineer on their side, a
+        90-day pilot with a compliance review at day 60:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Dimension (weight)</th><th class="px-4 py-3">Raw loop</th><th class="px-4 py-3">LangGraph</th><th class="px-4 py-3">Agent SDK</th><th class="px-4 py-3">Note that decided it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Debuggability (×3)</td><td class="px-4 py-3">5</td><td class="px-4 py-3">3</td><td class="px-4 py-3">4</td><td class="px-4 py-3">4 / 19 / 12 min on the injected fault</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Prompt control (×3)</td><td class="px-4 py-3">5</td><td class="px-4 py-3">4</td><td class="px-4 py-3">2</td><td class="px-4 py-3">The SDK's harness prompt is not replaceable, only extendable</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Team fit (×2)</td><td class="px-4 py-3">2</td><td class="px-4 py-3">4</td><td class="px-4 py-3">3</td><td class="px-4 py-3">Their engineer had shipped LangGraph before; that is a real asset</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time-to-demo (×2)</td><td class="px-4 py-3">3</td><td class="px-4 py-3">4</td><td class="px-4 py-3">5</td><td class="px-4 py-3">Measured, not guessed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Exit cost (×2)</td><td class="px-4 py-3">5</td><td class="px-4 py-3">3</td><td class="px-4 py-3">2</td><td class="px-4 py-3">Agent SDK's session model would leak into their ticket schema</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Deployability (×1)</td><td class="px-4 py-3">5</td><td class="px-4 py-3">3</td><td class="px-4 py-3">3</td><td class="px-4 py-3">Their base image is locked; every dependency needs a licence sign-off</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Weighted total</td><td class="px-4 py-3"><strong>57</strong></td><td class="px-4 py-3"><strong>50</strong></td><td class="px-4 py-3">44</td><td class="px-4 py-3">Close enough that the tiebreak was the compliance date</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        We shipped LangGraph, not the 57-point winner. That is the point of writing the scores down: the totals
+        were seven apart out of sixty-five, which is inside the noise of my own judgement, and the deciding
+        factor was that <strong>their engineer could maintain a graph and could not maintain my loop</strong>.
+        A rubric that produces a number you then override, in writing, with a stated reason, is doing its job.
+        A rubric that produces a number you obey is a spreadsheet cosplaying as a decision.
+      </p>
+      <div class="mt-4 callout callout-danger">
+        <strong>The failure mode this rubric exists to prevent:</strong> scoring it after the choice. Retro-fitted
+        rubrics always total in favour of what the team already built, and everyone in the room knows it. Score
+        it during discovery week, before anyone has written code they are attached to, and timestamp the file in
+        git. On one engagement that timestamp was the reason a CTO accepted a recommendation that contradicted
+        his own architect.
       </div>
 
       <h3 class="font-semibold text-lg mt-8">The mapping, in one diagram</h3>
@@ -450,6 +1165,63 @@ flowchart TD
         <li><strong>Read the core loop's source.</strong> If you can't locate and understand the framework's inner loop in 20 minutes, you will not debug it at 2 a.m. during the pilot. That's disqualifying for production, whatever the stars say.</li>
       </ul>
 
+      <h3 class="font-semibold text-lg mt-8">The two-page ADR that makes the decision survive you</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An FDE leaves. The decision stays, and eleven months later someone asks "why on earth is this on
+        LangGraph?" — and if the only answer is tribal memory, the team will either cargo-cult the choice or
+        rip it out for the wrong reasons. Write an <strong>architecture decision record</strong>: two pages,
+        in their repo, in git, dated. This is the same discipline
+        <a href="./fd3.html" class="text-viol underline decoration-viol/40">FD3</a> applies to solution
+        architecture, narrowed to one question. The revisit trigger at the bottom is the part most people omit
+        and the part that does the work.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">docs/adr/0007-agent-framework.md — copy this skeleton verbatim</span>
+        <pre class="code"># ADR-0007 · Agent framework for the claims-triage service
+Status: Accepted · Date: 2026-08-05 · Deciders: B. Tran (FDE), P. Okafor (Eng lead)
+Supersedes: none · Revisit by: 2027-02-01 or on trigger (below)
+
+## Context
+Triage 400 claims/day: 2 tools, one branch, a strict JSON verdict, and a
+human approval gate before any payout over EUR 2,000. One Python engineer
+maintains it after handover. Compliance review at day 60 requires that we
+show every prompt sent to the model.
+
+## Options considered
+1. Raw loop (AI6 shape)      — rubric 57/65
+2. LangGraph + checkpointer  — rubric 50/65
+3. Claude Agent SDK          — rubric 44/65
+Rubric and evidence: docs/adr/0007-rubric.md (scored 2026-05-12, pre-build)
+
+## Decision
+LangGraph, behind the AgentRunner interface in src/agent_runner.py.
+
+## Why, in one paragraph
+The approval gate is a real requirement, not a nice-to-have; interrupt_before
+plus a checkpointer is a shape the compliance reviewer already recognised.
+We accepted a 7-point rubric deficit against the raw loop because P. Okafor
+has shipped LangGraph before and will own this alone from November.
+
+## Consequences we are accepting
+- +2 dependency trees, pinned exactly; upgrades gated on the eval (AI9).
+- Framework types confined to agent_runner.py; enforced by a grep in CI.
+- Prompts live in prompts/*.txt; a CI test diffs the wire request against them.
+- Est. exit cost if we are wrong: 3 days (measured — we built the RawLoopRunner).
+
+## Revisit triggers  &lt;- the row people forget
+- We spend &gt; 2 weeks in a quarter fighting the framework, or
+- an upgrade breaks the eval twice in a row, or
+- the approval gate requirement is dropped.
+<span class="out">Two pages. Twelve months later it is the most-read file in the repo.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The line worth stealing is <strong>"est. exit cost: 3 days (measured)"</strong>. Almost every ADR you
+        will read guesses at that number or omits it. Because Lab 3 makes you build the alternative runner
+        behind the same interface, you can state it as a fact — and a stated, measured exit cost is what turns
+        "we're locked in" from an anxiety into a line item. It is also the single most reassuring sentence you
+        can put in front of a procurement team.
+      </p>
+
       <!-- ═══════════════ PART V ═══════════════ -->
       <div class="kicker text-rose-500 mt-14">Part V · Staying in control</div>
       <h2 class="font-display text-2xl font-bold mt-2">Using frameworks without being used by them</h2>
@@ -463,6 +1235,45 @@ flowchart TD
         Prompt management discipline is <a href="./ai1.html" class="text-viol underline decoration-viol/40">AI1</a>;
         here the rule is simply: <strong>if you didn't write it and version it, you don't own your agent's behavior.</strong>
       </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        "Dump what the framework sends" deserves to be mechanical rather than heroic. Every Python framework in
+        this module ends up in <code class="inline">anthropic.Anthropic</code>, so intercept there once and you
+        see the truth regardless of which layers are above it:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">wiretap.py — import this first and every request lands on disk</span>
+        <pre class="code"><span class="kw">import</span> json, pathlib, time, anthropic
+
+OUT = pathlib.<span class="fn">Path</span>(<span class="st">"wire"</span>); OUT.mkdir(exist_ok=<span class="kw">True</span>)
+_create = anthropic.resources.messages.Messages.create
+
+<span class="kw">def</span> <span class="fn">traced_create</span>(self, **kw):
+    stamp = f<span class="st">"{time.time_ns()}"</span>
+    (OUT / f<span class="st">"{stamp}.req.json"</span>).write_text(json.dumps({
+        <span class="st">"model"</span>:    kw.get(<span class="st">"model"</span>),
+        <span class="st">"system"</span>:   kw.get(<span class="st">"system"</span>),
+        <span class="st">"tools"</span>:    [t.get(<span class="st">"name"</span>) <span class="kw">for</span> t <span class="kw">in</span> kw.get(<span class="st">"tools"</span>, [])],
+        <span class="st">"messages"</span>: kw.get(<span class="st">"messages"</span>),
+        <span class="st">"extra"</span>:    {k: v <span class="kw">for</span> k, v <span class="kw">in</span> kw.items()
+                      <span class="kw">if</span> k <span class="kw">not</span> <span class="kw">in</span> {<span class="st">"model"</span>, <span class="st">"system"</span>, <span class="st">"tools"</span>, <span class="st">"messages"</span>}},
+    }, indent=<span class="st">2</span>, default=<span class="fn">str</span>))
+    <span class="kw">return</span> <span class="fn">_create</span>(self, **kw)
+
+anthropic.resources.messages.Messages.create = traced_create</pre>
+      </div>
+      <pre class="code mt-3">python -c <span class="st">"import wiretap, lg_agent; lg_agent.run('Triage T-4471')"</span>
+jq -r <span class="st">'.system'</span> wire/*.req.json | diff - prompts/triage.txt
+<span class="out">7a8,11</span>
+<span class="out">&gt; You are a helpful assistant that can use tools. Think step by step</span>
+<span class="out">&gt; and explain your reasoning before each tool call.</span>
+<span class="cm"># ↑ four lines you never wrote, prepended by the framework, changing behaviour</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That diff is the whole discipline in one command. Once it is clean, <strong>make it a test</strong> —
+        <code class="inline">assert wire_system_prompt() == Path("prompts/triage.txt").read_text()</code> in
+        your CI suite — and a framework upgrade that quietly changes an injected prompt becomes a red build
+        instead of a slow quality regression nobody can date. It costs about fifteen lines and it is the single
+        highest-yield test in this entire module.
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">Own your eval</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
@@ -472,40 +1283,128 @@ flowchart TD
         embed their eval in framework-specific harnesses discover, at the worst moment, that they can't compare
         the old stack to the new one at all.
       </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Concretely: the eval takes a <em>callable</em>, never a framework object. If your harness signature
+        mentions <code class="inline">CompiledGraph</code> or <code class="inline">ClaudeAgentOptions</code>,
+        it is already framework-specific and you will not notice until the day you need it most.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">eval_harness.py — the signature is the whole design</span>
+        <pre class="code"><span class="kw">from</span> typing <span class="kw">import</span> Callable
+<span class="kw">import</span> json, statistics, time
+
+Runner = Callable[[str], dict]      <span class="cm"># ticket_id -&gt; verdict dict. That's the contract.</span>
+
+<span class="kw">def</span> <span class="fn">evaluate</span>(run: Runner, cases: list[dict]) -&gt; dict:
+    rows = []
+    <span class="kw">for</span> c <span class="kw">in</span> cases:
+        t0 = time.perf_counter()
+        <span class="kw">try</span>:
+            got = <span class="fn">run</span>(c[<span class="st">"ticket_id"</span>])
+            err = <span class="kw">None</span>
+        <span class="kw">except</span> <span class="fn">Exception</span> <span class="kw">as</span> e:
+            got, err = {}, f<span class="st">"{type(e).__name__}: {e}"</span>
+        rows.append({
+            <span class="st">"id"</span>:       c[<span class="st">"ticket_id"</span>],
+            <span class="st">"category"</span>: got.get(<span class="st">"category"</span>) == c[<span class="st">"category"</span>],
+            <span class="st">"refund"</span>:   got.get(<span class="st">"refund_eligible"</span>) == c[<span class="st">"refund_eligible"</span>],
+            <span class="st">"sev_off"</span>:  <span class="fn">abs</span>(got.get(<span class="st">"severity"</span>, <span class="st">0</span>) - c[<span class="st">"severity"</span>]),
+            <span class="st">"secs"</span>:     time.perf_counter() - t0,
+            <span class="st">"error"</span>:    err,
+        })
+    <span class="kw">return</span> {
+        <span class="st">"n"</span>:            <span class="fn">len</span>(rows),
+        <span class="st">"category_acc"</span>: <span class="fn">sum</span>(r[<span class="st">"category"</span>] <span class="kw">for</span> r <span class="kw">in</span> rows) / <span class="fn">len</span>(rows),
+        <span class="st">"refund_acc"</span>:   <span class="fn">sum</span>(r[<span class="st">"refund"</span>] <span class="kw">for</span> r <span class="kw">in</span> rows) / <span class="fn">len</span>(rows),
+        <span class="st">"sev_mae"</span>:      statistics.<span class="fn">mean</span>(r[<span class="st">"sev_off"</span>] <span class="kw">for</span> r <span class="kw">in</span> rows),
+        <span class="st">"p50_secs"</span>:     statistics.<span class="fn">median</span>(r[<span class="st">"secs"</span>] <span class="kw">for</span> r <span class="kw">in</span> rows),
+        <span class="st">"errors"</span>:       [r <span class="kw">for</span> r <span class="kw">in</span> rows <span class="kw">if</span> r[<span class="st">"error"</span>]],
+    }
+
+cases = [json.loads(l) <span class="kw">for</span> l <span class="kw">in</span> <span class="fn">open</span>(<span class="st">"golden/triage.jsonl"</span>)]
+<span class="kw">for</span> name, run <span class="kw">in</span> [(<span class="st">"raw"</span>, triage_raw), (<span class="st">"langgraph"</span>, triage_lg), (<span class="st">"sdk"</span>, triage_sdk)]:
+    <span class="fn">print</span>(name, <span class="fn">evaluate</span>(run, cases))
+<span class="out">raw       {'n': 40, 'category_acc': 0.95, 'refund_acc': 0.93, 'sev_mae': 0.30, 'p50_secs': 6.2, …}</span>
+<span class="out">langgraph {'n': 40, 'category_acc': 0.95, 'refund_acc': 0.90, 'sev_mae': 0.35, 'p50_secs': 6.6, …}</span>
+<span class="out">sdk       {'n': 40, 'category_acc': 0.93, 'refund_acc': 0.90, 'sev_mae': 0.38, 'p50_secs': 9.8, …}</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three numbers, one table, no framework in the signature. Notice what that output licenses you to say:
+        <strong>on this task the three stacks are within 2 points of each other on accuracy</strong>, so the
+        decision is not about quality at all — it is about the rubric's other five rows. That sentence, backed
+        by a run anyone can repeat, ends more architecture debates than any amount of advocacy. Grader design,
+        judge calibration and CI thresholds are <a href="./ai9.html" class="text-viol underline decoration-viol/40">AI9</a>'s
+        territory; all this Part insists on is that the harness never learns which framework it is testing.
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">The thin-wrapper pattern</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         Confine framework imports to one module, behind an interface <em>you</em> define. Callers depend on your
         interface; the framework becomes an implementation detail you can eject from:
       </p>
-      <pre class="code mt-3"><span class="cm"># agent_runner.py — the ONLY file allowed to import a framework</span>
-from typing import Protocol
-from dataclasses import dataclass
+      <div class="mt-4">
+        <span class="code-label">agent_runner.py — the ONLY file allowed to import a framework</span>
+        <pre class="code"><span class="kw">import</span> os, uuid, pathlib
+<span class="kw">from</span> typing <span class="kw">import</span> Protocol
+<span class="kw">from</span> dataclasses <span class="kw">import</span> dataclass, field
+
+PROMPTS = pathlib.<span class="fn">Path</span>(<span class="st">"prompts"</span>)
 
 @dataclass
-class AgentResult:
+<span class="kw">class</span> <span class="fn">AgentResult</span>:
     answer: str
-    sources: list[str]
-    trace_id: str
+    sources: list[str] = field(default_factory=<span class="fn">list</span>)
+    trace_id: str = <span class="st">""</span>
+    turns: int = <span class="st">0</span>
+    usd: float = <span class="st">0.0</span>          <span class="cm"># every backend must report cost — see PR1</span>
 
-class AgentRunner(Protocol):
-    def run(self, question: str, session_id: str) -&gt; AgentResult: ...
+<span class="kw">class</span> <span class="fn">AgentRunner</span>(Protocol):
+    <span class="kw">def</span> <span class="fn">run</span>(self, question: str, session_id: str) -&gt; AgentResult: ...
 
-class LangGraphRunner:
-    """Wraps the compiled graph. Framework types never leak past this class."""
-    def __init__(self, prompts_dir: str): ...
-    def run(self, question: str, session_id: str) -&gt; AgentResult: ...
+<span class="kw">class</span> <span class="fn">LangGraphRunner</span>:
+    <span class="st">"""Wraps the compiled graph. Framework types never leave this class."""</span>
+    <span class="kw">def</span> <span class="fn">__init__</span>(self):
+        <span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent      <span class="cm"># import INSIDE</span>
+        <span class="kw">from</span> langchain_anthropic <span class="kw">import</span> ChatAnthropic
+        self._g = <span class="fn">create_react_agent</span>(
+            <span class="fn">ChatAnthropic</span>(model=<span class="st">"claude-opus-5"</span>, max_tokens=<span class="st">2048</span>),
+            tools=TOOLS, prompt=(PROMPTS / <span class="st">"triage.txt"</span>).read_text())
 
-class RawLoopRunner:
-    """Your AI6 loop behind the same interface — the eject seat."""
-    def run(self, question: str, session_id: str) -&gt; AgentResult: ...
+    <span class="kw">def</span> <span class="fn">run</span>(self, question, session_id) -&gt; AgentResult:
+        trace = <span class="fn">str</span>(uuid.uuid4())
+        out = self._g.invoke({<span class="st">"messages"</span>: [(<span class="st">"user"</span>, question)]},
+                             {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: session_id}})
+        msgs = out[<span class="st">"messages"</span>]
+        <span class="kw">return</span> <span class="fn">AgentResult</span>(                    <span class="cm"># ← translation happens HERE, once</span>
+            answer=msgs[-<span class="st">1</span>].content,
+            sources=<span class="fn">_cited</span>(msgs), trace_id=trace,
+            turns=<span class="fn">sum</span>(<span class="st">1</span> <span class="kw">for</span> m <span class="kw">in</span> msgs <span class="kw">if</span> m.type == <span class="st">"ai"</span>),
+            usd=<span class="fn">_price</span>(msgs))
 
-def get_runner() -&gt; AgentRunner:          <span class="cm"># callers only ever see this</span>
-    import os
-    return RawLoopRunner() if os.getenv("AGENT_BACKEND") == "raw" else LangGraphRunner("prompts/")</pre>
+<span class="kw">class</span> <span class="fn">RawLoopRunner</span>:
+    <span class="st">"""Your AI6 loop behind the same interface — the eject seat."""</span>
+    <span class="kw">def</span> <span class="fn">run</span>(self, question, session_id) -&gt; AgentResult: ...
+
+<span class="kw">def</span> <span class="fn">get_runner</span>() -&gt; AgentRunner:          <span class="cm"># callers only ever see this</span>
+    <span class="kw">return</span> {<span class="st">"raw"</span>: RawLoopRunner, <span class="st">"langgraph"</span>: LangGraphRunner}[
+        os.getenv(<span class="st">"AGENT_BACKEND"</span>, <span class="st">"langgraph"</span>)]()</pre>
+      </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        The discipline costs a file and saves a rewrite. Lab 3 makes you prove it works by swapping backends
-        under a passing test suite.
+        Two details do the actual work. <strong>The framework import lives inside
+        <code class="inline">__init__</code></strong>, not at module top level, so a deployment that only ever
+        uses <code class="inline">RawLoopRunner</code> does not need LangGraph installed at all — which is what
+        makes an air-gapped or slim-image variant possible without a code change. And
+        <strong><code class="inline">AgentResult</code> carries <code class="inline">usd</code> and
+        <code class="inline">turns</code></strong>, so every backend is obliged to answer the two questions
+        operations will ask. Enforce the boundary with one line in CI:
+      </p>
+      <pre class="code mt-3">grep -rn <span class="st">"langgraph\|langchain\|claude_agent_sdk"</span> --include=<span class="st">"*.py"</span> src/ \
+  | grep -v <span class="st">"src/agent_runner.py"</span> &amp;&amp; exit 1 || echo <span class="st">"boundary intact"</span>
+<span class="out">boundary intact</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The discipline costs one file and saves a rewrite. Lab 3 makes you prove it by swapping backends under
+        an unchanged test suite — and the number that comes out of that lab ("exit cost: 3 days, measured") is
+        the line that goes in the ADR.
       </p>
 
       <h3 class="font-semibold text-lg mt-8">Tracing through framework internals</h3>
@@ -518,12 +1417,416 @@ def get_runner() -&gt; AgentRunner:          <span class="cm"># callers only eve
         If not, you are flying an instrument approach with half the instruments.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">Dropping below the abstraction — an actual transcript</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Everything above is a habit. This is what the habit looks like at 16:40 on a Thursday, on a real
+        symptom: <em>"since Tuesday the agent sometimes answers refund questions without ever calling
+        <code class="inline">order_history</code>."</em> Intermittent, no exception, no framework error, and
+        two engineers already three hours into the framework's GitHub issues. The route through it is always
+        the same shape — go down a layer until you find the layer that is telling the truth.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Me as FDE
+    participant App as Product code
+    participant FW as Framework
+    participant Wire as wiretap.py
+    participant API as /v1/messages
+    Me->>App: reproduce on 20 tickets, record which fail
+    App-->>Me: 6/20 skip the tool — all 6 are LONG tickets
+    Note over Me: hypothesis 1: prompt<br/>hypothesis 2: context handling
+    Me->>FW: read the source of the message-trimming helper
+    FW-->>Me: keeps last N tokens, drops OLDEST first
+    Me->>Wire: dump the raw request for one failing ticket
+    Wire->>API: system=…  tools=[get_ticket]
+    Wire-->>Me: the tools array has ONE entry, not two
+    Note over Me,API: the tools array is truncated,<br/>not the messages. Cause found.
+    Me->>App: pin tools outside the trimmed region + add a CI assert
+    App-->>Me: 20/20 call the tool; assert fails loudly if it regresses
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The step that mattered is step 6, and it took ninety seconds because
+        <code class="inline">wiretap.py</code> was already in the repo. Here is the diff that ended it — the
+        two requests, printed side by side, one that works and one that doesn't:
+      </p>
+      <pre class="code mt-3">jq -c <span class="st">'{tools: .tools, n: (.messages|length)}'</span> wire/*.req.json | sort -u
+<span class="out">{"tools":["get_ticket","order_history"],"n":2}   ← the 14 that work</span>
+<span class="out">{"tools":["get_ticket"],"n":2}                   ← the 6 that fail</span>
+
+<span class="cm"># the framework's helper was budgeting tokens across the WHOLE request,</span>
+<span class="cm"># and shedding tool definitions once the ticket text got large enough.</span>
+<span class="cm"># Nothing raised. Nothing logged. The model simply stopped being able to call it.</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three things to take from this. <strong>The symptom was in the product tier and the cause was two
+        layers down</strong> — exactly the picture in Part I's diagram. <strong>No error was ever raised</strong>,
+        so no amount of exception logging would have found it; only the wire did. And the fix was not to
+        abandon the framework: it was eight lines that pin the tool definitions outside the trimmed region,
+        plus an assertion in CI that the request always carries both tools. Total elapsed time from symptom to
+        merged fix: <strong>50 minutes</strong>, against three hours already sunk in issue threads.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>The generalisable move:</strong> when a framework misbehaves, do not ask "what is the framework
+        doing wrong?" — ask <em>"what request is actually being sent, and is it the one I meant?"</em> Those are
+        different questions and only the second one is answerable in minutes. Keep a wiretap in every
+        engagement repo from week one; it costs fifteen lines and it converts framework archaeology into a
+        diff.
+      </div>
+
       <h3 class="font-semibold text-lg mt-8">Upgrade discipline</h3>
       <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
         <li><strong>Pin exact versions</strong> — framework <em>and</em> its transitive LLM deps. "Compatible release" ranges are how Tuesday's deploy behaves differently from Monday's.</li>
         <li><strong>Read the changelog before, not after.</strong> Look specifically for changed defaults (prompts, temperatures, retry counts) — the silent behavior shifts that never say "BREAKING".</li>
         <li><strong>Canary the upgrade:</strong> run the new version against your full eval and diff the scores before it touches production traffic. A framework upgrade is a model-change-sized event; treat it with model-change-sized ceremony.</li>
+        <li><strong>Diff the wire, not just the scores.</strong> An upgrade that changes an injected prompt but not your metrics has still changed your system; you want to know now, on your terms, rather than in three weeks when it interacts with something else.</li>
       </ul>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        All of that fits in one Makefile target, which is the difference between a policy people agree with and
+        a policy people follow:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">Makefile — <code class="inline">make upgrade PKG=langgraph V=0.7.2</code></span>
+        <pre class="code">upgrade:
+	git switch -c bump/$(PKG)-$(V)
+	python -c <span class="st">"import wiretap, evals.smoke"</span>      <span class="cm"># capture BEFORE</span>
+	mv wire wire.before
+	uv pip install $(PKG)==$(V)
+	python -c <span class="st">"import wiretap, evals.smoke"</span>      <span class="cm"># capture AFTER</span>
+	-diff &lt;(jq -S . wire.before/*.req.json) &lt;(jq -S . wire/*.req.json) \
+	   | tee upgrade-wire.diff
+	python -m evals.run --out upgrade-scores.json
+	python -m evals.compare baseline.json upgrade-scores.json --max-drop 0.02
+<span class="out">wire diff: 1 change  (system prompt +218 bytes: "Think step by step…")</span>
+<span class="out">scores:   category_acc 0.95 → 0.93  (-0.02)  FAIL: exceeds --max-drop</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That output is the whole argument for this section in eleven words: a patch-level bump added 218 bytes
+        of prompt you did not write and cost two points of accuracy. Without the target it ships. With it, the
+        build goes red and someone spends ten minutes rather than a fortnight.
+      </p>
+
+      <!-- ═══════════════ PART VI ═══════════════ -->
+      <div class="kicker text-indigo-500 dark:text-indigo-400 mt-14">Part VI · Inheriting someone else's stack</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Most of your career happens in a framework you did not choose</h2>
+
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Parts I–V assume you get to decide. Count your engagements honestly and that is the minority case. The
+        common one is this: a customer has been building for five months, someone picked a framework in week
+        two for reasons nobody present can reconstruct, there are 9,000 lines of it, two of the three original
+        engineers have left, and you are expected to be <strong>useful by tomorrow</strong> and to have an
+        opinion by Friday. The skill this Part teaches is not "evaluate frameworks". It is
+        <strong>orientation under time pressure in code you did not write</strong>, and it is the single most
+        reliable way an FDE earns trust in the first week.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>The two ways this goes wrong,</strong> and both are recognisable from the doorway. The first is
+        <em>deference</em>: you assume the existing choice was considered, work around its weirdness for six
+        weeks, and never ask why the retry logic is in three places. The second is <em>contempt</em>: you
+        announce in week one that it should all be rewritten, lose the room, and spend the rest of the
+        engagement being technically correct at people who no longer listen. The path between them is
+        evidence, gathered in the first ninety minutes.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">The 90-minute orientation</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You cannot read 9,000 lines before tomorrow, and you do not need to. An agent codebase has five load
+        bearing questions, and each has a fixed place to look. Do them in this order — the order matters,
+        because each answer tells you where to look for the next — and time-box each one. When the box expires,
+        write down what you know, mark the gap, and move on.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <svg viewBox="0 0 700 215" class="w-full min-w-[640px]" role="img" aria-label="The ninety-minute orientation route through an inherited agent codebase">
+          <text x="12" y="18" font-size="11" font-weight="700" fill="#6E6B64">90 MINUTES · IN THIS ORDER</text>
+          <g class="anim-pulse"><rect x="10" y="30" width="124" height="52" rx="9" fill="#2563EB"/>
+            <text x="72" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">0–15 · Run it</text>
+            <text x="72" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">one real request,</text>
+            <text x="72" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">end to end, locally</text></g>
+          <g class="anim-pulse d1"><rect x="152" y="30" width="124" height="52" rx="9" fill="#6d5acd"/>
+            <text x="214" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">15–35 · The wire</text>
+            <text x="214" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">dump one raw request</text>
+            <text x="214" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">model · tools · system</text></g>
+          <g class="anim-pulse d2"><rect x="294" y="30" width="124" height="52" rx="9" fill="#0D9488"/>
+            <text x="356" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">35–55 · Prompts</text>
+            <text x="356" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">which bytes are theirs,</text>
+            <text x="356" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">which are the library's</text></g>
+          <g class="anim-pulse d3"><rect x="436" y="30" width="124" height="52" rx="9" fill="#D97757"/>
+            <text x="498" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">55–75 · Boundary</text>
+            <text x="498" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">how far the framework</text>
+            <text x="498" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">has spread into the app</text></g>
+          <g class="anim-pulse d4"><rect x="578" y="30" width="112" height="52" rx="9" fill="#37474F"/>
+            <text x="634" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">75–90 · Truth</text>
+            <text x="634" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">is there any eval?</text>
+            <text x="634" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">any golden set at all?</text></g>
+          <line x1="134" y1="56" x2="150" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="276" y1="56" x2="292" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="418" y1="56" x2="434" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="560" y1="56" x2="576" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="12" y="112" font-size="11" font-weight="700" fill="#6E6B64">WHAT YOU WALK OUT WITH</text>
+          <text x="12" y="132" font-size="10" fill="#6E6B64">A one-page ORIENTATION.md: the request they actually send · the prompt inventory ·</text>
+          <text x="12" y="148" font-size="10" fill="#6E6B64">the blast radius of the framework · whether anyone can tell if quality changed.</text>
+          <text x="12" y="172" font-size="10" fill="#A8A49B">Not in scope today: opinions about the framework. Those are Friday's job,</text>
+          <text x="12" y="186" font-size="10" fill="#A8A49B">and they land very differently when the evidence came first.</text>
+          <text x="12" y="208" font-size="10" font-weight="700" fill="#D97757" class="anim-bounce">Useful by tomorrow. Opinionated by Friday. In that order.</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The first box is non-negotiable and people skip it constantly. <strong>Do not read code before you have
+        run one real request end to end on your own machine.</strong> Reading first gives you a model of the
+        system that is polite fiction; running first tells you which of the 9,000 lines are even executed. Half
+        the time you also discover the setup is undocumented, which is itself a finding worth reporting.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">orientation.sh — the first fifteen minutes, verbatim</span>
+        <pre class="code"><span class="cm"># 1. what actually runs — entry points, not the README's claims</span>
+rg -n <span class="st">"FastAPI\(|Flask\(|def main|if __name__|@app\.(post|get)"</span> --type py | head -20
+
+<span class="cm"># 2. which agent frameworks are really installed (pyproject lies less than docs)</span>
+rg -n <span class="st">"langgraph|langchain|llama_index|claude_agent_sdk|crewai|autogen"</span> \
+   pyproject.toml requirements*.txt 2&gt;/dev/null
+
+<span class="cm"># 3. how big is the surface? one number that predicts your whole week</span>
+rg -l <span class="st">"langgraph|langchain"</span> --type py | wc -l
+<span class="out">37</span>          <span class="cm"># ← 37 of 92 files import the framework. There is no wrapper. Note it.</span>
+
+<span class="cm"># 4. run ONE real request and keep the output</span>
+uv run python -m app.cli <span class="st">"Triage ticket T-4471"</span> 2&gt;&amp;1 | tee orientation/run1.log</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Box</th><th class="px-4 py-3">The question</th><th class="px-4 py-3">Where the answer lives</th><th class="px-4 py-3">Write down</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">0–15 · Run it</td><td class="px-4 py-3">Can I execute one real request without asking anyone?</td><td class="px-4 py-3">README, Makefile, docker-compose, the CI workflow (the most honest of the four)</td><td class="px-4 py-3">The exact command, and every step the README got wrong</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">15–35 · The wire</td><td class="px-4 py-3">What request do they actually send?</td><td class="px-4 py-3">Drop in <code class="inline">wiretap.py</code> from Part V and re-run</td><td class="px-4 py-3">Model id, tool names, system prompt length, any parameter you don't recognise</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">35–55 · Prompts</td><td class="px-4 py-3">Which bytes on that wire did a human here write?</td><td class="px-4 py-3">The prompt inventory below</td><td class="px-4 py-3">Every prompt, its file, and whether it is versioned or inline</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">55–75 · Boundary</td><td class="px-4 py-3">How far has the framework spread?</td><td class="px-4 py-3">The import-count grep; then the DB models and API schemas</td><td class="px-4 py-3">Files importing it, and whether its types reach persistence or the public API</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">75–90 · Truth</td><td class="px-4 py-3">Could anyone here tell if quality dropped?</td><td class="px-4 py-3"><code class="inline">tests/</code>, any <code class="inline">golden*</code> / <code class="inline">eval*</code> path, the CI config</td><td class="px-4 py-3">Number of scored cases. Usually zero. That is your first week's work.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The last row is the one that most often reframes the engagement. On four of the last five inherited
+        stacks I have walked into, the honest answer to "could anyone tell if quality dropped?" was
+        <strong>no</strong> — no golden set, no scored cases, nothing in CI beyond unit tests on the tool
+        functions. That finding outranks every framework opinion you might have, because until it is fixed
+        nobody can evaluate a migration either. <em>You cannot argue about the stack in a system that cannot
+        measure itself.</em>
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Reading the real quality signals of an inherited implementation</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Part IV taught you to judge a <em>framework</em> before adopting it. This is a different assessment:
+        judging the <em>implementation</em> you have been handed, where the framework choice is now a fixed
+        cost. A well-built LangGraph app is a far better place to spend three months than a badly built raw
+        loop, and the signals that tell them apart have almost nothing to do with which library is in
+        <code class="inline">pyproject.toml</code>.
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">Signals of a stack worth keeping
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(look for these first)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><strong>Prompts in files, in git,</strong> with a diff history that shows someone iterating on them deliberately.</li>
+            <li><strong>Pinned versions</strong> in a lockfile that is actually committed — and a dependency bump in the log that has a test run attached to it.</li>
+            <li><strong>A golden set,</strong> however small. Twelve scored cases beats an elegant architecture with none.</li>
+            <li><strong>Framework imports concentrated</strong> in a handful of files, even if nobody called it a wrapper.</li>
+            <li><strong>Traces or structured logs</strong> that let you reconstruct one bad answer without a debugger.</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-rose-500">Signals you are inheriting a maintenance problem
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(cost them in your plan)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><strong>Prompt strings inline in request handlers</strong>, several near-duplicates, none of them canonical.</li>
+            <li><strong>Unpinned ranges</strong> plus a comment like <code class="inline"># do not upgrade, it breaks</code>. Both halves are the finding.</li>
+            <li><strong>Framework types in the database schema or the public API</strong> — the exit cost is now a rewrite.</li>
+            <li><strong>Monkey-patched internals</strong>, vendored framework files, or a fork nobody is tracking upstream.</li>
+            <li><strong>A <code class="inline">try/except Exception: pass</code> around a model call.</strong> Somebody stopped an incident with it and it is still there.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Turn that into a number rather than a mood, because a number is reportable and a mood is not. I score
+        the ten signals above at one point each and put the total in <code class="inline">ORIENTATION.md</code>
+        as <strong>"inherited-stack health: 4/10"</strong> with the ten lines of justification underneath. The
+        insurer engagement from Part IV scored 3/10 on arrival and 8/10 at handover, and that pair of numbers
+        did more for the renewal conversation than any feature we shipped — because it made invisible work
+        visible to someone who was never going to read the code.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        One caution about how you deliver that score. Every one of those ten signals is also a judgement on
+        somebody who is probably still in the room, and a health score presented as a report card will be
+        argued with rather than acted on. The framing that works is temporal rather than personal: <em>"here is
+        where the code is today, here is where it needs to be before we can safely change anything, here are
+        the four things in between."</em> Same ten signals, same score, entirely different meeting. On the
+        insurer engagement the sentence that unlocked the work was "none of this is a criticism of the build —
+        it is the tax every agent codebase accrues in its first six months, and nobody has paid it down yet."
+        That was true, and it was also the only version of the truth anyone could act on.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Finding where the prompts actually live</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In an inherited agent codebase the prompts are the behaviour, and they are almost never all in one
+        place. They hide in four locations at once: files someone made deliberately, string literals inline in
+        handlers, templates the framework renders from its own package, and — the one that catches people —
+        rows in the customer's database, edited by a product manager through an admin screen you have not been
+        shown. Until you have all four, you do not know what your agent says.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt_inventory.sh — twenty minutes, four hiding places</span>
+        <pre class="code"><span class="cm"># 1. the deliberate ones</span>
+fd -e txt -e md -e j2 . prompts/ templates/ 2&gt;/dev/null
+
+<span class="cm"># 2. inline literals: any long string near a model call. Noisy on purpose.</span>
+rg -n --multiline <span class="st">'(system|prompt|instructions)\s*=\s*(f?"""|f?")[^"]{80,}'</span> --type py
+
+<span class="cm"># 3. the library's own templates — the ones nobody knows are being sent</span>
+python - &lt;&lt;<span class="st">'PY'</span>
+<span class="kw">from</span> app.agent <span class="kw">import</span> engine
+<span class="kw">for</span> k, v <span class="kw">in</span> engine.get_prompts().items():        <span class="cm"># LlamaIndex</span>
+    <span class="fn">print</span>(<span class="st">"=="</span>, k); <span class="fn">print</span>(v.template[:<span class="st">400</span>])
+PY
+
+<span class="cm"># 4. the ones in their database, edited by someone who is not an engineer</span>
+rg -n <span class="st">"prompt|instruction|system_message"</span> --type sql --type py -g <span class="st">"*model*"</span> -g <span class="st">"*migration*"</span>
+
+<span class="cm"># then the ground truth: what was ACTUALLY sent</span>
+python -c <span class="st">"import wiretap, app.cli"</span> &amp;&amp; jq -r <span class="st">'.system'</span> wire/*.req.json | wc -c
+<span class="out">6142</span>   <span class="cm"># 6.1 KB of system prompt. prompts/ accounts for 3.4 KB. Find the rest.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>The 2.7 KB gap is the deliverable.</strong> Every byte the wire carries that you cannot trace to
+        a file is behaviour nobody on the team owns, and reconciling that gap is a genuinely impressive first
+        week — it is concrete, it is finishable, it improves the system for everyone, and it steps on nobody's
+        design decisions. Record it as a table in <code class="inline">ORIENTATION.md</code>:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Fragment on the wire</th><th class="px-4 py-3">Bytes</th><th class="px-4 py-3">Origin</th><th class="px-4 py-3">Owned?</th><th class="px-4 py-3">Action</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">"You are a claims triage…"</td><td class="px-4 py-3">3,412</td><td class="px-4 py-3"><code class="inline">prompts/triage.txt</code></td><td class="px-4 py-3">Yes — in git</td><td class="px-4 py-3">None</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Think step by step and explain…"</td><td class="px-4 py-3">218</td><td class="px-4 py-3">LangGraph prebuilt default</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Move into <code class="inline">triage.txt</code> verbatim, or delete deliberately</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"IMPORTANT: never mention refunds…"</td><td class="px-4 py-3">1,940</td><td class="px-4 py-3"><code class="inline">settings</code> table, row id 3</td><td class="px-4 py-3">No — PM edits it live</td><td class="px-4 py-3">Version the table; add it to the eval fixture</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tool descriptions</td><td class="px-4 py-3">572</td><td class="px-4 py-3">Docstrings in <code class="inline">tools.py</code></td><td class="px-4 py-3">Yes, accidentally</td><td class="px-4 py-3">Say so out loud — a docstring edit is a prompt change</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Row three is the one that changes how a team behaves. When a product manager can edit a live prompt
+        with no review, no version and no eval, you do not have a deployment process — you have a shared text
+        box wired to production. The fix is rarely "take it away"; it is to keep the admin screen and put the
+        row under version control with an eval run on save. Row four is the quiet one:
+        <strong>tool descriptions are prompts</strong>, they are frequently written by whoever wrote the
+        function, and they are the most under-reviewed text in most agent codebases
+        (<a href="./ai8.html" class="text-viol underline decoration-viol/40">AI8</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Instrumenting a framework you did not write</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You will be asked "why did it do that?" long before you are allowed to change anything, so the second
+        artifact after the prompt inventory is observability — added from the outside, without touching their
+        code. Every framework in this module has an official seam for exactly this, and knowing all three
+        by name is a small thing that makes you look like you have done this before. The span shapes, sampling
+        and cost attribution are <a href="./pr1.html" class="text-viol underline decoration-viol/40">PR1</a>'s
+        subject; what belongs here is <em>where the hook goes</em> in each stack.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">observe.py — one file, imported first, three frameworks covered</span>
+        <pre class="code"><span class="cm"># A. LangGraph / LangChain — a callback handler attaches to every invoke()</span>
+<span class="kw">from</span> langchain_core.callbacks <span class="kw">import</span> BaseCallbackHandler
+
+<span class="kw">class</span> <span class="fn">Tap</span>(BaseCallbackHandler):
+    <span class="kw">def</span> <span class="fn">on_chat_model_start</span>(self, serialized, messages, **kw):
+        <span class="fn">log</span>.info(<span class="st">"llm_start"</span>, run_id=kw[<span class="st">"run_id"</span>], n_msgs=<span class="fn">len</span>(messages[<span class="st">0</span>]))
+    <span class="kw">def</span> <span class="fn">on_tool_start</span>(self, serialized, input_str, **kw):
+        <span class="fn">log</span>.info(<span class="st">"tool_start"</span>, tool=serialized[<span class="st">"name"</span>], args=input_str[:<span class="st">200</span>])
+    <span class="kw">def</span> <span class="fn">on_tool_error</span>(self, error, **kw):
+        <span class="fn">log</span>.error(<span class="st">"tool_error"</span>, err=<span class="fn">repr</span>(error))       <span class="cm"># the one that pays for itself</span>
+
+agent.invoke(payload, {<span class="st">"callbacks"</span>: [<span class="fn">Tap</span>()], <span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: sid}})
+
+<span class="cm"># B. Claude Agent SDK — hooks gate AND observe, without editing their agent</span>
+<span class="kw">async</span> <span class="kw">def</span> <span class="fn">post_tool</span>(input_data, tool_use_id, context):
+    <span class="fn">log</span>.info(<span class="st">"tool_done"</span>, tool=input_data[<span class="st">"tool_name"</span>],
+             bytes=<span class="fn">len</span>(<span class="fn">str</span>(input_data.get(<span class="st">"tool_response"</span>, <span class="st">""</span>))))
+    <span class="kw">return</span> {}                                    <span class="cm"># {} = allow, unchanged</span>
+
+options = <span class="fn">ClaudeAgentOptions</span>(hooks={<span class="st">"PostToolUse"</span>: [<span class="fn">HookMatcher</span>(hooks=[post_tool])]})
+
+<span class="cm"># C. Vercel AI SDK — onStepFinish on the server, one JSON line per step</span>
+<span class="cm"># streamText({ …, onStepFinish: ({ toolCalls, usage }) =&gt; log.info({ toolCalls, usage }) })</span>
+
+<span class="cm"># D. The universal fallback when a framework offers you nothing:</span>
+<span class="kw">import</span> wiretap        <span class="cm"># Part V. Works on anything that ends up in the Anthropic SDK.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Option D is the one to remember, because it is the only one that cannot be taken away from you. A
+        framework can lack callbacks, document them badly, or change them next release; it cannot avoid making
+        an HTTP request. <strong>Instrument at the layer that cannot lie.</strong> The practical test for
+        whether you are done: pick any bad answer from yesterday and reconstruct, from logs alone, every prompt
+        and every tool result involved. If you can, you can debug this system in front of a customer. If you
+        cannot, that is your next ticket, and it outranks whatever feature was planned.
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> hand the instrumentation over as <em>theirs</em>, not yours. A wiretap in
+        your notes helps this engagement; a <code class="inline">make wire</code> target in their Makefile, four
+        paragraphs in their CONTRIBUTING, and one engineer who has used it in front of you changes how the team
+        debugs after you leave. The measure of an FDE is what still works six months later.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Replace it, or live with it — costing the migration honestly</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Friday arrives and someone asks the question. Resist answering it as a framework question; answer it as
+        an arithmetic one. <strong>A migration is justified when the measured cost of staying exceeds the
+        measured cost of leaving, over a horizon someone will actually commit to.</strong> Both sides of that
+        inequality are estimable, and estimating them in public is the most valuable thing you will do that
+        week — including when the answer is "keep it", which it usually is.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Cost of staying (per quarter)</th><th class="px-4 py-3">How to measure it, this week</th><th class="px-4 py-3">Insurer engagement, actual</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Time lost fighting the abstraction</td><td class="px-4 py-3">Grep the last 90 days of PR titles and standup notes for framework workarounds; count engineer-days</td><td class="px-4 py-3">6.5 days/quarter</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Upgrade tax</td><td class="px-4 py-3">Count majors and breaking minors in the last year × the days each one cost them</td><td class="px-4 py-3">3 bumps × 1.5 days = 4.5 days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Debug latency premium</td><td class="px-4 py-3">Median time-to-root-cause on framework-adjacent incidents vs your own code</td><td class="px-4 py-3">+14 min per incident × 22 incidents ≈ 0.6 days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Capability ceiling</td><td class="px-4 py-3">List features you could not ship, or shipped worse, because of it — with dates</td><td class="px-4 py-3">1 (structured output workaround), no revenue impact</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><strong>Total drag</strong></td><td class="px-4 py-3">Sum the engineer-days; put a rate on it if the room is a finance room</td><td class="px-4 py-3"><strong>≈ 11.6 days/quarter</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Cost of leaving (one-off)</th><th class="px-4 py-3">The part people forget</th><th class="px-4 py-3">Insurer engagement, actual</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Re-implementation</td><td class="px-4 py-3">The loop is days; the accumulated edge cases are weeks</td><td class="px-4 py-3">9 days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Behaviour parity</td><td class="px-4 py-3">Silent things the framework did — retries, coercion, trimming — that you must now re-implement or consciously drop</td><td class="px-4 py-3">4 days (2 of them just retry semantics)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Building the eval you need first</td><td class="px-4 py-3">You cannot migrate safely without it, and it usually does not exist</td><td class="px-4 py-3">5 days — and worth it regardless of the decision</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Team re-learning</td><td class="px-4 py-3">Their engineers were productive; for a while they will not be</td><td class="px-4 py-3">~10 days spread across two people</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Political cost</td><td class="px-4 py-3">Someone chose this. Migration reads as a verdict on them unless you frame it as arithmetic.</td><td class="px-4 py-3">Not free. Never free.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><strong>Total</strong></td><td class="px-4 py-3">Divide the drag into it for a payback horizon</td><td class="px-4 py-3"><strong>28 days → payback in ~2.4 quarters</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        We did not migrate. Twenty-eight days against 11.6 days a quarter pays back in about seven months, and
+        nobody in that room could commit to the system still mattering in seven months — the pilot had a
+        go/no-go at day 90. Instead we spent <strong>seven of those twenty-eight days</strong> on the three
+        highest-leverage pieces: the eval (5), the prompt reconciliation (1.5), and the wrapper boundary around
+        the framework (0.5). Drag fell to about 4 days a quarter, and the migration option stayed open at a
+        now-measured cost. <strong>The best outcome of a migration analysis is usually not a migration</strong>
+        — it is a smaller, cheaper intervention that buys most of the benefit and keeps the door open.
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> decline the rewrite you would enjoy. The most senior thing you can do in
+        week one of an inherited stack is write "keep it, here is why, here is the number that would change my
+        mind" — and name the trigger explicitly, in their ADR, with a date. You lose a fun quarter of
+        greenfield work and gain a customer who believes you when the answer <em>is</em> "replace it".
+      </div>
 
       <!-- ═══════════════ skill ladder ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
@@ -618,6 +1921,14 @@ def get_runner() -&gt; AgentRunner:          <span class="cm"># callers only eve
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">If framework types appear in your API contracts, database rows, and test fixtures, you no longer have an exit. The thin wrapper (Part V) costs one file; the alternative costs a rewrite.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Arriving with a verdict instead of a wiretap</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Announcing in week one that the inherited stack should be rewritten costs you the room and buys you nothing. Run the 90-minute orientation, produce ORIENTATION.md, and let the numbers make the argument on Friday (Part VI).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep a wiretap in every engagement repo</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Fifteen lines that write every outbound request to disk turn framework archaeology into a <code class="inline">diff</code>. It found the truncated-tools bug in Part V in ninety seconds, after three hours of issue-thread reading had not.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
           <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Read the source of the layer below</div>
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Before adopting, find the framework's core loop and read it end-to-end. Twenty minutes of reading buys you 2 a.m. debugging ability no documentation provides.</p>
         </div>
@@ -634,6 +1945,9 @@ def get_runner() -&gt; AgentRunner:          <span class="cm"># callers only eve
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="sabotage"> <span>Injected the same bug (malformed tool JSON) into every stack and timed the diagnosis in each — with notes on where the error surfaced.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="webagent"> <span>Shipped a streaming web agent with the Vercel AI SDK: useChat, two server tools, tool-call states rendered in the UI.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="eject"> <span>Extracted all prompts to versioned files and swapped a framework backend for the raw loop behind an unchanged interface, proven by a passing test suite.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="wiretap"> <span>Dropped a wiretap into a framework build and diffed the raw system prompt against <code class="inline">prompts/</code> — recorded the byte gap and named every fragment you did not write.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="orientation"> <span>Ran the 90-minute orientation on a codebase you did not write and produced <code class="inline">ORIENTATION.md</code>: the request actually sent, the prompt inventory, the framework blast radius, and the inherited-stack health score.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="adr"> <span>Wrote the two-page ADR for one stack decision — weighted rubric, the reason you overrode it if you did, a measured exit cost, and explicit revisit triggers.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="report"> <span class="font-semibold">Produced the comparison report: rubric scores, measured findings, recommendation-by-scenario (catalog evidence ✓).</span></label>
       </div>
 
@@ -643,6 +1957,14 @@ def get_runner() -&gt; AgentRunner:          <span class="cm"># callers only eve
         <li><a class="text-coral underline" href="https://code.claude.com/docs/en/agent-sdk" target="_blank" rel="noopener">Claude Agent SDK docs</a> — the harness, hooks, sessions, permissions, and custom tools via in-process MCP.</li>
         <li><a class="text-coral underline" href="https://ai-sdk.dev/docs" target="_blank" rel="noopener">Vercel AI SDK docs</a> — streamText, generateObject, useChat, and the UI message-stream protocol.</li>
         <li><a class="text-coral underline" href="https://docs.llamaindex.ai" target="_blank" rel="noopener">LlamaIndex docs</a> — skim the ingestion/index/query-engine concepts even if you never adopt it; the vocabulary shows up in customer conversations.</li>
+        <li><a class="text-coral underline" href="https://docs.anthropic.com/en/api/messages" target="_blank" rel="noopener">Anthropic — Messages API reference</a> — the layer every framework in this module compiles down to, and the document you diff your wiretap dumps against.</li>
+        <li><a class="text-coral underline" href="https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview" target="_blank" rel="noopener">Anthropic — Tool use</a> · <a class="text-coral underline" href="https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/structured-outputs" target="_blank" rel="noopener">Structured outputs</a> — the two capabilities every wrapper in Part II models differently; read these before judging any of them.</li>
+        <li><a class="text-coral underline" href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Anthropic Engineering — Building effective agents</a> — the case for composable patterns over frameworks, from the team that ships both.</li>
+        <li><a class="text-coral underline" href="https://www.anthropic.com/engineering/building-agents-with-the-claude-agent-sdk" target="_blank" rel="noopener">Anthropic Engineering — Building agents with the Claude Agent SDK</a> — the harness's design intent; read it before deciding whether its opinions match your engagement.</li>
+        <li><a class="text-coral underline" href="https://langchain-ai.github.io/langgraph/concepts/persistence/" target="_blank" rel="noopener">LangGraph — Persistence &amp; checkpointers</a> · <a class="text-coral underline" href="https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/" target="_blank" rel="noopener">Human-in-the-loop</a> — the two features that genuinely justify adopting it; the Part II approval gate is built from these.</li>
+        <li><a class="text-coral underline" href="https://ai-sdk.dev/docs/ai-sdk-ui/chatbot-message-persistence" target="_blank" rel="noopener">Vercel AI SDK — Message persistence</a> · <a class="text-coral underline" href="https://ai-sdk.dev/docs/ai-sdk-ui/chatbot-resume-streams" target="_blank" rel="noopener">Resuming streams</a> — the exact split between the easy half and the infrastructure half of Part III.</li>
+        <li><a class="text-coral underline" href="https://modelcontextprotocol.io/docs/concepts/tools" target="_blank" rel="noopener">MCP — Tools</a> — how the Agent SDK's in-process servers and every MCP-shaped tool integration are specified, which is worth knowing before you write your first <code class="inline">@tool</code>.</li>
+        <li><a class="text-coral underline" href="https://opentelemetry.io/docs/specs/semconv/gen-ai/" target="_blank" rel="noopener">OpenTelemetry — GenAI semantic conventions</a> — the span names and attributes to emit when you instrument a framework you did not write (<a class="text-coral underline" href="./pr1.html">PR1</a>).</li>
       </ul>
 
       <nav id="page-nav" class="mt-14 flex gap-4"></nav>
@@ -765,9 +2087,40 @@ anyio.run(main)</pre>
         </table>
       </div>
     </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Wiretap all three.</strong> Numbers tell you which stack is fast; the wire tells you which stack is
+      <em>honest</em>. Save <code class="inline">wiretap.py</code> from Part V into the lab directory, import it
+      first in each runner, and compare what each stack actually sends for the same question:
+      <pre class="code">python -c <span class="st">"import wiretap, raw_agent;  raw_agent.run(Q)"</span>   &amp;&amp; mv wire wire.raw
+python -c <span class="st">"import wiretap, lg_agent;   lg_agent.run(Q)"</span>    &amp;&amp; mv wire wire.lg
+
+jq -r <span class="st">'.system'</span> wire.raw/*.req.json | wc -c
+jq -r <span class="st">'.system'</span> wire.lg/*.req.json  | wc -c
+diff &lt;(jq -r <span class="st">'.system'</span> wire.raw/*.req.json) &lt;(jq -r <span class="st">'.system'</span> wire.lg/*.req.json)</pre>
+      Expected: the raw version's system prompt is exactly your <code class="inline">SPEC_system_prompt.txt</code>;
+      at least one framework's is <span class="out">longer</span>. Record the byte delta and paste the added text
+      into <code class="inline">results.md</code> — that text is behaviour you did not author and did not agree to.
+      The Agent SDK is deliberately harder to wiretap this way; note <em>that</em> as a finding rather than
+      skipping the row.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Write the one-paragraph recommendation</strong> at the bottom of <code class="inline">results.md</code>,
+      before you look at anyone else's opinion. Force yourself into this shape — it is the paragraph you will
+      reuse verbatim in Lab 4 and in front of a customer:
+      <pre class="code">For &lt;this use case&gt;, on &lt;this team&gt;, with &lt;this constraint&gt;, I recommend
+&lt;stack&gt; because &lt;the two rubric rows that dominated&gt;. The number that would
+change my mind is &lt;metric + threshold&gt;. Measured, not assumed: &lt;3 numbers&gt;.
+<span class="cm"># e.g. "...because debuggability (4 vs 19 min) and prompt control dominated.</span>
+<span class="cm">#      The number that would change my mind: if their engineer cannot ship a</span>
+<span class="cm">#      change to the raw loop unaided in week 3."</span></pre>
+      If you cannot fill every slot from your own measurements, the missing slot is the next thing to measure —
+      not the next thing to guess.
+    </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
       <li>LangGraph import errors → langgraph and langchain-* move fast; create a fresh venv and install in one <code class="inline">pip install</code> command so the resolver aligns versions.</li>
+      <li><code class="inline">400 invalid_request_error</code> naming <code class="inline">temperature</code>, <code class="inline">top_p</code> or <code class="inline">budget_tokens</code> → you copied a pre-Opus-5 snippet, or a framework default is injecting one. Delete it; on Opus 5 and Sonnet 5 there is nothing to replace it with.</li>
+      <li>Wiretap catches nothing → your framework is not using the <code class="inline">anthropic</code> Python client on that path (a separate HTTP layer, or a subprocess harness). Fall back to the framework's own callback/hook and note the gap in results.md.</li>
       <li>Agent SDK finds no tools → check <code class="inline">allowed_tools</code> spelling exactly (<code class="inline">WebSearch</code>, not <code class="inline">web_search</code>).</li>
       <li>SDK answers differ wildly across runs → cap with <code class="inline">max_turns</code> and tighten the system prompt; note the variance in results.md — it's data, not noise.</li>
       <li>Latency comparisons feel unfair → run each question 3× and take the median; single runs measure network weather.</li>
@@ -835,6 +2188,62 @@ echo "ANTHROPIC_API_KEY=sk-ant-..." &gt; .env.local</pre>
       <code class="inline">streamText</code> and log a JSON line per step (tool name, input, ms) — a
       miniature of the <a class="underline" href="./pr1.html">PR1</a> tracing you'd wire in a real engagement.
       Confirm a two-tool turn produces two step logs.
+      <pre class="code">const result = streamText({
+  model: anthropic(<span class="st">'claude-opus-5'</span>),
+  system: SUPPORT_PROMPT, messages: convertToModelMessages(messages), tools,
+  onStepFinish: ({ toolCalls, usage }) =&gt; {
+    console.log(JSON.stringify({
+      at: <span class="st">'step'</span>, traceId,
+      tools: toolCalls.map(t =&gt; t.toolName),
+      in: usage.inputTokens, out: usage.outputTokens,
+    }));
+  },
+});</pre>
+      Expected on the refund question: <span class="out">{"at":"step","tools":["lookupOrder"],…}</span> then
+      <span class="out">{"at":"step","tools":["refundStatus"],…}</span> then a final step with no tools.
+    </div></div>
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Stop leaking your exceptions.</strong> Make <code class="inline">lookupOrder</code> throw
+      <code class="inline">new Error('PG connect ECONNREFUSED 10.0.4.7:5432')</code> and ask the order question.
+      Watch the internal host and port appear in the browser. Then fix it and confirm the customer-facing
+      string is the only thing that crosses the wire:
+      <pre class="code">return result.toUIMessageStreamResponse({
+  onError: (e) =&gt; { console.error({ err: e, traceId });
+                    return <span class="st">'That lookup failed — try again or give me the order ID.'</span>; },
+});</pre>
+      Expected before: <span class="out">ECONNREFUSED 10.0.4.7:5432</span> visible in the UI. After:
+      <span class="out">That lookup failed — try again or give me the order ID.</span> and the detail only in your
+      server log. This is a five-minute fix and a real finding in most codebases.
+    </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Survive a refresh.</strong> Add the smallest possible persistence — a JSON file keyed by chat id
+      is fine for a lab — and hydrate on load. Store <em>UI</em> messages so tool cards render identically after
+      reload:
+      <pre class="code"><span class="cm">// route.ts</span>
+return result.toUIMessageStreamResponse({
+  originalMessages: messages,
+  onFinish: async ({ messages: all }) =&gt;
+    fs.writeFile(`.chats/${chatId}.json`, JSON.stringify(all)),
+});
+
+<span class="cm">// page.tsx — hydrate</span>
+const { messages, sendMessage } = useChat({ id: chatId, messages: initial });</pre>
+      Test: ask the refund question, hard-refresh, and confirm the tool cards and the answer are still on screen
+      with the same ids. If tool parts vanish but text survives, you persisted model messages instead of UI
+      messages — that distinction is the whole point of the step.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Move the boundary (the step that changes how you build).</strong> Replace the two inline tools with
+      a call to a backend you own: a 30-line FastAPI endpoint that does the order lookup and streams NDJSON, and
+      a route handler that translates its events into UI message-stream frames using the Part III
+      <code class="inline">createUIMessageStream</code> pattern. Do not touch
+      <code class="inline">page.tsx</code>.
+      <pre class="code">uvicorn agent_api:app --port 8787          <span class="cm"># your Python tier</span>
+AGENT_URL=http://localhost:8787 npm run dev
+<span class="cm"># then: ask the same three questions from step 4 — identical UX, different architecture</span></pre>
+      Write one sentence in your notes: what did the client lose? (Nothing.) What did you gain? (An agent you can
+      run from pytest and a cron.) That sentence is the architecture argument you will make on a real
+      engagement.
     </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
@@ -859,16 +2268,40 @@ echo "ANTHROPIC_API_KEY=sk-ant-..." &gt; .env.local</pre>
   <div class="modal-body">
     <h4>🎯 Objective</h4>
     <p class="text-sm leading-relaxed mt-1">Prove you can eject. Take the Lab 1 LangGraph build, extract its prompts, hide it behind your own AgentRunner interface, then swap the backend to your raw AI6 loop with zero caller changes — verified by a test suite that passes on both.</p>
-    <h4>🔬 Steps</h4>
+    <h4>📦 Setup</h4>
     <div class="step"><div class="step-n">1</div><div class="step-body">
+      Start from Lab 1's working directory and give yourself the two things this lab measures against — a
+      baseline of current behaviour, and a wiretap:
+      <pre class="code">cd ai7-labs &amp;&amp; source .venv/bin/activate
+pip install pytest jsonschema
+cp ../ai7-notes/wiretap.py .          <span class="cm"># the Part V interceptor</span>
+mkdir -p prompts tests
+
+python -m pytest --version &amp;&amp; python -c <span class="st">"import wiretap; print('tap armed')"</span>
+<span class="out">pytest 8.3.3</span>
+<span class="out">tap armed</span></pre>
+      <span class="text-mute dark:text-mutedark">If Lab 1's LangGraph build is not working, fix that first — this
+      lab is about ejecting from something that runs, and ejecting from something broken teaches you nothing
+      except that it was broken.</span>
+    </div></div>
+    <h4>🔬 Steps</h4>
+    <div class="step"><div class="step-n">2</div><div class="step-body">
       <strong>Extract the prompts.</strong> Create <code class="inline">prompts/research_system.txt</code> (and any
       others your agent uses) and make <em>both</em> implementations load from these files. Then verify nothing
       hidden remains: log the actual request the framework sends (LangChain: set
       <code class="inline">ANTHROPIC_LOG=debug</code> or attach a callback that prints the rendered messages) and
       diff it against your files. Any text in the wire request that isn't in <code class="inline">prompts/</code>
       is prompt debt — pull it out or consciously document it.
+      <pre class="code">python -c <span class="st">"import wiretap, lg_agent; lg_agent.run('Who wrote Attention Is All You Need?')"</span>
+jq -r <span class="st">'.system'</span> wire/*.req.json &gt; wire_system.txt
+diff wire_system.txt prompts/research_system.txt
+<span class="out">3a4,5</span>
+<span class="out">&gt; You are a helpful assistant that can use tools. Think step by step…</span>
+<span class="cm"># append that text to your file verbatim, or delete it on purpose. Either is fine;</span>
+<span class="cm"># not knowing it was there is not.</span></pre>
+      Record the byte gap in <code class="inline">results.md</code> — it goes straight into Lab 4's findings.
     </div></div>
-    <div class="step"><div class="step-n">2</div><div class="step-body">
+    <div class="step"><div class="step-n">3</div><div class="step-body">
       <strong>Define the interface</strong> in <code class="inline">agent_runner.py</code> — exactly the Part V
       shape: <code class="inline">AgentResult</code> dataclass, <code class="inline">AgentRunner</code> Protocol,
       <code class="inline">get_runner()</code> factory reading <code class="inline">AGENT_BACKEND</code>. Move the
@@ -877,7 +2310,7 @@ echo "ANTHROPIC_API_KEY=sk-ant-..." &gt; .env.local</pre>
       <pre class="code">grep -rn "langgraph\|langchain" --include="*.py" . | grep -v agent_runner.py
 <span class="cm"># must print nothing — this one-liner IS the architecture test; add it to CI</span></pre>
     </div></div>
-    <div class="step"><div class="step-n">3</div><div class="step-body">
+    <div class="step"><div class="step-n">4</div><div class="step-body">
       <strong>Write the contract tests first</strong> in <code class="inline">test_runner.py</code> — they encode
       what any backend must do:
       <pre class="code">import os, pytest
@@ -897,12 +2330,12 @@ def test_answers(q, expected):
     assert r.trace_id, "every run must be traceable"</pre>
       Run with <code class="inline">AGENT_BACKEND=langgraph pytest -q</code> → green.
     </div></div>
-    <div class="step"><div class="step-n">4</div><div class="step-body">
+    <div class="step"><div class="step-n">5</div><div class="step-body">
       <strong>Implement the eject seat.</strong> Wrap your AI6 loop as <code class="inline">RawLoopRunner</code>:
       same prompts from <code class="inline">prompts/</code>, same two tools, mapping the loop's final state into
       <code class="inline">AgentResult</code>. Do not touch the tests or any caller.
     </div></div>
-    <div class="step"><div class="step-n">5</div><div class="step-body">
+    <div class="step"><div class="step-n">6</div><div class="step-body">
       <strong>The swap.</strong>
       <pre class="code">AGENT_BACKEND=langgraph pytest -q   <span class="cm"># green</span>
 AGENT_BACKEND=raw       pytest -q   <span class="cm"># must also be green — same tests, zero edits</span></pre>
@@ -910,9 +2343,43 @@ AGENT_BACKEND=raw       pytest -q   <span class="cm"># must also be green — sa
       providing (retries? output coercion? context trimming?). Write down what it was — that line belongs in the
       Lab 4 report, because it's the honest price of ejecting.
     </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Put a number on the exit.</strong> You have just done the migration in miniature, so stop
+      estimating and start counting. Record the wall-clock time you actually spent on steps 5 and 6, and list
+      every behaviour you had to re-implement to reach parity:
+      <pre class="code"># exit-cost.md
+Backend swapped: LangGraph → raw AI6 loop
+Elapsed: 2 h 40 m (RawLoopRunner) + 55 m (parity fixes) = 3 h 35 m
+Parity gaps found by the suite, not by reading:
+  1. framework retried a 529 once   → added tenacity, 6 lines
+  2. framework coerced tool args to str → added an explicit cast, 2 lines
+  3. framework ran 2 tools in parallel  → accepted the slowdown, noted it
+Extrapolated to the real service (4 tools, 3 prompts): ~3 days
+<span class="out">This is the "est. exit cost: 3 days (measured)" line in the ADR.</span></pre>
+      Almost nobody can state this number. Being able to is a large part of what separates score 3 from score 2.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Make the boundary permanent.</strong> A discipline that lives in your head lasts until the next
+      person. Wire both guards into CI so the architecture defends itself:
+      <pre class="code"># .github/workflows/agent.yml  (fragment)
+- name: framework boundary
+  run: |
+    ! grep -rn "langgraph\|langchain" --include="*.py" src/ | grep -v agent_runner.py
+- name: prompts are the only prompts
+  run: python -m tests.test_wire_matches_prompts
+- name: both backends satisfy the contract
+  run: |
+    AGENT_BACKEND=langgraph pytest -q
+    AGENT_BACKEND=raw       pytest -q
+<span class="out">3 checks passed — the eject seat is now a tested property, not a plan</span></pre>
+      Break each guard on purpose once (import langgraph in a random file; add a stray sentence to the
+      framework prompt) and confirm the build goes red. A guard you have never seen fail is a guard you do not
+      know works.
+    </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
-      <li>Tests flaky across backends → assert on substrings and facts, not exact phrasing; temperature 0 where the stack allows it.</li>
+      <li>Tests flaky across backends → assert on substrings and facts, not exact phrasing. Do <em>not</em> reach for <code class="inline">temperature</code>; it is rejected on Opus 5 and Sonnet 5. Tighten the prompt and the assertions instead.</li>
+      <li>The wire diff never comes out empty → some frameworks render tool descriptions into the system prompt. Those are prompts too; move the docstrings into <code class="inline">prompts/</code> or accept them explicitly in the test's allowlist.</li>
       <li>trace_id awkward in LangGraph → use the thread_id you pass in config; the point is a stable handle, not a specific format.</li>
       <li>Raw backend much slower → check you didn't lose parallel tool execution in the port; the framework may have been batching.</li>
     </ul>
@@ -932,20 +2399,46 @@ AGENT_BACKEND=raw       pytest -q   <span class="cm"># must also be green — sa
   <div class="modal-body">
     <h4>🎯 Objective</h4>
     <p class="text-sm leading-relaxed mt-1">Produce AI7's catalog evidence — <em>"same use case built and compared on two stacks"</em> — as a one-page report a customer CTO could act on: measured numbers from Labs 1–3, rubric scores, and a recommendation that changes with the scenario.</p>
-    <h4>🔬 Steps</h4>
+    <h4>📦 Setup</h4>
     <div class="step"><div class="step-n">1</div><div class="step-body">
+      One directory, every artifact, nothing retyped from memory. The report's authority is entirely a function
+      of whether each number can be traced back to a file:
+      <pre class="code">mkdir -p report &amp;&amp; cd report
+cp ../ai7-labs/results.md            .    <span class="cm"># Lab 1 measurements</span>
+cp ../ai7-labs/exit-cost.md          .    <span class="cm"># Lab 3 measured exit cost</span>
+cp ../ai7-labs/upgrade-wire.diff     .    <span class="cm"># the prompt bytes you did not write</span>
+cp -r ../ai7-web/notes               web/ <span class="cm"># Lab 2 build notes</span>
+
+grep -c <span class="st">"?"</span> results.md
+<span class="out">0</span>   <span class="cm"># any "?" left in the Lab 1 table means an unmeasured cell — go measure it</span></pre>
+      <span class="text-mute dark:text-mutedark">Budget 20 minutes here. Every minute you spend now is a
+      question you will not have to deflect later.</span>
+    </div></div>
+    <h4>🔬 Steps</h4>
+    <div class="step"><div class="step-n">2</div><div class="step-body">
       <strong>Assemble the measurements.</strong> Pull the Lab 1 table (LOC, time-to-working, correctness, latency,
       diagnosis time), the Lab 2 build notes (time to a working streaming UI, what the SDK saved you), and the
       Lab 3 findings (prompt debt discovered, behavior the framework silently provided). If any cell is a guess,
       go back and measure it — the report's authority comes entirely from the numbers being real.
     </div></div>
-    <div class="step"><div class="step-n">2</div><div class="step-body">
-      <strong>Score the Part IV rubric</strong> for each stack, 1–5 per dimension, one sentence of justification
-      each — team skill required, time-to-demo, debugging depth available, lock-in exposure, deployment
-      constraints, project velocity. A score without a justification sentence is an opinion; with one, it's a
-      finding.
-    </div></div>
     <div class="step"><div class="step-n">3</div><div class="step-body">
+      <strong>Score the Part IV rubric</strong> for each stack — the weighted version, 1–5 per dimension, with
+      the evidence column filled in. A score without evidence attached is an opinion; with it, it's a finding.
+      Write it as its own file so it can be timestamped and cited from the report:
+      <pre class="code"># rubric.md — scored 2026-08-__, BEFORE writing the recommendation
+| dimension (weight)  | raw | lg | sdk | evidence                          |
+|---------------------|-----|----|-----|-----------------------------------|
+| debuggability (x3)  |  5  | 3  |  4  | results.md: 4 / 19 / 12 min       |
+| prompt control (x3) |  5  | 4  |  2  | upgrade-wire.diff: +218 B on lg   |
+| team fit (x2)       |  ?  | ?  |  ?  | who maintains it after you leave? |
+| time-to-demo (x2)   |  ?  | ?  |  ?  | results.md time-to-working        |
+| exit cost (x2)      |  5  | 3  |  2  | exit-cost.md: 3 days measured     |
+| deployability (x1)  |  ?  | ?  |  ?  | image size delta, licence list    |
+<span class="out">weighted totals → raw 57 · langgraph 50 · sdk 44</span></pre>
+      If your weights differ from the Part IV defaults, say so in one line and give the reason. An argued weight
+      is a stronger artifact than a borrowed one.
+    </div></div>
+    <div class="step"><div class="step-n">4</div><div class="step-body">
       <strong>Write the report</strong> — this exact skeleton, your numbers:
       <pre class="code"># Agent stack comparison — research agent          2026-08-__
 ## Use case &amp; method
@@ -973,13 +2466,76 @@ skill-needed · time-to-demo · debuggability · lock-in · deploy-fit · veloci
 All prompts in prompts/ (versioned) · AgentRunner interface proven
 swappable by test suite (Lab 3) · eval is stack-agnostic (AI9)</pre>
     </div></div>
-    <div class="step"><div class="step-n">4</div><div class="step-body">
+    <div class="step"><div class="step-n">5</div><div class="step-body">
       <strong>The defense test.</strong> Have a colleague (or rubber duck, honestly) challenge two claims from the
       report. Every challenged claim must be answerable by pointing at a number, a diff, or a test run — not at a
       blog post. Revise anything you defended with someone else's benchmark.
     </div></div>
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Turn the recommendation into an ADR.</strong> A report is read once; an ADR is read for years. Copy
+      the Part IV skeleton into <code class="inline">docs/adr/0007-agent-framework.md</code>, pick <em>one</em>
+      stack for <em>one</em> named scenario, and fill in the two fields everybody omits:
+      <pre class="code">## Consequences we are accepting
+- Est. exit cost if we are wrong: 3 days (MEASURED — see exit-cost.md, Lab 3)
+- Framework confined to agent_runner.py; enforced by the CI grep
+
+## Revisit triggers
+- &gt; 2 weeks in a quarter fighting the framework, or
+- an upgrade breaks the eval twice in a row, or
+- the human-approval requirement is dropped
+<span class="out">git log -1 --format=%cd docs/adr/0007-agent-framework.md   # the date is the point</span></pre>
+      "Measured" is doing real work in that first line. Delete the word if you did not do Lab 3 — an honest
+      estimate labelled as an estimate is fine; an estimate labelled as a measurement is how you lose a room.
+    </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Stress the scenario table.</strong> Your report recommends different stacks for different
+      scenarios. Take each row and write the one sentence that would flip it. If a row cannot be flipped by any
+      plausible fact, it is not a recommendation — it is a preference wearing a table:
+      <pre class="code">| scenario              | recommend | what would flip it                       |
+|-----------------------|-----------|------------------------------------------|
+| demo next week        | Agent SDK | prompt control becomes a compliance req  |
+| approval workflow     | LangGraph | approval gate dropped → raw loop wins    |
+| customer web product  | AI SDK    | nothing — this one is not close          |
+| regulated / air-gapped| raw loop  | their platform team pre-approves the deps|
+<span class="out">4 rows, 4 flip conditions — every one of them observable, none of them a vibe</span></pre>
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Write the version for someone who will never read code.</strong> Five bullets, no framework names
+      in the first two. This is the artifact a sponsor actually forwards, and compressing to it is a real test
+      of whether you understand your own findings:
+      <pre class="code">1. All three options answer support tickets equally well (within 2 points on 40 cases).
+2. They differ 6x in how long it takes us to explain a wrong answer: 4 vs 26 minutes.
+3. We recommend LangGraph because Priya can maintain it and the approval gate is a
+   regulatory requirement — not because it scored highest (it did not).
+4. If we are wrong, switching back costs about 3 days. We measured that, we did not guess.
+5. We will revisit by 2027-02-01, or sooner if any of three named triggers fires.</pre>
+      If bullet 3 makes you uncomfortable, good — saying "we did not pick the highest score, and here is why"
+      is the sentence that buys you credibility for everything else in the document.
+    </div></div>
+    <div class="step"><div class="step-n">9</div><div class="step-body">
+      <strong>Reproducibility check.</strong> Hand the repo (not the report) to someone else and ask them to
+      regenerate one number — any number — from scratch. Time it. If it takes them more than fifteen minutes,
+      the gap is a missing <code class="inline">make</code> target, not a missing explanation. Add it:
+      <code class="inline">make bench</code> should re-run the 5 questions on all stacks and rewrite
+      <code class="inline">results.md</code> unattended.
+    </div></div>
+    <div class="step"><div class="step-n">10</div><div class="step-body">
+      <strong>File it, and schedule its own expiry.</strong> Put the report, the rubric, the ADR and the raw
+      artifacts in the evidence catalog together — a report without its inputs is a claim. Then set a calendar
+      reminder on the revisit date from step 6. <em>An unreviewed recommendation ages into folklore</em>, and
+      the folklore is what the next engineer inherits in Part VI. Being the person who dated their own advice
+      is a small thing that compounds across an entire career.
+    </div></div>
+    <h4>🧯 Troubleshooting</h4>
+    <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
+      <li>A cell in the Lab 1 table is still <code class="inline">?</code> → do not estimate it and do not drop the row. Go and measure it, or write "not measured" in the cell; a visible gap is credible, a plausible invention is not.</li>
+      <li>Every scenario recommends the same stack → either the scenarios are not different enough (add a regulated one and a demo-in-three-days one), or you scored the rubric after choosing. Re-read the Part IV danger callout.</li>
+      <li>The report reads as advocacy → count the sentences that concede something. Fewer than three and nobody will believe the rest of it; name what your recommended stack is genuinely worse at.</li>
+      <li>A reviewer challenges a number you cannot reproduce → that is the lab working. Delete the number, re-measure it, and note in the report which claims are measured and which are judgement. The distinction is the deliverable.</li>
+      <li>The rubric total contradicts your recommendation → that is allowed and common. Write the override reason in one sentence in the ADR; an unexplained override is what makes rubrics feel like theatre.</li>
+    </ul>
     <h4>✅ Done when</h4>
-    <p class="text-sm leading-relaxed mt-1">The report exists with real numbers in every table, a per-scenario recommendation, and an exit strategy section — and a teammate could reproduce any number in it from your repos. File it in the evidence catalog.</p>
+    <p class="text-sm leading-relaxed mt-1">The report exists with real numbers in every table, a per-scenario recommendation with a flip condition on every row, and an exit strategy backed by the measured 3-day figure from Lab 3; the ADR is committed with a date and revisit triggers; someone else regenerated one number from your repo in under fifteen minutes. File it in the evidence catalog.</p>
   </div>
 </dialog>
 
