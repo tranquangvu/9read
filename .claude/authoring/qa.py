@@ -36,7 +36,7 @@ def load_modules() -> list[dict]:
     block = re.search(r"const MODULES = \[(.*?)\n\];", src, re.S).group(1)
     out = []
     for code, name, crit in re.findall(
-        r'\{\s*code:\s*"([^"]+)",\s*name:\s*"([^"]+)",\s*critical:\s*(true|false)\s*\}', block
+        r'\{\s*code:\s*"([^"]+)",\s*name:\s*"([^"]+)"[^}]*,\s*critical:\s*(true|false)\s*\}', block
     ):
         out.append({"code": code, "name": name, "critical": crit == "true"})
     return out
@@ -52,19 +52,25 @@ KICKERS = [
 ]
 
 SCAFFOLD = [
-    "<!DOCTYPE html>", '<html lang="en">', "localStorage.getItem('fde-theme')",
+    "<!DOCTYPE html>", "localStorage.getItem('fde-theme')",
     "../../assets/site.css", "../../assets/site.js", "mermaid",
     'id="overlay"', 'id="sidebar"', 'id="module-nav"', 'id="menu-btn"',
     "data-theme-toggle", "data-group-chip", 'id="page-nav"',
 ]
 
+# Both English and Vietnamese lang attributes are valid.
+LANG_OK = re.compile(r'<html lang="(en|vi)">')
+
+# Trailing H2 sections — each is (english_exact, keyword_pattern_for_other_languages).
+# For English files we match the exact text. For non-English files (lang != en),
+# we match a regex keyword pattern to handle translation variations.
 TRAILING_H2 = [
-    "Skill ladder: what each score looks like",
-    None,  # "Hands-on labs" or "Hands-on practice"
-    "In the field",
-    "Pitfalls &amp; pro tips",
-    "Evidence checklist",
-    "Resources",
+    ("Skill ladder: what each score looks like", r"(skill\s*ladder|kỹ\s*năng|bậc\s*thang\s*kỹ\s*năng|thang\s*(điểm\s*)?kỹ\s*năng)"),
+    None,  # "Hands-on labs" / "Hands-on practice" / Vietnamese variants
+    ("In the field", r"(in\s*the\s*field|hiện\s*trường|thực\s*địa|trong\s+thực\s+tế)"),
+    ("Pitfalls &amp; pro tips", r"(pitfalls?\s*&amp;\s*pro\s*tips?|cạm\s*bẫy|các\s*bẫy)"),
+    ("Evidence checklist", r"(evidence\s*checklist|(danh\s*sách|checklist).*\s*bằng\s*chứng)"),
+    ("Resources", r"(resources|tài\s*nguyên)"),
 ]
 
 MODAL_H4 = ["🎯 Objective", "📦 Setup", "🔬 Steps", "🧯 Troubleshooting", "✅ Done when"]
@@ -135,6 +141,9 @@ def check_structure(path: Path, mods: dict, do_density: bool) -> None:
         if s not in html:
             fail(page, f"missing scaffolding: {s}")
 
+    if not LANG_OK.search(html):
+        fail(page, "missing or invalid lang attribute (expected en or vi)")
+
     for tag in BALANCED:
         o = len(re.findall(rf"<{tag}[\s>]", html))
         c = html.count(f"</{tag}>")
@@ -169,20 +178,45 @@ def check_structure(path: Path, mods: dict, do_density: bool) -> None:
     for i, accent in enumerate(LAB_ACCENTS, 1):
         if f"--lab-color:{accent}" not in html:
             fail(page, f"lab {i} accent {accent} missing")
-    if "LAB 4 · EVIDENCE" not in html:
+    if not (re.search(r'LAB\s*4\s*·\s*EVIDENCE', html) or
+            re.search(r'LAB\s*4\s*·\s*BẰNG CHỨNG', html) or
+            re.search(r'BÀI\s*(THỰC HÀNH|LAB)?\s*4\s*·\s*BẰNG CHỨNG', html)):
         fail(page, "LAB 4 · EVIDENCE badge missing")
     if "border-2 border-coral" not in html:
         fail(page, "lab 4 card is not border-2 border-coral")
 
     # trailing h2s in order
+    is_en = LANG_OK.search(html) and LANG_OK.search(html).group(1) == "en"
     last = -1
     for want_h2 in TRAILING_H2:
         if want_h2 is None:
-            i = max(html.find("Hands-on labs"), html.find("Hands-on practice"))
+            # Labs section: exact English match, or keyword match for other languages
+            en_patterns = ["Hands-on labs", "Hands-on practice"]
+            i = -1
+            for p in en_patterns:
+                cand = html.find(f">{p}</h2>")
+                if cand >= 0:
+                    i = cand
+                    break
+            if i < 0:
+                # Non-English: keyword match for "lab" or "thực hành"
+                for m in re.finditer(r'<h2[^>]*>([^<]+)</h2>', html):
+                    if re.search(r'(hands[- ]on|lab|thực\s*hành)', m.group(1), re.IGNORECASE):
+                        i = m.start()
+                        break
             label = "Hands-on labs/practice"
         else:
-            i = html.find(f">{want_h2}</h2>")
-            label = want_h2
+            en, kw_re = want_h2
+            if is_en:
+                i = html.find(f">{en}</h2>")
+            else:
+                # For non-English: find the h2 whose text matches the keyword pattern
+                i = -1
+                for m in re.finditer(r'<h2[^>]*>([^<]+)</h2>', html):
+                    if re.search(kw_re, m.group(1), re.IGNORECASE):
+                        i = m.start()
+                        break
+            label = en
         if i < 0:
             fail(page, f"missing trailing section: {label}")
         elif i < last:
@@ -199,13 +233,15 @@ def check_structure(path: Path, mods: dict, do_density: bool) -> None:
     if targets != [want_target]:
         fail(page, f"ladder .target on {targets}, want ['{want_target}'] (critical={meta['critical']})")
     if meta["critical"]:
-        if "badge-critical" not in html or "Target score: 3 / 4" not in html:
-            fail(page, "critical module missing badge-critical / 'Target score: 3 / 4'")
+        if "badge-critical" not in html:
+            fail(page, "critical module missing badge-critical")
+        if not re.search(r'(Target score|Mục tiêu|Điểm mục tiêu):\s*3\s*/\s*4', html):
+            fail(page, "critical module missing target score badge")
     else:
-        if "Target score: 2 / 4" not in html:
-            fail(page, "supporting module missing 'Target score: 2 / 4'")
-    if not re.search(r'badge badge-accent">[^<]*· 4 labs<', html):
-        fail(page, "badge-accent must end with '· 4 labs'")
+        if not re.search(r'(Target score|Mục tiêu|Điểm mục tiêu):\s*2\s*/\s*4', html):
+            fail(page, "supporting module missing target score badge")
+    if not re.search(r'badge badge-accent">[^<]*· 4 (labs|bài tập|bài lab|bài thực hành|lab)<', html):
+        fail(page, "badge-accent must end with '· 4 labs' or Vietnamese equivalent")
 
     # modal internals
     for lab in sorted(want):
@@ -244,9 +280,9 @@ def check_structure(path: Path, mods: dict, do_density: bool) -> None:
             if n < 4:
                 fail(page, f"{lab} troubleshooting has {n} bullets, need ≥4")
 
-    # footer
+    # footer: accept English name or Vietnamese name
     if f"AIFDE Mastery · {code} " not in html:
-        fail(page, f"footer must read 'AIFDE Mastery · {code} <Name>'")
+        fail(page, f"footer missing 'AIFDE Mastery · {code} ...'")
 
     # links
     for target in set(re.findall(r'href="\./(\w+)\.html"', html)):
@@ -334,7 +370,8 @@ def check_datakeys(paths: list[Path]) -> None:
         m = re.findall(r'data-key="[^"]+"[^>]*>\s*<span([^>]*)>([^<]*)', html)
         if m and "font-semibold" not in m[-1][0]:
             fail(page, "final checklist item lost font-semibold")
-        if "(catalog evidence ✓)" not in html:
+        if not (re.search(r'\(catalog evidence\s*✓\)', html) or
+                re.search(r'\(bằng chứng[^)]*✓\)', html)):
             fail(page, "missing '(catalog evidence ✓)' marker")
 
 
@@ -350,15 +387,19 @@ def check_registry(mods: list[dict]) -> None:
     n = len(codes)
     per = {g: sum(1 for c in codes if re.match(rf"^{g}\d+$", c)) for g in ("FN", "AI", "PR", "FD")}
     idx = INDEX.read_text()
+    vn_idx_path = ROOT / "vn" / "aifde" / "index.html"
+    vn_idx = vn_idx_path.read_text() if vn_idx_path.exists() else ""
     js = SITE_JS.read_text()
-    for label, needle in (
-        ("index skills", f"{n} skills in 4 tracks"),
-        ("index pill", f'px-4 py-1.5">{n} modules<'),
-        ("site.js blurb", f"A {n}-module curriculum"),
-        ("index AI count", f'AI Application Engineering <span class="text-mute dark:text-mutedark font-normal text-sm">· {per["AI"]} modules'),
+    for label, needle, vn_needle in (
+        ("index skills", f"{n} skills in 4 tracks", f"{n} kỹ năng trong 4 track"),
+        ("index pill", f'px-4 py-1.5">{n} modules<', f'px-4 py-1.5">{n} mô-đun<'),
+        ("site.js blurb", f"A {n}-module curriculum", f"Chương trình {n} mô-đun"),
+        ("index AI count", f'AI Application Engineering <span class="text-mute dark:text-mutedark font-normal text-sm">· {per["AI"]} modules',
+                           f'Kỹ thuật Ứng dụng AI <span class="text-mute dark:text-mutedark font-normal text-sm">· {per["AI"]} mô-đun'),
     ):
         src = js if "site.js" in label else idx
-        if needle not in src:
+        vn_src = js if "site.js" in label else vn_idx
+        if needle not in src and (not vn_needle or vn_needle not in vn_src):
             fail("registry", f"{label} out of date — expected '{needle}'")
     print(f"registry: {n} modules  FN={per['FN']} AI={per['AI']} PR={per['PR']} FD={per['FD']}")
 
