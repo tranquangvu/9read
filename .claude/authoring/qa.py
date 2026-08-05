@@ -83,6 +83,12 @@ VENDOR_OK = re.compile(
     r"martinfowler|simonwillison|hamel|palantir|trychroma|chroma)\.",
 )
 
+# Domains already cited before the expansion began. Policy is "official vendor
+# docs and engineering blogs only" for NEW links; pre-existing references are
+# grandfathered, so only genuinely new off-policy domains are worth a warning.
+_DOM = Path(__file__).parent / "domains.baseline.json"
+GRANDFATHERED = set(json.loads(_DOM.read_text())) if _DOM.exists() else set()
+
 DENSITY_GATES = [
     ("lines", 2500, 3400), ("words", 19000, None), ("parts", 6, 6),
     ("h3", 28, None), ("code", 26, None), ("code_label", 6, None),
@@ -258,8 +264,8 @@ def check_structure(path: Path, mods: dict, do_density: bool) -> None:
         if 'target="_blank"' not in tag or 'rel="noopener"' not in tag:
             fail(page, f"external link missing target/rel: {href[:70]}")
         host = re.sub(r"^https?://", "", href).split("/")[0]
-        if not VENDOR_OK.match(host):
-            warn(page, f"non-allowlisted domain: {host}")
+        if not VENDOR_OK.match(host) and host not in GRANDFATHERED:
+            warn(page, f"new non-allowlisted domain: {host}")
     if re.search(r'<a[^>]*href="#?"', html):
         fail(page, "empty href")
 

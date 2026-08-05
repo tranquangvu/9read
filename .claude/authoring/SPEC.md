@@ -112,6 +112,11 @@ badge and the ladder `.target` row · `assets/site.js` · `assets/site.css` · `
 
 If you find yourself typing a key that already exists, stop — you are about to wipe someone's progress.
 
+Rewording a checklist item's *label* is fine and often an improvement; only the `data-key`
+attribute itself is frozen. `qa.py` Group D is the authority here — it compares the actual key set
+and their relative order against `datakeys.baseline.json`. Do not use a `git diff | grep '^-'`
+guard for this: a reworded line shows up as a deletion and reads as a false alarm.
+
 ---
 
 ## 4. Voice contract
