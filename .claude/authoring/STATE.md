@@ -1,5 +1,26 @@
 # STATE.md — AI-track deep expansion: where things stand
 
+> ## ▶ RESUME HERE
+>
+> **The expansion is finished.** 16/16 AI modules green, 48 modules total, working tree clean,
+> 17 commits sitting on `feat/ai-track-deep-expansion`, nothing in flight.
+>
+> **The one remaining action is the merge**, which was deliberately left for the user:
+> ```sh
+> cd /Users/bentran/Workspace/goldenowl/ai-forward-deployed-engineer
+> python3 .claude/authoring/qa.py --all                    # confirm still green (expect 0 fails)
+> git checkout main && git merge feat/ai-track-deep-expansion
+> ```
+> Re-verify before merging — do not merge on the strength of this file alone.
+>
+> **Optional follow-ups**, neither blocking (details at the bottom):
+> 1. `ai2`'s *In the field* has 4 paragraphs where the spec says 3.
+> 2. The FDE skill-matrix sheet on Drive still lists 44 skills and is now out of date.
+>
+> If the ask is instead to keep expanding (e.g. the FN / PR / FD tracks), the machinery is reusable
+> as-is: `SPEC.md` + `PATTERNS.md` + `qa.py` + the wave/subagent pattern. Read the gotchas below
+> first — they were learned the hard way.
+
 **Branch:** `feat/ai-track-deep-expansion` (branched from `main`)
 **Plan:** `/Users/bentran/.claude/plans/review-l-i-c-c-ph-n-memoized-lemon.md`
 **Contract:** `SPEC.md` · **Markup:** `PATTERNS.md` · **Topic ownership:** `BOUNDARIES.md` · **Checker:** `qa.py`
