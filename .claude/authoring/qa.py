@@ -263,10 +263,12 @@ def check_structure(path: Path, mods: dict, do_density: bool) -> None:
     if re.search(r'<a[^>]*href="#?"', html):
         fail(page, "empty href")
 
-    # stale API shapes
+    # Stale API shapes — only inside code blocks. Naming a removed parameter in
+    # prose is how a module teaches the deprecation; that is not drift.
+    code_only = "\n".join(re.findall(r'<pre class="code[^"]*">(.*?)</pre>', html, re.S))
     for bad in ("budget_tokens", "temperature=", "top_p=", "top_k="):
-        if bad in html:
-            warn(page, f"stale API param in examples: {bad}")
+        if bad in code_only:
+            warn(page, f"stale API param in a code block: {bad}")
     for m in re.findall(r"claude-[a-z0-9.-]*-20\d{6}", html):
         if m != "claude-haiku-4-5-20251001":
             warn(page, f"date-suffixed model id: {m}")
