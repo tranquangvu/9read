@@ -18,7 +18,7 @@ User decisions, already made — do not re-litigate:
 4. External links: **official vendor docs and company engineering blogs only** — not papers, not
    practitioner blogs, not courses. Pre-existing links are grandfathered.
 
-## Progress: 13 of 16 modules complete
+## Progress: 14 of 16 modules complete
 
 | Module | Lines | Status |
 |---|---|---|
@@ -35,9 +35,9 @@ User decisions, already made — do not re-litigate:
 | AI14 · Text-to-SQL & Structured Data | 2,953 | ✅ committed (new) |
 | AI15 · Multi-agent Systems | 2,928 | ✅ committed (new) |
 | AI16 · Red-teaming & Adversarial Evaluation | 2,901 | ✅ committed (new) |
+| AI8 · Tool Calling & MCP | 3,053 | ✅ committed |
 | **AI1 · Prompt Engineering** | 2,501 | ⚠️ **7 gates open** |
 | **AI5 · Vector Databases** | 2,550 | ⚠️ **5 gates open** |
-| **AI8 · Tool Calling & MCP** | 2,958 | ⚠️ **5 gates open** |
 
 ## What is left — all of it is lab-modal work
 

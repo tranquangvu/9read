@@ -1447,6 +1447,410 @@ Any one of these triggers a re-run of this exact harness.
         it is the first line of the runbook for a reason.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">Dual-write: a side table, not a second column</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Part IV's shape — <code class="inline">ALTER TABLE chunks ADD COLUMN embedding_v2</code> — is the right
+        answer at 2M rows and the wrong one at 10M. Postgres has no in-place update: writing
+        <code class="inline">embedding_v2</code> on an existing row rewrites the <em>entire</em> heap tuple, body
+        text and all. Backfilling 10M rows that way produces 10M dead tuples, roughly <strong>90&nbsp;GB of bloat
+        and WAL</strong> that autovacuum then has to chase while your backfill is still running, and it invalidates
+        every visibility-map page the v1 index scan was relying on. The p95 you measured last week stops being true
+        halfway through the migration, and nobody connects the two events.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Put v2 in its own table keyed by <code class="inline">chunk_id</code>. Inserts into a fresh table are
+        append-only, cost one tuple each, and — the underrated part — <code class="inline">DROP TABLE</code> is a
+        one-second rollback of the entire experiment, at any hour, with no lock on the live path.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">003_v2.sql — the parallel universe, and the one denormalization it needs</span>
+        <pre class="code"><span class="cm">-- v2 lives BESIDE chunks, not inside it: no heap rewrite, no bloat,</span>
+<span class="cm">-- and the whole migration is revertible with one DROP.</span>
+CREATE TABLE chunk_emb_v2 (
+  chunk_id   bigint PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+  tenant_id  text NOT NULL,        <span class="cm">-- denormalized ON PURPOSE (see below)</span>
+  doc_type   text NOT NULL,        <span class="cm">-- ditto</span>
+  embedding  halfvec(1536) NOT NULL,
+  model      text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+<span class="cm">-- the index is built AFTER the backfill, never during it (Part IV)</span>
+<span class="cm">-- CREATE INDEX chunk_emb_v2_idx ON chunk_emb_v2</span>
+<span class="cm">--   USING hnsw (embedding halfvec_cosine_ops) WITH (m = 32, ef_construction = 200);</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">tenant_id</code> and <code class="inline">doc_type</code> are copied into the side
+        table deliberately, and the reason is the whole of Part III: <strong>the filter predicate must live on the
+        same relation as the vector index</strong>. If the tenant filter sits on <code class="inline">chunks</code>
+        and the ORDER BY sits on <code class="inline">chunk_emb_v2</code>, the planner has to fetch HNSW candidates
+        first and discard them after the join — you have rebuilt the post-filter recall collapse by accident, in the
+        one query nobody re-benchmarks. Pay the denormalization instead, and be honest in the runbook about its
+        price: a tenant reassignment now has two places to land, so the nightly sync updates both or a trigger does.
+        Structured predicates that get much richer than this — ranges, joins, aggregates — are the signal that the
+        question was never a similarity question at all
+        (<a href="./ai14.html" class="text-viol underline decoration-viol/40">AI14</a>).
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        One writer, four flags, and every state in the migration is a flag combination rather than a deploy:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">writer.py — the only place in the system that writes an embedding</span>
+        <pre class="code"><span class="kw">import</span> os, psycopg
+<span class="kw">from</span> pgvector.psycopg <span class="kw">import</span> register_vector
+
+F = {k: os.getenv(k, d) <span class="kw">for</span> k, d <span class="kw">in</span>
+     [(<span class="st">"EMB_WRITE_V1"</span>, <span class="st">"1"</span>), (<span class="st">"EMB_WRITE_V2"</span>, <span class="st">"0"</span>),
+      (<span class="st">"EMB_READ"</span>, <span class="st">"v1"</span>),      (<span class="st">"EMB_SHADOW"</span>, <span class="st">"0"</span>)]}
+
+V2_UPSERT = <span class="st">"""
+INSERT INTO chunk_emb_v2 (chunk_id, tenant_id, doc_type, embedding, model)
+VALUES (%s, %s, %s, %s, 'embed-v4')
+ON CONFLICT (chunk_id) DO UPDATE
+  SET embedding = EXCLUDED.embedding, tenant_id = EXCLUDED.tenant_id,
+      doc_type  = EXCLUDED.doc_type,  created_at = now()"""</span>
+
+<span class="kw">def</span> <span class="fn">write_chunk</span>(cur, chunk_id, tenant, doc_type, body):
+    <span class="cm">"""Called by ingest AND by the nightly sync. One code path, four flags."""</span>
+    <span class="kw">if</span> F[<span class="st">"EMB_WRITE_V1"</span>] == <span class="st">"1"</span>:
+        cur.execute(<span class="st">"UPDATE chunks SET embedding = %s, embedded_at = now() "</span>
+                    <span class="st">"WHERE id = %s"</span>, (embed_v1(body), chunk_id))
+    <span class="kw">if</span> F[<span class="st">"EMB_WRITE_V2"</span>] == <span class="st">"1"</span>:
+        cur.execute(V2_UPSERT, (chunk_id, tenant, doc_type, embed_v2(body)))
+
+<span class="cm"># The live writer UPSERTs (its value is the freshest that exists).</span>
+<span class="cm"># The backfill INSERTs ... ON CONFLICT DO NOTHING (its value is always older).</span>
+<span class="cm"># That asymmetry is the entire concurrency design. There is no lock.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read the last three comment lines twice — they are the part that people get wrong and then debug for a day.
+        The backfill and the live ingest run at the same time, on the same rows, for nine hours. If both used
+        <code class="inline">DO UPDATE</code>, a backfill batch that was queued before an edit would overwrite the
+        edit's fresh embedding with a stale one, and you would find out weeks later when a user says "I updated that
+        contract and search still shows the old wording". <strong>Live writer upserts, backfill does nothing on
+        conflict</strong> — no advisory locks, no coordination, no window.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">State</th><th class="px-4 py-3">WRITE_V1</th><th class="px-4 py-3">WRITE_V2</th><th class="px-4 py-3">READ</th><th class="px-4 py-3">SHADOW</th><th class="px-4 py-3">What is true here</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">S0 · steady</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">0</td><td class="px-4 py-3 font-mono">v1</td><td class="px-4 py-3 font-mono">0</td><td class="px-4 py-3">Today. The side table does not exist yet.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">S1 · dual-write</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">v1</td><td class="px-4 py-3 font-mono">0</td><td class="px-4 py-3">New and edited chunks land in both. Soak 24 h before starting the backfill — this is where you find out embed_v2 throws on empty strings.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">S2 · backfill</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">v1</td><td class="px-4 py-3 font-mono">0</td><td class="px-4 py-3"><strong>Identical flags to S1.</strong> The nine-hour job is not a deploy and cannot break production; kill it any time.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">S3 · shadow-read</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">v1</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3">Every query runs against both, serves v1, logs the diff. Costs one extra index scan per query; run it for a week of real traffic.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">S4 · cut</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">v2</td><td class="px-4 py-3 font-mono">0</td><td class="px-4 py-3">Users are on the new model. v1 is still written and still indexed, so rollback is <code class="inline">EMB_READ=v1</code> and a rolling restart.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">S5 · soaked</td><td class="px-4 py-3 font-mono">0</td><td class="px-4 py-3 font-mono">1</td><td class="px-4 py-3 font-mono">v2</td><td class="px-4 py-3 font-mono">0</td><td class="px-4 py-3">After 14 days. Stop writing v1; drop its index, then its column. This is the only irreversible step in the whole plan.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> ship S1 as its own release, weeks before anyone asks for the migration.
+        Dual-write costs one extra embedding call per <em>changed</em> chunk — on a corpus with 0.5% daily churn
+        that is 50K calls a day, about $0.70 — and it converts the migration from a project into a backfill.
+        The customer who has been dual-writing for a month can switch models in a week; the one who hasn't needs four.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The backfill is bounded by the embedding API, not by your database</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Everyone sizes this wrong in the same direction. They picture 10 million database writes and think "that's
+        the hard part". Postgres will take those inserts at 40–60K rows/s through <code class="inline">COPY</code>;
+        the whole write side is under five minutes of actual work. The clock is owned entirely by your embedding
+        account's <strong>tokens-per-minute limit</strong>, and the arithmetic fits on one slide — do it in front of
+        the customer, because the timeline they are about to hear is unintuitive:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Term</th><th class="px-4 py-3">Value</th><th class="px-4 py-3">Where the number comes from</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Chunks</td><td class="px-4 py-3 font-mono">10,000,000</td><td class="px-4 py-3"><code class="inline">SELECT count(*) FROM chunks</code> — not the customer's estimate</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Mean tokens/chunk</td><td class="px-4 py-3 font-mono">220</td><td class="px-4 py-3">Tokenize a 10K random sample. Do not assume; legal corpora run 2× this</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Total input tokens</td><td class="px-4 py-3 font-mono">2.2 B</td><td class="px-4 py-3">Product of the two rows above</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Account TPM limit</td><td class="px-4 py-3 font-mono">4,000,000 /min</td><td class="px-4 py-3">Your <em>tier's</em> limit from the response headers — never the docs' headline number</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ceiling</td><td class="px-4 py-3 font-mono">18,180 chunks/min</td><td class="px-4 py-3">TPM ÷ mean tokens = 303 chunks/s, perfectly utilized</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Wall clock, ideal</td><td class="px-4 py-3 font-mono">9.2 h</td><td class="px-4 py-3">10M ÷ 18,180 — and you will not hit 100% of the limit</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Wall clock, measured</td><td class="px-4 py-3 font-mono">≈ 9.5 h</td><td class="px-4 py-3">From the 1% dry run, including backoff on 429s</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">List price</td><td class="px-4 py-3 font-mono">$132</td><td class="px-4 py-3">2.2 B × $0.06 / 1M. Budget $150 with the dry runs and retries</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Nine and a half hours and $150.</strong> That pair of numbers reframes the entire conversation: the
+        thing the customer was bracing for costs less than a laptop and fits in one overnight window, while the
+        things they weren't thinking about — a week of shadow traffic, 83&nbsp;GB of extra disk, a 14-day soak —
+        are what actually make it a four-week project. Requesting a temporary TPM increase before the run is the one
+        lever that moves the 9.5 h; at 12M&nbsp;TPM it becomes 3.1 h and fits inside a maintenance window.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">backfill.py — rate-limited, resumable, safe to kill at any second</span>
+        <pre class="code"><span class="kw">import</span> time, psycopg
+<span class="kw">from</span> pgvector.psycopg <span class="kw">import</span> register_vector
+
+BATCH, TPM = <span class="st">128</span>, <span class="st">4_000_000</span>
+_bucket, _last = TPM, time.monotonic()
+
+<span class="kw">def</span> <span class="fn">take</span>(tokens):
+    <span class="cm">"""Token bucket. Blocks until the ACCOUNT budget can pay for this batch,</span>
+<span class="cm">    so we never generate a 429 rather than recovering from one."""</span>
+    <span class="kw">global</span> _bucket, _last
+    <span class="kw">while</span> <span class="kw">True</span>:
+        now = time.monotonic()
+        _bucket = <span class="fn">min</span>(TPM, _bucket + (now - _last) * TPM / <span class="st">60</span>)
+        _last = now
+        <span class="kw">if</span> _bucket &gt;= tokens:
+            _bucket -= tokens
+            <span class="kw">return</span>
+        time.sleep((tokens - _bucket) * <span class="st">60</span> / TPM)
+
+<span class="cm"># Keyset pagination + anti-join: restarting from id 0 is correct AND cheap,</span>
+<span class="cm"># because the finished prefix is an index-only scan. No checkpoint file,</span>
+<span class="cm"># no "where was I", nothing to corrupt.</span>
+NEXT = <span class="st">"""
+SELECT c.id, c.tenant_id, c.doc_type, c.body
+FROM chunks c LEFT JOIN chunk_emb_v2 v ON v.chunk_id = c.id
+WHERE c.id &gt; %s AND v.chunk_id IS NULL
+ORDER BY c.id LIMIT %s"""</span>
+
+INS = (<span class="st">"INSERT INTO chunk_emb_v2 (chunk_id,tenant_id,doc_type,embedding,model) "</span>
+       <span class="st">"VALUES (%s,%s,%s,%s,'embed-v4') ON CONFLICT (chunk_id) DO NOTHING"</span>)
+
+conn = psycopg.connect(DSN); register_vector(conn)
+last_id, done, t0 = <span class="st">0</span>, <span class="st">0</span>, time.perf_counter()
+<span class="kw">while</span> <span class="kw">True</span>:
+    rows = conn.execute(NEXT, (last_id, BATCH)).fetchall()
+    <span class="kw">if</span> <span class="kw">not</span> rows: <span class="kw">break</span>
+    take(<span class="fn">sum</span>(<span class="fn">len</span>(r[<span class="st">3</span>]) // <span class="st">4</span> <span class="kw">for</span> r <span class="kw">in</span> rows))     <span class="cm"># ~4 chars/token estimate</span>
+    vecs = embed_v2([r[<span class="st">3</span>] <span class="kw">for</span> r <span class="kw">in</span> rows])         <span class="cm"># ONE request, 128 inputs</span>
+    <span class="kw">with</span> conn.cursor() <span class="kw">as</span> cur:
+        cur.executemany(INS, [(r[<span class="st">0</span>], r[<span class="st">1</span>], r[<span class="st">2</span>], v) <span class="kw">for</span> r, v <span class="kw">in</span> <span class="fn">zip</span>(rows, vecs)])
+    conn.commit()
+    last_id, done = rows[-<span class="st">1</span>][<span class="st">0</span>], done + <span class="fn">len</span>(rows)
+    <span class="kw">if</span> done % <span class="st">100_000</span> &lt; BATCH:
+        rate = done / (time.perf_counter() - t0)
+        <span class="fn">print</span>(<span class="st">f"{done:&gt;9,} done {rate:6.0f} chunks/s "</span>
+              <span class="st">f"eta {(10_000_000-done)/rate/3600:4.1f} h"</span>)
+<span class="out">  100,096 done    301 chunks/s eta  9.1 h</span>
+<span class="out">  200,064 done    299 chunks/s eta  9.1 h</span>
+<span class="out">  300,032 done    288 chunks/s eta  9.4 h   # first 429 backoff shows up here</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three properties make this survivable rather than merely correct. It is <strong>killable</strong>: no
+        checkpoint state exists, so Ctrl-C and restart loses at most one batch of 128. It is
+        <strong>self-pacing</strong>: the bucket blocks before the request, so the run never produces the 429 storm
+        that gets your account throttled harder. And it prints an ETA that is <em>measured</em>, so at hour two you
+        can tell the customer whether the overnight window holds instead of guessing.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>Watch the write-ahead log, not the CPU.</strong> Ten million inserts of a 3&nbsp;KB tuple produce
+        roughly <strong>34&nbsp;GB of table and 40&nbsp;GB of WAL</strong>. If WAL archiving or a streaming replica
+        can't keep up, <code class="inline">pg_wal</code> grows until the volume fills — and that fills at 4am, four
+        hours into an unattended run. Put a governor in the loop: every 100 batches, check
+        <code class="inline">pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)</code> on
+        <code class="inline">pg_stat_replication</code> and sleep while it exceeds 256&nbsp;MB. Costing ten minutes
+        of the nine hours to never think about it again is a trade you take every time.
+      </div>
+      <div class="mt-4">
+        <span class="code-label">governor.sql — the query the loop polls every 100 batches</span>
+        <pre class="code"><span class="cm">-- replica lag in bytes, plus how much WAL is queued for the archiver.</span>
+<span class="cm">-- Sleep while either is red; both are cheap to read and both kill you silently.</span>
+SELECT application_name,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS lag_bytes
+FROM pg_stat_replication;
+<span class="out"> replica-1 |  18874368        -- 18 MB, healthy; pause above 256 MB</span>
+
+SELECT archived_count, failed_count,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')) AS wal_total
+FROM pg_stat_archiver;
+<span class="out"> 41207 | 0 | 1284 GB     -- failed_count must stay 0. If it moves, STOP the backfill.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">failed_count</code> is the one to alert on. A non-zero value means WAL segments are
+        piling up in <code class="inline">pg_wal</code> with nowhere to go, and the volume fills at a rate you can
+        compute exactly: 40&nbsp;GB over 9.5 hours is <strong>4.2&nbsp;GB/h</strong>. If the customer's data volume
+        has 60&nbsp;GB free, you have fourteen hours of runway and a backfill that needs nine and a half — which is
+        a plan, but only if someone wrote that subtraction down before the run started.
+      </p>
+      <div class="mt-4 callout callout-danger">
+        <strong>Do not build the HNSW index while the backfill runs.</strong> It is tempting — the index would be
+        "ready when the data is" — and it is wrong twice: the build is 3–5× slower competing for the same I/O, and
+        an HNSW graph grown incrementally under concurrent insert is measurably worse than one built in a single
+        pass, typically <strong>0.02–0.04 lower recall@10 at the same <code class="inline">ef_search</code></strong>.
+        Backfill to completion, then <code class="inline">CREATE INDEX CONCURRENTLY</code> once, then measure. On
+        10M halfvec rows with <code class="inline">maintenance_work_mem = 32GB</code> and 4 parallel workers that
+        build is about <strong>5 hours</strong> — put it in the plan as its own line item, not as a footnote.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Verification: recall parity on a golden set, not a smoke test</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The instinct at S3 is to compare v1's top-10 against v2's top-10 and gate on the overlap. Resist it — that
+        number will come back around <strong>0.35</strong> and it means nothing. Two different embedding models
+        induce two different geometries; low agreement is what "we changed the model" <em>looks</em> like, and
+        gating on agreement would only ever let through a model that changed nothing. The question is not
+        <em>"does v2 retrieve what v1 retrieved?"</em>. It is <em>"does v2 retrieve what the answer needed?"</em>,
+        and the only thing that can answer it is a labelled golden set — the one you built in
+        <a href="./ai4.html" class="text-viol underline decoration-viol/40">AI4</a> and put under regression control
+        in <a href="./ai9.html" class="text-viol underline decoration-viol/40">AI9</a>. If the customer doesn't have
+        one, building it is the first two days of the migration, not an optional extra, because without it the cut
+        is a vote.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>Two different things are both called "recall" in this module — keep them apart in the report.</strong>
+        <em>Index recall</em> is ANN vs an exact scan over <em>the same</em> vectors: it measures the index, tops out
+        at 1.000, and is what Part I's sweep and Lab 1 produce. <em>Retrieval recall@k</em> is the fraction of golden
+        questions whose known-correct chunk appears in the top k: it measures the <em>embeddings</em>, tops out well
+        below 1.000 on any real corpus, and is the only one that can tell you whether a model swap helped. A
+        migration that improves the second while slightly reducing the first is a good migration.
+      </div>
+      <div class="mt-4">
+        <span class="code-label">parity.py — the gate, run nightly during the S3 shadow week</span>
+        <pre class="code"><span class="kw">import</span> json, collections, psycopg
+<span class="kw">from</span> pgvector.psycopg <span class="kw">import</span> register_vector
+
+<span class="cm"># golden.jsonl from AI9: {"q": "...", "gold_chunk_ids": [...], "segment": "contracts"}</span>
+GOLD = [json.loads(l) <span class="kw">for</span> l <span class="kw">in</span> <span class="fn">open</span>(<span class="st">"golden.jsonl"</span>)]
+
+V1 = <span class="st">"""SELECT id FROM chunks
+      WHERE tenant_id = %s ORDER BY embedding &lt;=&gt; %s LIMIT 10"""</span>
+V2 = <span class="st">"""SELECT chunk_id FROM chunk_emb_v2
+      WHERE tenant_id = %s ORDER BY embedding &lt;=&gt; %s::halfvec LIMIT 10"""</span>
+
+<span class="kw">def</span> <span class="fn">recall_at_10</span>(sql, embed):
+    <span class="cm">"""Fraction of golden questions whose gold chunk lands in the top 10,</span>
+<span class="cm">    broken out by segment — the aggregate alone hides every real regression."""</span>
+    hits, total = collections.Counter(), collections.Counter()
+    <span class="kw">for</span> g <span class="kw">in</span> GOLD:
+        got = {r[<span class="st">0</span>] <span class="kw">for</span> r <span class="kw">in</span> conn.execute(sql, (g[<span class="st">"tenant"</span>], embed(g[<span class="st">"q"</span>])))}
+        total[g[<span class="st">"segment"</span>]] += <span class="st">1</span>
+        hits[g[<span class="st">"segment"</span>]] += <span class="fn">bool</span>(got &amp; <span class="fn">set</span>(g[<span class="st">"gold_chunk_ids"</span>]))
+    total[<span class="st">"ALL"</span>] = <span class="fn">sum</span>(total.values()); hits[<span class="st">"ALL"</span>] = <span class="fn">sum</span>(hits.values())
+    <span class="kw">return</span> {s: hits[s] / total[s] <span class="kw">for</span> s <span class="kw">in</span> total}
+
+conn = psycopg.connect(DSN); register_vector(conn)
+a, b = recall_at_10(V1, embed_v1), recall_at_10(V2, embed_v2)
+<span class="kw">for</span> seg <span class="kw">in</span> <span class="fn">sorted</span>(a, key=<span class="kw">lambda</span> s: b[s] - a[s]):
+    <span class="fn">print</span>(<span class="st">f"{seg:&lt;16} v1={a[seg]:.2f}  v2={b[seg]:.2f}  delta={b[seg]-a[seg]:+.2f}"</span>)
+<span class="out">de-legal          v1=0.79  v2=0.68  delta=-0.11    &lt;-- BLOCKS THE CUT</span>
+<span class="out">contracts         v1=0.84  v2=0.89  delta=+0.05</span>
+<span class="out">wiki              v1=0.88  v2=0.92  delta=+0.04</span>
+<span class="out">tickets           v1=0.90  v2=0.93  delta=+0.03</span>
+<span class="out">ALL               v1=0.87  v2=0.91  delta=+0.04</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That output is why the loop sorts by delta ascending. The headline is a clean win —
+        <strong>0.87 → 0.91</strong> aggregate recall@10, exactly the improvement the vendor's benchmark page
+        promised — and if you shipped on the headline you would have shipped an <strong>11-point regression on
+        German-language legal documents</strong>, discovered eight weeks later by the one team that uses them. The
+        aggregate is a weighted average of segments, and a segment that is 4% of the corpus can lose a third of its
+        recall without moving it by a single point.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Write the gate down before you run it, so the number cannot be renegotiated afterwards. The one that has
+        held up: <strong>cut when aggregate recall@10 is not worse, no segment with ≥30 golden questions regresses
+        by more than 0.02, and p95 latency is within 20% of v1's.</strong> In the run above, one line fails, and the
+        useful part is that it fails with a name attached — the investigation is "why did this model get worse at
+        German legal text", which turned out to be a chunker that split on English sentence boundaries and left
+        German compound clauses straddling two chunks. Re-chunk that segment, re-embed 400K rows, re-run the gate.
+        Three extra days, and nobody ever knows it nearly happened.
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Gate on these
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(measured, per segment)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><strong>Retrieval recall@10 per segment</strong> — the primary gate, from the AI9 golden set.</li>
+            <li><strong>p95 latency on the filtered query shape</strong> — halfvec is usually faster, but 1536 dims is 50% more distance arithmetic.</li>
+            <li><strong>Short-result rate</strong> — the Part IV signal, computed separately for v2's index.</li>
+            <li><strong>Index recall vs exact</strong> on the new index — proves the graph built correctly before you blame the model.</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-rose-500">Not these
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(they will mislead you)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><strong>v1/v2 top-10 overlap</strong> — ≈0.35 is normal and carries no information about quality.</li>
+            <li><strong>Raw cosine scores</strong> — not comparable across models; a "lower" score means nothing.</li>
+            <li><strong>Aggregate recall alone</strong> — the failure above is invisible in it.</li>
+            <li><strong>"It looks better in the demo"</strong> — the ten queries you personally try are the ten you tuned against.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> during S3, log every shadow comparison with the query, both result sets and
+        the served answer, then sample the <em>disagreements</em> for human review rather than reviewing randomly.
+        Two hundred labelled disagreements from real traffic is a better golden set than anything you can write at a
+        desk, and it costs one afternoon of a subject-matter expert's time — which the customer will happily give
+        you when the alternative is a model swap decided by vibes.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Rollback, the soak, and the conversation — priced</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Rollback is the cheapest insurance in this runbook and the first thing people optimize away. At S4 the v1
+        column and its index are still there, still being written, costing 87&nbsp;GB of disk and one extra
+        embedding call per changed chunk. Someone will ask to drop them the week after the cut, because the disk
+        bill is visible and the risk is not. The answer is a date, not a debate: <strong>14 days of soak</strong>,
+        because the failure modes that survive a week of shadow traffic are the seasonal ones — the monthly close,
+        the quarterly report, the one team that only searches on Fridays.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">rollback.md — the whole procedure, because it has to fit on a phone screen</span>
+        <pre class="code">SYMPTOM   retrieval quality complaints, or short-result rate &gt; 0.01, after S4
+
+1. kubectl set env deploy/search EMB_READ=v1     <span class="cm"># or your equivalent</span>
+2. rolling restart                                <span class="cm"># ~40 s for 6 replicas</span>
+3. confirm: curl -s $SEARCH/healthz | jq .emb_read
+   <span class="out">"v1"</span>
+4. STOP. Do not revert EMB_WRITE_V2 - keep dual-writing so the next
+   attempt does not need another 9.5 h backfill.
+5. file the segment + queries that regressed; re-run parity.py on them
+
+TOTAL TIME TO SAFETY: &lt; 60 s.  Nothing is dropped, nothing is rebuilt.
+NOT A ROLLBACK: any step involving DROP, REINDEX, or a data restore.</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Step 4 is the one worth arguing for. The reflex in an incident is to undo everything, and undoing
+        <code class="inline">EMB_WRITE_V2</code> means the side table starts drifting immediately — every edit made
+        while you are rolled back is a hole in v2, and the second attempt needs a full re-backfill instead of a
+        partial one. Roll back the <em>read</em>, never the write.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Now the conversation. "The new embedding model benchmarks better — how long to switch us over?" deserves a
+        number in the meeting, and this is the shape of the honest one. Note where the cost actually sits:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Phase</th><th class="px-4 py-3">Engineer-days</th><th class="px-4 py-3">Elapsed</th><th class="px-4 py-3">Other cost</th><th class="px-4 py-3">What it buys</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Golden set (if none exists)</td><td class="px-4 py-3 font-mono">2</td><td class="px-4 py-3 font-mono">2 d</td><td class="px-4 py-3">1 SME afternoon</td><td class="px-4 py-3">The ability to say "yes" or "no" at all</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Side table + dual-write (S1)</td><td class="px-4 py-3 font-mono">3</td><td class="px-4 py-3 font-mono">3 d + 24 h soak</td><td class="px-4 py-3">~$0.70/day</td><td class="px-4 py-3">Everything after this is a backfill, not a project</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Dry run on 1% (100K)</td><td class="px-4 py-3 font-mono">0.5</td><td class="px-4 py-3">6 min run</td><td class="px-4 py-3">$1.30</td><td class="px-4 py-3">The real rate, the real token mean, the real error rate</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Backfill (S2)</td><td class="px-4 py-3 font-mono">0.5</td><td class="px-4 py-3 font-mono">9.5 h</td><td class="px-4 py-3">$132 + 83 GB disk</td><td class="px-4 py-3">The part everyone was afraid of</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">HNSW build on 10M</td><td class="px-4 py-3 font-mono">0.5</td><td class="px-4 py-3 font-mono">5 h</td><td class="px-4 py-3">32 GB maintenance_work_mem</td><td class="px-4 py-3">Interactive latency on v2</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shadow week (S3) + parity</td><td class="px-4 py-3 font-mono">2</td><td class="px-4 py-3 font-mono">7 d</td><td class="px-4 py-3">+1 index scan/query</td><td class="px-4 py-3">The segment regression you would otherwise ship</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cut (S4) + 14-day soak</td><td class="px-4 py-3 font-mono">0.5</td><td class="px-4 py-3 font-mono">14 d</td><td class="px-4 py-3">87 GB held</td><td class="px-4 py-3">A 60-second exit for two weeks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Drop v1 (S5)</td><td class="px-4 py-3 font-mono">0.5</td><td class="px-4 py-3 font-mono">1 h</td><td class="px-4 py-3">—</td><td class="px-4 py-3">The disk back</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><strong>Total</strong></td><td class="px-4 py-3 font-mono"><strong>9.5</strong></td><td class="px-4 py-3 font-mono"><strong>≈ 4 weeks</strong></td><td class="px-4 py-3"><strong>≈ $150</strong></td><td class="px-4 py-3">A model swap nobody noticed happening</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Say the last row out loud: <strong>nine and a half engineer-days, about four weeks of calendar, and $150 of
+        API spend</strong>. Then say the sentence that makes you useful rather than merely accurate: <em>most of
+        those four weeks is waiting on purpose, and the waiting is the product.</em> Customers hear "four weeks" and
+        try to compress it; what they are actually proposing to cut is the shadow week and the soak, which are the
+        only two phases that catch a regression. If the timeline has to shrink, shrink the backfill by buying a
+        temporary rate-limit increase — that is the one phase where money converts directly into hours.
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> decline the migration. A model that wins by 4 points on an aggregate the
+        customer never measures, on a corpus where a reranker already recovers more than that
+        (<a href="./ai4.html" class="text-viol underline decoration-viol/40">AI4</a>), is not worth four weeks of
+        an engineering team's attention — and saying so, with the parity table in hand, is worth more than executing
+        it flawlessly. Run the golden set against the new model <em>before</em> anyone builds anything: it is two
+        days, it costs $1.30 on a 1% sample, and about half the time it ends the project with everyone relieved.
+      </div>
+
       <!-- ═══════════════ skill ladder ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
@@ -1503,7 +1907,7 @@ Any one of these triggers a re-run of this exact harness.
         <div class="lab-card rounded-2xl border-2 border-coral bg-card dark:bg-carddark p-5" style="--lab-color:#D97757">
           <div class="flex items-center justify-between">
             <span class="bg-coral text-white text-xs font-bold rounded-md px-2 py-1">LAB 4 · EVIDENCE</span>
-            <span class="text-xs text-mute dark:text-mutedark">~2 h</span>
+            <span class="text-xs text-mute dark:text-mutedark">~3 h</span>
           </div>
           <h3 class="font-semibold mt-3">The store-selection report</h3>
           <p class="mt-1.5 text-sm text-mute dark:text-mutedark leading-relaxed">A realistic customer scenario, your benchmark tables from Labs 1–3, a constraint-weighted decision matrix, and a recommendation with migration/exit notes.</p>
@@ -1539,6 +1943,14 @@ Any one of these triggers a re-run of this exact harness.
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Model swaps are when-not-if. No <code class="inline">embedding_model</code> column, no stored raw text, no blue/green pattern ⇒ a future full outage with your name in the postmortem. Design for it at the schema stage.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Gating a model swap on v1/v2 overlap</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Two models induce two geometries; ~0.35 top-10 agreement is normal and carries no quality signal. Gate on per-segment retrieval recall against a labelled golden set — the aggregate hid an 11-point regression in Part VI, and aggregates always will.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Dual-write long before you migrate</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Writing the second embedding on every changed chunk costs cents a day at typical churn and converts the next model swap from a four-week project into a backfill. Ship it as its own boring release while nobody is asking for it.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
           <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep the exact baseline forever</div>
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A brute-force scan over the same vectors is your permanent ground truth: it settles "is it the index or the embeddings?" in one query, and powers the weekly recall-drift monitor.</p>
         </div>
@@ -1555,6 +1967,9 @@ Any one of these triggers a re-run of this exact harness.
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="filtertrap"> <span>Reproduced the filtered-HNSW recall collapse on a selective filter and fixed it (iterative scan / pre-filter / partial index), with before/after numbers.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="hybrid"> <span>Ran hybrid dense + tsvector + RRF retrieval as a single SQL statement with ACL filtering before ranking, and wired a real RAG pipeline (AI4) to it.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="qdrant"> <span>Ran the identical workload in Qdrant and recorded comparable recall, latency, ingest and filtered-query numbers plus honest ergonomics notes.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="capacity"> <span>Turned a chunk count into an instance size with <code class="inline">capacity.py</code> — growth, migration double, build headroom — and measured the <code class="inline">halfvec</code> lever's recall cost on your own data rather than quoting it.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dualwrite"> <span>Built the dual-write side table and ran a rate-limited, resumable backfill (killed and restarted it at least once, on purpose) with a measured chunks/s and a projected wall clock.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="parity"> <span>Ran the per-segment recall-parity gate on a golden set, wrote the cut criteria down <em>before</em> seeing the numbers, and can state why v1/v2 top-k overlap is not a gate.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="report"> <span class="font-semibold">Produced the store-selection report: scenario constraints, benchmark tables, decision matrix, recommendation with migration/exit notes (catalog evidence ✓).</span></label>
       </div>
 
@@ -1564,6 +1979,12 @@ Any one of these triggers a re-run of this exact harness.
         <li><a class="text-coral underline" href="https://qdrant.tech/documentation/" target="_blank" rel="noopener">Qdrant documentation</a> — see especially the filtering and quantization guides; the filterable-HNSW design doc explains why its filtered recall holds.</li>
         <li><a class="text-coral underline" href="https://ann-benchmarks.com" target="_blank" rel="noopener">ann-benchmarks.com</a> — the standard methodology for recall-vs-QPS curves; steal its rigor (and its plots' shape) for your own reports.</li>
         <li><a class="text-coral underline" href="https://supabase.com/docs/guides/ai" target="_blank" rel="noopener">Supabase pgvector guides</a> — practical, production-flavored pgvector patterns (HNSW tuning, hybrid search) with worked examples.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/sql-createindex.html" target="_blank" rel="noopener">PostgreSQL — CREATE INDEX</a> — read the <code class="inline">CONCURRENTLY</code> and <code class="inline">maintenance_work_mem</code> notes before your first 10M-row build; they are the difference between 5 hours and a weekend.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/routine-vacuuming.html" target="_blank" rel="noopener">PostgreSQL — Routine vacuuming</a> — why the Part VI side table beats an extra column: this page is the bloat you avoid.</li>
+        <li><a class="text-coral underline" href="https://qdrant.tech/documentation/guides/quantization/" target="_blank" rel="noopener">Qdrant — Quantization</a> — scalar, product and binary quantization with the rescoring stage explained; the source for the 32×/−0.01 row in Part IV's lever table.</li>
+        <li><a class="text-coral underline" href="https://docs.pinecone.io/guides/index-data/indexing-overview" target="_blank" rel="noopener">Pinecone — Indexing overview</a> — the managed-store mental model (namespaces, serverless pods, metadata filters) you need to price the third column of your decision matrix honestly.</li>
+        <li><a class="text-coral underline" href="https://docs.voyageai.com/docs/embeddings" target="_blank" rel="noopener">Voyage AI — Embeddings</a> — dimensions, output dtypes and rate limits; the TPM number in Part VI's backfill arithmetic comes from a page like this one, per account tier.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.VectorDB.html" target="_blank" rel="noopener">AWS — pgvector on Aurora PostgreSQL</a> — what a managed Postgres actually lets you set (and not set); check this before you promise a customer a <code class="inline">maintenance_work_mem</code> value.</li>
       </ul>
 
       <nav id="page-nav" class="mt-14 flex gap-4"></nav>
@@ -1723,6 +2144,29 @@ for ef in [10, 40, 100, 200, 400]:
       </div>
       Your numbers will differ — that's the point; they're <em>yours</em>. Pick the ef_search you would ship for a RAG top-10 and write one sentence defending it. (Hint: for RAG, recall ≈ 0.95+ matters more than 2 ms vs 6 ms — the LLM call costs 100× either.)
     </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Measure the <code class="inline">halfvec</code> lever instead of quoting it.</strong> Part IV claims float16 costs about 0.002 recall for half the memory. Verify that claim on your own corpus — this is the single highest-leverage two-minute experiment in the module:
+      <pre class="code">-- add the half-precision copy alongside, index it, and compare sizes
+ALTER TABLE chunks ADD COLUMN embedding_h halfvec(1024);
+UPDATE chunks SET embedding_h = embedding::halfvec;
+SET maintenance_work_mem = '1GB';
+CREATE INDEX chunks_emb_h_idx ON chunks
+  USING hnsw (embedding_h halfvec_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes WHERE relname = 'chunks';</pre>
+      Expected: the <code class="inline">halfvec</code> index is roughly <span class="out">half the size</span> of the float32 one. Now re-run <code class="inline">bench_hnsw</code> against <code class="inline">embedding_h</code> (swap the column name in <code class="inline">EXACT</code>) at your shipped ef_search and record the recall delta. Report it as a number, e.g. <em>"0.951 → 0.949 for −48% index size"</em>. If your delta is much worse than 0.005, say so — a claim you tested and contradicted is more valuable than one you repeated.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Turn your measurements into a sizing line.</strong> Take Part IV's <code class="inline">capacity.py</code>, substitute your <em>measured</em> row size instead of its 1600-byte default, and run it for the Lab 4 scenario (2M chunks now, 2.5× growth):
+      <pre class="code">SELECT pg_total_relation_size('chunks') / count(*) AS bytes_per_row FROM chunks;
+<span class="out"> 2914      -- your real number; the 1600 default is optimistic for tsvector-heavy rows</span></pre>
+      <pre class="code">print(plan(2_000_000, row_bytes=2914))
+<span class="out">{'rows_2y': 5000000, 'hot_gb': 37.4, 'ram_gb': 49.4, 'disk_gb': 106.6}</span>
+print(plan(2_000_000, row_bytes=2914, elem=2))   # halfvec, from step 7
+<span class="out">{'rows_2y': 5000000, 'hot_gb': 27.1, 'ram_gb': 39.1, 'disk_gb': 90.2}</span></pre>
+      One instance size apart, on evidence you produced yourself in ten minutes. That pair of lines goes straight into Lab 4's report and is the reason the sizing section reads as engineering rather than as a vendor's calculator.
+    </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
       <li>Index build very slow or OOM-killed → raise container memory; ensure <code class="inline">maintenance_work_mem</code> was set in the <em>same session</em> as CREATE INDEX.</li>
@@ -1746,8 +2190,19 @@ for ef in [10, 40, 100, 200, 400]:
   <div class="modal-body">
     <h4>🎯 Objective</h4>
     <p class="text-sm leading-relaxed mt-1">Reproduce the most important failure in this module — the filtered-HNSW recall collapse — fix it three ways with measured results, then run production-grade hybrid retrieval in one SQL statement and wire your AI4 RAG to it.</p>
-    <h4>🔬 Steps</h4>
+    <h4>📦 Setup</h4>
     <div class="step"><div class="step-n">1</div><div class="step-body">
+      <strong>Confirm Lab 1's state is intact</strong> — this lab is worthless without the same vectors and the same ground truth. Two minutes now saves an hour of confusing recall numbers:
+      <pre class="code">docker compose up -d
+docker compose exec db psql -U postgres -d vectors -c \
+  "SELECT count(*), count(DISTINCT tenant_id) FROM chunks;
+   SELECT indexrelname FROM pg_stat_user_indexes WHERE relname='chunks';"
+python3 -c "import json; t=json.load(open('truth.json')); print(len(t), 'query truths')"</pre>
+      Expected: <span class="out">50000 | 10</span>, an index list containing <code class="inline">chunks_emb_idx</code>, and <span class="out">100 query truths</span>. If <code class="inline">truth.json</code> is missing, re-run Lab 1 step 4 — do <em>not</em> regenerate the vectors, or every number in Lab 3 stops being comparable.
+      <span class="text-mute dark:text-mutedark">Keep the same Python session or re-import <code class="inline">queries</code> with <code class="inline">default_rng(7)</code>; the query set must be byte-identical across all four labs.</span>
+    </div></div>
+    <h4>🔬 Steps</h4>
+    <div class="step"><div class="step-n">2</div><div class="step-body">
       <strong>Build filtered ground truth</strong> for the 0.5% tenant (<code class="inline">t9</code>, ~250 of 50K rows). Extend <code class="inline">bench.py</code>:
       <pre class="code">FILT = ("SELECT id FROM chunks WHERE tenant_id = %s "
         "ORDER BY embedding &lt;=&gt; %s LIMIT 10")
@@ -1762,7 +2217,7 @@ def filtered_truth():
     return out
 ftruth = filtered_truth()</pre>
     </div></div>
-    <div class="step"><div class="step-n">2</div><div class="step-body">
+    <div class="step"><div class="step-n">3</div><div class="step-body">
       <strong>Now hit the trap.</strong> Same query through HNSW at default settings:
       <pre class="code">conn.execute("SET hnsw.ef_search = 40")
 conn.execute("SET hnsw.iterative_scan = off")   <span class="cm"># pgvector ≥0.8 defaults protect you; disable to SEE the failure</span>
@@ -1774,7 +2229,7 @@ for i, q in enumerate(queries):
 print(f"filtered recall={np.mean(rec):.3f}   queries returning &lt;10 rows: {short}/100")</pre>
       Expected: <span class="out">recall collapses (often &lt; 0.3) and most queries return far fewer than 10 rows</span>. The graph found 40 candidates; ~0.5% of them were t9. Run <code class="inline">EXPLAIN ANALYZE</code> on one query and see the rows discarded after the index scan. <em>This</em> is the production bug from Part III, on your laptop, on purpose.
     </div></div>
-    <div class="step"><div class="step-n">3</div><div class="step-body">
+    <div class="step"><div class="step-n">4</div><div class="step-body">
       <strong>Fix it three ways, measure each:</strong>
       <pre class="code"><span class="cm">-- fix A: iterative scan (pgvector ≥ 0.8) — keeps walking until LIMIT matches found</span>
 SET hnsw.iterative_scan = relaxed_order;
@@ -1788,7 +2243,7 @@ CREATE INDEX chunks_emb_t0_idx ON chunks
   USING hnsw (embedding vector_cosine_ops) WHERE tenant_id = 't0';</pre>
       Re-run the step-2 measurement under fix A and fix B. Record a mini-table: <em>strategy · recall · p50</em>. Takeaway to memorize: the right fix depends on selectivity — there is no single setting to cargo-cult.
     </div></div>
-    <div class="step"><div class="step-n">4</div><div class="step-body">
+    <div class="step"><div class="step-n">5</div><div class="step-body">
       <strong>Hybrid RRF in one statement.</strong> The Lab 1 bodies contain planted identifiers (<code class="inline">INV-00042</code>) that cosine similarity is terrible at — exactly AI4's dense blind spot. Run the Part III CTE:
       <pre class="code">WITH dense AS (
   SELECT id, ROW_NUMBER() OVER (ORDER BY embedding &lt;=&gt; %s) AS r
@@ -1811,8 +2266,35 @@ WHERE d.id IS NOT NULL OR s.id IS NOT NULL
 ORDER BY rrf DESC LIMIT 5;</pre>
       Search for <code class="inline">"INV-00042"</code> with a random query vector: sparse rescues the exact-identifier match that dense alone would drop. One round-trip, ACL inside both branches, everything in the customer's existing backup domain.
     </div></div>
-    <div class="step"><div class="step-n">5</div><div class="step-body">
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Prove the ACL, don't assume it.</strong> A filter that ranks correctly and leaks occasionally is worse than one that is simply slow. Write the test that a security reviewer would write:
+      <pre class="code">import itertools, collections
+leaks = collections.Counter()
+for tenant, q in itertools.product([f"t{i}" for i in range(10)], queries[:20]):
+    rows = conn.execute(FILT, (tenant, q)).fetchall()
+    ids  = [r[0] for r in rows]
+    if ids:
+        owners = conn.execute(
+            "SELECT DISTINCT tenant_id FROM chunks WHERE id = ANY(%s)", (ids,)).fetchall()
+        for (o,) in owners:
+            if o != tenant: leaks[tenant] += 1
+print("cross-tenant rows returned:", sum(leaks.values()), dict(leaks))</pre>
+      Expected: <span class="out">cross-tenant rows returned: 0 {}</span>. Now break it deliberately — move the tenant predicate out of the SQL and into a Python post-filter over <code class="inline">LIMIT 10</code> — and watch the count go non-zero <em>and</em> the result lists go short. Filtering after ranking is the same bug wearing two hats: a correctness hole and a recall hole (<a href="./pr13.html" class="text-viol underline decoration-viol/40">PR13</a>).
+    </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
       <strong>Wire your AI4 RAG to pgvector.</strong> In your <code class="inline">ai4-labs/rag.py</code>, replace the numpy <code class="inline">retrieve()</code> with the hybrid SQL (real voyage embeddings this time — a <code class="inline">vector(1024)</code> column matches voyage-3). Re-run your AI4 golden-set eval against the pgvector backend: recall@5 should match or beat the numpy + rank_bm25 version — now with persistence, concurrency, ACL and backups included. That eval-to-eval comparison is your first cross-store benchmark, and the habit this module exists to build.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Emit the two production signals</strong> from Part IV so the trap can never come back silently. Add them to the query path and log them per request:
+      <pre class="code">-- short-result rate: the filtered-recall trap, visible the hour it starts
+CREATE VIEW search_health AS
+SELECT date_trunc('hour', ts) AS hour,
+       count(*) FILTER (WHERE n_results &lt; requested_k)::float / count(*) AS short_rate,
+       percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms
+FROM query_log GROUP BY 1 ORDER BY 1 DESC;
+
+SELECT * FROM search_health LIMIT 3;</pre>
+      <span class="out"> 2026-08-05 14:00 | 0.0009 | 7.2</span> is healthy; <span class="out">0.0400</span> is the trap arriving. Write down the alert threshold you would set and why — a number you can defend beats a dashboard nobody reads, and this view is three lines you can hand to the customer's on-call.
     </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
@@ -1912,11 +2394,60 @@ for ef in [40, 100]: bench_qdrant(ef, flt=t9)</pre>
         <li>Where each store made you smile, and where it made you read docs for 20 minutes.</li>
       </ul>
     </div></div>
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Quantization, measured.</strong> Part IV's lever table claims int8 scalar quantization buys 4× memory for about a point of recall, with float rescoring of the top candidates. Qdrant makes that a config change, so there is no excuse for quoting it second-hand:
+      <pre class="code">client.update_collection("chunks",
+    quantization_config=models.ScalarQuantization(
+        scalar=models.ScalarQuantizationConfig(
+            type=models.ScalarType.INT8, quantile=0.99, always_ram=True)))
+
+<span class="cm"># wait for status green again, then re-run with and without rescoring</span>
+def bench_quant(ef, rescore):
+    params = models.SearchParams(hnsw_ef=ef,
+        quantization=models.QuantizationSearchParams(rescore=rescore, oversampling=2.0))
+    <span class="cm"># ... identical loop to bench_qdrant, passing search_params=params ...</span>
+
+for r in [False, True]: bench_quant(100, r)</pre>
+      Typical shape: <span class="out">rescore=False → recall ≈ 0.94</span>, <span class="out">rescore=True → recall ≈ 0.97</span> at a fraction of a millisecond more. Record the collection's reported memory before and after (<code class="inline">client.get_collection("chunks")</code>). The report sentence you are earning here is "int8 + rescoring held recall within 0.01 at 4× less RAM <em>on our data</em>" — the last three words are the whole value.
+    </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
+      <strong>Run the ops drill both stores must survive.</strong> Benchmarks pick a favorite; restore drills pick the one you can actually operate. Time both, honestly:
+      <pre class="code"># Qdrant: snapshot, delete the collection, restore, re-verify count
+curl -s -X POST localhost:6333/collections/chunks/snapshots | jq -r .result.name
+curl -s -X DELETE localhost:6333/collections/chunks
+curl -s -X PUT "localhost:6333/collections/chunks/snapshots/recover" \
+  -H 'content-type: application/json' \
+  -d '{"location":"file:///qdrant/snapshots/chunks/&lt;name&gt;.snapshot"}'
+curl -s localhost:6333/collections/chunks | jq .result.points_count
+
+# pgvector: the equivalent, using tooling the DBA team already has
+docker compose exec -T db pg_dump -U postgres -d vectors -Fc &gt; chunks.dump
+docker compose exec -T db psql -U postgres -c "DROP DATABASE vectors;"
+docker compose exec -T db createdb -U postgres vectors
+docker compose exec -T db pg_restore -U postgres -d vectors -j4 &lt; chunks.dump</pre>
+      Write down two numbers and one sentence each: <em>restore wall-clock</em>, <em>whether the index came back or had to be rebuilt</em>, and <em>how much of this the customer's existing runbooks already cover</em>. On the pgvector side the index rebuild is inside the restore time — that is the RTO line Part IV told you to budget, and now you have measured it rather than estimated it.
+    </div></div>
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Freeze the comparison into a file</strong>, while every caveat is still in your head. Lab 4 consumes this verbatim, and a table written from memory a week later is fiction:
+      <pre class="code">| metric                          | pgvector | qdrant | notes                       |
+|---------------------------------|----------|--------|-----------------------------|
+| recall@10 (ef=100)              |          |        | vs shared exact ground truth|
+| p50 / p95 ms (ef=100)           |          |        | pgvector: driver overhead;  |
+|                                 |          |        | qdrant: HTTP overhead       |
+| ingest vectors/s                |          |        | COPY vs gRPC batch upsert   |
+| filtered recall, 0.5% tenant    |          |        | the row that decides things |
+| index build, 50K                |          |        | qdrant builds in background |
+| memory after int8 + rescore     |    n/a   |        | pgvector: halfvec = 2x only |
+| restore wall-clock              |          |        | includes index rebuild?     |</pre>
+      Fill every cell or write <code class="inline">not measured</code> — never leave a blank, because a blank cell in a customer-facing table reads as a zero. Save it as <code class="inline">bench.md</code> next to the scripts that produced it.
+    </div></div>
     <h4>🧯 Troubleshooting</h4>
     <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
       <li>Upserts slow → you're on REST; use <code class="inline">QdrantClient(url=..., prefer_grpc=True)</code> for bulk loads.</li>
       <li>Recall oddly low → collection status wasn't green yet, or tenants/doc_types regenerated with a different seed — the payloads must match Lab 1's assignment exactly.</li>
       <li>Filtered recall denominator wrong → ftruth sets can have &lt; 10 members for tiny tenants; divide by <code class="inline">len(base)</code>, as shown, in both labs.</li>
+      <li>Recall drops after enabling quantization → you benchmarked before the collection re-optimized, or you left <code class="inline">rescore=False</code>; poll for <span class="out">green</span> again and compare both rescoring modes rather than one.</li>
+      <li>Snapshot recover returns 404 → the <code class="inline">file://</code> path is inside the <em>container</em> (<code class="inline">/qdrant/snapshots/…</code>), not on your host; list them with <code class="inline">curl -s localhost:6333/collections/chunks/snapshots</code>.</li>
     </ul>
     <h4>✅ Done when</h4>
     <p class="text-sm leading-relaxed mt-1">A side-by-side table exists: pgvector vs Qdrant × {recall@10, p50, p95, ingest rate, filtered recall} at matched settings, plus five honest ergonomics bullets. No winner declared yet — that's Lab 4's job, and it depends on constraints, not vibes.</p>
@@ -1926,7 +2457,7 @@ for ef in [40, 100]: bench_qdrant(ef, flt=t9)</pre>
 <dialog id="lab4" class="lab-modal" style="--lab-color:#D97757">
   <div class="modal-head">
     <div>
-      <div class="text-[11px] font-bold uppercase tracking-wider opacity-80">Lab 4 · evidence artifact · ~2 h</div>
+      <div class="text-[11px] font-bold uppercase tracking-wider opacity-80">Lab 4 · evidence artifact · ~3 h</div>
       <div class="font-display font-bold text-lg leading-tight">The store-selection report</div>
     </div>
     <button data-modal-close aria-label="Close" title="Close" class="shrink-0 w-9 h-9 rounded-full bg-white/20 hover:bg-white/35 flex items-center justify-center text-base leading-none transition-colors">✕</button>
@@ -1934,8 +2465,23 @@ for ef in [40, 100]: bench_qdrant(ef, flt=t9)</pre>
   <div class="modal-body">
     <h4>🎯 Objective</h4>
     <p class="text-sm leading-relaxed mt-1">Produce AI5's catalog evidence — <em>"justified vector store choice with a benchmark"</em> — as the document you would actually hand a customer architect: constraints first, your measurements second, a defensible recommendation with its exit plan third.</p>
-    <h4>🔬 Steps</h4>
+    <h4>📦 Setup</h4>
     <div class="step"><div class="step-n">1</div><div class="step-body">
+      <strong>Collect the evidence into one directory</strong> before you write a word. A report whose numbers can't be traced to a script is an opinion with a table in it:
+      <pre class="code">mkdir -p report/data &amp;&amp; cd report
+cp ../ai5-labs/{ingest.py,bench.py,truth.json} data/
+cp ../qdrant-labs/{bench_qdrant.py,bench.md} data/
+python3 - &lt;&lt;'PY'
+import pathlib, json
+have = {p.name for p in pathlib.Path("data").iterdir()}
+need = {"ingest.py","bench.py","truth.json","bench_qdrant.py","bench.md"}
+print("missing:", need - have or "nothing — you can write the report")
+PY</pre>
+      Expected: <span class="out">missing: nothing — you can write the report</span>. Also copy your Lab 1 step 7 halfvec delta and step 8 sizing output into <code class="inline">data/sizing.txt</code> — you will want them in two different sections and you will not remember them.
+      <span class="text-mute dark:text-mutedark">Write the report in Markdown in this directory, not in a doc tool. It has to survive being pasted into the customer's wiki by someone who wasn't in the room.</span>
+    </div></div>
+    <h4>🔬 Steps</h4>
+    <div class="step"><div class="step-n">2</div><div class="step-body">
       <strong>Fix the scenario</strong> (write it down verbatim — constraints drive everything after):
       <pre class="code">Customer: mid-size insurer, on-prem, standardized on PostgreSQL 16 (DBA team of 3).
 Corpus:   2M chunks now → ~5M in 2 years, 1024-dim.
@@ -1944,10 +2490,10 @@ Rules:    documents may not leave the datacenter. No new 24/7 ops capacity.
 Load:     ~5 QPS average, 20 QPS peak. Nightly sync ~50K chunks.</pre>
       Note what the scenario already decides: managed SaaS is eliminated by residency <em>before any benchmark runs</em> — say so explicitly in the report. Benchmarks decide between the survivors; constraints decide who survives.
     </div></div>
-    <div class="step"><div class="step-n">2</div><div class="step-body">
+    <div class="step"><div class="step-n">3</div><div class="step-body">
       <strong>Assemble the benchmark section</strong> from Labs 1–3: the exact-baseline table, the ef_search sweep, the filter-trap collapse + fixes, and the pgvector/Qdrant side-by-side. Add one honest extrapolation paragraph: your 50K numbers → the scenario's 2M (linear memory: 2M ⇒ ~8&nbsp;GB vectors + ~10&nbsp;GB rows; build time ×40 with the same maintenance_work_mem caveat; state clearly that you <em>extrapolated</em> and that a pre-production run at full scale is milestone 1).
     </div></div>
-    <div class="step"><div class="step-n">3</div><div class="step-body">
+    <div class="step"><div class="step-n">4</div><div class="step-body">
       <strong>Build the decision matrix</strong> — weights from the customer's constraints, not your taste:
       <div class="mt-2 overflow-x-auto rounded-lg border border-line dark:border-linedark">
         <table class="w-full text-xs bg-card dark:bg-carddark">
@@ -1965,7 +2511,28 @@ Load:     ~5 QPS average, 20 QPS peak. Nightly sync ~50K chunks.</pre>
       </div>
       Score 1–5 from <em>your lab data</em> where a row is measurable, from the scenario where it isn't — and mark which is which. A matrix where every number traces to a measurement or a stated constraint is the difference between analysis and decoration.
     </div></div>
-    <div class="step"><div class="step-n">4</div><div class="step-body">
+    <div class="step"><div class="step-n">5</div><div class="step-body">
+      <strong>Size the machine, and show the lever.</strong> The architect's next question after "which store" is always "how big a box", and the answer that lands is the one with a cheaper alternative attached. Use your measured row size from Lab 1 step 8:
+      <pre class="code">## Sizing (measured row size 2,914 B from our 50K corpus, not a default)
+                            hot set   RAM    disk    instance
+2M today,   float32/1024     15.0 GB  25.0   42.6    32 GB
+5M in 2 yr, float32/1024     37.4 GB  49.4  106.6    64 GB
+5M in 2 yr, halfvec/1024     27.1 GB  39.1   90.2    48 GB   &lt;- recommended
+measured cost of halfvec on our corpus: recall@10 0.951 -&gt; 0.949</pre>
+      Two properties make this section persuasive rather than merely present: every input is a number you measured, and the recommendation is the <em>cheaper</em> row. An FDE who arrives with a smaller invoice and the measurement that justifies it gets believed about the expensive things later.
+    </div></div>
+    <div class="step"><div class="step-n">6</div><div class="step-body">
+      <strong>Price the re-embedding migration</strong> using Part VI's runbook against <em>this</em> scenario's numbers — 5M chunks, not 10M. Redo the arithmetic rather than scaling the module's answer; the whole point is that the customer's TPM tier is the variable:
+      <pre class="code">## Re-embedding, when (not if) the model changes
+chunks 5,000,000  x  mean 220 tok  =  1.1 B tokens
+account tier 4M TPM  -&gt;  18,180 chunks/min  -&gt;  4.6 h wall clock
+list price 1.1 B x $0.06/1M       =  $66
+peak disk during S1-S4: 90.2 GB (v1) + ~68 GB (v2) = ~158 GB  &lt;- CHECK THE VOLUME
+engineer-days: 9.5 total, of which 5 are golden set + shadow week
+calendar: ~4 weeks, ~3 of which are deliberate waiting</pre>
+      Then write the one sentence that makes this section worth more than the benchmark: <em>"the day-1 schema below makes this a backfill; without it, it is a re-platforming."</em> Point at the <code class="inline">embedding_model</code>/<code class="inline">embedded_at</code> columns and the retained raw text in your schema and note that they cost nothing today.
+    </div></div>
+    <div class="step"><div class="step-n">7</div><div class="step-body">
       <strong>Write the recommendation + migration/exit notes</strong> — this exact skeleton, your numbers:
       <pre class="code"># Vector store selection — &lt;scenario&gt;                      2026-08-__
 ## Constraints (from discovery)
@@ -1992,11 +2559,42 @@ scale/QPS outgrow Postgres — its filtered-search results were stronger.
 ## Risks &amp; milestone 1
 extrapolation risk → full-scale dry run on customer spec before commit</pre>
     </div></div>
-    <div class="step"><div class="step-n">5</div><div class="step-body">
+    <div class="step"><div class="step-n">8</div><div class="step-body">
+      <strong>Write the "what we are not doing" section.</strong> This is the score-4 half of the artifact and the half everyone omits. Three items, each with the reason and the trigger that would change the answer:
+      <ul class="mt-1 space-y-1.5 list-disc pl-5">
+        <li><strong>No dedicated vector service today.</strong> 2M chunks is 15 GB; the measured p95 at 20 QPS has headroom. Trigger to revisit: sustained &gt; 50 QPS, or a corpus past ~20M chunks.</li>
+        <li><strong>No sharding, no multi-node.</strong> One instance holds the working set with room for the 2-year projection. Trigger: the hot set exceeds 60% of RAM, which the monitoring in Part IV will tell you months in advance.</li>
+        <li><strong>No model migration in phase 1</strong>, even though a better embedding model exists. Trigger: a per-segment parity run on the golden set showing ≥ 0.03 aggregate gain with no segment regressing more than 0.02. Cost of finding out: $1.30 and two days.</li>
+      </ul>
+      Declining work in writing, with a measurable trigger attached, is what separates a consultant from a vendor. It also protects you: when the trigger fires in eighteen months, the plan was already agreed.
+    </div></div>
+    <div class="step"><div class="step-n">9</div><div class="step-body">
       <strong>Red-team your own report.</strong> Three questions a sharp customer architect would ask — answer them in an appendix: <em>"Why should I believe 50K predicts 2M?"</em> (you flagged it: milestone 1), <em>"What if the DBA team shrinks?"</em> (Qdrant fallback is documented), <em>"Your favorite won — surprise me"</em> (the filtered-search row shows Qdrant winning something that mattered, and the report says so). If your report can't survive these, it isn't evidence yet.
     </div></div>
+    <div class="step"><div class="step-n">10</div><div class="step-body">
+      <strong>Make it re-runnable, then hand it over.</strong> The report's real half-life comes from someone else reproducing it after you leave. Ship the scripts with it and prove the path works from a clean checkout:
+      <pre class="code">report/
+├── README.md          # the report itself
+├── data/              # scripts + truth.json + bench.md from Labs 1-3
+└── run.sh             # docker compose up; ingest; bench; print every table
+
+$ ./run.sh 2&gt;&amp;1 | tail -4
+<span class="out">pgvector  ef=100  recall@10=0.972  p50=2.8ms  p95=5.1ms</span>
+<span class="out">qdrant    ef=100  recall@10=0.975  p50=3.4ms  p95=6.0ms</span>
+<span class="out">filtered t9  pgvector 0.31 -&gt; 0.96 (iterative)   qdrant 0.97 (native)</span>
+<span class="out">all tables regenerated in 6m41s from a clean checkout</span></pre>
+      That last line is the sentence to put at the top of the report. "Every number here regenerates in under seven minutes, here is the command" ends the credibility conversation before it starts — and it is the difference between a document the customer files and one they run.
+    </div></div>
+    <h4>🧯 Troubleshooting</h4>
+    <ul class="text-sm space-y-1.5 list-disc pl-5 mt-1 leading-relaxed">
+      <li>The matrix produces a winner you don't believe → your weights encode taste, not constraints. Re-derive each weight from a sentence in the scenario; if no sentence supports it, the row does not belong in the matrix.</li>
+      <li>Both stores score within 0.3 of each other → that is a real and reportable result. Say "they are equivalent on the measured axes; we recommend X on ops fit" rather than inventing a tiebreaker criterion after the fact.</li>
+      <li>Blank cells in the benchmark table → fill them or write <code class="inline">not measured</code>. Customers read a blank as a zero, and one blank cell costs the whole table its authority.</li>
+      <li>The report has grown past four pages → move the methodology and the raw sweeps into an appendix. Constraints, table, matrix, recommendation, risks — the decision-maker reads only those five, and burying them is how a good analysis loses to a slide deck.</li>
+      <li><code class="inline">run.sh</code> fails on a clean checkout → almost always a file you generated by hand in an earlier lab and never scripted (usually <code class="inline">truth.json</code>). Regenerate it from <code class="inline">ingest.py</code> + <code class="inline">bench.py</code> and commit the seeds, not the outputs.</li>
+    </ul>
     <h4>✅ Done when</h4>
-    <p class="text-sm leading-relaxed mt-1">The report exists with real numbers in every benchmark cell, the matrix traces to measurements or stated constraints, the losing store's wins are printed, and the exit path is costed. A teammate could re-run every number from your repo — and you could defend the recommendation to a hostile architect. This document format is reusable at every engagement where "which vector store?" comes up, which is most of them.</p>
+    <p class="text-sm leading-relaxed mt-1">The report exists with real numbers in every benchmark cell, the matrix traces to measurements or stated constraints, the losing store's wins are printed, the sizing section names an instance and shows the cheaper lever, the re-embedding migration is priced in engineer-days and dollars, and there is a written list of what you are <em>not</em> building with a measurable trigger for each. <code class="inline">./run.sh</code> regenerates every table from a clean checkout — and you could defend the recommendation to a hostile architect. This document format is reusable at every engagement where "which vector store?" comes up, which is most of them.</p>
   </div>
 </dialog>
 
