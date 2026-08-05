@@ -28,6 +28,10 @@ const MODULES = [
   { code: "AI10", name: "Fine-tuning & Model Adaptation", critical: false },
   { code: "AI11", name: "Multimodal AI", critical: false },
   { code: "AI12", name: "Open-source & Local Models", critical: false },
+  { code: "AI13", name: "Reasoning Models & Extended Thinking", critical: true },
+  { code: "AI14", name: "Text-to-SQL & Structured Data", critical: true },
+  { code: "AI15", name: "Multi-agent Systems", critical: false },
+  { code: "AI16", name: "Red-teaming & Adversarial Evaluation", critical: true },
   { code: "PR1", name: "AI Observability & Tracing", critical: true },
   { code: "PR2", name: "Model Routing, Latency & Cost", critical: true },
   { code: "PR3", name: "Reliability & Background Processing", critical: true },
@@ -63,7 +67,7 @@ const TOPICS = [
     name: "AIFDE Mastery",
     tagline: "AI Forward Deployed Engineer",
     blurb:
-      "A 44-module curriculum taking an engineer from Python and LLM fundamentals to shipping, " +
+      "A 48-module curriculum taking an engineer from Python and LLM fundamentals to shipping, " +
       "operating and selling AI systems inside a customer's stack — each module with hands-on labs " +
       "and an evidence artifact.",
     meta: `${MODULES.length} modules`,
