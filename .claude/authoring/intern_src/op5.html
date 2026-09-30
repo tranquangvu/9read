@@ -1,496 +1,622 @@
-<!-- meta: days=1 -->
-        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Cloudflare Essentials</h1>
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Cloud Infrastructure on AWS II: Production Operations</h1>
         <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
-          Many client domains already sit on Cloudflare. In one day you'll learn what actually changes when a DNS
-          record is proxied, which SSL/TLS mode to choose and why, how caching, the WAF and rate limiting protect the
-          origin, what R2 and Workers are for, and how to debug the famous redirect loops and 52x errors.
+          <a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a> got the clinic API running on AWS.
+          This module is about keeping it running when real users arrive. It covers the other compute options (EC2 and
+          Lambda), auto scaling, queues and events, a managed cache, email, alarms and audit trails, encryption,
+          backups, and the parts of the bill that surprise everyone. The aim is not to master each service. It is to
+          recognise them in a client's account, know when each one is the right tool, and know the one or two things
+          about each that cause incidents.
         </p>
         <div class="mt-6 callout callout-why">
-          <strong>Why it matters when AI writes the code:</strong> Cloudflare settings live in a dashboard, not in
-          your repo, so an agent can't see them. When a site breaks behind Cloudflare, the agent will confidently
-          "fix" the app: add redirects, change cookies, bump timeouts. The real cause is often one dropdown, such as
-          the SSL mode. You need a mental model of the two connections (visitor → Cloudflare, Cloudflare → origin)
-          to point the agent at the right layer.
+          <strong>Why it matters when AI writes the code:</strong> ask an agent for "a queue for reminder emails" and it
+          will produce working Terraform in a minute. It rarely adds a dead-letter queue, a visibility timeout that
+          matches the job, an alarm on queue age, a log retention period or a restore test. None of those gaps shows up
+          in a demo. They show up as emails sent twice, a queue silently backing up for a week, or a backup nobody can
+          restore. Your job is to know which production details are missing from a plan that looks complete.
         </div>
 <!-- @@BODY@@ -->
 
       <!-- ═══════════════ PART I ═══════════════ -->
-      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · DNS and the proxy</div>
-      <h2 class="font-display text-2xl font-bold mt-2">The orange cloud changes who your visitors talk to</h2>
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Compute beyond Fargate</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pick the compute by the shape of the work, not by habit</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Cloudflare starts as a DNS provider: you change your domain's nameservers at the registrar to the two
-        Cloudflare gives you, and Cloudflare now answers DNS queries for the zone. Each record then has one switch
-        that matters more than any other: <strong>Proxied</strong> (the orange cloud) or <strong>DNS only</strong>
-        (grey).
+        ECS Fargate from <a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a> is our default for
+        a web API: a container that runs all the time behind a load balancer. Two other options appear in almost every
+        client account, and a third setting decides how many Fargate tasks you run. Choose by asking what the work
+        looks like: always on, or triggered by events? Seconds long, or hours?
       </p>
-
-      <h3 class="font-semibold text-lg mt-7">Two request paths</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        With a proxied record, DNS returns a <em>Cloudflare</em> IP. The visitor's browser connects to the nearest
-        Cloudflare data centre, which then opens its own, separate connection to your origin. That gives you two
-        TLS connections to get right. With DNS only, Cloudflare just answers the lookup and steps out of the way.
-      </p>
-      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
-        <svg viewBox="0 0 700 230" class="w-full min-w-[620px]" role="img" aria-label="Proxied versus DNS-only request paths through Cloudflare">
-          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">PROXIED · orange cloud</text>
-          <g class="anim-pulse"><rect x="10" y="34" width="120" height="46" rx="9" fill="#37474F"/>
-            <text x="70" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Visitor</text>
-            <text x="70" y="69" text-anchor="middle" fill="#ffffffbb" font-size="9">browser · app</text></g>
-          <g class="anim-pulse d1"><rect x="250" y="34" width="190" height="46" rx="9" fill="#D97757"/>
-            <text x="345" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Cloudflare edge</text>
-            <text x="345" y="69" text-anchor="middle" fill="#ffffffbb" font-size="9">cache · WAF · rate limit · DDoS</text></g>
-          <g class="anim-pulse d2"><rect x="560" y="34" width="130" height="46" rx="9" fill="#2563EB"/>
-            <text x="625" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Origin</text>
-            <text x="625" y="69" text-anchor="middle" fill="#ffffffbb" font-size="9">ALB · Vercel · VPS</text></g>
-          <line x1="130" y1="57" x2="250" y2="57" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="440" y1="57" x2="560" y2="57" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <text x="190" y="98" text-anchor="middle" font-size="10" fill="#6E6B64">TLS leg 1: edge cert</text>
-          <text x="500" y="98" text-anchor="middle" font-size="10" fill="#6E6B64">TLS leg 2: SSL mode</text>
-          <text x="12" y="140" font-size="11" font-weight="700" fill="#6E6B64">DNS ONLY · grey cloud</text>
-          <g class="anim-pulse d3"><rect x="10" y="154" width="120" height="46" rx="9" fill="#37474F"/>
-            <text x="70" y="174" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Visitor</text>
-            <text x="70" y="189" text-anchor="middle" fill="#ffffffbb" font-size="9">gets origin IP</text></g>
-          <g class="anim-pulse d4"><rect x="560" y="154" width="130" height="46" rx="9" fill="#2563EB"/>
-            <text x="625" y="174" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Origin</text>
-            <text x="625" y="189" text-anchor="middle" fill="#ffffffbb" font-size="9">its own cert</text></g>
-          <line x1="130" y1="177" x2="560" y2="177" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 5"/>
-          <text x="345" y="170" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">Cloudflare only answered the DNS lookup</text>
-        </svg>
-      </div>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3"></th><th class="px-4 py-3">Proxied (orange)</th><th class="px-4 py-3">DNS only (grey)</th></tr></thead>
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">You manage</th><th class="px-4 py-3">Right when</th><th class="px-4 py-3">Wrong when</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">DNS answer</td><td class="px-4 py-3">Cloudflare IPs. The origin IP is hidden.</td><td class="px-4 py-3">The real origin IP or CNAME target</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Caching, WAF, rate limiting, DDoS</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">No, none of it applies</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Visitor's TLS certificate</td><td class="px-4 py-3">Cloudflare's edge certificate</td><td class="px-4 py-3">The origin's own certificate</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Works for</td><td class="px-4 py-3">HTTP/HTTPS traffic on supported ports</td><td class="px-4 py-3">Anything: mail (MX), SSH, databases, third-party verification records</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Use when</td><td class="px-4 py-3">Your website or API, where you want Cloudflare's features</td><td class="px-4 py-3">Non-HTTP services, or an origin platform that asks you not to proxy (Part IV)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EC2</td><td class="px-4 py-3">The whole virtual machine: OS, patches, disk, process manager</td><td class="px-4 py-3">A legacy app that isn't containerised, special hardware (GPU), software that needs a full OS</td><td class="px-4 py-3">A normal web API a small team must keep patched</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ECS Fargate</td><td class="px-4 py-3">The container and its task definition</td><td class="px-4 py-3">Always-on APIs and workers, long requests, WebSockets</td><td class="px-4 py-3">Something that runs for two seconds, ten times a day</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lambda</td><td class="px-4 py-3">One function and its trigger</td><td class="px-4 py-3">Event-driven glue: a file uploaded, a message queued, a nightly job. Spiky or low traffic.</td><td class="px-4 py-3">Jobs over 15 minutes, steady high traffic, many DB connections, persistent connections</td></tr>
           </tbody>
         </table>
       </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    Q{"Is it already a container<br/>or can it become one?"}
+    Q -->|"no: legacy app, full OS, GPU"| E["EC2<br/>+ SSM Session Manager"]
+    Q -->|"yes"| R{"Runs all the time,<br/>or on events?"}
+    R -->|"always on, long requests,<br/>WebSockets"| F["ECS Fargate<br/>+ auto scaling"]
+    R -->|"on events, under 15 min,<br/>spiky or rare"| L["Lambda<br/>+ API Gateway, S3, SQS or a schedule"]
+        </pre>
+      </div>
 
-      <h3 class="font-semibold text-lg mt-8">Reading a zone</h3>
+      <h3 class="font-semibold text-lg mt-7">EC2: the virtual machine you still meet</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        A typical client zone, in the shape the dashboard shows it. Read the Proxy column before anything else:
+        EC2 is a virtual server. You pick an <strong>AMI</strong> (the disk image it boots from, such as Amazon Linux
+        or Ubuntu) and an <strong>instance type</strong>. The name encodes the shape: in <code class="inline">t4g.medium</code>,
+        <code class="inline">t</code> is the family (burstable, general purpose; <code class="inline">m</code> is
+        balanced, <code class="inline">c</code> compute-heavy, <code class="inline">r</code> memory-heavy),
+        <code class="inline">4</code> the generation, <code class="inline">g</code> means Graviton (ARM, usually cheaper),
+        and <code class="inline">medium</code> the size. Its disk is an <strong>EBS volume</strong>, which outlives the
+        instance only if you configure it to.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will mostly meet EC2 on client projects that started before containers: a Rails app on two instances, a
+        WordPress server, a reporting box. Treat such an instance as a pet you inherited. Know how it gets its code,
+        how it restarts, and where its backups are. Never log in by opening port 22 to the internet and sharing an SSH
+        key. Use <strong>SSM Session Manager</strong>: the instance runs the SSM agent with an IAM role, and you get a
+        shell through AWS, with every session logged.
       </p>
       <div class="mt-4">
-        <span class="code-label">clinic.vn — DNS records</span>
-        <pre class="code">Type   Name     Content                                   Proxy
-A      @        203.0.113.10                              <span class="out">Proxied</span>     <span class="cm"># marketing site on a VPS</span>
-CNAME  api      clinic-alb-123.ap-southeast-1.elb.amazonaws.com  <span class="out">Proxied</span>  <span class="cm"># AWS ALB (OP4)</span>
-CNAME  app      cname.vercel-dns.com                      DNS only    <span class="cm"># Vercel: follow Vercel's advice</span>
-CNAME  _abc.api _xyz.acm-validations.aws                  DNS only    <span class="cm"># ACM validation: must stay grey</span>
-MX     @        mail.provider.com                         DNS only    <span class="cm"># mail is never proxied</span>
-TXT    @        "v=spf1 include:… ~all"                   —</pre>
+        <span class="code-label">terminal — a shell on a private instance, no SSH port</span>
+        <pre class="code">aws ssm start-session --target i-0abc123def4567890      <span class="cm"># needs the SSM agent + instance role</span>
+
+<span class="cm"># port-forward to RDS through the instance (the bastion pattern from OP4)</span>
+aws ssm start-session --target i-0abc123def4567890 \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["clinic-prod.xxxx.ap-southeast-1.rds.amazonaws.com"],
+                 "portNumber":["5432"],"localPortNumber":["15432"]}'
+<span class="cm"># then: psql -h localhost -p 15432 … — security group stays closed to the internet</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Lambda + API Gateway: functions that run on events</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>Lambda function</strong> is code AWS runs when something happens, and you pay per invocation and per
+        millisecond. The trigger can be an HTTP request through <strong>API Gateway</strong> (or a Lambda function URL),
+        a file landing in S3, messages in an SQS queue, or a schedule from EventBridge (Part II). For the clinic, good
+        Lambda jobs are "make a thumbnail when a patient uploads a photo" and "every night, mark no-show bookings".
+      </p>
+      <div class="mt-4">
+        <span class="code-label">thumbnail.ts — Lambda triggered by S3 uploads</span>
+        <pre class="code"><span class="kw">import</span> type { S3Event } <span class="kw">from</span> <span class="st">"aws-lambda"</span>;
+
+<span class="cm">// created ONCE per execution environment, reused across invocations</span>
+<span class="kw">const</span> s3 = <span class="kw">new</span> <span class="fn">S3Client</span>({});
+
+<span class="kw">export const</span> <span class="fn">handler</span> = <span class="kw">async</span> (event: S3Event) =&gt; {
+  <span class="kw">for</span> (<span class="kw">const</span> record <span class="kw">of</span> event.Records) {          <span class="cm">// one event can carry several files</span>
+    <span class="kw">const</span> key = decodeURIComponent(record.s3.object.key.replace(<span class="st">/\+/g</span>, <span class="st">" "</span>));
+    <span class="kw">if</span> (key.startsWith(<span class="st">"thumbs/"</span>)) <span class="kw">continue</span>;       <span class="cm">// don't trigger yourself in a loop</span>
+    <span class="kw">await</span> <span class="fn">makeThumbnail</span>(s3, record.s3.bucket.name, key);
+  }
+};</pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Cloudflare also <strong>flattens CNAMEs at the apex</strong>, so <code class="inline">clinic.vn</code> itself can
-        point at a hostname, which plain DNS doesn't allow. That's the same problem Route 53 alias records solve
-        (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>). DNS fundamentals such as
-        record types and TTLs are in <a href="./op1.html" class="text-viol underline decoration-viol/40">OP1</a>.
-      </p>
-      <h3 class="font-semibold text-lg mt-8">Moving a live domain without an outage</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Changing nameservers on a client's production domain is a small change with a big blast radius. When you add
-        the zone, Cloudflare scans for existing records, but the scan can miss some. Work through it in this order:
+        The limits decide when Lambda is the wrong tool:
       </p>
       <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>Export the old zone first.</strong> Compare it line by line with what Cloudflare imported, especially
-          MX, TXT (SPF, DKIM, domain verification) and any subdomain that someone "set up years ago".</li>
-        <li><strong>Start with every record grey.</strong> Switch nameservers, wait, and check that the site and email
-          still work. Only then turn on the proxy, one hostname at a time.</li>
-        <li><strong>Set SSL to Full (strict) before you proxy</strong>, and confirm the origin has a valid certificate.</li>
-        <li><strong>Schedule it</strong> outside the client's peak hours, with your mentor aware of it and the old DNS
-          export ready for a rollback.</li>
+        <li><strong>15 minutes maximum</strong> per invocation. A long export belongs in an ECS task.</li>
+        <li><strong>Cold starts</strong>: the first request to a new execution environment pays for booting it, from
+          tens of milliseconds to seconds depending on runtime and package size. Fine for background jobs, noticeable
+          on a user-facing API with low traffic.</li>
+        <li><strong>Concurrency</strong>: a traffic spike becomes hundreds of parallel copies, each with its own
+          database connection. Postgres runs out of connections long before Lambda runs out of copies. Put
+          <strong>RDS Proxy</strong> in between, or cap the function's reserved concurrency.</li>
+        <li><strong>An S3 trigger that writes back to the same bucket</strong> can call itself forever. Write outputs
+          to another prefix or bucket and filter the trigger.</li>
       </ul>
-      <div class="mt-4 callout callout-warn">
-        <strong>Hidden origin, leaked origin:</strong> proxying hides your origin IP only if nothing else reveals it.
-        An old grey record pointing at the same server, an email sent directly from it, or an ALB that accepts
-        traffic from anywhere all let attackers skip Cloudflare entirely. Make the origin accept traffic only from
-        Cloudflare: allow only Cloudflare's published IP ranges, or use a mechanism like Authenticated Origin Pulls
-        or a secret header checked at the origin.
+
+      <h3 class="font-semibold text-lg mt-8">ECS service auto scaling: more tasks when it's busy</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        OP4 ran a fixed two tasks. With <strong>auto scaling</strong>, the ECS service changes its desired count between
+        a minimum and a maximum. The simplest and usually best policy is <strong>target tracking</strong>: "keep average
+        CPU near 60%" or "keep requests per task near 500 a minute", and AWS adds or removes tasks to hold that line.
+        It only works if the app is <strong>stateless</strong>: no sessions in memory, no files on local disk, no
+        in-process cron. That is the design rule from
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>, and scaling is where breaking it
+        hurts.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">autoscaling.tf — target tracking on CPU</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_appautoscaling_target"</span> <span class="st">"api"</span> {
+  service_namespace  = <span class="st">"ecs"</span>
+  resource_id        = <span class="st">"service/clinic/api"</span>
+  scalable_dimension = <span class="st">"ecs:service:DesiredCount"</span>
+  min_capacity       = 2           <span class="cm"># never below 2: one per AZ</span>
+  max_capacity       = 10          <span class="cm"># the ceiling protects the DB and the bill</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_appautoscaling_policy"</span> <span class="st">"cpu"</span> {
+  name               = <span class="st">"api-cpu-60"</span>
+  policy_type        = <span class="st">"TargetTrackingScaling"</span>
+  service_namespace  = aws_appautoscaling_target.api.service_namespace
+  resource_id        = aws_appautoscaling_target.api.resource_id
+  scalable_dimension = aws_appautoscaling_target.api.scalable_dimension
+  target_tracking_scaling_policy_configuration {
+    target_value       = 60
+    predefined_metric_specification { predefined_metric_type = <span class="st">"ECSServiceAverageCPUUtilization"</span> }
+    scale_out_cooldown = 60        <span class="cm"># add tasks quickly</span>
+    scale_in_cooldown  = 300       <span class="cm"># remove them slowly, to avoid flapping</span>
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three review questions for any scaling setup. <strong>Is the maximum safe for the database?</strong> Ten tasks
+        with a pool of 20 connections each is 200 connections. <strong>Does a new task become healthy fast enough</strong>
+        to help during the spike? A two-minute boot means scaling lags every burst. <strong>Can a task being removed
+        finish its work?</strong> Scale-in stops tasks, so long-running jobs belong in a queue worker (Part II), and
+        ECS task scale-in protection exists for the rare task that must not be stopped mid-job.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>The other simple options.</strong> When a client wants to stay on AWS with a small team, you may also
+        see simpler managed options such as Elastic Beanstalk or Amplify Hosting. They trade flexibility for less
+        setup. Check the service's current status and roadmap, and ask your mentor before adding one: each is another
+        thing the team has to understand at 2 a.m.
       </div>
 
       <!-- ═══════════════ PART II ═══════════════ -->
-      <div class="kicker text-viol mt-14">Part II · SSL/TLS</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Full (strict), or you are only pretending to encrypt</h2>
+      <div class="kicker text-viol mt-14">Part II · Messaging, cache and email</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Anything slow or unreliable leaves the request path</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Leg 1 (visitor → Cloudflare) is handled for you with a free edge certificate. The <strong>SSL/TLS
-        encryption mode</strong> controls leg 2 (Cloudflare → origin), and that's where most mistakes happen.
+        <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a> explained why sending an email or
+        calling a slow provider inside a request is a bad idea, and what queues, retries and idempotent consumers are.
+        This Part is the AWS version of that picture: which service plays which role, and the settings that decide
+        whether it behaves.
       </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 230" class="w-full min-w-[620px]" role="img" aria-label="Booking API publishes to SNS, which fans out to an email SQS queue and an analytics queue; EventBridge Scheduler triggers a nightly Lambda; failed messages go to a dead-letter queue">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">CLINIC · ONE EVENT, SEVERAL CONSUMERS</text>
+          <g class="anim-pulse"><rect x="10" y="80" width="120" height="50" rx="9" fill="#D97757"/>
+            <text x="70" y="101" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Booking API</text>
+            <text x="70" y="117" text-anchor="middle" fill="#ffffffbb" font-size="9">ECS · after commit</text></g>
+          <g class="anim-pulse d1"><rect x="170" y="80" width="120" height="50" rx="9" fill="#6d5acd"/>
+            <text x="230" y="101" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SNS topic</text>
+            <text x="230" y="117" text-anchor="middle" fill="#ffffffbb" font-size="9">booking-created</text></g>
+          <g class="anim-pulse d2"><rect x="340" y="40" width="130" height="46" rx="9" fill="#2563EB"/>
+            <text x="405" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SQS email-queue</text>
+            <text x="405" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">visibility 60 s</text></g>
+          <g class="anim-pulse d2"><rect x="340" y="124" width="130" height="46" rx="9" fill="#2563EB"/>
+            <text x="405" y="144" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SQS analytics</text>
+            <text x="405" y="159" text-anchor="middle" fill="#ffffffbb" font-size="9">own pace, own retries</text></g>
+          <g class="anim-pulse d3"><rect x="520" y="40" width="130" height="46" rx="9" fill="#0D9488"/>
+            <text x="585" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Email worker</text>
+            <text x="585" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">sends via SES</text></g>
+          <g class="anim-pulse d4"><rect x="520" y="124" width="130" height="46" rx="9" fill="#37474F"/>
+            <text x="585" y="144" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">DLQ</text>
+            <text x="585" y="159" text-anchor="middle" fill="#ffffffbb" font-size="9">after 5 failed tries</text></g>
+          <line x1="130" y1="105" x2="170" y2="105" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="290" y1="95" x2="340" y2="63" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="290" y1="115" x2="340" y2="147" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="470" y1="63" x2="520" y2="63" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="585" y1="86" x2="585" y2="124" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <g class="anim-pulse d1"><rect x="170" y="180" width="120" height="40" rx="9" fill="#DB2777"/>
+            <text x="230" y="198" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">EventBridge</text>
+            <text x="230" y="211" text-anchor="middle" fill="#ffffffbb" font-size="9">Scheduler · 02:00 daily</text></g>
+          <g class="anim-pulse d3"><rect x="340" y="186" width="130" height="34" rx="9" fill="#0D9488"/>
+            <text x="405" y="207" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Lambda: no-shows</text></g>
+          <line x1="290" y1="200" x2="340" y2="203" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="600" y="210" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">alarm on DLQ depth (Part III)</text>
+        </svg>
+      </div>
 
-      <h3 class="font-semibold text-lg mt-7">The modes</h3>
-      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+      <h3 class="font-semibold text-lg mt-7">SQS, SNS and EventBridge: which one</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The three names get mixed up constantly. The difference is who receives a message and whether it waits.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Mode</th><th class="px-4 py-3">Cloudflare → origin</th><th class="px-4 py-3">Certificate checked?</th><th class="px-4 py-3">Verdict</th></tr></thead>
+            <th class="px-4 py-3">Service</th><th class="px-4 py-3">Model</th><th class="px-4 py-3">Use it for</th><th class="px-4 py-3">Watch out</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Off</td><td class="px-4 py-3">HTTP, and visitors get HTTP too</td><td class="px-4 py-3">—</td><td class="px-4 py-3">Never</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Flexible</td><td class="px-4 py-3">Plain HTTP</td><td class="px-4 py-3">—</td><td class="px-4 py-3">Avoid. The padlock lies: data crosses the internet unencrypted. It is also the classic cause of redirect loops.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Full</td><td class="px-4 py-3">HTTPS (matching the visitor's protocol)</td><td class="px-4 py-3">No. Any certificate, even self-signed or expired.</td><td class="px-4 py-3">A stepping stone only. An attacker in the middle could present any certificate.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Full (strict)</td><td class="px-4 py-3">HTTPS</td><td class="px-4 py-3">Yes: valid, unexpired, matching hostname, from a public CA or a Cloudflare Origin CA certificate</td><td class="px-4 py-3"><strong>The default choice</strong></td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Strict (SSL-Only Origin Pull)</td><td class="px-4 py-3">Always HTTPS, even when the visitor used HTTP</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">Enterprise zones only. You'll rarely need it.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SQS</td><td class="px-4 py-3">A queue. Messages wait until one consumer takes and deletes them.</td><td class="px-4 py-3">Background jobs: send email, generate a PDF, call a slow provider</td><td class="px-4 py-3">At-least-once delivery: the same message can arrive twice</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SNS</td><td class="px-4 py-3">A topic. Each message is pushed to every subscriber right away.</td><td class="px-4 py-3">Fan-out: one "booking created" to email, analytics and a webhook. Also alarm notifications.</td><td class="px-4 py-3">No storage: subscribe an SQS queue if the consumer must not miss messages</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EventBridge</td><td class="px-4 py-3">An event bus with rules that route by content, plus Scheduler for timed jobs</td><td class="px-4 py-3">Reacting to AWS events (an ECS task stopped), routing between services, cron-style schedules</td><td class="px-4 py-3">Rules match on JSON patterns: a typo means nothing fires, silently</td></tr>
           </tbody>
         </table>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Newer zones may show <strong>Automatic SSL/TLS</strong>, where Cloudflare scans the origin and picks the most
-        secure mode that works. That's a good default, but still check which mode it actually chose, and aim for Full
-        (strict).
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Getting a certificate the origin can present</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Full (strict) needs a valid certificate on the origin. You have two good options:
+        Four SQS settings decide whether a queue behaves in production:
       </p>
       <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>A publicly trusted certificate</strong>: ACM on an AWS ALB, Let's Encrypt on a VPS, or the one a
-          platform like Vercel issues. It works whether the record is proxied or not.</li>
-        <li><strong>A Cloudflare Origin CA certificate</strong>: free, generated in the dashboard, with a very long
-          validity. It is trusted <em>only by Cloudflare</em>, not by browsers. If someone turns the record grey or
-          pauses Cloudflare, visitors see certificate errors. Use it for a VPS or container that is only ever
-          reached through the proxy.</li>
+        <li><strong>Visibility timeout</strong>: while a consumer works on a message, it is hidden from others. If the
+          job takes longer than the timeout, a second worker picks it up too. Set it to several times the job's real
+          duration.</li>
+        <li><strong>Dead-letter queue (DLQ)</strong> with <code class="inline">maxReceiveCount</code>: after N failed
+          attempts, the message moves to the DLQ instead of retrying forever. Fix the bug, then use <strong>redrive</strong>
+          to move messages back.</li>
+        <li><strong>Long polling</strong> (<code class="inline">WaitTimeSeconds</code> up to 20): consumers wait for
+          messages instead of asking in a tight loop, which cuts empty requests and cost.</li>
+        <li><strong>Standard vs FIFO</strong>: standard is the default, nearly unlimited throughput, best-effort order.
+          FIFO keeps order within a message group and removes duplicates within a window, with lower throughput. Pick
+          FIFO only when order really matters, and still write consumers that are safe to run twice
+          (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>).</li>
       </ul>
-      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
-        <pre class="mermaid">
-flowchart LR
-    V["Visitor"] -->|"HTTPS · edge cert"| E["Cloudflare edge"]
-    E -->|"Flexible: HTTP"| O1["Origin :80<br/>unencrypted leg"]
-    E -->|"Full: HTTPS, any cert"| O2["Origin :443<br/>not verified"]
-    E -->|"Full strict: HTTPS, valid cert"| O3["Origin :443<br/>verified ✓"]
-        </pre>
+      <div class="mt-4">
+        <span class="code-label">queues.tf — an email queue with a DLQ</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_sqs_queue"</span> <span class="st">"email_dlq"</span> {
+  name                      = <span class="st">"clinic-prod-email-dlq"</span>
+  message_retention_seconds = 1209600      <span class="cm"># 14 days to notice and fix</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_sqs_queue"</span> <span class="st">"email"</span> {
+  name                       = <span class="st">"clinic-prod-email"</span>
+  visibility_timeout_seconds = 60          <span class="cm"># job takes ~10 s; leave room</span>
+  receive_wait_time_seconds  = 20          <span class="cm"># long polling</span>
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.email_dlq.arn
+    maxReceiveCount     = 5                <span class="cm"># then park it, don't retry forever</span>
+  })
+}
+<span class="cm"># ✗ agent default: no redrive_policy → a poison message retries until retention expires</span></pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Once Full (strict) works, turn on <strong>Always Use HTTPS</strong> so HTTP visitors are redirected at the
-        edge. Enable <strong>HSTS</strong> only after you're sure every subdomain serves HTTPS correctly, because
-        browsers remember it and you can't easily take it back.
+        For scheduled work, <strong>EventBridge Scheduler</strong> replaces the cron line on a server. It invokes a
+        Lambda, starts an ECS task or sends to a queue on a cron or rate expression, with a time zone, retries and its
+        own DLQ. A schedule in code is reviewable. A crontab on one EC2 instance disappears with the instance.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">ElastiCache: managed Valkey or Redis</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When the clinic's doctor list or availability summary is read thousands of times a minute, a cache in front
+        of Postgres helps. The patterns (cache-aside, TTLs, invalidation) are in
+        <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>. On AWS the cache is usually
+        <strong>ElastiCache</strong>, running Valkey (the open-source fork of Redis that AWS now recommends) or Redis
+        OSS. Serverless ElastiCache sizes itself. Node-based clusters give you fixed nodes you choose.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Private, like RDS</strong>: private subnets, and a security group that allows port 6379 only from
+          <code class="inline">sg-app</code>.</li>
+        <li><strong>Encryption in transit and auth on</strong>. Clients must connect with TLS, which is the most common
+          "it works locally but times out on AWS" cause.</li>
+        <li><strong>A cache is not a database.</strong> Nodes can be replaced and data evicted. If losing the cache would
+          lose data (not just speed), the design is wrong.</li>
+        <li><strong>Replicas and Multi-AZ</strong> for production, so a node failure is a failover and not a
+          stampede of cache misses onto Postgres.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">SES: sending email from AWS</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Amazon <strong>SES</strong> sends transactional email such as booking confirmations and password resets. Three
+        things always come up on a new project:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Verify the domain</strong> with the DNS records SES gives you: DKIM (Easy DKIM CNAMEs), plus SPF and
+          a DMARC policy on your domain. Without them, mail lands in spam or is rejected.</li>
+        <li><strong>Sandbox mode</strong>: a new account can only send to verified addresses, with a low daily limit.
+          You must request production access, and AWS reviews how you handle bounces and complaints. Do this early,
+          not on launch day.</li>
+        <li><strong>Bounces and complaints</strong> go to an SNS topic (or an event destination). Stop sending to
+          addresses that bounce or complain. High rates can get sending paused for the whole account.</li>
+      </ul>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        And send from the email worker behind the queue in the diagram, never inside the booking request. Hosted
+        alternatives such as Resend are in <a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>.
       </p>
 
       <!-- ═══════════════ PART III ═══════════════ -->
-      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Caching and protection</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Cache the static, shield the dynamic</h2>
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Seeing and securing production</div>
+      <h2 class="font-display text-2xl font-bold mt-2">You should hear about a problem before the client does</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Once traffic flows through the proxy, you get two families of features: caching, which makes things faster
-        and cheaper, and security, which keeps bad traffic away from the origin. Both are configured as
-        <strong>rules</strong> in the dashboard (or through the API and Terraform). The general theory of HTTP and
-        CDN caching (<code class="inline">Cache-Control</code>, TTLs, invalidation) belongs to
-        <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>. This Part covers the Cloudflare
-        controls.
+        OP4 sent logs to CloudWatch. Logs answer "what happened?" once you are already looking. Production also needs
+        <strong>alarms</strong> that tell you something is wrong, a <strong>trail</strong> of who changed what in the
+        account, and <strong>encryption</strong> that holds even if a disk or a backup leaks. The concepts behind
+        metrics, logs and traces are in <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
       </p>
 
-      <h3 class="font-semibold text-lg mt-7">What Cloudflare caches, and how you change it</h3>
+      <h3 class="font-semibold text-lg mt-7">CloudWatch metrics and alarms</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        By default Cloudflare caches static files by <strong>file extension</strong> (images, CSS, JS, fonts, PDFs
-        and so on) and <strong>does not cache HTML or JSON</strong>. That's a safe default for an app with logged-in
-        pages. You change the behaviour with <strong>Cache Rules</strong>: match requests with an expression
-        (hostname, path, header), then mark them eligible or ineligible for cache and set edge and browser TTLs. To
-        see what happened to a request, read its response headers:
-      </p>
-      <div class="mt-4">
-        <span class="code-label">terminal — is it cached?</span>
-        <pre class="code">curl -sI https://clinic.vn/assets/app.3f9c2a1.js | grep -iE "cf-cache-status|cache-control|age"
-<span class="out">cf-cache-status: HIT</span>                    <span class="cm"># served from the edge</span>
-cache-control: public, max-age=31536000, immutable
-age: 5203
-
-curl -sI https://api.clinic.vn/bookings/me | grep -i cf-cache-status
-<span class="out">cf-cache-status: DYNAMIC</span>                <span class="cm"># not eligible: good, it's per-user data</span></pre>
-      </div>
-      <div class="mt-4 callout callout-danger">
-        <strong>Never "cache everything" on a host that serves logged-in pages or per-user API responses</strong>
-        unless the rule bypasses cache for authenticated requests. Otherwise Cloudflare can store one patient's
-        booking page and serve it to the next visitor. Cache static assets on a path like
-        <code class="inline">/assets/*</code>, and leave the API dynamic unless you've designed for it.
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        When content changes, <strong>purge</strong> it. You can purge single URLs, everything, or (on current plans)
-        by hostname, prefix or cache tag. Better still, fingerprint asset filenames (<code class="inline">app.3f9c2a1.js</code>)
-        so a deploy produces new URLs and nothing needs purging. Purge from CI with the API:
-      </p>
-      <div class="mt-4">
-        <span class="code-label">ci/purge.sh — purge specific URLs after a deploy</span>
-        <pre class="code"><span class="cm"># CF_API_TOKEN: a scoped token with Cache Purge on this one zone only</span>
-curl -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/purge_cache" \
-  -H "Authorization: Bearer $CF_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data '{"files":["https://clinic.vn/","https://clinic.vn/pricing"]}'
-<span class="cm"># "Purge Everything" is the sledgehammer: every asset goes back to the origin at once</span></pre>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">WAF, rate limiting and DDoS</h3>
-      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Feature</th><th class="px-4 py-3">What it does</th><th class="px-4 py-3">Typical use on a client app</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">DDoS protection</td><td class="px-4 py-3">Automatic mitigation of network and HTTP floods on proxied traffic, on every plan</td><td class="px-4 py-3">Nothing to configure. Just make sure the origin can't be reached directly.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">WAF managed rules</td><td class="px-4 py-3">Rulesets maintained by Cloudflare that block known attack patterns. The Free plan has the Free Managed Ruleset. Paid plans add the Cloudflare Managed Ruleset and the OWASP Core Ruleset.</td><td class="px-4 py-3">Turn on, start in a log-only style where possible, watch Security Events for false positives</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">WAF custom rules</td><td class="px-4 py-3">Your own expressions: block, challenge, skip</td><td class="px-4 py-3">Challenge <code class="inline">/admin</code> from outside Vietnam. Block a known bad ASN.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Rate limiting rules</td><td class="px-4 py-3">Count requests matching an expression per IP (or other key) and block or challenge above a threshold. The Free plan includes a limited version.</td><td class="px-4 py-3">Throttle <code class="inline">POST /auth/login</code> and OTP endpoints</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Edge rate limiting is a coarse first shield. It doesn't replace per-user limits and idempotency in the app
-        itself (<a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>), because Cloudflare
-        doesn't know who the user is. Login protection and brute-force defence in general are in
-        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
-      </p>
-
-      <p class="mt-3 text-[15px] leading-relaxed">
-        It helps to picture a proxied request passing through these layers in order (simplified). A request blocked
-        early never reaches the cache or your origin, which is exactly the point:
-      </p>
-      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
-        <pre class="mermaid">
-flowchart LR
-    R["Request"] --> D["DDoS<br/>mitigation"]
-    D --> C["WAF<br/>custom rules"]
-    C --> RL["Rate limiting<br/>rules"]
-    RL --> M["WAF<br/>managed rules"]
-    M --> K{"In cache?"}
-    K -->|"HIT"| V["Response from edge"]
-    K -->|"MISS or DYNAMIC"| O["Origin"]
-    C -.->|"block or challenge"| X["Stopped at edge"]
-    RL -.->|"over limit"| X
-    M -.->|"attack pattern"| X
-        </pre>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Page Rules are legacy: use the specific rule types</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Older tutorials, and agents trained on them, reach for <strong>Page Rules</strong>. Cloudflare is phasing them
-        out in favour of purpose-built rule types. Use the new ones for anything you create:
+        AWS services publish <strong>metrics</strong> to CloudWatch automatically: request counts, latency, CPU, queue
+        depth. An <strong>alarm</strong> watches one metric and changes state when it crosses a threshold for a number
+        of periods. Its action is usually an SNS topic, which emails the team or feeds a Slack channel (through Amazon Q
+        Developer in chat applications, formerly AWS Chatbot, or a small Lambda). You don't need fifty alarms. You need the few that mean users are hurting:
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">You want to…</th><th class="px-4 py-3">Old Page Rule setting</th><th class="px-4 py-3">Use now</th></tr></thead>
+            <th class="px-4 py-3">Service</th><th class="px-4 py-3">Metric</th><th class="px-4 py-3">It means</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Redirect <code class="inline">www</code> → apex, or an old path → a new one</td><td class="px-4 py-3">Forwarding URL</td><td class="px-4 py-3">Redirect Rules (single or bulk redirects)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Force HTTPS</td><td class="px-4 py-3">Always Use HTTPS</td><td class="px-4 py-3">The zone-wide Always Use HTTPS setting, or a Redirect Rule</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Cache a path, set TTLs</td><td class="px-4 py-3">Cache Level, Edge Cache TTL</td><td class="px-4 py-3">Cache Rules</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Change a setting for one path</td><td class="px-4 py-3">SSL, Security Level, Rocket Loader</td><td class="px-4 py-3">Configuration Rules</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Send a path to a different origin or Host</td><td class="px-4 py-3">Host Header / Resolve Override</td><td class="px-4 py-3">Origin Rules</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ALB</td><td class="px-4 py-3"><code class="inline">HTTPCode_Target_5XX_Count</code>, <code class="inline">TargetResponseTime</code> (p95)</td><td class="px-4 py-3">Users are getting errors, or waiting</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ALB target group</td><td class="px-4 py-3"><code class="inline">UnHealthyHostCount</code> &gt; 0</td><td class="px-4 py-3">Tasks are failing health checks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ECS service</td><td class="px-4 py-3"><code class="inline">CPUUtilization</code>, <code class="inline">MemoryUtilization</code></td><td class="px-4 py-3">Near the limit: scaling isn't keeping up, or a memory leak</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">RDS</td><td class="px-4 py-3"><code class="inline">CPUUtilization</code>, <code class="inline">FreeStorageSpace</code>, <code class="inline">DatabaseConnections</code></td><td class="px-4 py-3">A slow query, a disk about to fill, a connection leak</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SQS</td><td class="px-4 py-3"><code class="inline">ApproximateAgeOfOldestMessage</code>, DLQ <code class="inline">ApproximateNumberOfMessagesVisible</code> &gt; 0</td><td class="px-4 py-3">Workers are stuck or behind, or jobs are failing</td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">alarms.tf — one alarm that pages the team</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_cloudwatch_metric_alarm"</span> <span class="st">"email_dlq"</span> {
+  alarm_name          = <span class="st">"clinic-prod-email-dlq-not-empty"</span>
+  namespace           = <span class="st">"AWS/SQS"</span>
+  metric_name         = <span class="st">"ApproximateNumberOfMessagesVisible"</span>
+  dimensions          = { QueueName = aws_sqs_queue.email_dlq.name }
+  statistic           = <span class="st">"Maximum"</span>
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = <span class="st">"GreaterThanThreshold"</span>
+  treat_missing_data  = <span class="st">"notBreaching"</span>
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]   <span class="cm"># → email / Slack</span>
+  ok_actions          = [aws_sns_topic.ops_alerts.arn]   <span class="cm"># also say when it recovers</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two more habits. Put the key metrics on one <strong>dashboard</strong> per environment, so the first minute of an
+        incident is looking, not searching. And set <strong>log retention</strong> on every log group (30 or 90 days is
+        typical), because the default is "never expire". For requests that cross several services, <strong>tracing</strong>
+        with AWS X-Ray, or OpenTelemetry through the AWS Distro for OpenTelemetry (ADOT), shows where the time went.
+        Most teams add it once the system has more than one service, not on day one.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">CloudTrail and GuardDuty: who did what, and what looks wrong</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>CloudTrail</strong> records API calls made in the account: who (which user or role), what action, on
+        which resource, when and from which IP. The last 90 days of management events are visible in the console
+        by default. For a real project, keep a <strong>trail</strong> that writes to an S3 bucket nobody can delete
+        from, so you still have evidence months later. When a security group "changed by itself", CloudTrail tells you
+        who changed it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — who modified the database security group?</span>
+        <pre class="code">aws cloudtrail lookup-events --region ap-southeast-1 \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AuthorizeSecurityGroupIngress \
+  --max-results 5 \
+  --query "Events[].{time:EventTime,user:Username}"
+<span class="cm"># then open the full event: the request parameters show the port and CIDR that were opened</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>GuardDuty</strong> reads CloudTrail, VPC flow logs and DNS logs and raises <strong>findings</strong>:
+        access keys used from an unusual country, an instance talking to a known crypto-mining pool, someone disabling
+        logging. Turn it on in every production account and route high-severity findings to the same alert channel as
+        your alarms. <strong>Security Hub</strong> collects findings from GuardDuty and other checks into one list and
+        scores the account against best-practice standards. Security design in general is in
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">KMS: encryption at rest, and the key you must never delete</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>KMS</strong> (Key Management Service) holds the keys that encrypt data at rest in RDS, S3, EBS, SQS and
+        Secrets Manager. The data is encrypted with data keys, and those are protected by a KMS key that never leaves
+        AWS. Turning encryption on is usually one setting. Deciding <em>whose</em> key it is matters more:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3"></th><th class="px-4 py-3">AWS managed key (<code class="inline">aws/rds</code>, <code class="inline">aws/s3</code>…)</th><th class="px-4 py-3">Customer managed key (CMK)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Who controls it</td><td class="px-4 py-3">AWS creates and rotates it, one per service</td><td class="px-4 py-3">You: key policy, rotation, who may use it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">No monthly key charge</td><td class="px-4 py-3">A monthly charge per key, plus requests</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Share snapshots across accounts</td><td class="px-4 py-3">Not possible</td><td class="px-4 py-3">Possible, via the key policy</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Choose it when</td><td class="px-4 py-3">Default for most projects</td><td class="px-4 py-3">The client's compliance rules require it, or you need cross-account backups or separate access control</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>Deleting a KMS key deletes the data.</strong> Everything encrypted with it, including RDS snapshots and
+        S3 objects, becomes permanently unreadable. AWS forces a waiting period of 7 to 30 days before deletion for
+        exactly this reason. If an agent's plan schedules a key for deletion, or a key policy change would lock out
+        the account's own admins, stop and get your mentor. Disable a key if you must; never delete one on your own.
       </div>
 
       <!-- ═══════════════ PART IV ═══════════════ -->
-      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Beyond the proxy, and when it breaks</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Know which origin you're fronting, and read the error code</h2>
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Surviving failure and the bill</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A backup you haven't restored is a hope, and a bill you haven't tagged is a guess</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Cloudflare is more than a proxy. Two products come up on client projects often enough to recognise, and the
-        way you put Cloudflare in front of an app depends on where that app is hosted. Then there's the skill you'll
-        need most: telling from one error page which layer is broken.
+        The last two conversations every client eventually has are "we lost data, how far back can we go?" and "why
+        did the bill double?". Both are cheap to answer if you prepared, and very expensive if you didn't.
       </p>
 
-      <h3 class="font-semibold text-lg mt-7">R2 and Workers in one paragraph each</h3>
+      <h3 class="font-semibold text-lg mt-7">Backups, Multi-AZ and replicas are three different things</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>R2</strong> is Cloudflare's object storage. It speaks the S3 API, so the same SDK and presigned-URL
-        pattern from <a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a> works with a different
-        endpoint. Its selling point is that it doesn't charge egress fees for reading data out, which matters for
-        download-heavy apps such as media or public files. Keep buckets private and serve public files through a
-        custom domain.
-      </p>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        <strong>Workers</strong> are small JavaScript/TypeScript functions that run on Cloudflare's edge, in front of
-        or instead of an origin. Good uses are redirects with logic, adding headers, A/B routing, and small APIs.
-        Workers are not a place for your main backend's business logic unless the team has chosen that platform.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">src/index.ts — a Worker that adds a header and passes through</span>
-        <pre class="code"><span class="kw">export default</span> {
-  <span class="kw">async</span> <span class="fn">fetch</span>(request: Request): Promise&lt;Response&gt; {
-    <span class="kw">const</span> res = <span class="kw">await</span> <span class="fn">fetch</span>(request);          <span class="cm">// forward to the origin as normal</span>
-    <span class="kw">const</span> out = <span class="kw">new</span> <span class="fn">Response</span>(res.body, res);    <span class="cm">// copy: fetched responses are immutable</span>
-    out.headers.set(<span class="st">"X-Frame-Options"</span>, <span class="st">"DENY"</span>);
-    <span class="kw">return</span> out;
-  },
-};
-<span class="cm">// scaffold: npm create cloudflare@latest   ·   ship: npx wrangler deploy</span></pre>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">In front of Vercel vs in front of AWS</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        The same orange cloud means very different things depending on the origin. Vercel already <em>is</em> a CDN
-        with its own firewall, while an AWS ALB is a bare origin.
+        Start with two numbers the client should agree to. <strong>RPO</strong> (recovery point objective): how much
+        recent data can we afford to lose? <strong>RTO</strong> (recovery time objective): how long can we be down?
+        "Up to 5 minutes of bookings, back within 1 hour" leads to a different setup from "one day, one day". Then pick
+        the tools that meet the numbers, and don't confuse them:
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3"></th><th class="px-4 py-3">Vercel origin (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>)</th><th class="px-4 py-3">AWS ALB origin (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>)</th></tr></thead>
+            <th class="px-4 py-3">Feature</th><th class="px-4 py-3">Protects against</th><th class="px-4 py-3">Does NOT protect against</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Recommended record</td><td class="px-4 py-3"><strong>DNS only.</strong> Vercel's docs recommend against a reverse proxy in front of it.</td><td class="px-4 py-3"><strong>Proxied</strong> is a common, reasonable setup</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Why</td><td class="px-4 py-3">A proxy hides visitor signals from Vercel's firewall and bot protection, adds latency, and creates two caches to keep in sync</td><td class="px-4 py-3">The ALB has no CDN or WAF of its own, so Cloudflare adds caching and protection</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">SSL mode</td><td class="px-4 py-3">Not relevant when grey. Vercel issues the certificate.</td><td class="px-4 py-3">Full (strict): the ALB's ACM certificate is publicly trusted and matches the hostname</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Caveats</td><td class="px-4 py-3">If a client insists on proxying, expect certificate and caching surprises. Escalate to your mentor rather than improvising.</td><td class="px-4 py-3">Lock the ALB so only Cloudflare can reach it. Don't also put CloudFront in the chain (two CDNs). Keep the ACM validation CNAME grey. Long requests hit Cloudflare's timeout (524).</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">RDS Multi-AZ</td><td class="px-4 py-3">A failed instance or AZ: automatic failover in a minute or two</td><td class="px-4 py-3">A bad migration or a <code class="inline">DELETE</code> without <code class="inline">WHERE</code>: the standby copies the mistake instantly</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Read replica</td><td class="px-4 py-3">Too many reads on the primary (it is a scaling tool, <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>)</td><td class="px-4 py-3">Data mistakes, which replicate too. Failover is manual (promotion).</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Automated backups + PITR</td><td class="px-4 py-3">Human and code mistakes: restore to any second in the retention window</td><td class="px-4 py-3">Losing the account or region, unless copied elsewhere</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Manual snapshot</td><td class="px-4 py-3">"Before this risky migration": kept until you delete it</td><td class="px-4 py-3">Anything after the snapshot was taken</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AWS Backup plan</td><td class="px-4 py-3">One policy for RDS, EBS, S3 and more: schedule, retention, copy to another region or account, lock against deletion</td><td class="px-4 py-3">Nothing extra on its own: you still have to test restores</td></tr>
           </tbody>
         </table>
       </div>
-
-      <h3 class="font-semibold text-lg mt-8">Troubleshooting: loops and 52x errors</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Cloudflare's own error pages (the 52x family) all mean <strong>Cloudflare couldn't get a good answer from
-        your origin</strong>. The number tells you which step failed, so read it before touching code:
-      </p>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Symptom</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">Usual cause → fix</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">ERR_TOO_MANY_REDIRECTS</td><td class="px-4 py-3">Redirect loop</td><td class="px-4 py-3">SSL mode <strong>Flexible</strong> while the origin redirects HTTP → HTTPS. Cloudflare calls over HTTP, the origin says "go HTTPS", and it repeats forever. → Full (strict).</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">520</td><td class="px-4 py-3">Origin returned something unexpected</td><td class="px-4 py-3">The app crashed mid-response, sent an empty reply or oversized headers → check the origin's logs</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">521</td><td class="px-4 py-3">Origin refused the connection</td><td class="px-4 py-3">The app is down, or a firewall/security group blocks Cloudflare's IPs</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">522</td><td class="px-4 py-3">Connection timed out</td><td class="px-4 py-3">Wrong origin IP/record, or packets silently dropped by a firewall</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">523</td><td class="px-4 py-3">Origin unreachable</td><td class="px-4 py-3">DNS record points somewhere that doesn't route, such as a deleted load balancer</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">524</td><td class="px-4 py-3">Connected, but no response in time</td><td class="px-4 py-3">A slow request (a big report, an export). → Move it to a background job (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>), don't raise the timeout.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">525</td><td class="px-4 py-3">SSL handshake with origin failed</td><td class="px-4 py-3">Full or Full (strict) but the origin doesn't serve HTTPS on 443, or has a TLS misconfiguration</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">526</td><td class="px-4 py-3">Invalid origin certificate</td><td class="px-4 py-3">Full (strict) and the origin certificate is expired, self-signed or for the wrong hostname → install a valid or Origin CA certificate</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        The redirect loop is worth seeing once, because it looks like an app bug and isn't one:
-      </p>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
-sequenceDiagram
-    autonumber
-    participant B as Browser
-    participant CF as Cloudflare (SSL Flexible)
-    participant O as Origin (forces HTTPS)
-    B->>CF: GET https://clinic.vn/
-    CF->>O: GET http://clinic.vn/ (Flexible = HTTP)
-    O-->>CF: 301 Location https://clinic.vn/
-    CF-->>B: 301 Location https://clinic.vn/
-    B->>CF: GET https://clinic.vn/
-    Note over B,O: same request again, forever<br/>fix = Full (strict), not removing the origin redirect
+flowchart LR
+    I["Incident:<br/>bad migration at 14:05"] --> Q{"What broke?"}
+    Q -->|"instance or AZ down"| MA["Multi-AZ fails over<br/>no action, ~1-2 min"]
+    Q -->|"data is wrong"| P["PITR: restore to 14:04<br/>as a NEW instance"]
+    P --> C["Compare, copy the good rows back<br/>or repoint the app"]
+    Q -->|"account or region lost"| X["Restore from a backup copied<br/>to another region or account"]
         </pre>
       </div>
-      <div class="mt-4">
-        <span class="code-label">terminal — which layer answered?</span>
-        <pre class="code">dig +short api.clinic.vn                  <span class="cm"># Cloudflare IPs = proxied; origin IP/hostname = grey</span>
-curl -sI https://api.clinic.vn/healthz | grep -iE "^server|cf-ray|cf-cache-status"
-<span class="out">server: cloudflare</span>                        <span class="cm"># you're going through the edge</span>
-<span class="out">cf-ray: 8f1c…-SIN</span>                         <span class="cm"># quote this ray ID when asking for help</span>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Point-in-time restore always creates a <strong>new</strong> instance with a new endpoint. Then you decide
+        whether to repoint the app or copy data back. That takes time, which is why the only honest RTO is one you
+        have measured. Once per quarter (or once, now, in the sandbox), restore staging from a production-like backup
+        and write down how long it took.
+      </p>
 
-<span class="cm"># bypass Cloudflare: call the origin directly with the right Host/SNI</span>
-curl -sI https://api.clinic.vn/healthz --resolve api.clinic.vn:443:&lt;ORIGIN_IP&gt;
-<span class="cm"># works direct but fails via Cloudflare → it's Cloudflare config (SSL mode, rules)</span>
-<span class="cm"># fails direct too → it's your app or origin network (OP4)</span></pre>
+      <h3 class="font-semibold text-lg mt-8">Cost: tags, budgets and the usual surprises</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        OP4 listed what bills by the hour. The next step is being able to <em>explain</em> a bill. Three tools do most
+        of the work:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Cost allocation tags</strong>: tag every resource with <code class="inline">project</code>,
+          <code class="inline">env</code> and <code class="inline">owner</code> (Terraform <code class="inline">default_tags</code>
+          does it for you), then activate the tags in the Billing console. Only then can Cost Explorer split the bill
+          by environment.</li>
+        <li><strong>Cost Explorer</strong>: group by service, then by tag, over the last few months. A sudden step up is
+          almost always one new resource or one config change. CloudTrail tells you who made it.</li>
+        <li><strong>Budgets and Cost Anomaly Detection</strong>: a monthly budget with alerts at 80% and 100% of
+          forecast, and anomaly detection that emails when spend jumps unusually for a service.</li>
+      </ul>
+      <div class="mt-4">
+        <span class="code-label">provider.tf — tags on everything, for free</span>
+        <pre class="code">provider <span class="st">"aws"</span> {
+  region = <span class="st">"ap-southeast-1"</span>
+  default_tags {
+    tags = {
+      project = <span class="st">"clinic"</span>
+      env     = <span class="st">"staging"</span>          <span class="cm"># one provider block per environment</span>
+      owner   = <span class="st">"team-booking"</span>
+    }
+  }
+}
+<span class="cm"># then: Billing → Cost allocation tags → activate project, env, owner</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Surprise on the bill</th><th class="px-4 py-3">Where it comes from</th><th class="px-4 py-3">Fix</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">NAT Gateway data processing</td><td class="px-4 py-3">Every GB through the NAT is charged, including image pulls and S3 traffic</td><td class="px-4 py-3">VPC endpoints for S3 and ECR, fewer NATs in staging</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Forgotten environments</td><td class="px-4 py-3">A demo stack's ALB, RDS and NAT left running for months</td><td class="px-4 py-3">Tags plus a monthly review. Tear down with IaC.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Logs kept forever</td><td class="px-4 py-3">Log groups with "never expire" and debug-level logging</td><td class="px-4 py-3">Retention on every group, info level in production</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Data transfer</td><td class="px-4 py-3">Traffic out to the internet, and between AZs</td><td class="px-4 py-3">A CDN for downloads, keep chatty services in the same AZ where safe</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Orphans</td><td class="px-4 py-3">Unattached EBS volumes, old snapshots, unused Elastic IPs</td><td class="px-4 py-3">Delete after checking, and set snapshot retention</td></tr>
+          </tbody>
+        </table>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        That last pair of commands is the whole troubleshooting method: <strong>split the path in two</strong> and
-        test each half. For an ALB origin, <code class="inline">--resolve</code> needs an IP, so use one from
-        <code class="inline">dig</code> on the ALB's hostname, remembering that ALB IPs change. If the origin correctly accepts only Cloudflare's
-        IPs, the direct call from your laptop will be refused. In that case check the origin from inside its own
-        network (the ALB target health, the app logs) instead of opening the firewall.
+        When the load has been steady for a few months, <strong>Savings Plans</strong> (for Fargate, Lambda and EC2) or
+        <strong>Reserved Instances</strong> (for RDS and ElastiCache) trade a one- or three-year commitment for a lower
+        rate. That is a decision for the client and your lead, not for an agent. What you can always do is make
+        staging sleep: scale its ECS services to zero and stop its RDS instance at night with a scheduled job. Check
+        current pricing in the AWS Pricing Calculator before quoting any saving.
       </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>A stopped RDS instance starts itself again after seven days.</strong> AWS restarts stopped instances
+        automatically so they can be patched. A "stop staging at night" job must stop it again every night, not once.
+      </div>
 
       <!-- ═══════════════ Claude Code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        The agent can't see your dashboard, so <strong>you bring the evidence to it</strong>: response headers,
-        <code class="inline">dig</code> output, the error code and ray ID, and screenshots of the SSL mode and rules.
-        If the team manages Cloudflare with Terraform, the agent can read and change the config like any other code,
-        and that's the better setup for anything beyond a single zone.
+        The same rules as <a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a> apply: a sandbox
+        account or read-only credentials while you learn, permission rules so that <code class="inline">apply</code> and
+        anything with <code class="inline">delete</code> ask you first, and a plan before any code. The agent is most
+        useful here as a reviewer of production readiness, because it can check a long list faster than you.
       </p>
-      <pre class="code mt-3">Our site behind Cloudflare shows ERR_TOO_MANY_REDIRECTS. Here is `curl -sIL` output (pasted),
-the SSL/TLS mode (Flexible), and our Nginx config. Explain the loop step by step: which
-hop issues which redirect. Propose the fix at the right layer. Don't change app code yet.</pre>
-      <pre class="code mt-3">Write a Cloudflare Cache Rule plan for clinic.vn: cache /assets/* for a year at the edge,
-never cache /api/* or any request carrying our session cookie. For each rule give the
-expression, the action and a curl command + expected cf-cache-status that proves it.</pre>
-      <pre class="code mt-3">We run the API on an AWS ALB behind Cloudflare. List every way the origin could still be
-reached without Cloudflare, and how to close each one. Mark which are config vs code.</pre>
+      <div class="mt-4">
+        <span class="code-label">prompt — production-readiness review of a queue</span>
+        <pre class="code">Review infra/queues.tf and the email worker in src/workers/email.ts for production readiness.
+Check: DLQ + maxReceiveCount, visibility timeout vs the worker's real duration, long polling,
+idempotency of the worker (what happens if the same message arrives twice?), an alarm on
+DLQ depth and on age of oldest message, and IAM limited to this queue's ARN.
+Output a table: check | status | file:line | fix. Don't edit anything.</pre>
+      </div>
+      <pre class="code mt-3">List every CloudWatch alarm in ap-southeast-1 for project=clinic, env=prod (read-only CLI).
+Compare against: ALB 5xx and p95 latency, unhealthy hosts, ECS CPU/memory, RDS CPU,
+free storage and connections, SQS DLQ depth. Report what's missing and draft Terraform for it.</pre>
+      <pre class="code mt-3">Explain last month's AWS bill for tag project=clinic using Cost Explorer (read-only).
+Group by service and env, show the three biggest month-over-month increases, and for each,
+find the change in CloudTrail that likely caused it. Don't change or delete any resource.</pre>
       <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>Explain a redirect chain or 52x from headers you pasted</li>
-            <li>Draft rule expressions and the curl checks that prove them</li>
-            <li>Write Cloudflare Terraform or a small Worker, plus its tests</li>
-            <li>Write the CI purge step with a scoped API token variable</li>
+            <li>Draft queues, alarms, scaling policies and backup plans in Terraform or CDK</li>
+            <li>Audit an existing account read-only: missing alarms, retention, DLQs, tags</li>
+            <li>Summarise Cost Explorer and CloudTrail output into a short explanation</li>
+            <li>Write the Lambda handler and its least-privilege role</li>
+            <li>Produce a restore-drill runbook from your RDS settings</li>
           </ul>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-coral">You must check</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>The SSL mode in the dashboard: Full (strict)</li>
-            <li>Which records are proxied, record by record</li>
-            <li>That no cache rule can store authenticated responses</li>
-            <li>API token scope: one zone, only the permissions needed</li>
-            <li>After any change: headers via <code class="inline">curl -sI</code>, not "it loads in my browser"</li>
+            <li>Every queue has a DLQ, and every DLQ has an alarm</li>
+            <li>The scaling maximum against the database's connection limit</li>
+            <li>Nothing in the plan deletes or disables a KMS key, a trail or a backup</li>
+            <li>SES is out of the sandbox before launch, with bounce handling</li>
+            <li>That you ran the restore yourself and timed it</li>
           </ul>
         </div>
       </div>
       <div class="mt-4 callout callout-warn">
-        <strong>Red flags in agent output:</strong> "set SSL to Flexible" to make an error go away · removing the
-        app's HTTPS redirect to "fix" a loop · "cache everything" on an app or API host · a new Page Rule instead of a
-        Redirect or Cache Rule · a Global API Key instead of a scoped API token · raising timeouts to hide a 524 ·
-        proxying a Vercel domain without discussing Vercel's guidance.
+        <strong>Red flags in agent output:</strong> an SQS queue with no <code class="inline">redrive_policy</code> ·
+        a visibility timeout shorter than the job · a Lambda that writes to the bucket that triggers it · auto scaling
+        with no maximum, or a maximum the database can't serve · port 22 open to <code class="inline">0.0.0.0/0</code>
+        "to debug" · <code class="inline">aws_kms_key</code> with a short <code class="inline">deletion_window_in_days</code>
+        or a schedule-key-deletion call · alarms with no <code class="inline">alarm_actions</code> · log groups without
+        <code class="inline">retention_in_days</code> · <code class="inline">skip_final_snapshot = true</code> on a
+        production database.
       </div>
 
       <!-- ═══════════════ skill ladder ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Thinks of Cloudflare as "the thing that makes sites faster".</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows about the orange cloud. Can't explain the two TLS legs or why Flexible is dangerous.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds DNS records and follows a runbook for SSL and caching. Needs help to diagnose a 52x or a redirect loop.</div></div>
-        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Puts an app behind Cloudflare with Full (strict), safe cache rules and a login rate limit, and locks the origin. Decides proxied vs DNS-only per origin with reasons. Diagnoses a 52x by splitting the path.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Manages zones as code, writes the team's Cloudflare runbook, and reviews other people's rule changes for cache leaks and origin exposure.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Knows AWS only as the OP4 reference architecture.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can say what EC2, Lambda, SQS, SNS, ElastiCache and SES are for. Can't yet say when each is the wrong choice.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Recognises these services in a client account and reviews an agent's plan for them: DLQs, visibility timeouts, scaling limits, the core alarms, log retention, backups and tags. Asks the mentor about KMS, cost commitments and DR design.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Chooses between ECS, Lambda and EC2 for a workload and defends it. Sets up queues, alarms, scaling and backup plans from IaC, runs a timed restore, and explains the monthly bill by tag.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the team's production-readiness checklist and alarm baseline, agrees RPO/RTO with clients, and runs cost and security reviews across projects.</div></div>
       </div>
       <div class="mt-4 callout callout-tip">
-        <strong>Self-check before claiming 3:</strong> given only a <code class="inline">curl -sI</code> output and an
-        error code, can you say whether the problem is DNS, SSL mode, a rule, or the origin? Can you explain to a
-        client, in two sentences, why their Vercel site should stay DNS-only?
+        <strong>Self-check before claiming 2:</strong> given a plan with an SQS queue, can you name the three settings
+        you would check first? Can you explain why Multi-AZ doesn't save you from a bad migration? If the bill rose 40%
+        last month, which two consoles would you open, in which order?
       </div>
 
       <!-- ═══════════════ pitfalls ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
       <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Flexible "because it works"</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">It shows a padlock while the origin leg is plain HTTP, and it breaks the moment the app adds an HTTPS redirect. Fix the origin certificate instead.</p>
+          <div class="font-semibold text-rose-500">✗ A queue without a DLQ</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One malformed message retries until retention expires, and every retry costs a worker's time. Add a DLQ and an alarm on it, always as a pair.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Changing five settings at once</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Dashboard changes have no diff and no undo button. Change one thing, test with curl, and write down what you changed in the ticket.</p>
+          <div class="font-semibold text-rose-500">✗ Treating Multi-AZ as a backup</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The standby replays every change, including the mistake. Only backups and point-in-time restore take you back in time.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Proxying verification records</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">ACM, Vercel and email providers verify with DNS lookups. A proxied validation record can make verification or renewal fail months later.</p>
+          <div class="font-semibold text-rose-500">✗ Alarms nobody receives</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An alarm with no action, or one that emails a person who has left, is decoration. Send alarms to a team channel and test one by forcing it.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Fingerprint assets, purge rarely</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Hashed filenames plus long TTLs give you instant deploys and a high hit rate without a purge step.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Leave the SES sandbox early</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Request production access in the first week of the project, with your bounce-handling plan written down. Launch day is the wrong day to wait for a review.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep the ray ID</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The <code class="inline">cf-ray</code> header identifies one request at the edge. Put it in bug reports, together with the time and URL.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Tag from the first resource</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">default_tags</code> costs nothing on day one. Adding tags to a year-old account costs a week, and the history before it stays unexplained.</p>
         </div>
       </div>
 
       <!-- ═══════════════ evidence & resources ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="legs"> <span>Can draw the two TLS legs and explain what each SSL mode does to leg 2.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="records"> <span>Reviewed a real zone and justified proxied vs DNS-only for every record.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cache"> <span>Wrote a cache rule and proved it with <code class="inline">cf-cache-status</code>: HIT on assets, DYNAMIC on the API.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="debug"> <span>Reproduced a redirect loop or a 52x on purpose in a test zone, and fixed it at the right layer.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cf-front"> <span class="font-semibold">Put a test domain (or the OP4 API) behind Cloudflare with Full (strict), a cache rule for static assets, a rate limit on login and a locked-down origin. Submit a one-page runbook with before/after <code class="inline">curl -sI</code> output for each setting (mentor evidence ✓).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="compute-choice"> <span>For three workloads in my project (the API, a nightly job, a file-processing step), chose EC2, ECS or Lambda for each and explained the choice to my mentor.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="messaging"> <span>Can explain SQS vs SNS vs EventBridge with an example from the clinic app, and name the four SQS settings that matter.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="alarms"> <span>Listed the core alarms for my stack, with the metric and threshold for each, and who receives them.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dr"> <span>Can explain RPO and RTO, and the difference between Multi-AZ, a read replica and point-in-time restore.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="prod-ready"> <span class="font-semibold">In a sandbox account, from IaC: an SQS queue with a DLQ and a worker (Lambda or ECS), a CloudWatch alarm on DLQ depth that notifies you through SNS (forced once to prove it fires), tags on every resource, and a timed restore of a small RDS instance to a point in time. Submit the IaC PR, a screenshot of the alarm notification, the restore time, and proof you tore it down (mentor evidence ✓).</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
       <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
-        <li><a class="text-coral underline" href="https://developers.cloudflare.com/dns/proxy-status/" target="_blank" rel="noopener">Cloudflare — Proxy status</a> — what proxied and DNS-only change, and which records can be proxied.</li>
-        <li><a class="text-coral underline" href="https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/" target="_blank" rel="noopener">Cloudflare — SSL/TLS encryption modes</a> · <a class="text-coral underline" href="https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/" target="_blank" rel="noopener">Origin CA certificates</a> — Part II, from the source.</li>
-        <li><a class="text-coral underline" href="https://developers.cloudflare.com/cache/how-to/cache-rules/" target="_blank" rel="noopener">Cloudflare — Cache Rules</a> · <a class="text-coral underline" href="https://developers.cloudflare.com/cache/how-to/purge-cache/" target="_blank" rel="noopener">Purge cache</a> — rule expressions and purge methods.</li>
-        <li><a class="text-coral underline" href="https://developers.cloudflare.com/waf/" target="_blank" rel="noopener">Cloudflare — WAF</a> — managed rules, custom rules and rate limiting rules.</li>
-        <li><a class="text-coral underline" href="https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/" target="_blank" rel="noopener">Cloudflare — Troubleshooting 5xx errors</a> — every 52x code with causes and fixes.</li>
-        <li><a class="text-coral underline" href="https://developers.cloudflare.com/r2/" target="_blank" rel="noopener">Cloudflare — R2</a> · <a class="text-coral underline" href="https://developers.cloudflare.com/workers/" target="_blank" rel="noopener">Workers</a> — start here if a project uses either.</li>
-        <li><a class="text-coral underline" href="https://vercel.com/kb/guide/cloudflare-with-vercel" target="_blank" rel="noopener">Vercel — Using Cloudflare with Vercel</a> — Vercel's own reasons to keep its domains DNS-only.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/lambda/latest/dg/welcome.html" target="_blank" rel="noopener">AWS — Lambda developer guide</a> — triggers, limits, concurrency and cold starts.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-auto-scaling.html" target="_blank" rel="noopener">AWS — ECS service auto scaling</a> — target tracking and step scaling for Fargate services.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html" target="_blank" rel="noopener">AWS — SQS dead-letter queues</a> · <a class="text-coral underline" href="https://docs.aws.amazon.com/scheduler/latest/UserGuide/what-is-scheduler.html" target="_blank" rel="noopener">EventBridge Scheduler</a> — DLQs, redrive, and cron without a server.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html" target="_blank" rel="noopener">AWS — Request SES production access</a> — leaving the sandbox, and what AWS asks about bounces.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Best_Practice_Recommended_Alarms_AWS_Services.html" target="_blank" rel="noopener">AWS — CloudWatch recommended alarms</a> — the per-service alarm list behind Part III's table.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/guardduty/latest/ug/what-is-guardduty.html" target="_blank" rel="noopener">AWS — GuardDuty</a> · <a class="text-coral underline" href="https://docs.aws.amazon.com/kms/latest/developerguide/overview.html" target="_blank" rel="noopener">KMS developer guide</a> — threat findings, and how keys protect data at rest.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_PIT.html" target="_blank" rel="noopener">AWS — RDS point-in-time recovery</a> · <a class="text-coral underline" href="https://docs.aws.amazon.com/aws-backup/latest/devguide/whatisbackup.html" target="_blank" rel="noopener">AWS Backup</a> — restores, and one backup policy for everything.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html" target="_blank" rel="noopener">AWS — Cost Explorer</a> · <a class="text-coral underline" href="https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/cost-alloc-tags.html" target="_blank" rel="noopener">Cost allocation tags</a> — explaining the bill by project and environment.</li>
       </ul>
