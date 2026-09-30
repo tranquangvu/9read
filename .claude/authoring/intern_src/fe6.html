@@ -1,0 +1,635 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Performance, SEO &amp; Production Readiness</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Your app is deployed (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>). That is
+          where the real work on a frontend starts: real users on mid-range phones and slow 4G, real crawlers deciding
+          whether your clinic pages show up in search, real errors you will never see on your laptop. This module
+          covers measuring speed with Core Web Vitals, the handful of changes that actually make a Next.js app faster,
+          what to do when it breaks in production (hydration errors, error boundaries, Sentry), and how to reach users
+          safely: SEO, two languages, and the frontend security mistakes agents make most.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent optimises what it can see, and it can't
+          see your users. It will happily add a 300 KB chart library to the booking page, mark the whole layout
+          <code class="inline">"use client"</code>, render a date that differs between server and browser, and put an
+          auth token in <code class="inline">localStorage</code>. None of these fail a build or a demo on a fast
+          laptop. They show up as a slow score in Search Console, a console full of hydration warnings, and a security
+          review finding. Your job is to measure, read the numbers, and tell the agent exactly what to fix.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Measuring speed</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Measure real users first, then optimise the worst page</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        "Make it faster" is not a task. "The doctor profile page has an LCP of 4.1 s at p75 on mobile, the target is
+        2.5 s" is. Performance work without a number turns into an agent sprinkling
+        <code class="inline">useMemo</code> and lazy imports across the codebase and nobody knowing whether anything
+        improved. We use the clinic booking app from <a href="./fe1.html" class="text-viol underline decoration-viol/40">FE1</a>
+        and <a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a>: public pages
+        (<code class="inline">/clinics/[slug]</code>, <code class="inline">/doctors/[id]</code>) that must load fast and
+        rank in search, and the booking flow (<code class="inline">/book/[doctorId]</code>) that must respond fast to
+        taps.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Three numbers Google and your users care about</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Core Web Vitals</strong> are three metrics that describe how a page feels: does the main content
+        appear quickly, does the page respond when I tap, and does it stay still while loading. Google uses them as a
+        search ranking signal, and they are measured at the <strong>75th percentile</strong> of real visits, so
+        one-in-four of your users can be slower than the number you report.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Metric</th><th class="px-4 py-3">What it measures</th><th class="px-4 py-3">Good · Poor</th><th class="px-4 py-3">Usual cause in a Next.js app</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">LCP · Largest Contentful Paint</td><td class="px-4 py-3">When the biggest thing above the fold (hero image, heading) is painted</td><td class="px-4 py-3">≤ 2.5 s · &gt; 4 s</td><td class="px-4 py-3">Slow server data on a dynamic page, a hero image without <code class="inline">priority</code>, a web font blocking text</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">INP · Interaction to Next Paint</td><td class="px-4 py-3">The delay from a tap or key press until the screen visibly responds, worst case across the visit</td><td class="px-4 py-3">≤ 200 ms · &gt; 500 ms</td><td class="px-4 py-3">Too much JavaScript on the main thread: big client bundles, hydration of a huge tree, a slow re-render on every keystroke</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CLS · Cumulative Layout Shift</td><td class="px-4 py-3">How much content jumps around while the page loads</td><td class="px-4 py-3">≤ 0.1 · &gt; 0.25</td><td class="px-4 py-3">Images without dimensions, a cookie banner or ad pushed in at the top, a font swap that changes line heights</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        INP replaced the older FID (First Input Delay) in 2024. If an agent or an old blog post talks about FID, the
+        advice is out of date. INP is stricter: it counts the whole interaction including the re-render, not just the
+        wait before your handler starts.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Lab data tells you why, field data tells you whether</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        There are two kinds of performance data and you need both. <strong>Lab data</strong> is one run in a
+        controlled environment: Lighthouse in Chrome DevTools, PageSpeed Insights' lab section. It is repeatable and
+        comes with a diagnosis, but it is one simulated device. <strong>Field data</strong> (also called RUM, real user
+        monitoring) is collected from actual visits: Vercel Speed Insights, the Chrome UX Report behind PageSpeed
+        Insights and Search Console. It is the truth, but it is noisy and slow to change.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 210" class="w-full min-w-[620px]" role="img" aria-label="Performance loop: field data finds the slow page, lab data explains it, fix, then confirm in field data">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">THE PERFORMANCE LOOP · one page at a time</text>
+          <g class="anim-pulse"><rect x="10" y="60" width="140" height="56" rx="9" fill="#2563EB"/>
+            <text x="80" y="84" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Field data</text>
+            <text x="80" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">which page, which metric, p75</text></g>
+          <g class="anim-pulse d1"><rect x="185" y="60" width="140" height="56" rx="9" fill="#6d5acd"/>
+            <text x="255" y="84" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Lab run</text>
+            <text x="255" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">Lighthouse · Performance panel</text></g>
+          <g class="anim-pulse d2"><rect x="360" y="60" width="140" height="56" rx="9" fill="#D97757"/>
+            <text x="430" y="84" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">One fix</text>
+            <text x="430" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">smallest change, one PR</text></g>
+          <g class="anim-pulse d3"><rect x="535" y="60" width="150" height="56" rx="9" fill="#0D9488"/>
+            <text x="610" y="84" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Re-measure</text>
+            <text x="610" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">lab now · field in 1–4 weeks</text></g>
+          <line x1="150" y1="88" x2="185" y2="88" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="325" y1="88" x2="360" y2="88" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="500" y1="88" x2="535" y2="88" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <path d="M 610 116 Q 610 180 350 180 Q 80 180 80 120" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 5"/>
+          <text x="350" y="198" text-anchor="middle" font-size="10" fill="#A8A49B">field data decides whether the fix worked, not the Lighthouse score on your laptop</text>
+          <text x="255" y="140" text-anchor="middle" font-size="10" fill="#A8A49B">throttle: mobile, slow 4G, 4× CPU</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Always run Lighthouse against a <strong>production build</strong> (<code class="inline">next build &amp;&amp; next start</code>
+        or the preview URL), in an incognito window, with mobile throttling. <code class="inline">next dev</code> is
+        unoptimised on purpose and its scores mean nothing. And never chase a Lighthouse score of 100: it is a lab
+        number, and the last 5 points are rarely worth a day.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Collecting field data from your own users</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        On Vercel, <strong>Speed Insights</strong> collects Core Web Vitals from real visits per route with one
+        component. Outside Vercel, Next.js exposes the same numbers through <code class="inline">useReportWebVitals</code>,
+        and you send them to whatever analytics you already use. Either way, you get a per-route p75, which is what
+        tells you where to start.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/layout.tsx — field data on Vercel</span>
+        <pre class="code"><span class="kw">import</span> { SpeedInsights } <span class="kw">from</span> <span class="st">"@vercel/speed-insights/next"</span>;
+
+<span class="kw">export default function</span> <span class="fn">RootLayout</span>({ children }: { children: React.ReactNode }) {
+  <span class="kw">return</span> (
+    &lt;html lang=<span class="st">"vi"</span>&gt;
+      &lt;body&gt;
+        {children}
+        &lt;SpeedInsights /&gt;   <span class="cm">// tiny script, reports LCP / INP / CLS per route</span>
+      &lt;/body&gt;
+    &lt;/html&gt;
+  );
+}
+<span class="cm">// Not on Vercel? A client component calling useReportWebVitals(metric =&gt; send(metric))</span></pre>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Pick the page, then the metric.</strong> For the clinic app, the public doctor pages matter most for
+        LCP (first visit from Google, cold cache, phone). The booking page matters most for INP (many taps: date,
+        slot, form). The dashboard is behind login, used on desktop by staff, and is usually last in the queue.
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Making it fast</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Most slow Next.js pages ship too much JavaScript</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Server Components (<a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a>) send HTML and
+        no component code. Every <code class="inline">"use client"</code> file, and everything it imports, goes into
+        the JavaScript the phone must download, parse and run before the page responds to taps. That is why the
+        single biggest lever on INP in App Router projects is <strong>keeping the client part of the tree small</strong>.
+        The data side (what is cached, what is dynamic) is in <a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a>
+        and HTTP/CDN caching is in <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>. This
+        Part is about the bytes.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Read the bundle before you guess</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <code class="inline">next build</code> output lists each route with its size. When a route is heavy, open
+        a bundle analyzer to see <em>which</em> modules are in it. Next.js 16 builds with Turbopack and ships its own
+        analyzer; older webpack builds use <code class="inline">@next/bundle-analyzer</code>. The command name has
+        changed between versions, so check the docs for yours. What you look for is always the same: one big box
+        that shouldn't be there.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">You see in the bundle</th><th class="px-4 py-3">Why an agent put it there</th><th class="px-4 py-3">Fix</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A whole date or utility library (<code class="inline">moment</code>, all of <code class="inline">lodash</code>)</td><td class="px-4 py-3">It imported the default export for one function</td><td class="px-4 py-3">Use <code class="inline">Intl</code> / native methods, or import the single function</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A chart, map or rich-text editor on every page</td><td class="px-4 py-3">It was imported in a shared layout or a barrel file (<code class="inline">components/index.ts</code>)</td><td class="px-4 py-3">Import it only where used, and load it with <code class="inline">next/dynamic</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Your database or server SDK</td><td class="px-4 py-3">A client component imported a file that also imports server code</td><td class="px-4 py-3">Add <code class="inline">import "server-only"</code> to server modules so the build fails instead</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Most of the page's components</td><td class="px-4 py-3"><code class="inline">"use client"</code> at the top of a layout or page "to make a hook work"</td><td class="px-4 py-3">Move the directive down to the one interactive leaf</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That last row is the most common and the most expensive. One <code class="inline">"use client"</code> on the
+        clinic page because the agent wanted a <code class="inline">useState</code> for a "show more" toggle turns the
+        whole page, its markdown renderer and its map into client JavaScript. The fix is always the same: extract the
+        toggle into its own small client component and keep the page a Server Component.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Load heavy things later, and third-party scripts last</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Some code is genuinely needed, just not on first paint: the clinic map below the fold, the rich-text editor
+        in a modal, the chart on a dashboard tab. <code class="inline">next/dynamic</code> splits it into its own chunk
+        that loads when the component renders. Third-party scripts (analytics, chat widgets, tag managers) are often
+        the heaviest thing on a page, and you don't control their code at all. Load them with
+        <code class="inline">next/script</code> and the latest strategy that still works.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/clinics/[slug]/ClinicMap.tsx — lazy client island</span>
+        <pre class="code"><span class="st">"use client"</span>;
+<span class="kw">import</span> dynamic <span class="kw">from</span> <span class="st">"next/dynamic"</span>;
+<span class="kw">import</span> Script <span class="kw">from</span> <span class="st">"next/script"</span>;
+
+<span class="kw">const</span> <span class="fn">Map</span> = dynamic(() =&gt; <span class="kw">import</span>(<span class="st">"./MapInner"</span>), {
+  ssr: <span class="kw">false</span>,                                    <span class="cm">// map needs window; skip server render</span>
+  loading: () =&gt; &lt;div className=<span class="st">"h-64 rounded-xl bg-sand"</span> /&gt;, <span class="cm">// same height → no CLS</span>
+});
+
+<span class="kw">export function</span> <span class="fn">ClinicMap</span>(props: { lat: <span class="kw">number</span>; lng: <span class="kw">number</span> }) {
+  <span class="kw">return</span> &lt;Map {...props} /&gt;;
+}
+
+<span class="cm">// In the root layout, for the support chat widget:</span>
+&lt;Script src=<span class="st">"https://chat.example.com/widget.js"</span> strategy=<span class="st">"lazyOnload"</span> /&gt;
+<span class="cm">// strategies: beforeInteractive (rare) · afterInteractive (default) · lazyOnload (idle time)</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note the placeholder with a fixed height. Lazy loading without reserving space trades an LCP problem for a
+        CLS problem. The same rule is why <code class="inline">next/image</code> insists on dimensions and why
+        <code class="inline">next/font</code> exists: both are covered in
+        <a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a>. What matters here is the one
+        image that <em>is</em> the LCP element (the doctor's photo, the clinic hero): give it
+        <code class="inline">priority</code> so it is not lazy-loaded, and give it a correct
+        <code class="inline">sizes</code> so a phone doesn't download the desktop version.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Fixing slow interactions: profile, then change one thing</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        If INP is bad on the booking page, the question is "what runs on the main thread when the user taps a
+        date?". Record the interaction in the Chrome DevTools <strong>Performance</strong> panel (it shows INP per
+        interaction and the long tasks behind it), then open the <strong>React DevTools Profiler</strong> to see which
+        components re-rendered and how long each took. Usually you find one of these:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Profiler shows</th><th class="px-4 py-3">Fix</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">The whole page re-renders on each keystroke in the search box</td><td class="px-4 py-3">Move the input's state down into the input component, or keep it in the URL (<a href="./fe4.html" class="text-viol underline decoration-viol/40">FE4</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A list of 2,000 bookings renders every row</td><td class="px-4 py-3">Paginate on the server first. If you really need a long list, virtualise it (<code class="inline">@tanstack/react-virtual</code>) so only visible rows exist</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">An expensive filter recomputed on every render</td><td class="px-4 py-3">Let the React Compiler memoise, or <code class="inline">useMemo</code> with the right deps (<a href="./fe1.html" class="text-viol underline decoration-viol/40">FE1</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Typing is fine but the results list lags behind</td><td class="px-4 py-3"><code class="inline">useDeferredValue</code> for the list, or <code class="inline">startTransition</code> around the non-urgent update, so the input stays responsive</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Memoising without a profile is noise.</strong> An agent asked to "improve performance" will wrap
+        components in <code class="inline">memo</code> and functions in <code class="inline">useCallback</code>
+        everywhere. It makes the code harder to read and usually changes nothing you can measure. Ask for the
+        Profiler recording or the before/after INP first, and reject performance PRs that don't have one.
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · When it breaks in production</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Users will hit errors you never saw, so design the failure and record it</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        On your laptop everything is fresh, your language is Vietnamese, your clock is in Hanoi, and you have no
+        browser extensions. In production, a user in Sydney on an old iPhone with Google Translate on opens a booking
+        link from last week. Three things make that survivable: HTML that the server and the browser agree on,
+        error boundaries that show a useful screen instead of a white page, and error monitoring that tells you it
+        happened before the client does.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Hydration errors: the server and the browser disagreed</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A page is rendered twice: once on the server into HTML, and once in the browser, where React
+        <strong>hydrates</strong> it by attaching event handlers to the existing HTML. React expects the browser's
+        first render to produce exactly the same markup. When it doesn't, you get a hydration mismatch: React
+        discards the server HTML for that part of the tree and re-renders it on the client. The page usually still
+        works, which is why agents ignore the warning, but you lose the speed of server rendering, the content can
+        flicker, and sometimes event handlers attach to the wrong element.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant S as Server (UTC)
+    participant B as Browser (UTC+7)
+    participant R as React
+    S->>B: HTML "Booked at 02:30"
+    B->>R: hydrate: render the same components again
+    R->>R: new Date().toLocaleTimeString()<br/>→ "09:30"
+    R-->>B: ⚠ text mismatch: "02:30" vs "09:30"
+    Note over R,B: React throws away the server HTML<br/>for this subtree and re-renders on the client
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        React 19 prints a diff of the mismatched markup in the console and the Next.js dev overlay, so you can see
+        exactly which element differed. Nearly every mismatch comes from one of five causes:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Cause</th><th class="px-4 py-3">Looks like</th><th class="px-4 py-3">Fix</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Time and locale</td><td class="px-4 py-3"><code class="inline">new Date()</code>, <code class="inline">toLocaleString()</code> without an explicit time zone</td><td class="px-4 py-3">Format with a fixed <code class="inline">timeZone</code> (the clinic's, not the server's), or render the relative time only on the client</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Browser-only checks</td><td class="px-4 py-3"><code class="inline">typeof window !== "undefined" ? … : …</code> inside render</td><td class="px-4 py-3">Render the same thing first, then switch in an effect, or load the component with <code class="inline">ssr: false</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Random values</td><td class="px-4 py-3"><code class="inline">Math.random()</code> or <code class="inline">crypto.randomUUID()</code> for element IDs</td><td class="px-4 py-3"><code class="inline">useId()</code>, which is stable across server and client</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Invalid HTML nesting</td><td class="px-4 py-3"><code class="inline">&lt;div&gt;</code> inside <code class="inline">&lt;p&gt;</code>, <code class="inline">&lt;a&gt;</code> inside <code class="inline">&lt;a&gt;</code>, a table without <code class="inline">&lt;tbody&gt;</code></td><td class="px-4 py-3">Fix the markup: the browser "repairs" invalid HTML, so its DOM no longer matches React's</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Browser extensions</td><td class="px-4 py-3">Extra attributes on <code class="inline">&lt;html&gt;</code> or <code class="inline">&lt;body&gt;</code> you didn't write</td><td class="px-4 py-3">Not your bug. Reproduce in incognito before you change code</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">BookingTime.tsx — deterministic on both sides</span>
+        <pre class="code"><span class="kw">const</span> fmt = <span class="kw">new</span> Intl.DateTimeFormat(<span class="st">"vi-VN"</span>, {
+  timeZone: <span class="st">"Asia/Ho_Chi_Minh"</span>,     <span class="cm">// the clinic's zone: same answer on server and browser</span>
+  dateStyle: <span class="st">"medium"</span>, timeStyle: <span class="st">"short"</span>,
+});
+
+<span class="kw">export function</span> <span class="fn">BookingTime</span>({ startsAt }: { startsAt: <span class="kw">string</span> }) {
+  <span class="kw">const</span> id = useId();                   <span class="cm">// ✓ not Math.random()</span>
+  <span class="kw">return</span> &lt;time id={id} dateTime={startsAt}&gt;{fmt.format(<span class="kw">new</span> Date(startsAt))}&lt;/time&gt;;
+}
+
+<span class="cm">// Only for a value that MUST differ, like "last updated 3 s ago":</span>
+&lt;span suppressHydrationWarning&gt;{relative(now)}&lt;/span&gt;   <span class="cm">// one element deep, text only</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">suppressHydrationWarning</code> is an escape hatch for a single text node that is
+        expected to differ. It works one level deep and hides the warning, not the problem. An agent that puts it on
+        <code class="inline">&lt;body&gt;</code> or on a whole component to "fix" hydration errors has turned off the
+        alarm and left the fire burning. The one accepted exception is <code class="inline">&lt;html suppressHydrationWarning&gt;</code>
+        for a theme script that sets a class before hydration (<a href="./fe3.html" class="text-viol underline decoration-viol/40">FE3</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Error boundaries: every failure gets a screen</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a> introduced the special files. In
+        production, decide per segment what the user sees when something throws, and make sure each one is useful:
+        what happened, what to do next, and no stack trace.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">File</th><th class="px-4 py-3">Catches</th><th class="px-4 py-3">Clinic app example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">not-found.tsx</code></td><td class="px-4 py-3">A call to <code class="inline">notFound()</code> and unknown URLs. Returns status 404.</td><td class="px-4 py-3">"This doctor no longer takes bookings" with a link to the clinic's other doctors</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">book/error.tsx</code></td><td class="px-4 py-3">Errors thrown while rendering this segment. The layout above stays.</td><td class="px-4 py-3">"We couldn't load free slots." with a Retry button. Header and navigation still work.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">app/error.tsx</code></td><td class="px-4 py-3">Anything not caught deeper, below the root layout</td><td class="px-4 py-3">Generic "Something went wrong" plus a support contact and an error ID</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">global-error.tsx</code></td><td class="px-4 py-3">Errors in the root layout itself. Replaces the whole page, so it renders its own <code class="inline">&lt;html&gt;</code> and <code class="inline">&lt;body&gt;</code>.</td><td class="px-4 py-3">A minimal, style-light page. Rare, but without it the user gets a blank screen.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">app/book/error.tsx</span>
+        <pre class="code"><span class="st">"use client"</span>;                                   <span class="cm">// error boundaries are client components</span>
+<span class="kw">import</span> { useEffect } <span class="kw">from</span> <span class="st">"react"</span>;
+<span class="kw">import</span> * <span class="kw">as</span> Sentry <span class="kw">from</span> <span class="st">"@sentry/nextjs"</span>;
+
+<span class="kw">export default function</span> <span class="fn">BookingError</span>({ error, reset }: {
+  error: Error &amp; { digest?: <span class="kw">string</span> }; reset: () =&gt; <span class="kw">void</span>;
+}) {
+  useEffect(() =&gt; { Sentry.captureException(error); }, [error]); <span class="cm">// report it once</span>
+  <span class="kw">return</span> (
+    &lt;div role=<span class="st">"alert"</span>&gt;
+      &lt;p&gt;We couldn't load free slots. Please try again.&lt;/p&gt;
+      &lt;button onClick={reset}&gt;Retry&lt;/button&gt;
+      &lt;p&gt;Error ID: {error.digest}&lt;/p&gt;   <span class="cm">// matches the server log; never error.message</span>
+    &lt;/div&gt;
+  );
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        In production, Next.js replaces the message of errors thrown in Server Components with a generic one and
+        gives you a <code class="inline">digest</code> instead, so secrets in error messages don't leak. Show the
+        digest to the user; your server logs have the real message under the same ID. Expected failures ("slot
+        already taken") are not exceptions: return them from the Server Action as data and render them in the form
+        (<a href="./fe4.html" class="text-viol underline decoration-viol/40">FE4</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Error monitoring: find out before the client emails you</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An error boundary helps the user. Monitoring helps you. A tool such as <strong>Sentry</strong> collects every
+        unhandled error from the browser and the server, groups identical ones, and shows how many users hit each.
+        Logs, metrics and traces as a discipline are in <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>.
+        For a Next.js frontend, four settings decide whether the reports are useful:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Both sides are instrumented.</strong> The Sentry wizard creates client and server config, and hooks the server side into Next.js through <code class="inline">instrumentation.ts</code> (including errors from Server Components and Server Actions). Check both exist.</li>
+        <li><strong>Source maps are uploaded, not served.</strong> Without them, a browser stack trace points at <code class="inline">chunk-8f3a.js:1:48213</code>. The build uploads maps to Sentry and does not publish them to users.</li>
+        <li><strong>Every event carries a release and an environment.</strong> Tag the release with the git commit SHA, so you can say "this started with deploy <code class="inline">a1b2c3d</code>" and roll back (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>). Keep preview and production separate.</li>
+        <li><strong>No personal data in events.</strong> Patient names, phone numbers and tokens must not end up in error payloads or breadcrumbs. Review what is sent by default and scrub it.</li>
+      </ul>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Then read it. A monitoring tool no one opens is decoration. A good habit: after every production deploy,
+        look at "new issues in this release" for five minutes the same afternoon.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Search, languages and security</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A public page must be findable, readable in the user's language, and safe to render</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The clinic's doctor pages are its storefront. A patient searching "bác sĩ nhi Hà Nội" should find them, see
+        a proper preview when the link is shared in Zalo or Facebook, read them in Vietnamese or English, and never
+        be exposed to a script injected through a doctor's bio. All of this is mostly configuration, which is exactly
+        why it gets forgotten.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">SEO is metadata, a sitemap and server-rendered content</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Search engines rank pages they can read. Server Components already give you the most important part: the
+        content is in the HTML, not fetched later by client JavaScript. The rest is file conventions in the
+        <code class="inline">app</code> folder. <a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a>
+        showed the <code class="inline">metadata</code> export. For production, check this list:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Piece</th><th class="px-4 py-3">Where</th><th class="px-4 py-3">What to check</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Title and description per page</td><td class="px-4 py-3"><code class="inline">generateMetadata</code> in each dynamic page</td><td class="px-4 py-3">Unique per doctor, not "Create Next App" on every page</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Canonical URL</td><td class="px-4 py-3"><code class="inline">alternates.canonical</code> + <code class="inline">metadataBase</code> in the root layout</td><td class="px-4 py-3">One URL per page, so <code class="inline">?utm=…</code> copies don't compete</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sitemap</td><td class="px-4 py-3"><code class="inline">app/sitemap.ts</code></td><td class="px-4 py-3">Lists every public clinic and doctor page, generated from the database</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Robots</td><td class="px-4 py-3"><code class="inline">app/robots.ts</code></td><td class="px-4 py-3">Blocks <code class="inline">/dashboard</code> and <code class="inline">/api</code>; preview deployments are not indexed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Social preview image</td><td class="px-4 py-3"><code class="inline">opengraph-image.tsx</code> in the segment</td><td class="px-4 py-3">A generated card with the doctor's name and clinic, 1200×630</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Structured data</td><td class="px-4 py-3">A JSON-LD <code class="inline">&lt;script&gt;</code> in the page</td><td class="px-4 py-3">Valid in Google's Rich Results Test (for example a <code class="inline">Physician</code> or <code class="inline">MedicalClinic</code>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">app/doctors/[id]/page.tsx — metadata and JSON-LD</span>
+        <pre class="code"><span class="kw">export async function</span> <span class="fn">generateMetadata</span>(props: PageProps&lt;<span class="st">"/doctors/[id]"</span>&gt;): Promise&lt;Metadata&gt; {
+  <span class="kw">const</span> { id } = <span class="kw">await</span> props.params;
+  <span class="kw">const</span> d = <span class="kw">await</span> getDoctor(id);          <span class="cm">// deduplicated with the page's own call</span>
+  <span class="kw">if</span> (!d) <span class="kw">return</span> {};
+  <span class="kw">return</span> {
+    title: <span class="st">`${d.name} · ${d.specialty} · ${d.clinic.name}`</span>,
+    description: d.bio.slice(<span class="st">0</span>, <span class="st">155</span>),
+    alternates: { canonical: <span class="st">`/doctors/${id}`</span> },
+  };
+}
+
+<span class="cm">// inside the page component:</span>
+<span class="kw">const</span> jsonLd = { <span class="st">"@context"</span>: <span class="st">"https://schema.org"</span>, <span class="st">"@type"</span>: <span class="st">"Physician"</span>, name: d.name };
+&lt;script type=<span class="st">"application/ld+json"</span>
+  dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd).replace(<span class="st">/&lt;/g</span>, <span class="st">"\\u003c"</span>) }} /&gt;
+<span class="cm">// the replace stops a "&lt;/script&gt;" inside the data from closing the tag early</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Verify, don't assume: view the page source (not DevTools' Elements panel, which shows the DOM after
+        JavaScript) and check the title, canonical and JSON-LD are there. Paste the URL into a social preview
+        debugger. After launch, submit the sitemap in Google Search Console, which is also where the field Core Web
+        Vitals from Part I show up per URL group.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Two languages: route by locale, format with Intl</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The clinic serves Vietnamese patients and English-speaking expats. The common setup in App Router is
+        <strong>next-intl</strong>: a <code class="inline">[locale]</code> segment at the top of the app, a message
+        file per language, and <code class="inline">proxy.ts</code> redirecting <code class="inline">/</code> to the
+        right locale. Each language gets its own URL (<code class="inline">/vi/bac-si/42</code>,
+        <code class="inline">/en/doctors/42</code>), which is also what search engines need, declared with
+        <code class="inline">alternates.languages</code> in the metadata.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">messages/en.json · messages/vi.json · a component</span>
+        <pre class="code"><span class="cm">// en.json</span>  { <span class="st">"Booking"</span>: { <span class="st">"slotsLeft"</span>: <span class="st">"{count, plural, =0 {No slots left} one {# slot left} other {# slots left}}"</span> } }
+<span class="cm">// vi.json</span>  { <span class="st">"Booking"</span>: { <span class="st">"slotsLeft"</span>: <span class="st">"{count, plural, =0 {Hết lịch trống} other {Còn # lịch trống}}"</span> } }
+
+<span class="kw">const</span> t = useTranslations(<span class="st">"Booking"</span>);
+<span class="kw">const</span> format = useFormatter();
+t(<span class="st">"slotsLeft"</span>, { count: <span class="st">3</span> });                             <span class="cm">// ✓ plural rules per language</span>
+format.number(<span class="st">350000</span>, { style: <span class="st">"currency"</span>, currency: <span class="st">"VND"</span> }); <span class="cm">// ✓ "350.000 ₫" in vi</span>
+
+<span class="st">"Còn "</span> + count + <span class="st">" lịch trống"</span>                          <span class="cm">// ✗ concatenation: untranslatable</span>
+price.toFixed(<span class="st">2</span>) + <span class="st">" VND"</span>                               <span class="cm">// ✗ VND has no decimals; wrong separators</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The rule for agents: <strong>no user-visible string in a component, and no hand-formatted number, date or
+        currency</strong>. Everything goes through the message file and the <code class="inline">Intl</code>-based
+        formatter. Grep the diff for Vietnamese or English text inside JSX; that is where missing translations hide.
+        And set <code class="inline">&lt;html lang&gt;</code> to the active locale, which screen readers and
+        browser translation rely on.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Frontend security: what the browser can see, an attacker can see</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        XSS, CSP, sessions and the OWASP Top 10 as concepts are owned by
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>, and validating Server Action input
+        is in <a href="./fe4.html" class="text-viol underline decoration-viol/40">FE4</a>. What matters here is how
+        those mistakes look in a React / Next.js diff:
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="What reaches the browser: client bundle, NEXT_PUBLIC env vars, localStorage and rendered HTML are all readable by an attacker; httpOnly cookies and server-only code are not">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">READABLE BY ANY SCRIPT IN THE PAGE</text>
+          <text x="470" y="20" font-size="11" font-weight="700" fill="#6E6B64">NOT REACHABLE FROM JS</text>
+          <g class="anim-pulse"><rect x="10" y="36" width="130" height="50" rx="9" fill="#DB2777"/>
+            <text x="75" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Client bundle</text>
+            <text x="75" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">every "use client" import</text></g>
+          <g class="anim-pulse d1"><rect x="155" y="36" width="130" height="50" rx="9" fill="#DB2777"/>
+            <text x="220" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">NEXT_PUBLIC_*</text>
+            <text x="220" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">inlined at build time</text></g>
+          <g class="anim-pulse d2"><rect x="10" y="100" width="130" height="50" rx="9" fill="#DB2777"/>
+            <text x="75" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">localStorage</text>
+            <text x="75" y="138" text-anchor="middle" fill="#ffffffbb" font-size="9">one XSS → token stolen</text></g>
+          <g class="anim-pulse d3"><rect x="155" y="100" width="130" height="50" rx="9" fill="#DB2777"/>
+            <text x="220" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Rendered HTML</text>
+            <text x="220" y="138" text-anchor="middle" fill="#ffffffbb" font-size="9">props passed to clients too</text></g>
+          <g class="anim-pulse d1"><rect x="470" y="36" width="210" height="50" rx="9" fill="#0D9488"/>
+            <text x="575" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">httpOnly, Secure cookie</text>
+            <text x="575" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">session token lives here</text></g>
+          <g class="anim-pulse d2"><rect x="470" y="100" width="210" height="50" rx="9" fill="#0D9488"/>
+            <text x="575" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Server-only code and env</text>
+            <text x="575" y="138" text-anchor="middle" fill="#ffffffbb" font-size="9">import "server-only" · DATABASE_URL</text></g>
+          <line x1="300" y1="95" x2="455" y2="95" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 5"/>
+          <text x="378" y="88" text-anchor="middle" font-size="10" fill="#A8A49B">trust boundary</text>
+          <text x="350" y="180" text-anchor="middle" font-size="10" fill="#A8A49B">if it is on the left, assume the attacker has it</text>
+        </svg>
+      </div>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong><code class="inline">dangerouslySetInnerHTML</code> with user content.</strong> React escapes text by default, so this prop is the main way XSS gets into a React app. A doctor's bio written in a rich-text editor must be sanitised with DOMPurify (or rendered from Markdown with HTML disabled) before it reaches this prop. Every occurrence in a diff needs a sentence explaining where the HTML came from.</li>
+        <li><strong>Tokens in <code class="inline">localStorage</code>.</strong> Any script on the page, including a compromised third-party widget, can read it. Session tokens belong in an <code class="inline">httpOnly</code>, <code class="inline">Secure</code>, <code class="inline">SameSite</code> cookie set by the server. Supabase's SSR helpers (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>) already do this.</li>
+        <li><strong>Secrets behind <code class="inline">NEXT_PUBLIC_</code>.</strong> The prefix inlines the value into the client bundle (<a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a>). Search the built <code class="inline">.next/static</code> folder for your secret's first characters to prove it isn't there.</li>
+        <li><strong>Too much data passed to a Client Component.</strong> Props from a Server Component to a Client Component are serialised into the page. Passing the whole <code class="inline">patient</code> row to show a first name ships the phone number and date of birth too.</li>
+        <li><strong>No security headers.</strong> Set a Content Security Policy, <code class="inline">X-Content-Type-Options</code>, <code class="inline">Referrer-Policy</code> and frame protection in <code class="inline">next.config</code> <code class="inline">headers()</code>, or in <code class="inline">proxy.ts</code> when the CSP needs a per-request nonce (which makes those pages dynamic).</li>
+      </ul>
+      <div class="mt-4">
+        <span class="code-label">DoctorBio.tsx — sanitise before you inject</span>
+        <pre class="code"><span class="kw">import</span> DOMPurify <span class="kw">from</span> <span class="st">"isomorphic-dompurify"</span>;   <span class="cm">// works on server and client</span>
+
+<span class="kw">export function</span> <span class="fn">DoctorBio</span>({ html }: { html: <span class="kw">string</span> }) {
+  <span class="kw">const</span> clean = DOMPurify.sanitize(html, { USE_PROFILES: { html: <span class="kw">true</span> } }); <span class="cm">// strips &lt;script&gt;, onerror=…</span>
+  <span class="kw">return</span> &lt;div dangerouslySetInnerHTML={{ __html: clean }} /&gt;;
+}
+<span class="cm">// ✗ &lt;div dangerouslySetInnerHTML={{ __html: doctor.bio }} /&gt;   ← stored XSS on every visit</span></pre>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>Stored XSS on a public page is a breach, not a bug.</strong> One doctor account (or one compromised
+        admin) saves a bio with an <code class="inline">&lt;img onerror&gt;</code>, and the script runs for every patient
+        who opens that profile, with their session. If you find unsanitised HTML from the database rendered into a
+        page, stop and escalate it to your mentor the same day.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Production readiness is where agents are most useful as auditors: they can grep a whole codebase for
+        <code class="inline">dangerouslySetInnerHTML</code>, run Lighthouse, read a bundle report and list every page
+        without metadata faster than you can. Where they are least useful is judging which finding matters. Give them
+        a number to move and a checklist to run, and keep the prioritising for yourself.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — a measured performance fix</span>
+        <pre class="code">Field data (Speed Insights) shows /doctors/[id] at LCP 4.1 s p75 on mobile.
+1. Run Lighthouse (mobile) against the production preview URL and report the
+   LCP element and the LCP breakdown (TTFB, load delay, load time, render delay).
+2. Run the bundle analyzer and list the 5 largest modules in this route's client JS.
+3. Propose at most 3 changes, each with the metric it should move and why.
+Do not edit code yet. Do not add useMemo/memo without a Profiler reason.</pre>
+      </div>
+      <pre class="code mt-3">Audit the app for hydration risks. Search for: new Date( / toLocale* without a
+timeZone, typeof window in render, Math.random or randomUUID in JSX, &lt;div&gt; inside
+&lt;p&gt;, and every suppressHydrationWarning. For each: file:line, why it can
+mismatch, the minimal fix. Then load /book/42 in the browser and report console warnings.</pre>
+      <pre class="code mt-3">Production readiness review of the public pages (/clinics/*, /doctors/*):
+- generateMetadata present, unique title, canonical URL
+- sitemap.ts and robots.ts exist; /dashboard is disallowed
+- every dangerouslySetInnerHTML: where does the HTML come from, is it sanitised?
+- any token or secret in localStorage or a NEXT_PUBLIC_ variable
+- any hard-coded user-visible string outside messages/*.json
+Output a table: check, status, file:line, fix. <span class="cm"># you decide what ships first</span></pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Run Lighthouse and the bundle analyzer and summarise the reports</li>
+            <li>Move <code class="inline">"use client"</code> down to leaf components</li>
+            <li>Write <code class="inline">generateMetadata</code>, <code class="inline">sitemap.ts</code>, <code class="inline">robots.ts</code> and OG images</li>
+            <li>Extract hard-coded strings into message files</li>
+            <li>Set up Sentry with the wizard and add error boundaries per segment</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>A before/after number for every performance change, on a production build</li>
+            <li>That the LCP image has <code class="inline">priority</code> and lazy content reserves its space</li>
+            <li>Every <code class="inline">dangerouslySetInnerHTML</code> and every <code class="inline">suppressHydrationWarning</code>, by hand</li>
+            <li>Page source (not DevTools) for title, canonical and JSON-LD</li>
+            <li>That error events in Sentry have readable stack traces and no patient data</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent output:</strong> <code class="inline">"use client"</code> added to a layout or page
+        · <code class="inline">suppressHydrationWarning</code> on <code class="inline">&lt;body&gt;</code> or a wrapper
+        · <code class="inline">dangerouslySetInnerHTML</code> fed straight from the database · a token written to
+        <code class="inline">localStorage</code> · <code class="inline">memo</code>/<code class="inline">useCallback</code>
+        added "for performance" with no measurement · a whole library imported for one function · Lighthouse run on
+        <code class="inline">next dev</code> · the same static title on every page · text built by string
+        concatenation in a two-language app.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has not measured a page's performance or looked at a production error.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can name LCP, INP and CLS and has run Lighthouse once. Treats hydration warnings as noise.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Finds the slowest page from field data, uses Lighthouse and the bundle analyzer to explain it, and ships one measured fix. Fixes hydration mismatches at the cause. Adds metadata, a sitemap and error boundaries, and spots unsafe HTML and token storage in review. Asks the mentor which findings to prioritise.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Owns the production readiness of a frontend: performance budgets, monitoring with useful releases, SEO and i18n set up correctly, security headers in place. Prioritises by user impact without help.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the team's launch checklist and performance budgets, wires them into CI (<a href="./qa3.html" class="text-viol underline decoration-viol/40">QA3</a>) and CLAUDE.md, and runs the post-launch review with the client.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> can you name your app's worst page and its p75 LCP and INP
+        right now? Is your browser console free of hydration warnings on the main flow? Could you point to every
+        <code class="inline">dangerouslySetInnerHTML</code> in the codebase and say where its HTML comes from?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Optimising on your laptop</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A MacBook on office Wi-Fi is not your user. Throttle to mobile and slow 4G, measure the production build, and trust field data over any single run.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Silencing hydration warnings</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">suppressHydrationWarning</code> on a wrapper hides the message, not the mismatch. Find the non-deterministic value and make it deterministic.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Showing error.message to users</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">It can contain SQL, file paths or secrets, and it means nothing to a patient. Show a human sentence, a retry and the digest.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ One metric, one fix, one PR</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Put the before and after numbers in the PR description. Five optimisations in one PR means you never learn which one worked.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Add <code class="inline">server-only</code> early</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One import line in every data-access module turns "the DB client leaked into the bundle" from a silent bug into a build error.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Read Sentry after every deploy</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Five minutes on "new issues in this release" catches most regressions before the client's users report them.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cwv-explain"> <span>Can explain LCP, INP and CLS to my mentor, name the usual cause of each in a Next.js app, and say why field data beats a Lighthouse score.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="bundle-fix"> <span>Used the bundle analyzer to find one oversized client dependency or misplaced <code class="inline">"use client"</code>, fixed it, and recorded the route size before and after.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="hydration"> <span>Reproduced a hydration mismatch (date, random ID or invalid nesting), explained the cause from the React diff, and fixed it without <code class="inline">suppressHydrationWarning</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="errors-sentry"> <span>Added segment error boundaries and Sentry with source maps and release tags, then triggered a test error and showed a readable stack trace in Sentry.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="launch-audit"> <span class="font-semibold">Ran a launch audit of my deployed app with Claude Code (Core Web Vitals on the two most important pages, metadata/sitemap/robots/OG, hydration warnings, <code class="inline">dangerouslySetInnerHTML</code>, token storage, NEXT_PUBLIC_ variables), fixed the top three findings in separate PRs with before/after evidence, and shared the audit table with my mentor (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://web.dev/articles/vitals" target="_blank" rel="noopener">web.dev — Web Vitals</a> — the definitions and thresholds of LCP, INP and CLS used in Part I.</li>
+        <li><a class="text-coral underline" href="https://nextjs.org/docs/app/guides/production-checklist" target="_blank" rel="noopener">Next.js — Production Checklist</a> — the official pre-launch list for performance, SEO and security.</li>
+        <li><a class="text-coral underline" href="https://nextjs.org/docs/app/guides/lazy-loading" target="_blank" rel="noopener">Next.js — Lazy Loading</a> · <a class="text-coral underline" href="https://nextjs.org/docs/app/api-reference/components/script" target="_blank" rel="noopener">Script component</a> — <code class="inline">next/dynamic</code> and third-party script strategies from Part II.</li>
+        <li><a class="text-coral underline" href="https://react.dev/reference/react-dom/client/hydrateRoot#hydrating-server-rendered-html" target="_blank" rel="noopener">React — Hydrating server-rendered HTML</a> — why mismatches happen and the escape hatches React offers.</li>
+        <li><a class="text-coral underline" href="https://docs.sentry.io/platforms/javascript/guides/nextjs/" target="_blank" rel="noopener">Sentry — Next.js guide</a> — setup, source maps and releases for Part III.</li>
+        <li><a class="text-coral underline" href="https://nextjs.org/docs/app/getting-started/metadata-and-og-images" target="_blank" rel="noopener">Next.js — Metadata and OG images</a> — metadata, sitemap, robots and generated social cards.</li>
+        <li><a class="text-coral underline" href="https://next-intl.dev/docs/getting-started/app-router" target="_blank" rel="noopener">next-intl — App Router setup</a> — locale routing, messages and formatting.</li>
+        <li><a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP — XSS Prevention Cheat Sheet</a> — the rules behind sanitising HTML before rendering it (<a class="text-coral underline" href="./sd10.html">SD10</a>).</li>
+      </ul>

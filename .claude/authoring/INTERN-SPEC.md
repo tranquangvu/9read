@@ -97,6 +97,10 @@ this one wins for `intern/`.
 | Playwright and Playwright MCP | QA2 |
 | Definition of Done, PR evidence, CI gates | QA3 |
 | Docker and GitHub Actions | OP2 |
+| CSS layout, Tailwind, class composition (cn/cva), shadcn/ui in code, dark mode, motion | FE3 |
+| React Hook Form + Zod, Server Action forms, optimistic UI, URL state, pagination, uploads, realtime on the client | FE4 |
+| Vitest + React Testing Library + MSW, a11y checks, frontend lint/type/CI gates | FE5 |
+| Core Web Vitals, bundle size, hydration errors, error monitoring, SEO, i18n, frontend security | FE6 |
 
 ## API code
 Anthropic API examples use `claude-opus-5-5` / `claude-sonnet-5-5` / `claude-haiku-4-5-20251001`

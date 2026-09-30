@@ -1,0 +1,690 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Forms, Mutations &amp; URL State</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Reading data is the easy half of a frontend. This module is about the other half: forms that validate
+          once and agree with the server, mutations that survive a slow network and a slot that someone else just
+          took, list screens whose filters live in the URL, uploads that don't go through your server, and live
+          data that stays correct. It is the week you switch your client from mocks to the real API, so every
+          example runs against the booking API you build in <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent builds a form that looks finished in
+          minutes. It validates on the client only, shows "Something went wrong" for every server error, lets an
+          impatient user book the same slot twice, and keeps the doctor filter in <code class="inline">useState</code>
+          so the back button wipes it. None of that shows up in a happy-path demo against a mock. All of it shows up
+          in the first week against a real API with real users. Your job is to know which paths the agent skipped.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Production forms</div>
+      <h2 class="font-display text-2xl font-bold mt-2">One schema, validated twice, owned once</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <a href="./fe1.html" class="text-viol underline decoration-viol/40">FE1</a> showed a controlled input with a
+        derived error. That is fine for a phone field. The real booking form has a patient name, date of birth, phone,
+        email, reason for visit, an insurance number that is only required for some clinics, and a consent checkbox.
+        Hand-written <code class="inline">useState</code> per field doesn't scale to that. Teams use a form library
+        plus a schema, and the important decision is not which library but <strong>where the rules live</strong>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The schema is the contract, not the form</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Write the rules once, as a <strong>Zod schema</strong> in a file that both the browser and the server
+        import. The client uses it for instant feedback. The server uses the <em>same</em> schema to reject bad input,
+        because client validation is only a convenience: anyone can send any request. Two copies of the rules, one in
+        the form and one in the action, will drift within a sprint.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/schemas/booking.ts — shared by client and server</span>
+        <pre class="code"><span class="kw">import</span> { z } <span class="kw">from</span> <span class="st">"zod"</span>;             <span class="cm">// Zod v4</span>
+
+<span class="kw">export const</span> <span class="fn">BookingInput</span> = z.object({
+  slotId: z.string().min(<span class="st">1</span>),
+  patientName: z.string().trim().min(<span class="st">2</span>, <span class="st">"Enter the patient's full name"</span>),
+  phone: z.string().regex(<span class="st">/^\+?\d{9,12}$/</span>, <span class="st">"Enter 9–12 digits"</span>),
+  email: z.email(<span class="st">"Enter a valid email"</span>),            <span class="cm">// v4: top-level z.email()</span>
+  insuranceNo: z.string().optional(),
+  consent: z.literal(<span class="kw">true</span>, { error: <span class="st">"You must accept the terms"</span> }),
+}).refine(
+  (d) =&gt; !d.insuranceNo || /^[A-Z]{2}\d{8}$/.test(d.insuranceNo),
+  { path: [<span class="st">"insuranceNo"</span>], error: <span class="st">"Format: 2 letters + 8 digits"</span> },
+);
+
+<span class="kw">export type</span> <span class="fn">BookingInput</span> = z.infer&lt;<span class="kw">typeof</span> BookingInput&gt;;  <span class="cm">// the type comes from the rules</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice what the schema does <em>not</em> contain: "this slot is still free" or "this patient has no other
+        booking that day". Those are business rules that need the database, and they live in the service layer
+        (<a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>). The schema checks
+        <strong>shape</strong>. The server checks <strong>truth</strong>. The form must be ready for both kinds of
+        failure.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Check</th><th class="px-4 py-3">Where it runs</th><th class="px-4 py-3">Booking example</th><th class="px-4 py-3">How the user sees it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Shape</td><td class="px-4 py-3">Zod schema, in the browser <strong>and</strong> on the server</td><td class="px-4 py-3">Phone has 9–12 digits, consent is ticked</td><td class="px-4 py-3">Message under the field, on blur or submit</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Business rule</td><td class="px-4 py-3">Service layer, server only</td><td class="px-4 py-3">Slot is in the future, patient has no clash</td><td class="px-4 py-3">422 mapped to a field or a form-level message</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">State conflict</td><td class="px-4 py-3">Database constraint, server only</td><td class="px-4 py-3">Someone booked 09:30 a second ago</td><td class="px-4 py-3">409, with a way forward: "pick another slot"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Permission</td><td class="px-4 py-3">Inside the action or handler</td><td class="px-4 py-3">You may only book for patients on your account</td><td class="px-4 py-3">403/404, never a silent success</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">React Hook Form: the client half</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        React Hook Form (v7) keeps field values in the DOM (uncontrolled inputs) and only re-renders what changed, so
+        a 12-field form doesn't re-render on every keystroke. The <code class="inline">zodResolver</code> plugs the
+        shared schema in. Three settings matter more than the rest: <strong>when</strong> to validate
+        (<code class="inline">mode</code>), what the <strong>default values</strong> are, and how you show errors
+        accessibly.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">BookingForm.tsx — client validation with the shared schema</span>
+        <pre class="code"><span class="st">"use client"</span>;
+<span class="kw">const</span> form = useForm&lt;BookingInput&gt;({
+  resolver: zodResolver(BookingInput),
+  mode: <span class="st">"onTouched"</span>,                  <span class="cm">// validate after the user leaves a field, not on every key</span>
+  defaultValues: { slotId, patientName: <span class="st">""</span>, phone: <span class="st">""</span>, email: <span class="st">""</span>, consent: <span class="kw">false</span> },
+});
+<span class="kw">const</span> { errors, isSubmitting } = form.formState;
+
+&lt;label htmlFor=<span class="st">"phone"</span>&gt;Phone&lt;/label&gt;
+&lt;input id=<span class="st">"phone"</span> type=<span class="st">"tel"</span> {...form.register(<span class="st">"phone"</span>)}
+  aria-invalid={!!errors.phone} aria-describedby=<span class="st">"phone-err"</span> /&gt;
+{errors.phone &amp;&amp; &lt;p id=<span class="st">"phone-err"</span> role=<span class="st">"alert"</span>&gt;{errors.phone.message}&lt;/p&gt;}
+
+&lt;button disabled={isSubmitting}&gt;{isSubmitting ? <span class="st">"Booking…"</span> : <span class="st">"Book slot"</span>}&lt;/button&gt;
+<span class="cm">// Always pass defaultValues: undefined → "uncontrolled to controlled" warnings and broken reset()</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You don't always need the library. A three-field form posted to a Server Action works with plain
+        <code class="inline">&lt;form action&gt;</code> and the server-side schema alone (next section). Reach for
+        React Hook Form when you need instant field feedback, conditional fields, field arrays ("add another
+        patient") or a multi-step wizard. <strong>Check what the project already uses</strong> before accepting an
+        agent's <code class="inline">npm install</code> of a second form library.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Server Actions: the server half, with errors that land on fields</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a> introduced Server Actions and
+        <code class="inline">updateTag</code>. For forms, the missing piece is the <strong>return value</strong>. An
+        action used with React 19's <code class="inline">useActionState</code> receives the previous state and the
+        form data, and returns the next state. Return structured errors instead of throwing, and the form can put
+        every message next to the right field, even with JavaScript still loading.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/book/actions.ts — validate, authorize, return field errors</span>
+        <pre class="code"><span class="st">"use server"</span>;
+<span class="kw">export type</span> <span class="fn">FormState</span> = { ok: <span class="kw">boolean</span>; fieldErrors?: Record&lt;<span class="kw">string</span>, <span class="kw">string</span>[]&gt;; formError?: <span class="kw">string</span> };
+
+<span class="kw">export async function</span> <span class="fn">bookSlot</span>(_prev: FormState, fd: FormData): Promise&lt;FormState&gt; {
+  <span class="kw">const</span> user = <span class="kw">await</span> requireUser();                        <span class="cm">// public endpoint: auth first</span>
+  <span class="kw">const</span> parsed = BookingInput.safeParse(Object.fromEntries(fd));
+  <span class="kw">if</span> (!parsed.success)                                        <span class="cm">// same schema as the client</span>
+    <span class="kw">return</span> { ok: <span class="kw">false</span>, fieldErrors: z.flattenError(parsed.error).fieldErrors };
+
+  <span class="kw">const</span> res = <span class="kw">await</span> api.post(<span class="st">"/bookings"</span>, parsed.data, { user });
+  <span class="kw">if</span> (res.status === <span class="st">409</span>) <span class="kw">return</span> { ok: <span class="kw">false</span>, formError: <span class="st">"That slot was just taken. Pick another."</span> };
+  <span class="kw">if</span> (res.status === <span class="st">422</span>) <span class="kw">return</span> { ok: <span class="kw">false</span>, fieldErrors: fromProblem(res.body) }; <span class="cm">// BE1 pointers → fields</span>
+  <span class="kw">if</span> (!res.ok) <span class="kw">return</span> { ok: <span class="kw">false</span>, formError: <span class="st">`Booking failed (ref ${res.body.trace_id})`</span> };
+
+  updateTag(<span class="st">`slots-${parsed.data.slotId}`</span>);
+  redirect(<span class="st">`/bookings/${res.body.id}`</span>);
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">BookingForm.tsx — wiring the action</span>
+        <pre class="code"><span class="kw">const</span> [state, formAction, pending] = useActionState(bookSlot, { ok: <span class="kw">false</span> });
+
+&lt;form action={formAction}&gt;
+  {state.formError &amp;&amp; &lt;div role=<span class="st">"alert"</span>&gt;{state.formError}&lt;/div&gt;}   <span class="cm">// form-level: 409, 500</span>
+  &lt;input name=<span class="st">"phone"</span> defaultValue={…} aria-invalid={!!state.fieldErrors?.phone} /&gt;
+  {state.fieldErrors?.phone?.map(m =&gt; &lt;p key={m}&gt;{m}&lt;/p&gt;)}             <span class="cm">// field-level: 422</span>
+  &lt;button disabled={pending}&gt;{pending ? <span class="st">"Booking…"</span> : <span class="st">"Book slot"</span>}&lt;/button&gt;
+&lt;/form&gt;
+<span class="cm">// Inside a child component, useFormStatus() gives the same "pending" without prop drilling.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        One trap sits between the two halves: <strong>FormData values are always strings</strong>. A ticked checkbox
+        arrives as <code class="inline">"on"</code>, an unticked one is simply missing, and a number field arrives as
+        <code class="inline">"3"</code>. A schema that expects <code class="inline">true</code> passes in React Hook
+        Form and fails in the action. Use <code class="inline">z.coerce.number()</code> and
+        <code class="inline">z.stringbool()</code> where the input is a form post, and test the action with a real
+        form submit, not only with a typed object.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Every Server Action is a public HTTP endpoint, so every one of them repeats the same three steps: check who
+        the user is, parse the input with the schema, and check that this user may touch <em>this</em> record. The
+        third step is where IDOR bugs come from ("book for patient 812" when 812 isn't yours). How to design the
+        ownership check is in <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>. Here, the
+        rule for review is simple: an action that uses an ID from the form without checking ownership is a bug, even
+        if the UI never shows other users' IDs.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Double submit is a server problem with a UI symptom</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Disabling the button while <code class="inline">pending</code> stops the obvious double click. It doesn't stop
+        a user on flaky 4G who taps, sees nothing, reloads and taps again, or a retry at the network layer. The UI
+        guard is for comfort. The real guard is on the server: a unique constraint on
+        <code class="inline">(slot_id)</code> for active bookings, or an <strong>idempotency key</strong> the client
+        generates once per form and sends with every retry, so the server returns the first result instead of
+        creating a second booking (<a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>).
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>"Disable the button" is not a fix for duplicate bookings.</strong> If an agent's answer to "users
+        booked twice" is only a <code class="inline">disabled</code> prop, ask what happens when the request is
+        retried after a timeout. The answer has to involve the database or an idempotency key.
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Mutations against a real API</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every write has three endings, and the demo only shows one</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A mock API always says yes, instantly. A real one is slow sometimes, says no sometimes, and sometimes never
+        answers. Before you accept any mutation an agent wrote, name its three endings: <strong>success</strong>,
+        <strong>rejected</strong> (a 4xx the user can act on) and <strong>failed</strong> (a timeout or 5xx the user
+        can only retry). Then check the UI does something sensible in each.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Map API errors to something the user can do</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Your backend returns RFC 9457 problem details with a stable <code class="inline">type</code>
+        (<a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>). The frontend's job is to turn
+        each one into a next step. Switch on <code class="inline">status</code> and <code class="inline">type</code>,
+        never on the English <code class="inline">title</code>, which the backend team will reword.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Response</th><th class="px-4 py-3">Meaning for the UI</th><th class="px-4 py-3">What the booking screen does</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">400 / 422 with <code class="inline">errors[]</code></td><td class="px-4 py-3">Input is wrong. The user can fix it.</td><td class="px-4 py-3">Map each <code class="inline">pointer</code> (<code class="inline">#/phone</code>) to its field. Unknown pointers go to a form-level message.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">401</td><td class="px-4 py-3">Session expired</td><td class="px-4 py-3">Keep the form values, send to sign-in with a return URL, restore after</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">403 / 404</td><td class="px-4 py-3">Not yours, or gone</td><td class="px-4 py-3">Form-level message and a link back to the list. Don't offer "retry".</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">409 <code class="inline">slot-taken</code></td><td class="px-4 py-3">The world changed under you</td><td class="px-4 py-3">Refetch slots, keep the patient details, move focus to the slot picker: "09:30 was just taken"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">429</td><td class="px-4 py-3">Too many requests</td><td class="px-4 py-3">Wait for <code class="inline">Retry-After</code>, then allow retry</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">5xx / timeout / offline</td><td class="px-4 py-3">We don't know if it worked</td><td class="px-4 py-3">"Couldn't confirm your booking" + retry (safe only with an idempotency key) + the <code class="inline">trace_id</code> for support</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The last row is the one agents always get wrong. After a timeout, the booking <em>may</em> exist. Saying
+        "Booking failed" is a lie half the time, and the user books again. Say what you know ("we couldn't confirm"),
+        and on retry send the same idempotency key so the server can answer "already done".
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/api/problem.ts — problem details to form errors</span>
+        <pre class="code"><span class="kw">export function</span> <span class="fn">fromProblem</span>(p: Problem): Record&lt;<span class="kw">string</span>, <span class="kw">string</span>[]&gt; {
+  <span class="kw">const</span> out: Record&lt;<span class="kw">string</span>, <span class="kw">string</span>[]&gt; = {};
+  <span class="kw">for</span> (<span class="kw">const</span> e <span class="kw">of</span> p.errors ?? []) {
+    <span class="kw">const</span> field = FIELD_BY_POINTER[e.pointer] ?? <span class="st">"_form"</span>;  <span class="cm">// "#/slot_id" → "slotId"</span>
+    (out[field] ??= []).push(e.detail);
+  }
+  <span class="kw">return</span> out;
+}
+<span class="cm">// One mapping table, one place. snake_case API fields ↔ camelCase form fields live here only.</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Optimistic UI: show the result before the server agrees</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An <strong>optimistic update</strong> changes the screen immediately, as if the request had already
+        succeeded, and rolls back if it fails. It makes an app feel instant. It is also a promise to the user that
+        you might have to break. Use it when the server almost always says yes and a rollback is cheap to understand.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant C as Client cache
+    participant S as API
+    U->>C: star "Dr. Lan" as favourite
+    Note over C: onMutate: cancel refetches,<br/>snapshot old list, write new list
+    C-->>U: star is filled at once
+    C->>S: POST /favourites
+    alt 201 Created
+        S-->>C: ok
+        Note over C: onSettled: invalidate,<br/>refetch the truth
+    else 5xx or timeout
+        S-->>C: error
+        Note over C: onError: restore snapshot
+        C-->>U: star empties + toast "Couldn't save"
+    end
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">useToggleFavourite.ts — TanStack Query v5 with rollback</span>
+        <pre class="code"><span class="kw">return</span> useMutation({
+  mutationFn: (doctorId: <span class="kw">string</span>) =&gt; api.post(<span class="st">"/me/favourites"</span>, { doctorId }),
+  onMutate: <span class="kw">async</span> (doctorId) =&gt; {
+    <span class="kw">await</span> qc.cancelQueries({ queryKey: [<span class="st">"favourites"</span>] });   <span class="cm">// stop an in-flight refetch overwriting us</span>
+    <span class="kw">const</span> previous = qc.getQueryData&lt;<span class="kw">string</span>[]&gt;([<span class="st">"favourites"</span>]);
+    qc.setQueryData&lt;<span class="kw">string</span>[]&gt;([<span class="st">"favourites"</span>], (old = []) =&gt; [...old, doctorId]);
+    <span class="kw">return</span> { previous };                                      <span class="cm">// → context for onError</span>
+  },
+  onError: (_err, _id, ctx) =&gt; qc.setQueryData([<span class="st">"favourites"</span>], ctx?.previous),
+  onSettled: () =&gt; qc.invalidateQueries({ queryKey: [<span class="st">"favourites"</span>] }),  <span class="cm">// always resync</span>
+});</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        With Server Actions, React 19's <code class="inline">useOptimistic</code> does the same job with less code: it
+        shows an optimistic value while the action is pending and drops it automatically when the action finishes,
+        at which point the real data from the refreshed server render takes over. There is no manual rollback
+        because there is nothing to roll back: the optimistic value only ever existed for the duration of the
+        transition.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">NotesList.tsx — useOptimistic with a Server Action</span>
+        <pre class="code"><span class="kw">const</span> [optimisticNotes, addOptimistic] = useOptimistic(
+  notes,                                                  <span class="cm">// real data from the server</span>
+  (current, draft: <span class="kw">string</span>) =&gt; [...current, { id: <span class="st">"temp"</span>, text: draft, sending: <span class="kw">true</span> }],
+);
+
+<span class="kw">async function</span> <span class="fn">submit</span>(fd: FormData) {
+  addOptimistic(String(fd.get(<span class="st">"text"</span>)));                <span class="cm">// shows at once, greyed out</span>
+  <span class="kw">await</span> addNote(fd);                                      <span class="cm">// Server Action + updateTag</span>
+}                                                          <span class="cm">// transition ends → real list replaces it</span>
+&lt;form action={submit}&gt;…&lt;/form&gt;</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">When not to be optimistic</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Optimism is a product decision disguised as a technical one. Ask: how often does the server say no, and what
+        does the user lose if we told them "yes" for two seconds and then took it back?
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Action</th><th class="px-4 py-3">Optimistic?</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Star a doctor, tick a checklist item, add a note</td><td class="px-4 py-3">✓ Yes</td><td class="px-4 py-3">Almost never rejected. A rollback is obvious and harmless.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Reorder a list, rename something</td><td class="px-4 py-3">✓ Usually</td><td class="px-4 py-3">Rare conflicts. Show a toast if it rolls back.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Book a slot</td><td class="px-4 py-3">✗ No</td><td class="px-4 py-3">Conflicts (409) are normal at busy clinics. "Booked!" then "not booked" destroys trust. Show a pending state instead.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Pay, cancel, delete an account, send a message to a doctor</td><td class="px-4 py-3">✗ Never</td><td class="px-4 py-3">Money, legal or irreversible effects. The user must see the server's real answer.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Pending is not the same as optimistic.</strong> For a booking, show "Booking 09:30…" with the button
+        disabled and the rest of the form still readable. It is honest, it is fast enough, and it never has to take
+        anything back.
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · List screens: filters, pages and search</div>
+      <h2 class="font-display text-2xl font-bold mt-2">If the user can see it change, it belongs in the URL</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The "Find a doctor" screen has a specialty filter, a district filter, a sort order, a search box and pages.
+        An agent will put all of that in <code class="inline">useState</code>. It works, until the receptionist
+        copies the link to send a colleague "cardiologists in District 3, sorted by next free slot", and the colleague
+        sees the unfiltered list. Or the user opens a doctor, presses Back, and lands on page 1 with every filter
+        cleared.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The URL is state you get for free</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Search params are the one piece of state that survives a reload, can be shared, works with Back and Forward,
+        and is visible to the server, so a Server Component can render the right results on the first request.
+        Treat them as the <strong>single source of truth</strong> for anything that describes <em>which</em> data is
+        on screen. Keep <code class="inline">useState</code> for things that don't: whether a dropdown is open, what
+        the user is halfway through typing.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 210" class="w-full min-w-[620px]" role="img" aria-label="URL search params drive the query key and the rendered list; UI controls only write to the URL">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">ONE SOURCE OF TRUTH · THE URL</text>
+          <g class="anim-pulse"><rect x="10" y="60" width="150" height="54" rx="9" fill="#37474F"/>
+            <text x="85" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Filter controls</text>
+            <text x="85" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">select · sort · page · search</text></g>
+          <g class="anim-pulse d1"><rect x="200" y="60" width="170" height="54" rx="9" fill="#DB2777"/>
+            <text x="285" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">URL search params</text>
+            <text x="285" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">?spec=cardio&amp;district=3&amp;page=2</text></g>
+          <g class="anim-pulse d2"><rect x="410" y="60" width="130" height="54" rx="9" fill="#6d5acd"/>
+            <text x="475" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Query key</text>
+            <text x="475" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">["doctors", params]</text></g>
+          <g class="anim-pulse d3"><rect x="575" y="60" width="115" height="54" rx="9" fill="#0D9488"/>
+            <text x="632" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Doctor list</text>
+            <text x="632" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">rendered result</text></g>
+          <line x1="160" y1="87" x2="200" y2="87" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="370" y1="87" x2="410" y2="87" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="540" y1="87" x2="575" y2="87" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="180" y="52" text-anchor="middle" font-size="9" fill="#A8A49B">writes only</text>
+          <path d="M 285 114 Q 285 165 85 165 Q 85 140 85 118" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 5"/>
+          <text x="190" y="182" text-anchor="middle" font-size="10" fill="#A8A49B">controls read their value back from the URL</text>
+          <text x="520" y="160" text-anchor="middle" font-size="10" fill="#A8A49B">reload · share · Back all reproduce the same screen</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        In Next.js you can read params with <code class="inline">useSearchParams</code> and write them with
+        <code class="inline">router.replace</code>, but parsing numbers, defaults and arrays by hand gets repetitive.
+        <strong>nuqs</strong> gives you a <code class="inline">useState</code>-shaped hook backed by the URL, with typed
+        parsers. It is small and widely used. As always, check whether the project already has a convention.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">DoctorFilters.tsx — URL-backed state with nuqs</span>
+        <pre class="code"><span class="st">"use client"</span>;
+<span class="kw">import</span> { useQueryStates, parseAsString, parseAsInteger, parseAsStringLiteral } <span class="kw">from</span> <span class="st">"nuqs"</span>;
+
+<span class="kw">export const</span> <span class="fn">doctorParams</span> = {
+  spec: parseAsString,                                          <span class="cm">// null when absent</span>
+  district: parseAsInteger,
+  sort: parseAsStringLiteral([<span class="st">"next-free"</span>, <span class="st">"rating"</span>] <span class="kw">as const</span>).withDefault(<span class="st">"next-free"</span>),
+  page: parseAsInteger.withDefault(<span class="st">1</span>),
+};
+
+<span class="kw">const</span> [params, setParams] = useQueryStates(doctorParams, { history: <span class="st">"push"</span> });
+<span class="cm">// changing a filter must reset the page, or page 7 of a 2-page result is empty</span>
+&lt;select value={params.spec ?? <span class="st">""</span>} onChange={e =&gt; setParams({ spec: e.target.value || <span class="kw">null</span>, page: <span class="st">1</span> })}&gt;</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two decisions to check in review. <strong>Push or replace?</strong> Filters and pages are places the user
+        wants to go Back to, so push. A search box that updates on every keystroke should replace, or the Back button
+        replays "c", "ca", "car". <strong>Validate what you read.</strong> The URL is user input:
+        <code class="inline">?page=-4</code> or <code class="inline">?sort=drop</code> must fall back to a default, not
+        crash the page or reach your API.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Pagination from the client's side</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The backend decides whether pages are <strong>offset</strong> (<code class="inline">?page=3</code>) or
+        <strong>cursor</strong> (<code class="inline">?cursor=eyJ…</code>) based, and why
+        (<a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>). The frontend has to pick the
+        matching UI, and the two don't mix well.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">UI pattern</th><th class="px-4 py-3">API style</th><th class="px-4 py-3">Good for</th><th class="px-4 py-3">Watch out for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Numbered pages</td><td class="px-4 py-3">Offset</td><td class="px-4 py-3">Admin tables, search results people discuss ("it's on page 3")</td><td class="px-4 py-3">Page number in the URL. Keep the previous page visible while the next loads (<code class="inline">placeholderData: keepPreviousData</code>).</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Load more" button</td><td class="px-4 py-3">Cursor</td><td class="px-4 py-3">Booking history, patient notes</td><td class="px-4 py-3">Default choice for feeds. Accessible, and the footer stays reachable.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Infinite scroll</td><td class="px-4 py-3">Cursor</td><td class="px-4 py-3">Browse-style content, social feeds</td><td class="px-4 py-3">Footer unreachable, Back loses position, hard for keyboard users. Needs a real reason.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">useBookingHistory.ts — cursor pages with useInfiniteQuery</span>
+        <pre class="code"><span class="kw">return</span> useInfiniteQuery({
+  queryKey: [<span class="st">"bookings"</span>, <span class="st">"history"</span>, patientId],
+  queryFn: ({ pageParam, signal }) =&gt;
+    api.get&lt;Page&lt;Booking&gt;&gt;(<span class="st">`/patients/${patientId}/bookings`</span>, { params: { cursor: pageParam, limit: <span class="st">20</span> }, signal }),
+  initialPageParam: <span class="kw">null</span> <span class="kw">as</span> <span class="kw">string</span> | <span class="kw">null</span>,
+  getNextPageParam: (last) =&gt; last.next_cursor,               <span class="cm">// null → hasNextPage = false</span>
+});
+<span class="cm">// UI: data.pages.flatMap(p =&gt; p.items) · button disabled={!hasNextPage || isFetchingNextPage}</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Search as you type: debounce, cancel, and ignore the stale answer</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Searching doctors by name on every keystroke sends a request per letter, and responses can arrive out of
+        order: the reply for "ng" lands after the reply for "nguyen" and overwrites it. The fix has three parts, and
+        agents usually write only the first.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Debounce</strong> the value that drives the request (about 300 ms), not the input itself. The input must stay instant.</li>
+        <li><strong>Cancel</strong> the previous request. TanStack Query passes an <code class="inline">AbortSignal</code> to <code class="inline">queryFn</code>; pass it to <code class="inline">fetch</code> and superseded requests are aborted.</li>
+        <li><strong>Key by the term</strong>, so a late answer for "ng" is stored under <code class="inline">["doctors", "ng"]</code> and can never be shown for "nguyen".</li>
+      </ul>
+      <div class="mt-4">
+        <span class="code-label">DoctorSearch.tsx — the three parts together</span>
+        <pre class="code"><span class="kw">const</span> [q, setQ] = useQueryState(<span class="st">"q"</span>, parseAsString.withDefault(<span class="st">""</span>).withOptions({ history: <span class="st">"replace"</span> }));
+<span class="kw">const</span> term = useDebouncedValue(q.trim(), <span class="st">300</span>);          <span class="cm">// 1. debounce what we fetch with</span>
+
+<span class="kw">const</span> results = useQuery({
+  queryKey: [<span class="st">"doctors"</span>, <span class="st">"search"</span>, term],                   <span class="cm">// 3. answer stored per term</span>
+  queryFn: ({ signal }) =&gt; api.get(<span class="st">"/doctors"</span>, { params: { q: term }, signal }), <span class="cm">// 2. cancellable</span>
+  enabled: term.length &gt;= <span class="st">2</span>,                              <span class="cm">// don't search for "n"</span>
+  placeholderData: keepPreviousData,                       <span class="cm">// no flash of empty list between terms</span>
+});</pre>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Uploads, live data and screen states</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Files skip your server, events trigger refetches, and every screen has four states</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The last three topics look unrelated, but they share one idea: don't make your own code carry more than it
+        has to. Let storage receive the bytes, let the cache fetch the truth, and let a type force you to draw every
+        state of the screen.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">File upload: straight to storage with a presigned URL</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A patient uploads a photo of their insurance card. The agent's first version posts the file to a Server
+        Action or an API route, which forwards it to storage. That puts every byte through your server twice, hits
+        request-size limits (Server Actions default to 1 MB, serverless functions have their own caps), and ties up a
+        function for the whole upload. The standard pattern is a <strong>presigned URL</strong>: your server checks
+        who the user is and what they want to upload, then hands back a short-lived URL that allows exactly one PUT
+        to exactly one storage key.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant A as Your API / Server Action
+    participant S as Storage (S3 · Supabase)
+    B->>B: check type and size first<br/>(image/jpeg, ≤ 5 MB)
+    B->>A: request upload URL<br/>{ bookingId, contentType, size }
+    Note over A: auth + owns booking?<br/>re-check type and size
+    A-->>B: presigned PUT URL (5 min)<br/>+ object key
+    B->>S: PUT file bytes (progress events)
+    S-->>B: 200
+    B->>A: confirm { bookingId, key }
+    Note over A: verify object exists,<br/>save key on the booking
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The browser checks type and size to give fast feedback. The server checks again before signing, and the
+        signature itself should pin the content type and a maximum size, because a user can ignore your JavaScript.
+        The object key is generated by the server (<code class="inline">insurance/{bookingId}/{uuid}.jpg</code>), never
+        taken from the file name. Store the key, not a public URL, and serve private files through short-lived signed
+        GET URLs. On AWS this is S3 (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>); on
+        Supabase it is Storage with signed upload URLs (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">uploadInsuranceCard.ts — client side, with progress</span>
+        <pre class="code"><span class="kw">const</span> MAX = <span class="st">5</span> * <span class="st">1024</span> * <span class="st">1024</span>;
+<span class="kw">if</span> (![<span class="st">"image/jpeg"</span>, <span class="st">"image/png"</span>].includes(file.type) || file.size &gt; MAX)
+  <span class="kw">throw new</span> UserError(<span class="st">"JPEG or PNG, up to 5 MB"</span>);               <span class="cm">// UX only; server re-checks</span>
+
+<span class="kw">const</span> { url, key } = <span class="kw">await</span> getUploadUrl({ bookingId, contentType: file.type, size: file.size });
+
+<span class="kw">await new</span> Promise&lt;<span class="kw">void</span>&gt;((resolve, reject) =&gt; {
+  <span class="kw">const</span> xhr = <span class="kw">new</span> XMLHttpRequest();                           <span class="cm">// fetch() has no upload progress yet</span>
+  xhr.upload.onprogress = (e) =&gt; setProgress(e.loaded / e.total);
+  xhr.onload = () =&gt; (xhr.status &lt; <span class="st">300</span> ? resolve() : reject(<span class="kw">new</span> Error(<span class="st">`PUT ${xhr.status}`</span>)));
+  xhr.onerror = () =&gt; reject(<span class="kw">new</span> Error(<span class="st">"network"</span>));
+  xhr.open(<span class="st">"PUT"</span>, url); xhr.setRequestHeader(<span class="st">"Content-Type"</span>, file.type); xhr.send(file);
+});
+<span class="kw">await</span> confirmUpload({ bookingId, key });                         <span class="cm">// only now does the booking point at it</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Live data: an event means "refetch", not "patch it by hand"</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The slot grid should update when another patient books. You can push changes with WebSockets, Server-Sent
+        Events, or Supabase Realtime (Postgres changes over a WebSocket). The tempting implementation takes each
+        event's payload and splices it into local state. That duplicates the server's logic in the browser, breaks
+        when an event is missed during a reconnect, and fights with the cache. The robust pattern is smaller: treat
+        the event as a <strong>signal</strong> and let the cache refetch the truth.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">useLiveSlots.ts — Supabase Realtime → invalidate</span>
+        <pre class="code">useEffect(() =&gt; {                                            <span class="cm">// a real external system: effect is right</span>
+  <span class="kw">const</span> channel = supabase
+    .channel(<span class="st">`slots-${doctorId}`</span>)
+    .on(<span class="st">"postgres_changes"</span>,
+        { event: <span class="st">"*"</span>, schema: <span class="st">"public"</span>, table: <span class="st">"bookings"</span>, filter: <span class="st">`doctor_id=eq.${doctorId}`</span> },
+        () =&gt; qc.invalidateQueries({ queryKey: [<span class="st">"slots"</span>, doctorId] }))   <span class="cm">// signal, not data</span>
+    .subscribe();
+  <span class="kw">return</span> () =&gt; { supabase.removeChannel(channel); };            <span class="cm">// cleanup on unmount / doctor change</span>
+}, [doctorId, qc]);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Invalidation also makes reconnects boring: after the socket comes back, invalidate once and you are correct
+        again, whatever you missed. Hand-merging payloads is worth it only for very high-frequency data (a chat, a
+        live cursor), and then the merge needs its own tests. Realtime also respects row-level security in Supabase:
+        check that a patient only receives events for rows they are allowed to read
+        (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Loading, empty, error, ready: implement all four</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <a href="./ag4.html" class="text-viol underline decoration-viol/40">AG4</a> taught you to design every state
+        of a screen. Implementing them is where they get lost: the agent builds the ready state from the design and
+        leaves <code class="inline">{data?.map(…)}</code>, which renders nothing while loading, nothing on error, and
+        nothing when the list is empty. Three different situations, one blank screen.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">DoctorList.tsx — every state handled, in order</span>
+        <pre class="code"><span class="kw">const</span> { data, isPending, isError, error, refetch, isFetching } = useDoctors(params);
+
+<span class="kw">if</span> (isPending) <span class="kw">return</span> &lt;DoctorListSkeleton rows={<span class="st">6</span>} /&gt;;           <span class="cm">// same shape as the list: no layout jump</span>
+<span class="kw">if</span> (isError)   <span class="kw">return</span> &lt;ErrorPanel error={error} onRetry={refetch} /&gt;; <span class="cm">// says what failed + a way out</span>
+<span class="kw">if</span> (data.items.length === <span class="st">0</span>)
+  <span class="kw">return</span> hasFilters(params)
+    ? &lt;Empty title=<span class="st">"No doctors match"</span> action={&lt;ClearFilters /&gt;} /&gt;   <span class="cm">// empty because of filters</span>
+    : &lt;Empty title=<span class="st">"No doctors at this clinic yet"</span> /&gt;;            <span class="cm">// genuinely empty</span>
+
+<span class="kw">return</span> &lt;ul aria-busy={isFetching}&gt;{data.items.map(d =&gt; &lt;DoctorRow key={d.id} doctor={d} /&gt;)}&lt;/ul&gt;;
+<span class="cm">// After the first two early returns, TypeScript knows data is defined. No data?.x anywhere.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two details separate a finished screen from a demo. <strong>Background refetches don't bring the skeleton
+        back</strong>: <code class="inline">isPending</code> is only true when there is no data yet, while
+        <code class="inline">isFetching</code> covers refreshes, so use a subtle indicator for the second. And
+        <strong>there are two kinds of empty</strong>: "nothing matches your filters" needs a "clear filters" button,
+        "nothing exists yet" needs a call to action or an explanation. With Server Components, the same four states
+        come from <code class="inline">loading.tsx</code> / <code class="inline">&lt;Suspense&gt;</code>,
+        <code class="inline">error.tsx</code>, and your own empty branch (<a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a>).
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Test the states on purpose.</strong> In the browser DevTools, throttle the network to "Slow 4G" to see
+        loading, block the request URL to see the error state, and filter for something absurd to see empty. MSW
+        handlers that return 409, 422 and 500 make the same checks repeatable in tests
+        (<a href="./fe5.html" class="text-viol underline decoration-viol/40">FE5</a>).
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents write the happy path first and stop there, because the prompt usually only describes the happy path.
+        Name the unhappy endings in the prompt, point at the schema and the API contract, and make the agent prove each
+        ending in the browser against the real API or an MSW handler.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — a form with every ending specified</span>
+        <pre class="code">Build the booking form for /book/[slotId].
+- Schema: lib/schemas/booking.ts (shared). Do not define rules anywhere else.
+- Submit via a Server Action with useActionState. Inside the action: requireUser(),
+  safeParse with the same schema, ownership check on patientId, then POST /bookings.
+- Map responses: 422 errors[] → fields via lib/api/problem.ts, 409 slot-taken →
+  form message + refetch slots, 5xx/timeout → "couldn't confirm" + retry that
+  reuses the same Idempotency-Key.
+- Not optimistic. Button shows "Booking…" while pending.
+Finish with a table: each response code, what the user sees, how you tested it.</pre>
+      </div>
+      <pre class="code mt-3">Move the doctor list filters (spec, district, sort, page, q) from useState into
+the URL with nuqs. Filters push history, the search box replaces. Changing any
+filter resets page to 1. Invalid values fall back to defaults. Then show me:
+reload keeps the filters, Back restores the previous filter, a shared link works.</pre>
+      <pre class="code mt-3">Review src/features/ for mutation gaps. For every useMutation and Server Action list:
+file:line, does it validate on the server, does it check ownership, what the UI does
+on 409, 422 and 5xx, what it invalidates, and whether it is optimistic.
+Flag any optimistic update on bookings or payments. Don't edit yet.
+<span class="cm"># a table of gaps is faster to review than a diff that "fixes everything"</span></pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Write the Zod schema from the OpenAPI spec, and the form markup from the schema</li>
+            <li>Build the problem-details → field-error mapper and its pointer table</li>
+            <li>Convert useState filters to URL state, with parsers and defaults</li>
+            <li>Scaffold useInfiniteQuery, skeletons, empty and error panels</li>
+            <li>Write MSW handlers for 409, 422 and 500 so every ending can be clicked through</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The server parses with the shared schema. No rules exist only in the form.</li>
+            <li>Every action authenticates and checks ownership of every ID it receives</li>
+            <li>What the user sees after a timeout, and that a retry can't create a duplicate</li>
+            <li>Which mutations are optimistic, and that none of them are bookings or payments</li>
+            <li>Reload, Back and a shared link on every list screen, done by you</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent output:</strong> validation only in the client component · a Server Action that
+        uses <code class="inline">formData.get("patientId")</code> without an ownership check · one
+        <code class="inline">catch</code> that shows "Something went wrong" for every status · filters or page number
+        in <code class="inline">useState</code> · <code class="inline">onChange</code> firing a request per keystroke
+        with no debounce or cancellation · file uploads posted through a Server Action · realtime payloads spliced into
+        state by hand · <code class="inline">{data?.map(…)}</code> with no loading, error or empty branch.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has only built forms and lists against a mock that always succeeds.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows client validation isn't enough and that the URL can hold state, but ships the agent's happy path as it is.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Builds forms on a shared schema with server-side errors mapped to fields, handles 409/422/5xx deliberately, keeps list filters in the URL, and implements all four screen states. Asks the mentor about optimistic updates and idempotency.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Decides optimistic vs pending per action and can defend it. Designs uploads and live updates without help. Reviews a teammate's mutation code for authz and retry gaps.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the team's form, error-mapping and URL-state conventions, ships shared helpers for them, and encodes them in CLAUDE.md and review checklists.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> pick your last form. Can you show, in the browser, what the
+        user sees for a 422, a 409 and a timeout? Can you point to the one file where its rules live? On your last
+        list screen, does reload keep the filters?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ "Something went wrong"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One generic message for every error hides the 422 the user could have fixed and the 409 that needed a new slot. Map by status and problem type.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Optimistic bookings</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Showing "Booked!" before the server agrees is a promise you break at every busy clinic. Use a pending state for anything that can conflict or costs money.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Filters that forget</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Filters in <code class="inline">useState</code> vanish on reload and Back, and can't be shared. If it decides which data is shown, it goes in the URL.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep the user's input on failure</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">After a 409 or an expired session, the patient's name, phone and notes must still be there. Retyping a form is the fastest way to lose a booking.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Generate the schema from the contract</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">When the backend publishes OpenAPI (<a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>), generate types or Zod schemas from it. A renamed field then breaks the build, not production.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Events invalidate, queries fetch</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Realtime and webhooks say "something changed". The query layer decides what is true. It survives missed events and reconnects for free.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="shared-schema"> <span>Built a form whose rules live in one Zod schema, imported by both the form and the Server Action or API handler.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="error-map"> <span>Mapped 422 field errors, 409 conflicts and 5xx/timeouts to different, actionable UI, and kept the user's input in every case.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="url-state"> <span>Moved a list screen's filters, sort, page and search into the URL; reload, Back and a shared link all reproduce the screen.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="four-states"> <span>Implemented loading, error (with retry), both kinds of empty, and ready on one screen, and demonstrated each with throttling or blocked requests.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="booking-flow-pr"> <span class="font-semibold">Switched your week-3 booking client to the real API with Claude Code: shared-schema booking form via a Server Action, URL-backed doctor search with cursor "load more", and an insurance-card upload through a presigned URL. Opened a PR with a table of every response code and what the user sees, plus a short recording of a 409 and a timeout (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://react-hook-form.com/get-started" target="_blank" rel="noopener">React Hook Form — Get started</a> — registration, resolvers and error handling from Part I.</li>
+        <li><a class="text-coral underline" href="https://zod.dev/" target="_blank" rel="noopener">Zod — Documentation</a> — schemas, coercion, <code class="inline">stringbool</code> and error formatting in v4.</li>
+        <li><a class="text-coral underline" href="https://react.dev/reference/react/useActionState" target="_blank" rel="noopener">React — useActionState</a> · <a class="text-coral underline" href="https://react.dev/reference/react/useOptimistic" target="_blank" rel="noopener">useOptimistic</a> — form state and optimistic values with actions.</li>
+        <li><a class="text-coral underline" href="https://nextjs.org/docs/app/guides/forms" target="_blank" rel="noopener">Next.js — Forms with Server Actions</a> — validation, pending state and returning errors.</li>
+        <li><a class="text-coral underline" href="https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates" target="_blank" rel="noopener">TanStack Query — Optimistic updates</a> · <a class="text-coral underline" href="https://tanstack.com/query/latest/docs/framework/react/guides/infinite-queries" target="_blank" rel="noopener">Infinite queries</a> — rollback and cursor pages.</li>
+        <li><a class="text-coral underline" href="https://nuqs.dev/docs" target="_blank" rel="noopener">nuqs — Documentation</a> — type-safe URL search params as state.</li>
+        <li><a class="text-coral underline" href="https://supabase.com/docs/guides/storage/uploads/standard-uploads" target="_blank" rel="noopener">Supabase — Storage uploads</a> · <a class="text-coral underline" href="https://supabase.com/docs/guides/realtime/postgres-changes" target="_blank" rel="noopener">Realtime Postgres changes</a> — uploads and live updates from Part IV.</li>
+      </ul>
