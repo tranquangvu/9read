@@ -50,14 +50,14 @@ def build(code: str, reg: dict) -> Path:
         '<span class="badge badge-neutral">Elective</span>\n'
         '          <span class="badge badge-neutral">Target score: 2 / 4</span>'
     )
-    page = HEAD.replace("@@TITLE@@", f"{code.upper()} · {esc(name)} — AI-Native Developer Internship")
+    page = HEAD.replace("@@TITLE@@", f"{code.upper()} · {esc(name)} — AI-Native Engineer Internship")
     page += f"""
 <div class="min-h-screen lg:flex">
   <div id="overlay" class="hidden fixed inset-0 bg-black/40 z-30 lg:hidden"></div>
   <aside id="sidebar" class="fixed z-40 inset-y-0 left-0 w-72 -translate-x-full lg:translate-x-0 transition-transform bg-card dark:bg-carddark border-r border-line dark:border-linedark flex flex-col">
     <div class="px-5 py-5 border-b border-line dark:border-linedark">
       <a href="../index.html" class="block">
-        <div class="font-display text-lg font-bold leading-tight">AI-Native Developer</div>
+        <div class="font-display text-lg font-bold leading-tight">AI-Native Engineer</div>
         <div class="text-xs text-mute dark:text-mutedark mt-0.5">9-week Internship Program</div>
       </a>
     </div>
@@ -89,7 +89,7 @@ def build(code: str, reg: dict) -> Path:
     </article>
 
     <footer class="px-6 py-8 text-center text-xs text-mute dark:text-mutedark">
-      AI-Native Developer Internship · {code.upper()} {esc(name)}
+      AI-Native Engineer Internship · {code.upper()} {esc(name)}
     </footer>
   </main>
 </div>

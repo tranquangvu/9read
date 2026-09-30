@@ -1,4 +1,4 @@
-# INTERN-SPEC.md — AI-Native Developer Internship module contract
+# INTERN-SPEC.md — AI-Native Engineer Internship module contract
 
 The second program on the site (`intern/`). The pages use the same markup vocabulary as AIFDE, so
 everything in `PATTERNS.md` applies. The differences are below. Where the two documents disagree,
@@ -106,6 +106,9 @@ this one wins for `intern/`.
 | Playwright and Playwright MCP | QA2 |
 | Definition of Done, PR evidence, CI gates | QA3 |
 | Docker and GitHub Actions | OP2 |
+| Ownership, questioning business logic, verifying your own work, bug-bash and regression, after-release follow-up and incidents | PP1 |
+| Product thinking, trade-offs, prioritisation and focus, responsible AI use, ethics, deliberate learning and self-assessment | PP2 |
+| Written and async communication, status and estimates, clients, demos and English, cross-functional work and feedback, mentoring | PP3 |
 | EC2, Lambda, ECS auto scaling, SQS/SNS/EventBridge, ElastiCache, SES, CloudWatch alarms, CloudTrail/GuardDuty, KMS, backup/DR, AWS cost management | OP5 |
 | CSS layout, Tailwind, class composition (cn/cva), shadcn/ui in code, dark mode, motion | FE3 |
 | React Hook Form + Zod, Server Action forms, optimistic UI, URL state, pagination, uploads, realtime on the client | FE4 |

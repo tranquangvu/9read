@@ -61,7 +61,7 @@ const AIFDE_MODULES = [
 ];
 
 
-/* ---------- AI-Native Developer Internship ---------- */
+/* ---------- AI-Native Engineer Internship ---------- */
 const INTERN_GROUPS = [
   { key: "CO", name: "Engineering Foundations", color: "#2563EB" },
   { key: "AG", name: "AI-native Development", color: "#C2410C" },
@@ -71,12 +71,13 @@ const INTERN_GROUPS = [
   { key: "SD", name: "System Design", color: "#7C3AED" },
   { key: "QA", name: "Quality Ownership", color: "#16A34A" },
   { key: "OP", name: "DevOps & Deployment", color: "#A16207" },
+  { key: "PP", name: "Professional Practice", color: "#475569" },
 ];
 
 /* Order = recommended 9-week order. critical = Core (everyone), else Elective (path-dependent).
    soon = page not written yet: listed but not linked. Remove the flag when the page ships. */
 const INTERN_MODULES = [
-  { code: "CO1", name: "The Developer Role in the AI Era", critical: true },
+  { code: "CO1", name: "Engineer in the AI Era", critical: true },
   { code: "CO5", name: "Dev Environment, Dependencies & Tooling", critical: true },
   { code: "CO2", name: "Git, Team Workflow & Code Review", critical: true },
   { code: "CO3", name: "Reading & Debugging Code You Didn't Write", critical: true },
@@ -131,6 +132,9 @@ const INTERN_MODULES = [
   { code: "OP5", name: "Cloud Infrastructure on AWS II: Production Operations", critical: false },
   { code: "OP6", name: "Cloudflare Essentials", critical: true },
   { code: "AG6", name: "AI Agent Systems: RAG, Tools, MCP, Memory", critical: true },
+  { code: "PP1", name: "Ownership, Verification & Follow-through", critical: true },
+  { code: "PP2", name: "Product Thinking, Trade-offs & Growth", critical: true },
+  { code: "PP3", name: "Communication & Collaboration", critical: true },
 ];
 
 /* ---------- program registry ---------- */
@@ -164,7 +168,7 @@ const TOPICS = [
   },
   {
     slug: "intern",
-    name: "AI-Native Developer Internship",
+    name: "AI-Native Engineer Internship",
     tagline: "9 weeks · intern to professional",
     blurb:
       "A 9-week program for interns who already know basic programming: let coding agents write the syntax, " +
