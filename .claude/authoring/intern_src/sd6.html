@@ -1,0 +1,856 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Design Patterns II: Behavioral</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Behavioral patterns are about <em>who does what</em> and <em>how objects talk to each other</em>: which rule
+          to apply, who hears about a change, how a request becomes a job, what a booking is allowed to do next, and
+          which checks a request passes through before it reaches your handler. You will meet all of them in
+          frameworks you already use. This module teaches you to name them, to use them on purpose, and to spot
+          when an agent has used one where a plain <code class="inline">if</code> would do.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> agents produce two opposite failures. The first is
+          the 200-line <code class="inline">if/elsif</code> chain that grows a new branch with every feature request. The
+          second is a textbook pattern with an interface, three classes and a registry, wrapped around a rule that
+          has one variant. Both compile and both pass tests. Only your judgement can tell which one this code
+          needs, and behavioral patterns are where the gap between "works today" and "still works after ten
+          change requests" is widest.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Algorithms that vary</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Swap the rule, keep the caller</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The first two patterns answer the same question: <strong>part of this logic changes from case to case, so
+        where does the changing part live?</strong> Strategy puts each variant in its own object and lets the caller
+        pick one. Template method keeps a fixed skeleton in a base class and lets subclasses fill in the steps.
+        Both rely on the ideas from <a href="./sd5.html" class="text-viol underline decoration-viol/40">SD5</a>:
+        depend on an interface, and be open for extension but closed for modification.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Strategy: one interface, many interchangeable rules</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>The problem.</strong> An e-commerce checkout has discount rules: a percentage off, a fixed amount off,
+        "buy 2 get 1 free", a member price. Every sales campaign adds one. If the rules live inside
+        <code class="inline">checkout()</code> as branches, every campaign edits the most important function in the
+        shop and risks breaking the others. <strong>Strategy</strong> gives every rule the same small interface. The
+        checkout depends on that interface only, and a new rule is a new class that nobody else has to touch.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+classDiagram
+    class Checkout {
+        -DiscountRule rule
+        +total(cart) Money
+    }
+    class DiscountRule {
+        &lt;&lt;interface&gt;&gt;
+        +apply(cart) Money
+    }
+    class PercentOff {
+        +percent
+        +apply(cart) Money
+    }
+    class FixedOff {
+        +amount
+        +apply(cart) Money
+    }
+    class BuyXGetY {
+        +x
+        +y
+        +apply(cart) Money
+    }
+    Checkout --> DiscountRule : uses
+    PercentOff ..|> DiscountRule
+    FixedOff ..|> DiscountRule
+    BuyXGetY ..|> DiscountRule
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">discounts.ts — rules as strategies</span>
+        <pre class="code"><span class="kw">interface</span> <span class="fn">DiscountRule</span> {
+  <span class="fn">apply</span>(cart: Cart): number;              <span class="cm">// returns the discount in minor units (đồng)</span>
+}
+
+<span class="kw">const</span> percentOff = (pct: number): DiscountRule =&gt; ({
+  apply: (cart) =&gt; Math.floor(cart.subtotal * pct / <span class="st">100</span>),
+});
+<span class="kw">const</span> fixedOff = (amount: number): DiscountRule =&gt; ({
+  apply: (cart) =&gt; Math.min(amount, cart.subtotal),   <span class="cm">// never discount below zero</span>
+});
+
+<span class="cm">// The registry maps a campaign type (stored in the DB) to a rule.</span>
+<span class="kw">const</span> rules: Record&lt;Campaign[<span class="st">"type"</span>], (c: Campaign) =&gt; DiscountRule&gt; = {
+  percent: (c) =&gt; percentOff(c.value),
+  fixed:   (c) =&gt; fixedOff(c.value),
+};
+
+<span class="kw">export function</span> <span class="fn">total</span>(cart: Cart, campaign?: Campaign): number {
+  <span class="kw">const</span> rule = campaign ? rules[campaign.type](campaign) : { apply: () =&gt; <span class="st">0</span> };
+  <span class="kw">return</span> cart.subtotal - rule.apply(cart);          <span class="cm">// checkout never changes again</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice that the strategies here are plain functions returned from small factories, not classes. In
+        TypeScript, Python, Ruby and Go, <strong>a function is already a one-method strategy</strong>. Reach for a
+        class only when the rule needs several methods or its own state.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The same shape fits <strong>notification channels</strong> in the clinic app. A booking confirmation goes by
+        email, SMS or a Zalo message depending on the patient's preference. Each channel implements
+        <code class="inline">send(patient, message)</code>, and the booking service picks the channel from the
+        patient's settings. When the clinic asks for push notifications, you add one class and one registry entry.
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-sky-600 dark:text-sky-400">How to spot it</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>A map or registry from a type string to an object or function</li>
+            <li>A constructor that takes "the thing that decides" as a parameter</li>
+            <li>Passport.js literally calls its login providers <em>strategies</em></li>
+            <li>Sorting with a comparator: <code class="inline">sorted(key=...)</code> in Python, <code class="inline">sort.Slice</code>'s less function in Go</li>
+            <li>Payment providers behind one <code class="inline">PaymentGateway</code> interface (the adapter from <a href="./sd5.html" class="text-viol underline decoration-viol/40">SD5</a> is often chosen like a strategy)</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">When it's over-engineering</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>There are two variants and no sign of a third: an <code class="inline">if</code> is clearer</li>
+            <li>Every "strategy" is a one-line class with an interface file of its own</li>
+            <li>The variants aren't really interchangeable: each needs different inputs, so the caller still branches</li>
+            <li>The rule is data (a percentage, a threshold): store it in a table, not in a class</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Template method: a fixed skeleton with pluggable steps</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>The problem.</strong> The shop receives payment webhooks from Stripe, VNPay and MoMo. Every handler
+        must do the same four things in the same order: verify the signature, parse the payload, record the event
+        once (idempotency), and update the order. Only the first two steps differ per provider. If each handler is
+        written from scratch, one of them will forget the idempotency check. <strong>Template method</strong> puts
+        the order of steps in a base class that nobody overrides, and leaves the provider-specific steps as
+        abstract methods.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">webhooks/base.py — the order of steps is not negotiable</span>
+        <pre class="code"><span class="kw">from</span> abc <span class="kw">import</span> ABC, abstractmethod
+
+<span class="kw">class</span> <span class="fn">PaymentWebhook</span>(ABC):
+    <span class="kw">def</span> <span class="fn">handle</span>(self, request) -&gt; <span class="fn">int</span>:          <span class="cm"># the template method</span>
+        <span class="kw">if not</span> self.verify_signature(request):
+            <span class="kw">return</span> <span class="st">401</span>
+        event = self.parse(request.body)          <span class="cm"># -&gt; PaymentEvent(order_id, status, provider_id)</span>
+        <span class="kw">if</span> self.already_processed(event.provider_id):
+            <span class="kw">return</span> <span class="st">200</span>                            <span class="cm"># providers retry, so dedupe first</span>
+        mark_order(event.order_id, event.status)
+        <span class="kw">return</span> <span class="st">200</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">verify_signature</span>(self, request) -&gt; bool: ...   <span class="cm"># step each provider fills in</span>
+    <span class="kw">@abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">parse</span>(self, body: bytes) -&gt; <span class="st">"PaymentEvent"</span>: ...
+
+    <span class="kw">def</span> <span class="fn">already_processed</span>(self, provider_id: str) -&gt; bool:  <span class="cm"># a "hook" with a default</span>
+        <span class="kw">return</span> ProcessedEvent.exists(provider_id)
+
+<span class="kw">class</span> <span class="fn">VnpayWebhook</span>(PaymentWebhook):
+    <span class="kw">def</span> <span class="fn">verify_signature</span>(self, request): <span class="kw">return</span> check_vnp_secure_hash(request.args)
+    <span class="kw">def</span> <span class="fn">parse</span>(self, body): ...</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>How to spot it:</strong> you already fill in template methods every day. A framework calls your
+        methods at fixed points of its own algorithm: Django's class-based views call your
+        <code class="inline">get_queryset()</code>, a test framework calls your <code class="inline">setUp()</code> and
+        <code class="inline">tearDown()</code> around each test, and a job framework calls your
+        <code class="inline">perform</code> inside its own retry and logging logic. Any base class with a public
+        method that calls several abstract or overridable methods is a template method.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>When it's over-engineering:</strong> there is only one subclass, or the "skeleton" is two lines.
+        It also turns bad when subclasses start overriding the template method itself, or when the base class
+        grows flags such as <code class="inline">skip_idempotency=True</code> for one special provider. Deep
+        inheritance is hard to follow. When the variants multiply, pass the varying steps in as strategies
+        instead: that is composition over inheritance.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Question</th><th class="px-4 py-3">Strategy</th><th class="px-4 py-3">Template method</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">What varies?</td><td class="px-4 py-3">The whole algorithm</td><td class="px-4 py-3">Some steps inside a fixed algorithm</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Mechanism</td><td class="px-4 py-3">Composition: the caller holds a rule object or function</td><td class="px-4 py-3">Inheritance: subclasses override steps</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Chosen when?</td><td class="px-4 py-3">At runtime, often from data (campaign type, user setting)</td><td class="px-4 py-3">At design time, by picking the subclass</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Best at</td><td class="px-4 py-3">Many independent variants that grow over time</td><td class="px-4 py-3">Enforcing an order of steps that nobody may skip</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Typical smell it fixes</td><td class="px-4 py-3"><code class="inline">switch (type)</code> repeated around the codebase</td><td class="px-4 py-3">Copy-pasted handlers where one copy forgot a step</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Reacting and requesting</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Events announce what happened, commands ask for what should happen</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        These two patterns both turn a call into something more flexible, but in opposite directions. An
+        <strong>event</strong> is a fact in the past tense, <code class="inline">BookingConfirmed</code>, and the
+        sender doesn't know or care who listens. A <strong>command</strong> is a request in the imperative,
+        <code class="inline">SendReminder</code>, with exactly one handler that is expected to do it. Mixing the two
+        up is one of the most common design errors in event-driven code.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Observer and pub/sub: decouple the side effects</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>The problem.</strong> When a booking is confirmed, the clinic app must email the patient, add the
+        appointment to the doctor's calendar, award loyalty points and update the analytics dashboard. If
+        <code class="inline">BookingService.confirm()</code> calls all four, it depends on four modules, it fails
+        when the analytics call times out, and every new side effect edits the booking code. With
+        <strong>observer</strong>, the booking publishes one event and each interested module subscribes to it.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    participant S as BookingService
+    participant B as Event bus
+    participant E as EmailListener
+    participant C as CalendarListener
+    participant L as LoyaltyListener
+    S->>S: confirm booking (DB commit)
+    S->>B: publish BookingConfirmed(id: 812)
+    B-->>E: notify
+    B-->>C: notify
+    B-->>L: notify
+    Note over S,B: the service doesn't know who listens
+    Note over E,L: in-process = same call stack<br/>via a broker = async, other processes
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        There are two flavours. <strong>In-process observer</strong>: listeners are functions called in the same
+        process, often in the same request. <strong>Pub/sub</strong>: the event goes through a broker (Redis, a
+        queue, Kafka) to other processes or services. The pattern is the same, but pub/sub adds delivery
+        guarantees, retries and duplicates, which <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>
+        covers. Designing a whole system around events is <a href="./sd4.html" class="text-viol underline decoration-viol/40">SD4</a>'s topic.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/models/booking.rb — observer via Rails callbacks and notifications</span>
+        <pre class="code"><span class="kw">class</span> <span class="fn">Booking</span> &lt; ApplicationRecord
+  <span class="cm"># Implicit observer: runs on EVERY save of this model, from anywhere.</span>
+  after_create_commit <span class="st">:send_confirmation_email</span>   <span class="cm"># after COMMIT, not after_save</span>
+
+  <span class="kw">def</span> <span class="fn">send_confirmation_email</span>
+    BookingMailer.confirmed(<span class="kw">self</span>).deliver_later     <span class="cm"># enqueue, never send inline</span>
+  <span class="kw">end</span>
+<span class="kw">end</span>
+
+<span class="cm"># Explicit observer: the service announces, subscribers opt in.</span>
+<span class="kw">class</span> <span class="fn">ConfirmBooking</span>
+  <span class="kw">def</span> <span class="fn">call</span>(booking)
+    booking.update!(status: <span class="st">"confirmed"</span>)
+    ActiveSupport::Notifications.instrument(<span class="st">"booking.confirmed"</span>, booking_id: booking.id)
+  <span class="kw">end</span>
+<span class="kw">end</span>
+
+ActiveSupport::Notifications.subscribe(<span class="st">"booking.confirmed"</span>) <span class="kw">do</span> |event|
+  LoyaltyPoints.award_for(event.payload[<span class="st">:booking_id</span>])
+<span class="kw">end</span></pre>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>The dangers of model callbacks.</strong> Rails callbacks (and Django signals, TypeORM subscribers,
+        Mongoose hooks) are observers that fire on <em>every</em> save, which is exactly why they bite:
+        <ul class="mt-2 space-y-1 list-disc pl-5">
+          <li><strong>Side effects inside the transaction.</strong> An email sent from <code class="inline">after_save</code> goes out even if the transaction rolls back. Use <code class="inline">after_commit</code>, or publish from the service after commit.</li>
+          <li><strong>Hidden control flow.</strong> Reading <code class="inline">booking.update!</code> gives no hint that it sends SMS and charges a card. Seeds, imports and admin fixes trigger it too.</li>
+          <li><strong>Skipped silently.</strong> <code class="inline">update_column</code>, <code class="inline">update_all</code> and raw SQL bypass callbacks, so the "always" behaviour isn't always.</li>
+          <li><strong>Order and cascades.</strong> A callback that saves another model triggers <em>its</em> callbacks. Ten models later, nobody can predict one save.</li>
+        </ul>
+        A good rule: callbacks may normalise the model's own data (trim an email, set a default). Anything that
+        touches another model or the outside world belongs in a service that publishes an explicit event (where
+        services sit is <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>'s topic).
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        One more trap: <strong>saving to the database and publishing to a broker are two separate writes</strong>.
+        If the process crashes between them, you have a confirmed booking and no email, or an email about a
+        booking that rolled back. The fix is the transactional outbox in
+        <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>.
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-viol">How to spot it</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Rails <code class="inline">after_create</code> / <code class="inline">after_commit</code>, <code class="inline">ActiveSupport::Notifications</code></li>
+            <li>Node's <code class="inline">EventEmitter</code>, <code class="inline">emitter.on(...)</code></li>
+            <li>NestJS <code class="inline">@OnEvent(...)</code> handlers from the event-emitter package</li>
+            <li>Django <code class="inline">post_save</code> signals, SQLAlchemy event listeners</li>
+            <li>Webhooks: the observer pattern across company boundaries</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">When it's over-engineering</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>There is one listener and it must succeed for the operation to succeed: just call it</li>
+            <li>The caller needs a result back from the "listener" (that's a function call wearing a costume)</li>
+            <li>An agent adds a message broker for events that never leave one process</li>
+            <li>You can't answer "what happens when I confirm a booking?" without grepping for string event names</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Command: turn a request into an object</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>The problem.</strong> "Send the reminder 24 hours before the appointment." "Cancel all Dr. An's
+        bookings tomorrow and notify the patients." "Undo the price change the admin made by mistake." Each of
+        these is a request that must be <em>stored, delayed, retried, logged or reversed</em>, which a plain method
+        call can't be. <strong>Command</strong> packs the request into an object: its name, its parameters, and a
+        method to execute it (and optionally to undo it). Once a request is data, you can put it in a queue, a
+        database row or an audit log.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">commands/cancel_booking.go — a command that can be queued and replayed</span>
+        <pre class="code"><span class="kw">type</span> <span class="fn">Command</span> <span class="kw">interface</span> {
+    Name() <span class="kw">string</span>
+    Execute(ctx context.Context) <span class="kw">error</span>
+}
+
+<span class="cm">// Only IDs and plain values: it must survive JSON serialisation into a queue.</span>
+<span class="kw">type</span> <span class="fn">CancelBooking</span> <span class="kw">struct</span> {
+    BookingID   <span class="kw">int64</span>  <span class="st">`json:"booking_id"`</span>
+    Reason      <span class="kw">string</span> <span class="st">`json:"reason"`</span>
+    RequestedBy <span class="kw">int64</span>  <span class="st">`json:"requested_by"`</span>
+    bookings    BookingStore                 <span class="cm">// injected by the handler, not serialised</span>
+}
+
+<span class="kw">func</span> (c CancelBooking) <span class="fn">Name</span>() <span class="kw">string</span> { <span class="kw">return</span> <span class="st">"cancel_booking"</span> }
+
+<span class="kw">func</span> (c CancelBooking) <span class="fn">Execute</span>(ctx context.Context) <span class="kw">error</span> {
+    <span class="cm">// Idempotent: cancelling an already-cancelled booking is a no-op, so retries are safe.</span>
+    <span class="kw">return</span> c.bookings.Cancel(ctx, c.BookingID, c.Reason)
+}
+
+<span class="cm">// The runner doesn't know what the command does: it logs, times, retries.</span>
+<span class="kw">func</span> <span class="fn">Run</span>(ctx context.Context, cmd Command) <span class="kw">error</span> {
+    log.Printf(<span class="st">"command=%s start"</span>, cmd.Name())
+    <span class="kw">return</span> cmd.Execute(ctx)
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Undo</strong> is the textbook use: each command stores what it needs to reverse itself. In backends
+        this appears as "bulk price change with a revert button" or an admin action log. It only works if the
+        world hasn't moved on: you can't un-send an SMS, so the undo of a sent notification is a
+        <em>compensating</em> action, such as a correction message. That idea grows into the saga pattern in
+        <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Where you've seen a command</th><th class="px-4 py-3">What the "command object" is</th><th class="px-4 py-3">What it buys you</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Background jobs</td><td class="px-4 py-3">A Sidekiq or ActiveJob class, a BullMQ job, a Celery task, with its serialised arguments</td><td class="px-4 py-3">Delay, retry and run on another machine (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CQRS command handlers</td><td class="px-4 py-3"><code class="inline">CreateBookingCommand</code> plus one handler</td><td class="px-4 py-3">A single, testable entry point per write (<a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Admin audit log</td><td class="px-4 py-3">A row: who, which command, which parameters, when</td><td class="px-4 py-3">"Who cancelled this booking?" has an answer</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Undo / revert</td><td class="px-4 py-3">A command that stores the previous values</td><td class="px-4 py-3">A safe revert button for bulk edits</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Frontend state</td><td class="px-4 py-3">Redux actions, <code class="inline">{ type, payload }</code></td><td class="px-4 py-3">Replayable, loggable state changes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>How to spot it:</strong> classes named with a verb (<code class="inline">SendReminderJob</code>,
+        <code class="inline">RefundOrder</code>) that have one public method (<code class="inline">perform</code>,
+        <code class="inline">execute</code>, <code class="inline">call</code>, <code class="inline">handle</code>).
+        <strong>When it's over-engineering:</strong> a synchronous "command bus" that routes every controller action
+        to a handler through a registry, when nothing is queued, logged or undone. You've added a layer of
+        indirection that makes "go to definition" stop working, and bought nothing.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>Commands carry IDs, not objects.</strong> A job enqueued with a whole <code class="inline">Booking</code>
+        object runs later with stale data, or fails to serialise. Pass <code class="inline">booking_id</code> and
+        reload inside <code class="inline">Execute</code>, then check the current state before acting: the booking
+        may have been cancelled while the job waited.
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Lifecycles &amp; conditionals</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A status column is a state machine, whether you draw it or not</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Almost every business object has a lifecycle: an order is placed, paid, shipped, delivered or refunded. A
+        booking is pending, confirmed, checked in, completed, cancelled or a no-show. The rules about which
+        change is allowed from which status are some of the most important business rules in the system, and
+        agents scatter them across controllers as <code class="inline">if</code> statements unless you tell them
+        otherwise.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">State: make the allowed transitions explicit</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>The problem.</strong> The cancel endpoint checks <code class="inline">status != 'completed'</code>. The
+        check-in endpoint checks <code class="inline">status == 'confirmed'</code>. The admin panel checks nothing.
+        Six months later, a completed booking gets cancelled and refunded. <strong>State</strong> puts the rules in
+        one place: a list of states, the events that move between them, and guards on each move. Start by drawing
+        it. If you can't draw it, you don't understand the feature yet.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> PendingPayment : patient books slot
+    PendingPayment --> Confirmed : deposit paid
+    PendingPayment --> Expired : 15 min timeout
+    Confirmed --> CheckedIn : arrives at clinic
+    Confirmed --> Cancelled : cancel more than 24h before
+    Confirmed --> NoShow : 30 min after start, not arrived
+    CheckedIn --> Completed : doctor closes visit
+    Cancelled --> [*]
+    Expired --> [*]
+    NoShow --> [*]
+    Completed --> [*]
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read the diagram for what is <em>missing</em>: there is no arrow from <code class="inline">Completed</code> to
+        <code class="inline">Cancelled</code>, so the refund bug above is impossible by design. Terminal states have
+        no outgoing arrows. Each arrow becomes a method or event name in code and a test case in
+        <a href="./qa1.html" class="text-viol underline decoration-viol/40">QA1</a>.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        There are two ways to implement it. The GoF version gives every state its own class
+        (<code class="inline">ConfirmedState.cancel()</code>, <code class="inline">CompletedState.cancel()</code> raises).
+        That pays off when each state has a lot of different <em>behaviour</em>. Most backend lifecycles only need a
+        <strong>transition table</strong>: data that says which event moves which state to which state, plus a
+        few guards. Start with the table.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+classDiagram
+    class Booking {
+        -BookingState state
+        +cancel()
+        +checkIn()
+    }
+    class BookingState {
+        &lt;&lt;interface&gt;&gt;
+        +cancel(booking)
+        +checkIn(booking)
+    }
+    class ConfirmedState {
+        +cancel(booking) "moves to Cancelled"
+        +checkIn(booking) "moves to CheckedIn"
+    }
+    class CompletedState {
+        +cancel(booking) "raises InvalidTransition"
+        +checkIn(booking) "raises InvalidTransition"
+    }
+    Booking --> BookingState : delegates to
+    ConfirmedState ..|> BookingState
+    CompletedState ..|> BookingState
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That is the GoF shape: <code class="inline">Booking</code> delegates each call to its current state object,
+        and the state object decides what happens. It earns its keep when states behave very differently (a
+        "draft" order recalculates prices on every edit, a "paid" order refuses edits). When the only difference
+        is <em>which arrows exist</em>, the table below is shorter and easier to review.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-state.ts — a transition table with guards</span>
+        <pre class="code"><span class="kw">type</span> Status = <span class="st">"pending_payment"</span> | <span class="st">"confirmed"</span> | <span class="st">"checked_in"</span> | <span class="st">"completed"</span>
+             | <span class="st">"cancelled"</span> | <span class="st">"expired"</span> | <span class="st">"no_show"</span>;
+<span class="kw">type</span> Event = <span class="st">"pay"</span> | <span class="st">"expire"</span> | <span class="st">"check_in"</span> | <span class="st">"cancel"</span> | <span class="st">"mark_no_show"</span> | <span class="st">"complete"</span>;
+
+<span class="kw">const</span> transitions: Record&lt;Event, { from: Status[]; to: Status }&gt; = {
+  pay:          { from: [<span class="st">"pending_payment"</span>], to: <span class="st">"confirmed"</span> },
+  expire:       { from: [<span class="st">"pending_payment"</span>], to: <span class="st">"expired"</span> },
+  check_in:     { from: [<span class="st">"confirmed"</span>],       to: <span class="st">"checked_in"</span> },
+  cancel:       { from: [<span class="st">"confirmed"</span>],       to: <span class="st">"cancelled"</span> },
+  mark_no_show: { from: [<span class="st">"confirmed"</span>],       to: <span class="st">"no_show"</span> },
+  complete:     { from: [<span class="st">"checked_in"</span>],      to: <span class="st">"completed"</span> },
+};
+
+<span class="kw">export function</span> <span class="fn">transition</span>(b: Booking, event: Event, now = <span class="kw">new</span> Date()): Status {
+  <span class="kw">const</span> t = transitions[event];
+  <span class="kw">if</span> (!t.from.includes(b.status))
+    <span class="kw">throw new</span> InvalidTransition(b.status, event);          <span class="cm">// the ONLY place this rule lives</span>
+  <span class="kw">if</span> (event === <span class="st">"cancel"</span> &amp;&amp; hoursUntil(b.startsAt, now) &lt; <span class="st">24</span>)
+    <span class="kw">throw new</span> TooLateToCancel();                        <span class="cm">// guard: a rule on top of the arrow</span>
+  <span class="kw">return</span> t.to;
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two more layers make the state machine trustworthy. In the database, a <code class="inline">CHECK</code>
+        constraint limits <code class="inline">status</code> to the known values
+        (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>). Under concurrency, persist the
+        transition with a conditional update, <code class="inline">UPDATE bookings SET status = 'cancelled' WHERE id = $1
+        AND status = 'confirmed'</code>, and treat "0 rows updated" as a conflict. Otherwise two requests can both
+        pass the in-memory check, which is the check-then-write race again.
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">How to spot it</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>A <code class="inline">status</code> or <code class="inline">state</code> column plus <code class="inline">if (x.status == ...)</code> in many files (the smell)</li>
+            <li>State-machine libraries: AASM or state_machines in Ruby, <code class="inline">transitions</code> in Python, XState in TypeScript</li>
+            <li>Methods named after events: <code class="inline">confirm!</code>, <code class="inline">may_cancel?</code>, <code class="inline">canTransition()</code></li>
+            <li>Rails <code class="inline">enum status:</code> gives you the states but <em>not</em> the transitions: any code can still set any value</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">When it's over-engineering</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>A boolean flag (<code class="inline">is_published</code>) with no rules between its values</li>
+            <li>A class per state when the states differ only in which transitions are allowed</li>
+            <li>A workflow engine for a three-state lifecycle that lives in one service</li>
+            <li>Modelling every UI step as a state when the backend only cares about two of them</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Refactoring conditionals into strategy or state</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most real patterns arrive by refactoring, not by upfront design. The first version is an
+        <code class="inline">if</code>, and that's fine. You refactor when the same conditional appears in a
+        <strong>third</strong> place, or when a new variant forces you to edit a function that has nothing to do with
+        it. Here is a typical agent-written fee calculator for the clinic after three feature requests:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">fees.py — before: the branch grows with every request</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">consultation_fee</span>(booking):
+    base = booking.doctor.base_fee
+    <span class="kw">if</span> booking.patient.insurance == <span class="st">"baoviet"</span>:
+        fee = base * <span class="st">0.3</span>                      <span class="cm"># patient pays 30%</span>
+    <span class="kw">elif</span> booking.patient.insurance == <span class="st">"prudential"</span>:
+        fee = max(base - <span class="st">200_000</span>, <span class="st">0</span>)
+    <span class="kw">elif</span> booking.patient.is_staff:
+        fee = <span class="st">0</span>
+    <span class="kw">else</span>:
+        fee = base
+    <span class="kw">if</span> booking.is_weekend <span class="kw">and not</span> booking.patient.is_staff:
+        fee *= <span class="st">1.2</span>                            <span class="cm"># does the surcharge apply before or after insurance?</span>
+    <span class="kw">return</span> fee                               <span class="cm"># ...and the same chain is copied into invoice.py</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">fees.py — after: each payer rule is a strategy, the order is explicit</span>
+        <pre class="code"><span class="kw">from</span> typing <span class="kw">import</span> Callable
+PayerRule = Callable[[int], int]                  <span class="cm"># base fee in đồng -&gt; patient share</span>
+
+PAYER_RULES: dict[str, PayerRule] = {
+    <span class="st">"baoviet"</span>:    <span class="kw">lambda</span> base: base * <span class="st">30</span> // <span class="st">100</span>,
+    <span class="st">"prudential"</span>: <span class="kw">lambda</span> base: max(base - <span class="st">200_000</span>, <span class="st">0</span>),
+    <span class="st">"staff"</span>:      <span class="kw">lambda</span> base: <span class="st">0</span>,
+    <span class="st">"self_pay"</span>:   <span class="kw">lambda</span> base: base,
+}
+
+<span class="kw">def</span> <span class="fn">consultation_fee</span>(booking) -&gt; int:
+    base = booking.doctor.base_fee
+    <span class="kw">if</span> booking.is_weekend:
+        base = base * <span class="st">120</span> // <span class="st">100</span>             <span class="cm"># decided: surcharge applies to the base, before insurance</span>
+    <span class="kw">return</span> PAYER_RULES[booking.payer_code](base)  <span class="cm"># new insurer = one new line, KeyError if unknown</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Look at what the refactor forced: someone had to <strong>decide</strong> whether the weekend surcharge comes
+        before or after insurance. The if-chain hid that question. Money is also now integer arithmetic instead of
+        floats. And one behaviour <em>changed</em>: a Prudential patient on a weekend used to get the 200,000 đồng off
+        before the surcharge and now gets it after. Maybe that's what the clinic wants, maybe not. That is why the
+        behaviour must be pinned by tests <em>before</em> the refactor, so every change is one you chose.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">The conditional switches on…</th><th class="px-4 py-3">Refactor to</th><th class="px-4 py-3">Tell-tale sign</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A type or category chosen from data (insurer, channel, campaign type)</td><td class="px-4 py-3">Strategy + registry</td><td class="px-4 py-3">Each branch computes the same kind of result differently</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">The object's current status</td><td class="px-4 py-3">State (transition table first)</td><td class="px-4 py-3"><code class="inline">if status == ...</code> guards in several endpoints</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Which provider or integration</td><td class="px-4 py-3">Adapter behind one interface (<a href="./sd5.html" class="text-viol underline decoration-viol/40">SD5</a>)</td><td class="px-4 py-3">Branches call different external SDKs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A list of independent checks</td><td class="px-4 py-3">Chain of responsibility (Part IV)</td><td class="px-4 py-3">A long function of <code class="inline">if (!ok) return error</code> blocks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Two stable cases that won't grow</td><td class="px-4 py-3">Nothing. Keep the <code class="inline">if</code>.</td><td class="px-4 py-3">The branch hasn't changed in a year</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Refactor with the agent in two commits.</strong> First commit: characterisation tests that pin the
+        current behaviour of the if-chain, including the odd cases. Second commit: the refactor, with the tests
+        unchanged. If the agent needs to edit a test in the second commit, a behaviour changed, and you need to
+        know which one and why.
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Pipelines &amp; traversal</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every web framework is a chain of responsibility</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The last group is the one you use most without noticing. Every HTTP request in Express, NestJS, Gin, Rails
+        or Django passes through a line of small handlers before it reaches your controller. Understanding that
+        line, and its order, explains a surprising number of production bugs.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Chain of responsibility and middleware</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>The problem.</strong> Before the "create booking" handler runs, the request needs a request ID for
+        the logs, a check that the user is logged in, a rate limit, a body-size limit and input validation. Writing
+        those at the top of every handler means copies that drift apart. <strong>Chain of responsibility</strong>
+        links handlers so each one either deals with the request (and stops the chain) or passes it to the next.
+        Web <strong>middleware</strong> is the everyday variant: each layer does its part, calls
+        <code class="inline">next</code>, and can also act on the way back out. That's why the picture is usually
+        an onion.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="A middleware pipeline: request ID, logger, auth, rate limit, validation, then the handler, with an early exit at auth">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">POST /bookings · EACH LAYER CALLS next() OR STOPS THE CHAIN</text>
+          <g class="anim-pulse"><rect x="10" y="44" width="100" height="56" rx="9" fill="#37474F"/>
+            <text x="60" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Request ID</text>
+            <text x="60" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">tag every log line</text></g>
+          <g class="anim-pulse d1"><rect x="128" y="44" width="100" height="56" rx="9" fill="#2563EB"/>
+            <text x="178" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Logger</text>
+            <text x="178" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">timing on the way out</text></g>
+          <g class="anim-pulse d2"><rect x="246" y="44" width="100" height="56" rx="9" fill="#DB2777"/>
+            <text x="296" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Auth</text>
+            <text x="296" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">who is calling?</text></g>
+          <g class="anim-pulse d3"><rect x="364" y="44" width="100" height="56" rx="9" fill="#6d5acd"/>
+            <text x="414" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Rate limit</text>
+            <text x="414" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">per user / IP</text></g>
+          <g class="anim-pulse d4"><rect x="482" y="44" width="100" height="56" rx="9" fill="#0D9488"/>
+            <text x="532" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Validate</text>
+            <text x="532" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">schema of the body</text></g>
+          <g class="anim-pulse"><rect x="600" y="44" width="90" height="56" rx="9" fill="#D97757"/>
+            <text x="645" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Handler</text>
+            <text x="645" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">create booking</text></g>
+          <line x1="110" y1="72" x2="128" y2="72" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="228" y1="72" x2="246" y2="72" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="346" y1="72" x2="364" y2="72" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="464" y1="72" x2="482" y2="72" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="582" y1="72" x2="600" y2="72" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="296" y1="100" x2="296" y2="138" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+          <text x="296" y="154" text-anchor="middle" font-size="10" font-weight="700" fill="#DB2777" class="anim-bounce">401 · chain stops here</text>
+          <text x="350" y="186" text-anchor="middle" font-size="10" fill="#A8A49B">the response travels back out through Logger and Request ID, in reverse order</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">middleware/auth.go — a Gin middleware that can stop the chain</span>
+        <pre class="code"><span class="kw">func</span> <span class="fn">RequireUser</span>(sessions SessionStore) gin.HandlerFunc {
+    <span class="kw">return func</span>(c *gin.Context) {
+        user, err := sessions.FromToken(c.GetHeader(<span class="st">"Authorization"</span>))
+        <span class="kw">if</span> err != <span class="kw">nil</span> {
+            c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{<span class="st">"error"</span>: <span class="st">"unauthenticated"</span>})
+            <span class="kw">return</span>                             <span class="cm">// Abort: later handlers never run</span>
+        }
+        c.Set(<span class="st">"user"</span>, user)                    <span class="cm">// hand data down the chain</span>
+        c.Next()                                <span class="cm">// run the rest of the chain...</span>
+        <span class="cm">// ...code here runs on the way back out (after the handler)</span>
+    }
+}
+
+r := gin.New()
+r.Use(RequestID(), Logger())                     <span class="cm">// global: every route</span>
+api := r.Group(<span class="st">"/api"</span>, RequireUser(store))      <span class="cm">// only routes in this group</span>
+api.POST(<span class="st">"/bookings"</span>, RateLimit(<span class="st">10</span>), createBooking)</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The same shape in the other stacks: in Express a middleware is <code class="inline">(req, res, next) =&gt; {}</code>
+        registered with <code class="inline">app.use</code>, and not calling <code class="inline">next()</code> or sending
+        a response leaves the request hanging. In Rack (under Rails and Sinatra), a middleware is an object whose
+        <code class="inline">call(env)</code> calls <code class="inline">@app.call(env)</code> on the next one:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/maintenance_mode.rb — a Rack middleware</span>
+        <pre class="code"><span class="kw">class</span> <span class="fn">MaintenanceMode</span>
+  <span class="kw">def</span> <span class="fn">initialize</span>(app)
+    @app = app                                       <span class="cm"># the next link in the chain</span>
+  <span class="kw">end</span>
+
+  <span class="kw">def</span> <span class="fn">call</span>(env)
+    <span class="kw">if</span> ENV[<span class="st">"MAINTENANCE"</span>] == <span class="st">"1"</span>
+      <span class="kw">return</span> [<span class="st">503</span>, { <span class="st">"content-type"</span> =&gt; <span class="st">"text/plain"</span> }, [<span class="st">"Back soon"</span>]]  <span class="cm"># handled, stop</span>
+    <span class="kw">end</span>
+    @app.call(env)                                   <span class="cm"># pass it on</span>
+  <span class="kw">end</span>
+<span class="kw">end</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        NestJS splits the chain into named stages, each with a job. A request goes through
+        <strong>middleware → guards → interceptors (before) → pipes → your handler → interceptors (after)</strong>,
+        and <strong>exception filters</strong> catch errors from any stage. Knowing that order tells you where a
+        piece of logic belongs: authentication and authorisation in guards, validation and transformation in pipes,
+        logging, timing and response mapping in interceptors.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>Order is behaviour.</strong> Put the logger after auth and failed logins are never logged. Put the
+        rate limiter after an expensive body parser and an attacker can still make you parse huge bodies. Mount the
+        error handler first in Express and it catches nothing, because error-handling middleware must come after the
+        routes. When an agent adds a middleware, read <em>where</em> it was inserted, not just what it does.
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Outside HTTP</strong>, the classic "one handler takes it" chain appears in approval flows: a refund
+        under 500,000 đồng is approved by the receptionist, under 5 million by the clinic manager, anything larger
+        by finance. Each approver handles it or passes it up. <strong>When it's over-engineering:</strong> a chain
+        of handler classes for three checks that always run together and in the same order. A function with
+        three early returns is easier to read. Also be careful with building your own middleware framework: the
+        one in your web framework already exists and is documented.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Iterator and visitor, in brief</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Iterator</strong> gives you items one at a time without exposing how they're stored or fetched.
+        Modern languages build it in (<code class="inline">for ... of</code>, Python generators, Go's
+        <code class="inline">range</code>), so you rarely write the pattern, but you must choose it: loading
+        a million orders into memory to export them is the bug; iterating in batches is the fix. Rails'
+        <code class="inline">find_each</code> and a cursor-paginated API client are iterators.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">export.py — a generator iterates a paginated API lazily</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">all_orders</span>(client, page_size=<span class="st">500</span>):
+    cursor = <span class="kw">None</span>
+    <span class="kw">while True</span>:
+        page = client.list_orders(after=cursor, limit=page_size)
+        <span class="kw">yield from</span> page.items                  <span class="cm"># caller sees one order at a time</span>
+        <span class="kw">if not</span> page.next_cursor:
+            <span class="kw">return</span>
+        cursor = page.next_cursor
+
+<span class="kw">for</span> order <span class="kw">in</span> all_orders(shop):                 <span class="cm"># constant memory, even for 2M orders</span>
+    csv_writer.writerow(to_row(order))</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Visitor</strong> adds new operations to a fixed set of types without changing those types: one
+        visitor computes the tax of every line item in a cart, another renders the cart as an invoice. You'll meet
+        it mostly in tools that walk syntax trees. ESLint rules and Babel plugins are visitors with one method per
+        node type. In application code it is almost always over-engineering: a <code class="inline">switch</code>
+        on the type, or pattern matching in modern TypeScript, Python and Ruby, does the same job with far less code.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Choosing a behavioral pattern</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Start from the symptom in the code, not from the pattern catalogue. If no row matches, you probably don't
+        need a pattern.
+      </p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Symptom</th><th class="px-4 py-3">Pattern</th><th class="px-4 py-3">You've already used it in</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Same <code class="inline">switch (type)</code> in several places</td><td class="px-4 py-3">Strategy</td><td class="px-4 py-3">Passport strategies, sort comparators</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Copies of a flow where one forgot a step</td><td class="px-4 py-3">Template method</td><td class="px-4 py-3">Django class-based views, test <code class="inline">setUp</code>, job <code class="inline">perform</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">One action triggers many unrelated side effects</td><td class="px-4 py-3">Observer / pub-sub</td><td class="px-4 py-3">Rails callbacks, EventEmitter, NestJS <code class="inline">@OnEvent</code>, webhooks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A request must be delayed, retried, logged or undone</td><td class="px-4 py-3">Command</td><td class="px-4 py-3">Sidekiq / BullMQ / Celery jobs, Redux actions</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">if status == ...</code> guards spread across endpoints</td><td class="px-4 py-3">State</td><td class="px-4 py-3">AASM, XState, order and booking lifecycles</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">The same checks copied at the top of every handler</td><td class="px-4 py-3">Chain of responsibility</td><td class="px-4 py-3">Express, Gin, Rack middleware, NestJS guards and pipes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Loading everything into memory to loop over it</td><td class="px-4 py-3">Iterator</td><td class="px-4 py-3">Generators, <code class="inline">find_each</code>, cursor pagination</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents know every pattern in the catalogue, which is the problem: ask for "clean, extensible code" and you
+        get all of them. Ask instead for the <em>smallest</em> design that handles the variants you actually have,
+        and use the agent to find patterns, and missing ones, in code that already exists.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — find the behavioral patterns in an unfamiliar codebase</span>
+        <pre class="code">Map how a booking changes status in this repo.
+1. List every place that reads or writes bookings.status, with file:line.
+2. Draw the transitions you find as a Mermaid stateDiagram-v2.
+3. Flag transitions that are allowed in one code path but not another.
+4. List every callback, listener or subscriber that fires when a booking is saved.
+Don't change any code.</pre>
+      </div>
+      <pre class="code mt-3">Refactor consultation_fee() in fees.py into a strategy registry.
+Step 1: write characterisation tests for the current behaviour, including weekend
+and staff cases, and run them. Stop and show me.
+Step 2: refactor without editing the tests. If a test must change, stop and explain why.</pre>
+      <pre class="code mt-3">Review this diff for over-engineering. For each new interface, class or event,
+tell me how many implementations or listeners it has today, and whether a plain
+function or if-statement would be simpler. Be blunt.</pre>
+      <pre class="code mt-3">List the middleware for POST /api/bookings in the order it actually runs,
+including global, group and route-level ones. For each, say whether it can stop
+the chain and with which status code.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Find every conditional on a type or status, and every callback or listener</li>
+            <li>Draw the state machine and the middleware order from the real code</li>
+            <li>Write characterisation tests before a refactor</li>
+            <li>Do the mechanical refactor from if-chain to registry or transition table</li>
+            <li>Write a test per state-machine arrow, and one per forbidden arrow</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>That the pattern matches the number of variants you really have</li>
+            <li>The state diagram against the business rules, arrow by arrow</li>
+            <li>That side effects run after commit, not inside the transaction</li>
+            <li>Where a new middleware was inserted in the chain</li>
+            <li>That jobs and commands carry IDs and are safe to run twice</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent output:</strong> an interface with exactly one implementation and no plan for a
+        second · an <code class="inline">EventBus</code> class written from scratch · a model callback that sends
+        email, calls an API or saves another model · <code class="inline">status</code> assigned directly
+        (<code class="inline">booking.status = "cancelled"</code>) outside the state machine · events named as commands
+        (<code class="inline">SendEmailEvent</code>) · a job enqueued with a whole object instead of an ID · a new
+        middleware added with <code class="inline">app.use</code> at the end of the file, after the routes it was meant
+        to protect.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Writes every variant as another <code class="inline">elif</code>, and accepts whatever structure the agent produces.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can name strategy, observer, state and middleware, and recognises them in a framework when someone points them out.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Uses a strategy registry or a transition table when asked. Needs review to catch side effects inside transactions, middleware in the wrong order, or a pattern where an <code class="inline">if</code> would do.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Draws the state machine for a lifecycle and enforces it in one place, with a DB constraint and conditional updates. Refactors a growing if-chain into a strategy behind characterisation tests. Moves side effects out of model callbacks into explicit events after commit. Can list a request's middleware in order and explain each one. Rejects patterns that don't pay for themselves.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the team's conventions for events, jobs and state machines. Spots over-engineering in review and explains the simpler alternative. Leads the untangling of a callback-heavy legacy model.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 3:</strong> for the main entity in your capstone, can you draw its state
+        diagram from memory and point to the single place in code that enforces it? Can you name every side effect
+        of saving it, and say whether each runs before or after the commit? For one pattern in your code, can you
+        argue why a plain function would <em>not</em> have been enough?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Pattern first, problem second</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An interface, a factory and a registry for a rule with one variant. Wait until the third variant, or until you can name it, before you abstract.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Business logic in model callbacks</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Every save becomes a surprise: seeds send emails, imports charge cards, and <code class="inline">update_column</code> quietly skips the "always" rule.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Status as a free-for-all column</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">When any code can assign any status, the lifecycle only exists in someone's head. Route every change through one transition function.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Name events in the past tense</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">BookingConfirmed</code> is a fact any number of listeners may react to. <code class="inline">SendConfirmationEmail</code> is a command with one handler. The name keeps the design honest.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep the state diagram in the repo</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A Mermaid <code class="inline">stateDiagram-v2</code> next to the transition table is reviewable in PRs, and the agent can check the code against it on every task.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Prefer functions to one-method classes</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">In TypeScript, Python, Ruby and Go, a strategy or a command can be a function or a lambda. Promote it to a class when it needs state or several methods.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="spot"> <span>Found and named at least four behavioral patterns in a framework or codebase I use (for example middleware, callbacks, jobs, a status column), with <code class="inline">file:line</code> for each.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="state"> <span>Drew a Mermaid state diagram for a real lifecycle and enforced it in one transition function, a DB CHECK constraint and a conditional <code class="inline">UPDATE ... WHERE status = ...</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="callbacks"> <span>Moved a side effect (email, API call) out of a model callback into an explicit event or job that runs after commit, and can explain what could go wrong before.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="middleware"> <span>Listed the middleware chain for one endpoint in execution order, and showed with a test that auth stops the chain before the handler runs.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="refactor-pr"> <span class="font-semibold">Opened a PR that refactors a growing conditional (pricing, fees or notification channels) into a strategy or state machine: commit 1 adds characterisation tests, commit 2 refactors with the tests unchanged, and the PR description says which pattern was chosen, why, and when it would be over-engineering (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://refactoring.guru/design-patterns/behavioral-patterns" target="_blank" rel="noopener">Refactoring.Guru — Behavioral patterns</a> — diagrams and examples in many languages for every pattern in this module.</li>
+        <li><a class="text-coral underline" href="https://refactoring.guru/replace-conditional-with-polymorphism" target="_blank" rel="noopener">Refactoring.Guru — Replace Conditional with Polymorphism</a> — the refactoring behind Part III's before/after.</li>
+        <li><a class="text-coral underline" href="https://guides.rubyonrails.org/active_record_callbacks.html" target="_blank" rel="noopener">Rails Guides — Active Record Callbacks</a> — the callback order, transaction callbacks, and which methods skip callbacks.</li>
+        <li><a class="text-coral underline" href="https://expressjs.com/en/guide/using-middleware.html" target="_blank" rel="noopener">Express — Using middleware</a> — application, router and error-handling middleware, and why order matters.</li>
+        <li><a class="text-coral underline" href="https://docs.nestjs.com/faq/request-lifecycle" target="_blank" rel="noopener">NestJS — Request lifecycle</a> — the exact order of middleware, guards, interceptors, pipes and filters.</li>
+        <li><a class="text-coral underline" href="https://gin-gonic.com/en/docs/middleware/custom-middleware/" target="_blank" rel="noopener">Gin — Custom middleware</a> — <code class="inline">c.Next()</code>, <code class="inline">c.Abort()</code> and route groups.</li>
+        <li><a class="text-coral underline" href="https://martinfowler.com/eaaDev/DomainEvent.html" target="_blank" rel="noopener">Martin Fowler — Domain Event</a> — events as facts that happened, the basis for observer in business code.</li>
+      </ul>
