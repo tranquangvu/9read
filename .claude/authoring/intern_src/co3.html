@@ -1,0 +1,484 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Reading &amp; Debugging Code You Didn't Write</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Most of the code you work with was written by someone else: a teammate, a developer who left two years ago,
+          or an agent five minutes ago. This module teaches you to find your way around an unfamiliar codebase
+          quickly, to read agent output with healthy suspicion, and to debug with a method instead of guesses. It
+          ends with the bug classes that agents produce most often, so you can spot them before QA does.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> when the agent writes the code, you spend less
+          time writing and much more time reading. And when something breaks, the agent's first instinct is often
+          to try fixes one after another until the error goes away. A developer who can read, trace and debug
+          methodically is the one who finds the real cause, and stops the agent from burying it.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Reading an unfamiliar codebase</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Start at the edges and follow one path all the way through</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Don't read a codebase file by file from the top. You'll forget the first file before you reach the tenth.
+        Read it the way a request travels through it: find where things come in, follow one real path to the
+        database and back, and let the tests tell you what the code is supposed to do.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Find the entry points</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every app has a few places where the outside world gets in. Find them first. Then read the README, the
+        <code class="inline">package.json</code> scripts (or equivalent) and the folder structure. Ten minutes here
+        saves hours later.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Kind of app</th><th class="px-4 py-3">Look for</th><th class="px-4 py-3">It tells you</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Any project</td><td class="px-4 py-3">README, <code class="inline">package.json</code> / <code class="inline">Gemfile</code> / <code class="inline">go.mod</code>, <code class="inline">CLAUDE.md</code></td><td class="px-4 py-3">Stack, how to run it, how to test it, team conventions</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Backend API</td><td class="px-4 py-3">The routes file or route decorators (<code class="inline">config/routes.rb</code>, <code class="inline">@Controller</code>, <code class="inline">router.get</code>)</td><td class="px-4 py-3">Every URL the app answers, and which handler owns it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Web frontend</td><td class="px-4 py-3">The <code class="inline">app/</code> or <code class="inline">pages/</code> folder, the router config</td><td class="px-4 py-3">Every screen, and the components behind it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Background work</td><td class="px-4 py-3">Job and worker folders, cron config</td><td class="px-4 py-3">What runs without a user clicking anything (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Data</td><td class="px-4 py-3">Schema file, migrations folder</td><td class="px-4 py-3">The real data model, usually more honest than the code (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Trace one request end to end</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Pick one feature a user actually uses, for example "show a doctor's free slots", and follow it through every
+        layer. Write down the file and function at each hop. When you're done you'll understand the architecture
+        better than any diagram could tell you, because you've seen the real one. HTTP itself is covered in
+        <a href="./co4.html" class="text-viol underline decoration-viol/40">CO4</a>, and the layers in
+        <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant R as routes.ts
+    participant C as SlotsController
+    participant S as SlotService
+    participant D as Postgres
+    B->>R: GET /doctors/7/slots?date=2026-10-01
+    R->>C: list(req)
+    Note over C: validates date<br/>parses doctorId
+    C->>S: freeSlots(7, date)
+    S->>D: SELECT slots LEFT JOIN bookings ...
+    D-->>S: 12 rows
+    Note over S: filters out booked slots<br/>and slots in the past
+    S-->>C: 9 slots
+    C-->>B: 200 JSON
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice where the interesting decisions sit: the "in the past" filter lives in the service, not in SQL. That's
+        the kind of fact you only learn by tracing, and it's exactly where a time-zone bug would hide (Part IV).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Read the tests before the code</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Good tests are executable documentation. The test names list the rules, and the setup shows you how the
+        objects fit together. If a feature has no tests, that's a finding too: be extra careful changing it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">slot.service.test.ts — the rules, in plain sentences</span>
+        <pre class="code"><span class="fn">describe</span>(<span class="st">"SlotService.freeSlots"</span>, () =&gt; {
+  <span class="fn">it</span>(<span class="st">"excludes slots with an active booking"</span>, ...);
+  <span class="fn">it</span>(<span class="st">"includes slots whose booking was cancelled"</span>, ...);   <span class="cm">// ← a rule you'd miss in the SQL</span>
+  <span class="fn">it</span>(<span class="st">"excludes slots that start in the past"</span>, ...);
+  <span class="fn">it</span>(<span class="st">"uses the clinic's time zone for 'date'"</span>, ...);     <span class="cm">// ← and one you'd never guess</span>
+});</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Keep a map while you read</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Write your trace down as you go. It becomes your own reference, and it's the basis for the question you ask
+        your mentor ("I think X happens here, is that right?") instead of "how does this work?".
+      </p>
+      <div class="mt-4">
+        <span class="code-label">notes/trace-free-slots.md</span>
+        <pre class="code">GET /doctors/:id/slots
+  src/routes.ts:41            → SlotsController.list
+  src/slots/controller.ts:18  → parses ?date, 400 if invalid
+  src/slots/service.ts:33     → freeSlots(): query + filter past slots
+  src/slots/repo.ts:12        → SQL, LEFT JOIN bookings WHERE status='active'
+<span class="kw">? </span>Why is "past" filtered in code, not SQL?     <span class="cm"># ask mentor</span>
+<span class="kw">? </span>clinic.timezone used at service.ts:40 — what if null?</pre>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Reading agent output</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Confident is not the same as correct</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An agent's explanation of code reads fluently whether it's right or wrong. It may describe what code
+        <em>usually</em> does in projects like yours rather than what <em>this</em> code does. The fix is cheap: make
+        every claim point at a line you can open.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Ask for file:line citations, then check two</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When you ask the agent to explain something, require a citation for each claim. Then open at least two of the
+        cited lines yourself. If they don't say what the agent claimed, treat the rest of the explanation as
+        unverified and ask again.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — explain with citations</span>
+        <pre class="code">Explain how a booking gets cancelled in this repo, from the HTTP request
+to the database write. For every claim, cite file:line.
+Mark each claim as READ (you opened the file) or INFERRED (you're guessing
+from names or conventions). List anything you couldn't find.
+<span class="cm"># "INFERRED" tells you exactly which claims to check first</span></pre>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    A["Agent claim<br/>'cancel() checks ownership'"] --> B{"Has a<br/>file:line?"}
+    B -- "no" --> R["Ask again<br/>with citations"]
+    B -- "yes" --> C["Open the line<br/>in your editor"]
+    C --> D{"Says what<br/>was claimed?"}
+    D -- "yes" --> E["Trust this claim<br/>check one more"]
+    D -- "no" --> F["Treat the whole<br/>answer as unverified"]
+    F --> R
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This takes a minute per explanation. It's the difference between building your mental model on the code
+        and building it on the agent's guess about the code.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Three passes over an agent's diff</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Reading your own agent's diff is a different job from reviewing a teammate's PR
+        (<a href="./co2.html" class="text-viol underline decoration-viol/40">CO2</a>). You are looking for the places
+        where it did something other than what you meant. Do three quick passes, each with one question.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Pass</th><th class="px-4 py-3">Question</th><th class="px-4 py-3">What you catch</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">1 · Shape</td><td class="px-4 py-3">Which files changed, and should they have?</td><td class="px-4 py-3">Scope creep, deleted tests, new dependencies, config edits</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">2 · Paths</td><td class="px-4 py-3">What happens on the unhappy path: null, empty, error, timeout?</td><td class="px-4 py-3">Missing null checks, swallowed errors, wrong status codes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">3 · Reality</td><td class="px-4 py-3">Does every function, option and column it uses actually exist?</td><td class="px-4 py-3">Invented APIs, wrong library version, a column name from a different project</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Pass 3 is the one agents need most.</strong> A model can call a library method that sounds right but
+        doesn't exist in your version, or pass an option that was renamed. Type checking and tests catch many of
+        these. For the rest, jump to the definition in your editor. If the editor can't find it, the agent may have
+        invented it.
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · The debugging method</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Reproduce, isolate, hypothesise, verify, in that order</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Debugging by guessing ("maybe it's the cache? let me try…") feels fast and is slow. Each guess changes the
+        code, and after five guesses you no longer know which change did what. The method below is slower for the
+        first five minutes and much faster overall. It is also exactly what you should make the agent follow.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 210" class="w-full min-w-[620px]" role="img" aria-label="Debugging loop: reproduce, isolate, hypothesise, verify, then fix with a regression test">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">THE DEBUGGING LOOP · NO CODE CHANGES UNTIL STEP 4 CONFIRMS A CAUSE</text>
+          <g class="anim-pulse"><rect x="10" y="50" width="130" height="56" rx="9" fill="#2563EB"/>
+            <text x="75" y="74" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1 · Reproduce</text>
+            <text x="75" y="90" text-anchor="middle" fill="#ffffffbb" font-size="9">reliably · smallest case</text></g>
+          <g class="anim-pulse d1"><rect x="180" y="50" width="130" height="56" rx="9" fill="#6d5acd"/>
+            <text x="245" y="74" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">2 · Isolate</text>
+            <text x="245" y="90" text-anchor="middle" fill="#ffffffbb" font-size="9">halve the search space</text></g>
+          <g class="anim-pulse d2"><rect x="350" y="50" width="130" height="56" rx="9" fill="#D97757"/>
+            <text x="415" y="74" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">3 · Hypothesise</text>
+            <text x="415" y="90" text-anchor="middle" fill="#ffffffbb" font-size="9">one cause · a prediction</text></g>
+          <g class="anim-pulse d3"><rect x="520" y="50" width="130" height="56" rx="9" fill="#0D9488"/>
+            <text x="585" y="74" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">4 · Verify</text>
+            <text x="585" y="90" text-anchor="middle" fill="#ffffffbb" font-size="9">debugger · log · test</text></g>
+          <line x1="140" y1="78" x2="180" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="310" y1="78" x2="350" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="480" y1="78" x2="520" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <path d="M 585 106 Q 585 150 415 150 Q 415 130 415 108" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 5"/>
+          <text x="500" y="166" text-anchor="middle" font-size="10" fill="#A8A49B">prediction wrong → new hypothesis</text>
+          <g class="anim-pulse d4"><rect x="520" y="150" width="170" height="44" rx="9" fill="#37474F"/>
+            <text x="605" y="170" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Fix + regression test</text>
+            <text x="605" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">test red before · green after</text></g>
+          <line x1="650" y1="106" x2="650" y2="150" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">1 · Reproduce: no repro, no fix</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Turn the bug report into exact steps that fail every time, then shrink them. "Patients sometimes see
+        yesterday's slots" becomes "a patient in Hanoi at 00:30 local time sees slots dated the previous day".
+        The best repro is a failing automated test, because it later proves the fix and stays as a guard.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">slot.service.test.ts — the bug as a failing test</span>
+        <pre class="code"><span class="fn">it</span>(<span class="st">"returns the clinic's local date just after midnight"</span>, <span class="kw">async</span> () =&gt; {
+  vi.<span class="fn">setSystemTime</span>(<span class="kw">new</span> <span class="fn">Date</span>(<span class="st">"2026-10-01T17:30:00Z"</span>)); <span class="cm">// 00:30 on Oct 2 in Asia/Ho_Chi_Minh</span>
+  <span class="kw">const</span> slots = <span class="kw">await</span> service.<span class="fn">freeSlots</span>(doctorId, <span class="st">"today"</span>);
+  <span class="fn">expect</span>(slots[<span class="st">0</span>].date).<span class="fn">toBe</span>(<span class="st">"2026-10-02"</span>);
+});
+<span class="out">✗ expected "2026-10-02", received "2026-10-01"</span>   <span class="cm">// reproduced: now we can debug</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">2 · Isolate: halve the search space</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Cut the problem in half until it's small. Is the data wrong in the database, or only in the response? Does it
+        fail in the service test, or only through the API? If it used to work, <code class="inline">git bisect</code>
+        does the halving over history for you: it checks out a commit halfway between "good" and "bad", you (or a
+        script) say which it is, and it repeats until it names the first bad commit.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — find the commit that broke it</span>
+        <pre class="code">git bisect start
+git bisect bad                      <span class="cm"># current commit has the bug</span>
+git bisect good v1.4.0              <span class="cm"># this release didn't</span>
+git bisect run npx vitest run src/slots/slot.service.test.ts
+                                    <span class="cm"># exit 0 = good, non-zero = bad, fully automatic</span>
+<span class="out">a91c3e2 is the first bad commit</span>
+<span class="out">    refactor(slots): use toISOString() for date keys</span>   <span class="cm">// ← there's your suspect</span>
+git bisect reset                    <span class="cm"># back to where you started</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">3 and 4 · Hypothesise one cause, then prove it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        State one cause and what you'd see if it were true: "<code class="inline">toISOString()</code> converts to
+        UTC, so at 00:30 local time the date is still yesterday. If so, the variable <code class="inline">key</code>
+        will be <code class="inline">2026-10-01</code> at line 40." Then look, with the cheapest tool that can
+        answer the question.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tool</th><th class="px-4 py-3">Best when</th><th class="px-4 py-3">Watch out</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Stack trace</td><td class="px-4 py-3">There's an exception. Read it first, always.</td><td class="px-4 py-3">The top frame is often library code. Find the first frame in <em>your</em> code.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Debugger (breakpoints)</td><td class="px-4 py-3">You can reproduce locally and want to inspect many variables at one moment</td><td class="px-4 py-3">Pausing can hide timing bugs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Logs</td><td class="px-4 py-3">Staging or production, async flows, intermittent bugs</td><td class="px-4 py-3">Remove temporary debug logs before the PR. Never log secrets or personal data.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">git bisect</code></td><td class="px-4 py-3">"It used to work"</td><td class="px-4 py-3">Needs a reliable pass/fail check</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Browser DevTools</td><td class="px-4 py-3">Frontend state, network calls (<a href="./co4.html" class="text-viol underline decoration-viol/40">CO4</a>)</td><td class="px-4 py-3">Check the actual response, not what the UI shows</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">stack trace — read from your code outward</span>
+        <pre class="code">TypeError: Cannot read properties of null (reading 'timezone')
+    at SlotService.freeSlots (src/slots/service.ts:40:31)      <span class="cm">// ← first frame in OUR code: start here</span>
+    at SlotsController.list (src/slots/controller.ts:22:18)    <span class="cm">// ← who called it, with what</span>
+    at Layer.handle (node_modules/express/lib/router/layer.js:95:5)
+    at next (node_modules/express/lib/router/route.js:149:13)  <span class="cm">// framework plumbing: skip</span>
+<span class="cm">// Question to answer: why is clinic null at service.ts:40? (a doctor with no clinic?)</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        In VS Code, click the gutter to set a breakpoint and start the debug configuration for your test runner or
+        server. For Node you can also run with <code class="inline">node --inspect-brk</code> and attach Chrome
+        DevTools, or add a <code class="inline">debugger;</code> statement. When the breakpoint hits, check your
+        prediction against the real values. A confirmed hypothesis is a root cause. Only now do you change code.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>Fix the cause, not the symptom.</strong> Adding <code class="inline">?.</code> at line 40 makes the
+        crash disappear, and the doctor with no clinic now silently shows zero slots. Ask why the value is null, and
+        whether it's allowed to be. Then decide: fix the data, add a constraint, or handle the case on purpose with a
+        clear error.
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Bug classes in AI-generated code</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The same six bugs, again and again</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents learned from a huge amount of human code, so they make human mistakes, and they make them in
+        confident, tidy-looking code. The six classes below cover a large share of what reaches review. Learn to spot
+        each one in a diff in a few seconds.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Bug class</th><th class="px-4 py-3">Spot it by</th><th class="px-4 py-3">Test that catches it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Off-by-one</td><td class="px-4 py-3"><code class="inline">&lt;</code> vs <code class="inline">&lt;=</code>, <code class="inline">page * size</code>, slice ends</td><td class="px-4 py-3">The exact boundary: 24h exactly, last page, empty list</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Null handling</td><td class="px-4 py-3">Deep property chains, or <code class="inline">?.</code> sprinkled to silence errors</td><td class="px-4 py-3">A record with the optional relation missing</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Silent catch</td><td class="px-4 py-3"><code class="inline">catch</code> that logs, returns a default, or returns success</td><td class="px-4 py-3">Make the dependency throw, and assert the error reaches the caller</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Wrong async/await</td><td class="px-4 py-3"><code class="inline">forEach(async …)</code>, a missing <code class="inline">await</code>, un-awaited promises</td><td class="px-4 py-3">Assert the side effect happened <em>before</em> the function returned</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Stale closure</td><td class="px-4 py-3">React hooks with a missing dependency, timers reading old state</td><td class="px-4 py-3">Change state, wait for the timer, assert it used the new value</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time zones</td><td class="px-4 py-3"><code class="inline">new Date("2026-10-01")</code>, <code class="inline">toISOString().slice(0, 10)</code>, server-local time</td><td class="px-4 py-3">Freeze the clock near midnight in a non-UTC zone</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Off-by-one and null handling</h3>
+      <div class="mt-4">
+        <span class="code-label">booking.service.ts — two bugs in six lines</span>
+        <pre class="code"><span class="kw">const</span> hours = <span class="fn">hoursUntil</span>(booking.slot.startsAt);
+<span class="kw">if</span> (hours &lt; <span class="st">24</span>) <span class="kw">throw new</span> <span class="fn">TooLateError</span>();        <span class="cm">// ticket: "up to 24h before" → is exactly 24h allowed? ASK</span>
+
+<span class="kw">const</span> doctor = booking.slot.doctor?.name ?? <span class="st">""</span>; <span class="cm">// ✗ hides a missing doctor, sends an email "with Dr. "</span>
+<span class="kw">const</span> page = <span class="fn">Number</span>(req.query.page);          <span class="cm">// pages start at 1 in the UI…</span>
+<span class="kw">const</span> offset = page * size;                      <span class="cm">// ✗ …so page 1 skips the first `size` rows. (page - 1) * size</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Silent catch and wrong async/await</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        These are the most dangerous, because the code "works" in the demo. The user sees success while nothing
+        happened.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">reminders.job.ts — looks fine, sends nothing reliably</span>
+        <pre class="code"><span class="kw">async function</span> <span class="fn">sendReminders</span>(bookings) {
+  <span class="kw">try</span> {
+    bookings.<span class="fn">forEach</span>(<span class="kw">async</span> (b) =&gt; {             <span class="cm">// ✗ forEach doesn't wait for async callbacks</span>
+      <span class="kw">await</span> mailer.<span class="fn">send</span>(b.patient.email, ...);
+    });
+    <span class="kw">return</span> { ok: <span class="kw">true</span> };                          <span class="cm">// returns before any email is sent</span>
+  } <span class="kw">catch</span> (e) {
+    console.<span class="fn">log</span>(e);                               <span class="cm">// ✗ swallowed, and it never runs anyway:</span>
+    <span class="kw">return</span> { ok: <span class="kw">true</span> };                          <span class="cm">//   rejections inside forEach escape the try</span>
+  }
+}
+<span class="cm">// ✓ for (const b of bookings) await mailer.send(...)   or   await Promise.all(bookings.map(...))</span>
+<span class="cm">// ✓ let errors propagate, or record each failure and report it</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Stale closures and time zones</h3>
+      <div class="mt-4">
+        <span class="code-label">SlotCountdown.tsx and slot.service.ts</span>
+        <pre class="code"><span class="cm">// React: the interval callback captures `slots` from the FIRST render</span>
+<span class="fn">useEffect</span>(() =&gt; {
+  <span class="kw">const</span> id = <span class="fn">setInterval</span>(() =&gt; <span class="fn">refresh</span>(slots), <span class="st">30_000</span>);
+  <span class="kw">return</span> () =&gt; <span class="fn">clearInterval</span>(id);
+}, []);                                          <span class="cm">// ✗ `slots` missing from deps → always refreshes old data</span>
+
+<span class="cm">// Dates: a date-only string is parsed as UTC midnight</span>
+<span class="kw">new</span> <span class="fn">Date</span>(<span class="st">"2026-10-01"</span>)                           <span class="cm">// 2026-10-01T00:00Z = 07:00 in Vietnam</span>
+<span class="kw">new</span> <span class="fn">Date</span>().<span class="fn">toISOString</span>().<span class="fn">slice</span>(<span class="st">0</span>, <span class="st">10</span>)          <span class="cm">// ✗ the UTC date, not the clinic's date</span>
+<span class="cm">// ✓ store instants in UTC (timestamptz), convert with the clinic's IANA zone for display</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">react-hooks/exhaustive-deps</code> lint rule from the React Hooks ESLint plugin flags the
+        first one, which is a good reason to keep linting on. React itself is covered in
+        <a href="./ap1.html" class="text-viol underline decoration-viol/40">AP1</a>. For time zones, the rule is
+        simple: store moments in UTC, and do "what day is it?" only with an explicit zone.
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> when a bug class bites your project twice, turn it into a guard: a lint rule,
+        a shared helper such as <code class="inline">clinicToday(clinic)</code>, or a line in
+        <code class="inline">CLAUDE.md</code> ("never use toISOString() for calendar dates, use clinicToday()"). The
+        agent then stops making that mistake in this repo.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code is excellent at reading a codebase quickly and at running the tests, logs and bisects that
+        debugging needs. It's weaker at stopping itself from guessing. Give it the method explicitly, and it
+        becomes a strong debugging partner.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — debug with the method, not with guesses</span>
+        <pre class="code">Bug: patients in Vietnam see yesterday's slots just after midnight.
+Follow this method and stop after each step to show me:
+1. Reproduce: write a failing test. Show me it fails.
+2. Isolate: find where the wrong date first appears. Use git bisect if useful.
+3. Hypothesise: one root cause, with file:line, and what we'd observe if true.
+4. Verify: prove it with a log or the test output. Only then propose a fix.
+<span class="cm"># Do NOT change application code before step 4 is confirmed.</span></pre>
+      </div>
+      <pre class="code mt-3">Give me a tour of this repo for a new developer: entry points, the path of
+GET /doctors/:id/slots through each layer (file:line per hop), where tests
+live and how to run them. Mark anything you inferred rather than read.</pre>
+      <pre class="code mt-3">Review this diff only for these bug classes: off-by-one, null handling,
+silent catch, missing await, stale closures, time zones. For each hit give
+file:line and a test that would catch it. No style comments.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The codebase tour and request traces, with citations</li>
+            <li>Write the failing reproduction test</li>
+            <li>Run <code class="inline">git bisect run</code> and read long logs</li>
+            <li>Add temporary logging, and remove it after</li>
+            <li>Scan diffs for the six bug classes</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Two or more cited lines, opened yourself</li>
+            <li>That the repro test fails for the <em>right</em> reason</li>
+            <li>That the hypothesis was confirmed before the fix</li>
+            <li>That the fix addresses the cause, not the symptom</li>
+            <li>That temporary logs and debug code are gone from the PR</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent output:</strong> a third different "fix" for the same failure (it's guessing:
+        stop it and ask for the root cause) · a fix that adds <code class="inline">?.</code>, a
+        <code class="inline">try/catch</code> or a retry around the failing line · "the test was flaky" with no
+        evidence · a changed assertion instead of changed code · an explanation that names functions or files you
+        can't find.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Pastes the error into the agent and applies whatever comes back.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Reads stack traces and adds <code class="inline">console.log</code>. Explores code file by file with no plan.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Can trace a request with help and knows the four steps, but skips reproduce or verify under pressure. Uses the debugger occasionally.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Maps an unfamiliar feature in an hour. Every bug fix starts with a failing test and ends with a confirmed root cause. Uses debugger, logs and bisect appropriately. Spots the six bug classes in agent diffs and makes the agent follow the method.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Turns recurring bug classes into lint rules, helpers or <code class="inline">CLAUDE.md</code> guidance, and pairs with other interns on hard bugs.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 3:</strong> for your last bug fix, can you show the failing test that
+        reproduced it, name the root cause in one sentence with a file:line, and explain why the fix addresses that
+        cause and not just the symptom?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Changing code before you can reproduce</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Without a repro you can't tell whether your change fixed anything. The bug "goes away" and comes back next week.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Several changes at once</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">If three edits together fix it, you don't know which one mattered, and the other two may add new bugs. One change, one check.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Trusting the agent's summary of the code</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A summary describes what code like this usually does. Open the cited lines, especially the INFERRED ones.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Explain the bug out loud</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Describing the problem step by step, to a teammate or to the agent, often exposes the wrong assumption before anyone answers.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep the repro test</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The failing test you wrote to find the bug is the regression test. Commit it with the fix so the bug can't come back quietly.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Timebox, then ask</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">After an hour with no progress, write down what you tried and what you observed, and ask your mentor. That write-up is half the answer.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="trace"> <span>Traced one request through an unfamiliar codebase and wrote a trace note with file:line for every hop.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="citations"> <span>Asked the agent to explain a flow with citations, checked at least two, and caught or confirmed at least one INFERRED claim.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tools"> <span>Used a breakpoint debugger on a real bug, and ran <code class="inline">git bisect run</code> at least once (on a practice repo is fine).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="classes"> <span>Can point to each of the six bug classes in a code sample and name the test that would catch it.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="bug-report"> <span class="font-semibold">Fixed a real or seeded bug with Claude Code using the four-step method, and opened a PR with the failing-then-passing test, a one-sentence root cause with file:line, and a note on which bug class it was (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://code.claude.com/docs/en/common-workflows" target="_blank" rel="noopener">Anthropic — Claude Code common workflows</a> — the official recipes for understanding a new codebase and fixing bugs with the agent.</li>
+        <li><a class="text-coral underline" href="https://code.visualstudio.com/docs/debugtest/debugging" target="_blank" rel="noopener">VS Code — Debugging</a> — breakpoints, watch expressions and launch configurations.</li>
+        <li><a class="text-coral underline" href="https://nodejs.org/en/learn/getting-started/debugging" target="_blank" rel="noopener">Node.js — Debugging</a> — <code class="inline">--inspect</code> and attaching Chrome DevTools to a Node process.</li>
+        <li><a class="text-coral underline" href="https://developer.chrome.com/docs/devtools/javascript" target="_blank" rel="noopener">Chrome DevTools — Debug JavaScript</a> — the browser side of Part III.</li>
+        <li><a class="text-coral underline" href="https://git-scm.com/docs/git-bisect" target="_blank" rel="noopener">Git — git-bisect</a> — including <code class="inline">bisect run</code> and exit-code rules.</li>
+        <li><a class="text-coral underline" href="https://react.dev/reference/react/useEffect" target="_blank" rel="noopener">React — useEffect reference</a> · <a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date" target="_blank" rel="noopener">MDN — Date</a> — the official word on dependencies and date parsing from Part IV.</li>
+      </ul>

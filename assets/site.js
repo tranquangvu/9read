@@ -76,10 +76,10 @@ const INTERN_GROUPS = [
 /* Order = recommended 12-week order. critical = Core (everyone), else Elective (path-dependent).
    soon = page not written yet: listed but not linked. Remove the flag when the page ships. */
 const INTERN_MODULES = [
-  { code: "CO1", name: "The Developer Role in the AI Era", critical: true, soon: true },
-  { code: "CO2", name: "Git, GitHub Flow & Code Review", critical: true, soon: true },
-  { code: "CO3", name: "Reading & Debugging Code You Didn't Write", critical: true, soon: true },
-  { code: "CO4", name: "HTTP, APIs & How the Web Works", critical: true, soon: true },
+  { code: "CO1", name: "The Developer Role in the AI Era", critical: true },
+  { code: "CO2", name: "Git, GitHub Flow & Code Review", critical: true },
+  { code: "CO3", name: "Reading & Debugging Code You Didn't Write", critical: true },
+  { code: "CO4", name: "HTTP, APIs & How the Web Works", critical: true },
   { code: "AG1", name: "How LLMs & Coding Agents Work", critical: true, soon: true },
   { code: "AG2", name: "Claude Code Fundamentals", critical: true, soon: true },
   { code: "AG3", name: "Plan → Execute → Verify", critical: true },
