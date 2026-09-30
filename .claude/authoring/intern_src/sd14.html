@@ -1,0 +1,877 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Payments &amp; Money</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Sooner or later most client projects take money: a deposit for a clinic appointment, an order in a small
+          shop, a monthly SaaS plan. The code involved is small. The ways it can go wrong are many, and every one of them
+          costs someone real money or a support call. This module covers how to store and calculate amounts, how
+          payment gateways (Stripe and the Vietnamese ones: VNPay, MoMo, ZaloPay) actually work, how to stay correct
+          when webhooks arrive twice or out of order and your server crashes at the worst moment, and when a small
+          system needs a ledger rather than a <code class="inline">payments</code> table.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent will happily write
+          <code class="inline">price: number</code>, multiply it by <code class="inline">1.1</code> for tax, mark the
+          booking paid when the browser lands on <code class="inline">/payment/success</code>, and handle the webhook
+          without checking its signature. The demo works, the tests pass, and the sandbox is happy. Then a patient
+          edits the return URL and gets a free appointment, a retried webhook refunds someone twice, and the month-end
+          totals are off by 3,000 đ that nobody can explain. Payment bugs don't look like crashes. They look like money
+          quietly going missing, and you are the one who has to notice.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Money in data</div>
+      <h2 class="font-display text-2xl font-bold mt-2">An amount is an integer plus a currency, and rounding happens in one place</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Our running example is the <strong>clinic booking app</strong> from
+        <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>: patients book a slot with a doctor
+        and pay a deposit online. SD11 already sketched the booking lifecycle and a <code class="inline">payments</code>
+        table. This module is the detail behind that sketch. We start with the boring part, because it is where the
+        bugs that survive longest live: <strong>how you store and compute an amount</strong>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Never floats: integer minor units or NUMERIC</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Binary floating point cannot represent most decimal fractions exactly. <code class="inline">0.1 + 0.2</code> is
+        <code class="inline">0.30000000000000004</code> in JavaScript, Python, Java and Go alike. For one price that looks
+        harmless. Summed over 10,000 invoice lines, multiplied by a tax rate and rounded differently in two places, it
+        produces totals that disagree with the payment provider by a few cents or đồng, and nobody can find why.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Storage</th><th class="px-4 py-3">Right when</th><th class="px-4 py-3">Watch out for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">bigint</code> minor units</td><td class="px-4 py-3">The default. 150,000 đ is <code class="inline">150000</code>; $12.50 is <code class="inline">1250</code> cents. Matches what Stripe and most gateways send.</td><td class="px-4 py-3">You must know each currency's exponent. <code class="inline">node-postgres</code> returns <code class="inline">bigint</code> as a <em>string</em>, on purpose.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">numeric(14,2)</code> / <code class="inline">numeric(19,4)</code></td><td class="px-4 py-3">Unit prices with fractions of a minor unit (per-minute pricing, FX, tax bases), accounting exports</td><td class="px-4 py-3">Your language must use a decimal type too (<code class="inline">decimal.js</code>, Python <code class="inline">Decimal</code>, Java <code class="inline">BigDecimal</code>), or you convert back to float on read.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">real</code> / <code class="inline">double precision</code> / JS <code class="inline">number</code> with decimals</td><td class="px-4 py-3">Never for money</td><td class="px-4 py-3">Rounding drift, failed equality checks, totals that don't match the gateway.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Postgres <code class="inline">money</code> type</td><td class="px-4 py-3">Practically never</td><td class="px-4 py-3">Its output depends on the server's <code class="inline">lc_monetary</code> locale, and it stores no currency.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A JavaScript <code class="inline">number</code> is still safe for <em>integer</em> minor units up to
+        2<sup>53</sup>, about 9 × 10<sup>15</sup>. That is 9 million billion đồng, so integer VND in a
+        <code class="inline">number</code> is fine for a booking app. Decimals in a <code class="inline">number</code> are
+        not.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Currency is part of the amount</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">150000</code> means nothing without a currency. Store the
+        <a class="text-coral underline" href="https://www.iso.org/iso-4217-currency-codes.html" target="_blank" rel="noopener">ISO 4217</a>
+        code next to every amount, even if the client "only uses VND". The moment a clinic chain opens in Singapore or
+        a SaaS client bills in USD, every column without a currency becomes a migration. ISO 4217 also tells you the
+        <strong>exponent</strong>: how many minor-unit digits the currency has.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Currency</th><th class="px-4 py-3">Exponent</th><th class="px-4 py-3">150 units stored as</th><th class="px-4 py-3">Note</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">VND</td><td class="px-4 py-3">0</td><td class="px-4 py-3"><code class="inline">150</code></td><td class="px-4 py-3">No hào or xu in circulation. Stripe treats VND as a zero-decimal currency. <strong>VNPay's <code class="inline">vnp_Amount</code> expects the amount × 100 anyway</strong>, so check each gateway.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">USD, EUR, SGD</td><td class="px-4 py-3">2</td><td class="px-4 py-3"><code class="inline">15000</code></td><td class="px-4 py-3">The common case</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">JPY, KRW</td><td class="px-4 py-3">0</td><td class="px-4 py-3"><code class="inline">150</code></td><td class="px-4 py-3">Same trap as VND for code that assumes "× 100"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">KWD, BHD</td><td class="px-4 py-3">3</td><td class="px-4 py-3"><code class="inline">150000</code></td><td class="px-4 py-3">Rare, but proves the exponent must be a lookup, not a constant</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">migration — amounts with their currency</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">services</span> (             <span class="cm">-- what a clinic charges for</span>
+  id            bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  clinic_id     bigint <span class="kw">NOT NULL REFERENCES</span> clinics(id),
+  name          text   <span class="kw">NOT NULL</span>,
+  price_minor   bigint <span class="kw">NOT NULL CHECK</span> (price_minor &gt;= <span class="st">0</span>),   <span class="cm">-- 150000 = 150,000 đ</span>
+  currency      char(3) <span class="kw">NOT NULL DEFAULT</span> <span class="st">'VND'</span>,               <span class="cm">-- ISO 4217, always stored</span>
+  vat_rate_bp   int    <span class="kw">NOT NULL DEFAULT</span> <span class="st">0</span>   <span class="cm">-- basis points: 800 = 8%, 1000 = 10%</span>
+);
+<span class="cm">-- rates as integer basis points avoid 0.1 floats too</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">money.ts — a tiny Money type the agent should reuse everywhere</span>
+        <pre class="code"><span class="kw">export type</span> <span class="fn">Money</span> = { minor: bigint; currency: <span class="st">"VND"</span> | <span class="st">"USD"</span> | <span class="st">"SGD"</span> };
+
+<span class="kw">export function</span> <span class="fn">add</span>(a: Money, b: Money): Money {
+  <span class="kw">if</span> (a.currency !== b.currency) <span class="kw">throw new</span> <span class="fn">Error</span>(<span class="st">"currency mismatch"</span>);  <span class="cm">// ← never add VND to USD</span>
+  <span class="kw">return</span> { minor: a.minor + b.minor, currency: a.currency };
+}
+
+<span class="kw">const</span> EXP = { VND: <span class="st">0</span>, USD: <span class="st">2</span>, SGD: <span class="st">2</span> } <span class="kw">as const</span>;
+<span class="kw">export const</span> <span class="fn">format</span> = (m: Money) =&gt;
+  <span class="kw">new</span> Intl.<span class="fn">NumberFormat</span>(<span class="st">"vi-VN"</span>, { style: <span class="st">"currency"</span>, currency: m.currency })
+    .<span class="fn">format</span>(Number(m.minor) / <span class="st">10</span> ** EXP[m.currency]);   <span class="cm">// float only at the display edge</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Libraries such as <code class="inline">dinero.js</code> do this properly; a 30-line module like the one above is
+        also fine for a small app. What matters in review is that there is <strong>one</strong> money type, and that
+        amounts don't travel as bare numbers through ten functions. <code class="inline">Intl.NumberFormat</code> knows
+        each currency's display digits, so the UI never hard-codes "đ" or two decimals.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Discounts, tax and fees: fix the order, round once</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Total" is the result of a pipeline, and the order of the steps changes the answer. Usually a discount applies
+        to the price <em>before</em> tax, and tax is computed on the discounted amount. Payment fees (the 1–3% the
+        gateway takes) are normally the merchant's cost and don't appear on the patient's bill at all, but some clients
+        want a "card surcharge" line. None of this is your decision: <strong>write the order down with the client or
+        their accountant</strong>, then put it in exactly one function.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 170" class="w-full min-w-[620px]" role="img" aria-label="Price pipeline: list price, minus discount, plus VAT on the discounted amount, rounded once, then snapshotted on the order">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">ONE FUNCTION · priceBooking() · every step in integer minor units</text>
+          <g class="anim-pulse"><rect x="10" y="40" width="120" height="50" rx="9" fill="#2563EB"/>
+            <text x="70" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">List price</text>
+            <text x="70" y="77" text-anchor="middle" fill="#ffffffbb" font-size="9">500,000 đ</text></g>
+          <line x1="130" y1="65" x2="150" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="150" y="40" width="120" height="50" rx="9" fill="#6d5acd"/>
+            <text x="210" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">− Discount</text>
+            <text x="210" y="77" text-anchor="middle" fill="#ffffffbb" font-size="9">voucher 15% → 425,000</text></g>
+          <line x1="270" y1="65" x2="290" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="290" y="40" width="120" height="50" rx="9" fill="#0D9488"/>
+            <text x="350" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">+ Tax</text>
+            <text x="350" y="77" text-anchor="middle" fill="#ffffffbb" font-size="9">8% of 425,000 = 34,000</text></g>
+          <line x1="410" y1="65" x2="430" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d3"><rect x="430" y="40" width="120" height="50" rx="9" fill="#D97757"/>
+            <text x="490" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Round once</text>
+            <text x="490" y="77" text-anchor="middle" fill="#ffffffbb" font-size="9">documented rule</text></g>
+          <line x1="550" y1="65" x2="570" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d4"><rect x="570" y="40" width="120" height="50" rx="9" fill="#37474F"/>
+            <text x="630" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Snapshot</text>
+            <text x="630" y="77" text-anchor="middle" fill="#ffffffbb" font-size="9">459,000 on the order</text></g>
+          <text x="350" y="120" text-anchor="middle" font-size="10" fill="#6E6B64">gateway fee (≈1–3%) is NOT in this pipeline: it is the clinic's cost, seen later in the settlement report</text>
+          <text x="350" y="145" text-anchor="middle" font-size="10" fill="#A8A49B">tax rate and whether it applies at all is the accountant's call, not yours</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">pricing.ts — the whole rule, with rounding in one place</span>
+        <pre class="code"><span class="cm">// Half-up rounding on positive integer minor units. Agree the rule with the client.</span>
+<span class="kw">const</span> <span class="fn">pct</span> = (amount: bigint, bp: bigint) =&gt; (amount * bp + <span class="st">5000n</span>) / <span class="st">10000n</span>;
+
+<span class="kw">export function</span> <span class="fn">priceBooking</span>(listMinor: bigint, discountBp: bigint, vatBp: bigint) {
+  <span class="kw">const</span> discount = <span class="fn">pct</span>(listMinor, discountBp);        <span class="cm">// 1. discount on the list price</span>
+  <span class="kw">const</span> net      = listMinor - discount;
+  <span class="kw">const</span> vat      = <span class="fn">pct</span>(net, vatBp);                  <span class="cm">// 2. tax on the DISCOUNTED amount</span>
+  <span class="kw">return</span> { listMinor, discount, net, vat, total: net + vat };  <span class="cm">// 3. keep every line</span>
+}
+<span class="cm">// priceBooking(500000n, 1500n, 800n) → net 425000, vat 34000, total 459000</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two rounding questions come up on every project. <strong>Per line or per invoice?</strong> Rounding the tax on
+        each line and summing gives a slightly different number from rounding the tax on the invoice total; pick one to
+        match the client's invoicing software. <strong>Splitting</strong> an amount (three instalments, a group booking
+        split between patients) must hand out the remainder explicitly, so the parts always add up to the whole:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">allocate.ts — 100,000 đ in 3 parts is 33,334 + 33,333 + 33,333</span>
+        <pre class="code"><span class="kw">export function</span> <span class="fn">allocate</span>(total: bigint, parts: <span class="kw">number</span>): bigint[] {
+  <span class="kw">const</span> n = BigInt(parts);
+  <span class="kw">const</span> base = total / n, rest = total % n;           <span class="cm">// integer division, no floats</span>
+  <span class="kw">return</span> Array.<span class="fn">from</span>({ length: parts }, (_, i) =&gt;
+    BigInt(i) &lt; rest ? base + <span class="st">1n</span> : base);           <span class="cm">// ← the first `rest` parts get one more unit</span>
+}
+<span class="cm">// sum(allocate(x, n)) === x, always. Math.round(x / 3) * 3 is not.</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Snapshot the price on the order</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The clinic will change its prices. A booking made last month at 500,000 đ must still show 500,000 đ on its
+        receipt, its refund and its report, even after the service costs 550,000 đ. So the booking (or order) stores
+        <strong>copies</strong> of the amounts, tax rate and discount code as they were at checkout, not a foreign key
+        to the current price. This is the one place where "duplicate data" is correct, because it is a record of a
+        past fact, not the current state.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration — the booking owns its price</span>
+        <pre class="code"><span class="kw">ALTER TABLE</span> bookings
+  <span class="kw">ADD COLUMN</span> currency        char(3) <span class="kw">NOT NULL DEFAULT</span> <span class="st">'VND'</span>,
+  <span class="kw">ADD COLUMN</span> list_minor      bigint  <span class="kw">NOT NULL</span>,   <span class="cm">-- copied from services at checkout</span>
+  <span class="kw">ADD COLUMN</span> discount_minor  bigint  <span class="kw">NOT NULL DEFAULT</span> <span class="st">0</span>,
+  <span class="kw">ADD COLUMN</span> vat_minor       bigint  <span class="kw">NOT NULL DEFAULT</span> <span class="st">0</span>,
+  <span class="kw">ADD COLUMN</span> total_minor     bigint  <span class="kw">NOT NULL</span>,
+  <span class="kw">ADD COLUMN</span> voucher_code    text,              <span class="cm">-- the code as typed, not just an id</span>
+  <span class="kw">ADD CONSTRAINT</span> total_adds_up <span class="kw">CHECK</span>
+    (total_minor = list_minor - discount_minor + vat_minor);  <span class="cm">-- the DB rejects a bad sum</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Exchange rates</strong>, briefly: if the client shows prices in one currency and charges in another,
+        store the rate you used, its source and its timestamp on the order, and charge the amount you displayed. Most
+        small clients should avoid this entirely: charge in the local currency and let the patient's card issuer do the
+        conversion. Multi-currency pricing is a real feature with real accounting consequences, so treat it as one.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>Tax is a legal question.</strong> In Vietnam, VAT has a standard rate with temporary reductions for some
+        goods and services, some medical services are exempt, and e-invoices (hóa đơn điện tử) are required and issued
+        through licensed providers. The rules change often. Your job is to make the rate a <em>configurable
+        value</em> with an effective date, and let the client's accountant set it. Never hard-code
+        <code class="inline">0.1</code> in business logic. Check the current regulation for any real project.
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Payment flows</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The browser tells you where the patient went; only the server-to-server message tells you they paid</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Almost every payment integration has the same shape. Your server asks the provider to create a payment for an
+        amount. The patient is sent to the provider's page (or sees the provider's embedded form) and pays there. Then
+        two separate things happen: the patient's <strong>browser</strong> is sent back to your site, and the provider's
+        <strong>server</strong> calls yours with the result. The whole module rests on one rule: <strong>the second
+        message decides; the first one only changes what the patient sees.</strong>
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Three integration styles</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Style</th><th class="px-4 py-3">Examples</th><th class="px-4 py-3">Effort and control</th><th class="px-4 py-3">Card data on your page?</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Hosted checkout</td><td class="px-4 py-3">Stripe Checkout, Stripe Payment Links, Lemon Squeezy / Paddle for SaaS</td><td class="px-4 py-3">Least code; the provider handles 3-D Secure, wallets, receipts. Branding is limited.</td><td class="px-4 py-3">No</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Redirect gateway</td><td class="px-4 py-3">VNPay, MoMo, ZaloPay, most Vietnamese banks</td><td class="px-4 py-3">You build a signed URL, the patient pays on the gateway (card, QR, bank app), and you get a return URL plus an IPN.</td><td class="px-4 py-3">No</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Embedded fields</td><td class="px-4 py-3">Stripe Payment Element, Adyen Drop-in</td><td class="px-4 py-3">Payment form inside your page, rendered in the provider's iframes. More UI control, more states to handle (<code class="inline">requires_action</code>).</td><td class="px-4 py-3">Typed into the provider's iframe, never your DOM</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For a small or medium client, <strong>start with hosted checkout or the gateway's redirect</strong>. It ships
+        in days, and it keeps you out of most of the security scope (see PCI below). Choose embedded fields when the
+        client has a real reason, such as a one-page checkout on a high-traffic shop. A fully custom card form that
+        posts card numbers to your API is almost never a correct choice for an agency project.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Stripe: Checkout Sessions and PaymentIntents</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        For clients with an entity in a country Stripe supports (check Stripe's current country list: at the time of
+        writing, a Vietnamese company cannot open a Stripe account directly), Stripe is the reference design. A
+        <strong>Checkout Session</strong> is the hosted page. Under it sits a <strong>PaymentIntent</strong>, the object
+        that tracks one attempt to collect one amount through its states. You create the session on the server, send
+        the patient to its <code class="inline">url</code>, and wait for the webhook.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">api/checkout.ts — create a Checkout Session for a booking</span>
+        <pre class="code"><span class="kw">const</span> session = <span class="kw">await</span> stripe.checkout.sessions.<span class="fn">create</span>({
+  mode: <span class="st">"payment"</span>,
+  line_items: [{ quantity: <span class="st">1</span>, price_data: {
+    currency: booking.currency.<span class="fn">toLowerCase</span>(),
+    unit_amount: Number(booking.totalMinor),      <span class="cm">// ← from the DB snapshot, never from the client</span>
+    product_data: { name: <span class="st">`Deposit: ${service.name}`</span> } } }],
+  client_reference_id: String(payment.id),        <span class="cm">// links the event back to OUR row</span>
+  metadata: { paymentId: String(payment.id), bookingId: String(booking.id) },
+  expires_at: Math.<span class="fn">floor</span>(Date.<span class="fn">now</span>() / <span class="st">1000</span>) + <span class="st">30</span> * <span class="st">60</span>,  <span class="cm">// 30 min is Stripe's minimum</span>
+  success_url: <span class="st">`${APP}/bookings/${booking.id}?paid=1`</span>,   <span class="cm">// UX only, proves nothing</span>
+  cancel_url:  <span class="st">`${APP}/bookings/${booking.id}`</span>,
+}, { idempotencyKey: <span class="st">`checkout-${payment.id}`</span> });   <span class="cm">// Part III</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The webhook events to handle for this flow are <code class="inline">checkout.session.completed</code> (check its
+        <code class="inline">payment_status</code> is <code class="inline">paid</code>), plus
+        <code class="inline">checkout.session.async_payment_succeeded</code> / <code class="inline">_failed</code> if you
+        enable delayed payment methods, and <code class="inline">checkout.session.expired</code>. Event names and fields
+        evolve with Stripe's API versions, so pin your API version and read the current docs.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Vietnamese gateways: signed redirect, return URL, IPN</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        VNPay, MoMo and ZaloPay differ in field names but share one pattern. You build a request with the amount, your
+        order reference and a <strong>signature</strong>: an HMAC of the parameters using a secret the gateway gave you
+        (VNPay uses HMAC-SHA512 over the sorted query string; MoMo and ZaloPay use HMAC-SHA256 over a fixed field
+        order). The patient pays on the gateway. The gateway then calls your <strong>IPN URL</strong> (Instant Payment
+        Notification) server to server, and separately redirects the browser to your <strong>return URL</strong>. Both
+        carry a signature; only the IPN is authoritative.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant P as Patient browser
+    participant API as Booking API
+    participant DB as Postgres
+    participant G as VNPay / MoMo / ZaloPay
+    P->>API: POST /bookings/42/pay
+    API->>DB: INSERT payment 901 pending, amount from booking
+    API-->>P: 302 to gateway URL, params + HMAC signature
+    P->>G: pays by card, QR or bank app
+    G->>API: IPN, server to server, signed
+    API->>API: verify signature, order ref, amount
+    API->>DB: payment 901 captured, booking confirmed
+    API-->>G: ack in the format the gateway expects
+    G-->>P: redirect to return URL, also signed
+    P->>API: GET /payment/return?...
+    API->>DB: read status only, never write
+    API-->>P: "Paid" or "Confirming…"
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">gateways/vnpay.ts — verifying an IPN (sketch; follow the current VNPay spec)</span>
+        <pre class="code"><span class="kw">export function</span> <span class="fn">verifyVnpay</span>(query: Record&lt;string, string&gt;, secret: string) {
+  <span class="kw">const</span> { vnp_SecureHash, vnp_SecureHashType, ...rest } = query;
+  <span class="kw">const</span> signed = Object.<span class="fn">keys</span>(rest).<span class="fn">sort</span>()           <span class="cm">// sorted, exactly as the spec says</span>
+    .<span class="fn">map</span>((k) =&gt; <span class="st">`${k}=${encodeURIComponent(rest[k]).replace(/%20/g, "+")}`</span>)
+    .<span class="fn">join</span>(<span class="st">"&amp;"</span>);
+  <span class="kw">const</span> expected = crypto.<span class="fn">createHmac</span>(<span class="st">"sha512"</span>, secret).<span class="fn">update</span>(signed).<span class="fn">digest</span>(<span class="st">"hex"</span>);
+  <span class="kw">return</span> crypto.<span class="fn">timingSafeEqual</span>(                      <span class="cm">// ← constant time, never ===</span>
+    Buffer.<span class="fn">from</span>(expected), Buffer.<span class="fn">from</span>(String(vnp_SecureHash).<span class="fn">toLowerCase</span>()));
+}
+<span class="cm">// then: find payment by vnp_TxnRef, check vnp_Amount === total_minor * 100,
+// check vnp_ResponseCode and vnp_TransactionStatus are "00", and only then capture.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The general rule for verifying a webhook signature (raw body, constant-time compare) is in
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>. What is specific to payments is the
+        list of checks <em>after</em> the signature passes: the order reference exists, the <strong>amount and currency
+        match your snapshot</strong>, the result code means success, and the payment isn't already in a final state.
+        Each gateway also expects a specific acknowledgement (VNPay a JSON <code class="inline">RspCode</code>, MoMo an
+        HTTP 204, ZaloPay a <code class="inline">return_code</code>), and retries if it doesn't get one. The exact
+        formats, encodings and codes change between API versions, so implement against the gateway's current
+        integration document and its sandbox, and treat the snippet above as a shape, not a spec.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The payment state machine</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A payment is not a boolean <code class="inline">paid</code>. It moves through states, and some moves are
+        forbidden. Cards can be <strong>authorized</strong> (money reserved on the card) and later
+        <strong>captured</strong> (money actually taken), which is useful when the final amount isn't known yet.
+        Redirect gateways and wallets usually go straight to captured. Whatever the provider calls them, map its
+        statuses onto your own small set:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> pending: payment row created,<br/>patient sent to provider
+    pending --> authorized: card hold placed<br/>(manual capture only)
+    pending --> captured: IPN / webhook success
+    pending --> failed: declined, cancelled
+    pending --> expired: hold timeout, no answer
+    authorized --> captured: capture call
+    authorized --> expired: hold released
+    captured --> partially_refunded: refund part
+    captured --> refunded: refund all
+    partially_refunded --> refunded: refund the rest
+    failed --> [*]
+    expired --> [*]
+    refunded --> [*]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">payments.sql — only legal transitions are possible</span>
+        <pre class="code"><span class="kw">UPDATE</span> payments
+   <span class="kw">SET</span> status = <span class="st">'captured'</span>, captured_at = now(), provider_ref = $2
+ <span class="kw">WHERE</span> id = $1
+   <span class="kw">AND</span> status <span class="kw">IN</span> (<span class="st">'pending'</span>, <span class="st">'authorized'</span>)   <span class="cm">-- ← the guard: never from refunded/failed</span>
+<span class="kw">RETURNING</span> id;
+<span class="cm">-- 0 rows back = the event was a duplicate or arrived out of order.
+-- Log it, answer 200, and don't touch the booking.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A conditional <code class="inline">UPDATE … WHERE status IN (…)</code> is the whole state machine for a small
+        app; the pattern and the class-based alternative are in
+        <a href="./sd5.html" class="text-viol underline decoration-viol/40">SD5</a>. <strong>failed</strong> vs
+        <strong>expired</strong> matters to support staff: "your card was declined" and "you never finished paying" are
+        different conversations. Keep the provider's raw status string in a column too, for debugging.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Never trust the return URL</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The return URL is a page the patient's browser loads. The patient can close the tab before it loads, lose
+        signal in the lift, or type <code class="inline">/payment/return?status=success&amp;orderId=42</code> by hand.
+        Even when the gateway signs the return parameters, a replayed or shared link can arrive long after the fact.
+        So the return handler <strong>reads</strong> the payment's status from your database and shows it. If the IPN
+        hasn't arrived yet, show "Confirming your payment…" and poll for a few seconds. It never marks anything paid.
+      </p>
+      <div class="mt-4 callout callout-danger">
+        <strong>The most common payment bug in agent-written code:</strong> the return/success handler runs
+        <code class="inline">UPDATE bookings SET status = 'confirmed'</code>. Anyone who learns the URL pattern books
+        for free, and patients who close the tab early pay without getting a booking. Search the diff for any write
+        in a route the browser can reach after checkout.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">PCI DSS in plain words</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>PCI DSS</strong> is the card industry's security standard. Anyone who accepts cards must comply, and
+        the amount of work depends on how close your systems get to card numbers. If card data never touches your
+        servers or your page's DOM, because the patient types it on the provider's hosted page or into the provider's
+        iframe, the merchant can usually use the shortest self-assessment, <strong>SAQ A</strong>. If your own page's
+        JavaScript can affect the payment form, it grows to <strong>SAQ A-EP</strong>. If your API receives card numbers,
+        it becomes a full assessment that no small client wants to pay for.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Never</strong> log, store, or proxy a card number (PAN) or CVV. Not in logs, not in analytics, not in an error tracker's request body.</li>
+        <li>Use the provider's hosted page or its official iframe/element. Don't build "our own card form that forwards to Stripe".</li>
+        <li>Store only what the provider gives back for display: brand and last 4 digits, and the provider's payment or customer ID.</li>
+        <li>The eligibility criteria and the script-integrity requirements for payment pages changed with PCI DSS v4.x. The client signs the SAQ; check the current version with their acquirer or provider.</li>
+      </ul>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Correctness under failure</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Assume every message arrives twice, late or not at all, and prove the money still adds up</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Payment providers deliver webhooks <strong>at least once</strong>, in no guaranteed order, and retry for hours
+        or days when you don't answer. Your server restarts during deploys. Patients double-tap. None of this is rare at
+        scale, and even a clinic app taking 200 payments a day will see all of it within a month. This Part is the
+        checklist that keeps the numbers right anyway.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Write the payment row first, then call the provider with a key</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The order of operations is the design. Create your own <code class="inline">payments</code> row in
+        <code class="inline">pending</code> <em>before</em> talking to the provider, and derive the provider's idempotency
+        key from that row's ID. Then a retry, a double-tap, or a restart after a timeout reuses the same key, and the
+        provider returns the same session instead of creating a second one. How idempotency keys work on your own API
+        (the <code class="inline">Idempotency-Key</code> header and its table) is covered in
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>; here we only apply it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">services/start-payment.ts — the safe order</span>
+        <pre class="code"><span class="kw">export async function</span> <span class="fn">startPayment</span>(bookingId: bigint) {
+  <span class="kw">const</span> payment = <span class="kw">await</span> db.<span class="fn">one</span>(<span class="st">`
+    INSERT INTO payments (booking_id, amount_minor, currency, status, provider)
+    SELECT id, total_minor, currency, 'pending', 'vnpay' FROM bookings
+     WHERE id = $1 AND status = 'pending_payment'
+    ON CONFLICT (booking_id) WHERE status IN ('pending','authorized')
+      DO UPDATE SET updated_at = now()     -- reuse the open attempt
+    RETURNING *`</span>, [bookingId]);                <span class="cm">// 1. our row exists before any money moves</span>
+
+  <span class="kw">return</span> gateway.<span class="fn">createPaymentUrl</span>({
+    orderRef: <span class="st">`P${payment.id}`</span>,                 <span class="cm">// 2. the gateway's txn ref = our id</span>
+    amountMinor: payment.amount_minor,             <span class="cm">// 3. amount from the DB, not the request</span>
+    idempotencyKey: <span class="st">`pay-${payment.id}`</span>,         <span class="cm">//    where the provider supports one</span>
+  });
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">ON CONFLICT</code> target needs a partial unique index: at most one open payment per
+        booking. Redirect gateways often have no idempotency header; the equivalent is a <strong>unique transaction
+        reference per attempt</strong> (<code class="inline">vnp_TxnRef</code>, MoMo's <code class="inline">orderId</code>),
+        which the gateway refuses to reuse. If the patient returns after a failed attempt, create a <em>new</em> payment
+        row and a new reference rather than recycling the old one.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Webhooks: store first, dedupe by event ID, tolerate any order</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Treat the webhook endpoint as an <strong>inbox</strong>. Verify the signature, save the raw event with a unique
+        constraint on the provider's event ID, answer 200 quickly, and process it in a job. A duplicate hits the unique
+        constraint and becomes a no-op. A slow handler no longer makes the provider time out and retry. And when
+        something goes wrong you have the exact payload to replay.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">webhooks/stripe.ts — verify, store, acknowledge</span>
+        <pre class="code">app.<span class="fn">post</span>(<span class="st">"/webhooks/stripe"</span>, express.<span class="fn">raw</span>({ type: <span class="st">"application/json"</span> }), <span class="kw">async</span> (req, res) =&gt; {
+  <span class="kw">let</span> event;
+  <span class="kw">try</span> {
+    event = stripe.webhooks.<span class="fn">constructEvent</span>(      <span class="cm">// ← needs the RAW body, not parsed JSON</span>
+      req.body, req.headers[<span class="st">"stripe-signature"</span>]!, WEBHOOK_SECRET);
+  } <span class="kw">catch</span> { <span class="kw">return</span> res.<span class="fn">sendStatus</span>(<span class="st">400</span>); }
+
+  <span class="kw">await</span> db.<span class="fn">none</span>(<span class="st">`
+    INSERT INTO provider_events (provider, event_id, type, payload)
+    VALUES ('stripe', $1, $2, $3)
+    ON CONFLICT (provider, event_id) DO NOTHING`</span>,  <span class="cm">// duplicate delivery = no-op</span>
+    [event.id, event.type, event]);
+  <span class="kw">await</span> jobs.<span class="fn">enqueue</span>(<span class="st">"process-provider-event"</span>, { eventId: event.id });
+  res.<span class="fn">sendStatus</span>(<span class="st">200</span>);                              <span class="cm">// fast ack, work happens in the job</span>
+});</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Out-of-order delivery is handled by the state-machine guard from Part II, not by timestamps: a
+        <code class="inline">refund.succeeded</code> that arrives before <code class="inline">payment.succeeded</code> can't
+        apply to a <code class="inline">pending</code> row, so the job retries it later. And when in doubt, the job can
+        ask the provider for the <strong>current</strong> state of the object (retrieve the PaymentIntent, call the
+        gateway's query-transaction API) instead of trusting the order events came in. Enqueueing reliably after the
+        insert, and making the consumer idempotent, are <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>
+        and <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a> territory.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">When your server crashes between charge and save</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Walk every crash point in the flow and ask "who fixes this, and how?" If the answer is "nobody", you have found
+        a support ticket that says "I paid but my booking says unpaid".
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Crash or loss after…</th><th class="px-4 py-3">State left behind</th><th class="px-4 py-3">What recovers it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Payment row inserted, provider not called</td><td class="px-4 py-3"><code class="inline">pending</code> row, no money moved</td><td class="px-4 py-3">Patient retries (same row, same key), or the hold expires it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Provider called, response lost (timeout)</td><td class="px-4 py-3">Unknown: a session may exist</td><td class="px-4 py-3">Retry with the <em>same</em> idempotency key or transaction ref; never create a new one blindly</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Patient paid, webhook handler crashed before commit</td><td class="px-4 py-3">Money taken, row still <code class="inline">pending</code></td><td class="px-4 py-3">The provider retries the webhook (you returned 5xx or nothing)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Patient paid, webhook never arrives (misconfigured URL, outage past retry window)</td><td class="px-4 py-3">Money taken, row <code class="inline">pending</code></td><td class="px-4 py-3">A <strong>sweeper</strong> that queries the provider for stale pending rows, then reconciliation</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">jobs/sweep-pending.ts — every 5 minutes, ask instead of waiting</span>
+        <pre class="code"><span class="kw">const</span> stale = <span class="kw">await</span> db.<span class="fn">any</span>(<span class="st">`
+  SELECT * FROM payments
+   WHERE status = 'pending' AND created_at &lt; now() - interval '15 minutes'
+   LIMIT 100`</span>);
+<span class="kw">for</span> (<span class="kw">const</span> p <span class="kw">of</span> stale) {
+  <span class="kw">const</span> remote = <span class="kw">await</span> gateway.<span class="fn">queryTransaction</span>(<span class="st">`P${p.id}`</span>);  <span class="cm">// provider's truth</span>
+  <span class="kw">if</span> (remote.status === <span class="st">"success"</span>) <span class="kw">await</span> <span class="fn">applyCapture</span>(p.id, remote);  <span class="cm">// same code path as the webhook</span>
+  <span class="kw">else if</span> (remote.status === <span class="st">"failed"</span> || remote.status === <span class="st">"not_found"</span>) <span class="kw">await</span> <span class="fn">markExpired</span>(p.id);
+  <span class="cm">// "processing" → leave it; it will be checked again next run</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The key line is the comment on <code class="inline">applyCapture</code>: the sweeper and the webhook must share
+        one function, so both paths go through the same guard and the same outbox event. Two slightly different "mark as
+        paid" functions will drift apart within a sprint.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Holds, timeouts and the late payment</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        While the patient pays, the slot is held; <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>
+        walks through the hold, the expiry job and the partial unique index. The money side adds two rules.
+        <strong>First, the provider's timeout must be no longer than your hold</strong>, plus a grace period: set the
+        gateway's payment expiry (VNPay's <code class="inline">vnp_ExpireDate</code>, Stripe's
+        <code class="inline">expires_at</code>, MoMo's request expiry) so the patient cannot pay for a hold that already
+        lapsed. When a provider's minimum is longer than your hold (Stripe Checkout's is 30 minutes), either lengthen the
+        hold for that flow or expire the session yourself when the hold ends. <strong>Second, write the late-payment
+        path anyway</strong>: if a capture arrives for a booking that is <code class="inline">expired</code> and the
+        slot is gone, record the payment as captured, refund it automatically, and notify the patient and the clinic.
+        Money that arrived is never silently ignored.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Refunds and partial refunds</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A refund is its own record with its own lifecycle, not a status flip on the payment. It can be partial (keep a
+        cancellation fee), there can be several of them, and it is usually asynchronous: the provider accepts it, then
+        succeeds or fails later, and the money reaches the patient's card or wallet days after that. Some Vietnamese
+        gateways only allow refunds within a window or only for certain payment methods, so check what the gateway
+        supports before promising "instant refunds" to the client.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration — refunds can't exceed what was captured</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">refunds</span> (
+  id            bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  payment_id    bigint <span class="kw">NOT NULL REFERENCES</span> payments(id),
+  amount_minor  bigint <span class="kw">NOT NULL CHECK</span> (amount_minor &gt; <span class="st">0</span>),
+  reason        text   <span class="kw">NOT NULL</span>,                <span class="cm">-- 'patient_cancel', 'late_payment', ...</span>
+  status        text   <span class="kw">NOT NULL CHECK</span> (status <span class="kw">IN</span> (<span class="st">'requested'</span>,<span class="st">'succeeded'</span>,<span class="st">'failed'</span>)),
+  provider_ref  text   <span class="kw">UNIQUE</span>,
+  requested_by  bigint <span class="kw">REFERENCES</span> users(id)    <span class="cm">-- who pressed the button: audit</span>
+);
+<span class="cm">-- In the service, inside one transaction:
+--   SELECT ... FROM payments WHERE id = $1 FOR UPDATE;       -- lock the payment
+--   SUM(refunds not failed) + new amount &lt;= captured amount  -- else 409</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">FOR UPDATE</code> lock matters: two staff members clicking "Refund 200,000 đ" at the same
+        time must not both pass the check. Send the provider an idempotency key derived from the
+        <code class="inline">refunds.id</code>, for the same reason as the payment. And make sure only certain roles can
+        refund, with the permission check on the server (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Reconcile with the provider every day</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Webhooks, sweepers and guards make mismatches rare. <strong>Reconciliation</strong> is how you find the rest.
+        Once a day, a job fetches the provider's record of what happened (Stripe's balance transactions and payout
+        reconciliation reports, the Vietnamese gateways' settlement files or merchant-portal exports, often called
+        <em>đối soát</em>) and compares it line by line with your <code class="inline">payments</code> and
+        <code class="inline">refunds</code>, matched on the provider reference. Anything that doesn't match becomes an
+        alert and a row a human resolves.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Daily reconciliation: provider report and our payments table are matched by reference; matches are marked reconciled, mismatches become alerts for a human">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">DAILY · 02:00 · reconcile yesterday (and re-check the last 7 days)</text>
+          <g class="anim-pulse"><rect x="10" y="40" width="150" height="50" rx="9" fill="#2563EB"/>
+            <text x="85" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Provider report</text>
+            <text x="85" y="77" text-anchor="middle" fill="#ffffffbb" font-size="9">API export / settlement file</text></g>
+          <g class="anim-pulse d1"><rect x="10" y="110" width="150" height="50" rx="9" fill="#6d5acd"/>
+            <text x="85" y="131" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Our ledger</text>
+            <text x="85" y="147" text-anchor="middle" fill="#ffffffbb" font-size="9">payments + refunds</text></g>
+          <line x1="160" y1="65" x2="260" y2="95" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="160" y1="135" x2="260" y2="105" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="260" y="75" width="150" height="50" rx="9" fill="#0D9488"/>
+            <text x="335" y="96" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Match by ref</text>
+            <text x="335" y="112" text-anchor="middle" fill="#ffffffbb" font-size="9">amount · currency · status</text></g>
+          <line x1="410" y1="90" x2="510" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="410" y1="110" x2="510" y2="135" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d3"><rect x="510" y="40" width="180" height="50" rx="9" fill="#37474F"/>
+            <text x="600" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Matched ≈ 99.9%</text>
+            <text x="600" y="77" text-anchor="middle" fill="#ffffffbb" font-size="9">set reconciled_at, nothing else</text></g>
+          <g class="anim-pulse d4"><rect x="510" y="110" width="180" height="50" rx="9" fill="#DB2777"/>
+            <text x="600" y="131" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Mismatch</text>
+            <text x="600" y="147" text-anchor="middle" fill="#ffffffbb" font-size="9">recon_issues row + alert</text></g>
+          <text x="600" y="185" text-anchor="middle" font-size="10" fill="#DB2777" class="anim-bounce">a human decides; the job never "fixes" money</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Mismatch</th><th class="px-4 py-3">Usual cause</th><th class="px-4 py-3">Usual fix</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Provider has it, we don't (or ours is pending)</td><td class="px-4 py-3">Lost webhook, crashed handler, wrong IPN URL in one environment</td><td class="px-4 py-3">Run the same <code class="inline">applyCapture</code>; check the booking is still valid, else refund</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">We have it captured, provider doesn't</td><td class="px-4 py-3">Something marked it paid without the provider: the return-URL bug, a manual SQL fix</td><td class="px-4 py-3">Treat as an incident. Find the code path.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Amount or currency differs</td><td class="px-4 py-3">×100 confusion, rounding, price changed between snapshot and charge</td><td class="px-4 py-3">Fix the conversion; adjust with a refund or a new charge</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Payout total ≠ captured − refunds − fees</td><td class="px-4 py-3">Fees or chargebacks not recorded, a refund still settling</td><td class="px-4 py-3">Record fees and disputes from the report; re-check next day</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For a small client, reconciliation can start as a daily script that emails a CSV of mismatches to the
+        developer and the client's accountant. That is enough. What is not enough is <em>nothing</em>, which is what an
+        agent will build unless you ask.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Ledger, records &amp; operations</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Most small apps need a clean payments table, not a ledger, and every app needs tests that replay the ugly cases</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Once money flows correctly, the questions change: can the client's accountant trust your numbers, can support
+        explain every change to a payment, and will you find out about a problem before the clinic does?
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Double-entry ledger: what it is, and when you need one</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In <strong>double-entry</strong> bookkeeping every movement of money is recorded as a transaction with at least
+        two entries, one taking from an account and one giving to another, and the entries of each transaction sum to
+        zero. Balances are never stored and edited; they are the sum of entries. Mistakes are fixed with new, reversing
+        entries, never by updating old ones. The result is a record that always balances and explains itself.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">ledger.sql — the minimum shape</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">ledger_accounts</span> (id bigint <span class="kw">PRIMARY KEY</span>, code text <span class="kw">UNIQUE</span>, currency char(3));
+<span class="cm">-- e.g. 'patient_wallet:77', 'clinic_payable:12', 'platform_fees', 'gateway_clearing'</span>
+
+<span class="kw">CREATE TABLE</span> <span class="fn">ledger_entries</span> (
+  id           bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  txn_id       uuid   <span class="kw">NOT NULL</span>,                <span class="cm">-- groups the legs of one movement</span>
+  account_id   bigint <span class="kw">NOT NULL REFERENCES</span> ledger_accounts(id),
+  amount_minor bigint <span class="kw">NOT NULL</span>,                <span class="cm">-- + credit, − debit (pick and document)</span>
+  created_at   timestamptz <span class="kw">NOT NULL DEFAULT</span> now()
+);
+<span class="cm">-- A captured 459,000 đ deposit, 10% platform commission:
+--   gateway_clearing   -459000
+--   clinic_payable:12  +413100
+--   platform_fees       +45900        → the three legs sum to 0.
+-- Enforce "sum per txn_id = 0" in the one function that writes entries (or a
+-- deferred constraint trigger), and never UPDATE or DELETE a row.</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Your system…</th><th class="px-4 py-3">Payments + refunds tables</th><th class="px-4 py-3">Double-entry ledger</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">One merchant takes money for its own services (single clinic, small shop, SaaS plan)</td><td class="px-4 py-3">Enough. The provider and the accounting software are the books.</td><td class="px-4 py-3">Overkill</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Marketplace: you collect for many clinics and pay them out minus commission</td><td class="px-4 py-3">Breaks down: "how much do we owe clinic 12?" has no clean answer</td><td class="px-4 py-3">Yes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Stored balances: wallets, credits, prepaid packages, loyalty points with cash value</td><td class="px-4 py-3">A <code class="inline">balance</code> column that gets edited will drift</td><td class="px-4 py-3">Yes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Subscriptions with proration and credits</td><td class="px-4 py-3">Let the billing provider (Stripe Billing etc.) own it</td><td class="px-4 py-3">Only if you bill yourself</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A clinic <em>chain</em> taking deposits for its own branches is still one merchant: a payments table with a
+        <code class="inline">clinic_id</code> is fine. The day the client says "other clinics can join the platform and
+        we'll pay them monthly", that is the signal to add a ledger, before the first payout, not after. Also note that
+        holding money for others can bring licensing questions in some countries; that is the client's lawyer's call.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Invoices, receipts and audit</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>receipt</strong> confirms a payment happened; generate it from your snapshot and payment row, or let
+        the provider email one. An <strong>invoice</strong> is often a legal tax document with numbering and content
+        rules. In Vietnam that means an e-invoice issued through the client's licensed e-invoice provider, usually by
+        calling that provider's API from a background job after capture. Never invent your own "official invoice" PDF,
+        and never reuse or reorder invoice numbers.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Money rows are append-mostly.</strong> Payments change status through the guarded transitions; nothing deletes them. No soft-delete, no hard-delete, no "fix it in SQL" without a ticket.</li>
+        <li><strong>Every change has a who and a why.</strong> Refunds carry <code class="inline">requested_by</code> and a reason; manual adjustments go through an admin action that writes an audit row. General audit-trail design is <a href="./sd12.html" class="text-viol underline decoration-viol/40">SD12</a>.</li>
+        <li><strong>Keep the raw provider events</strong> in <code class="inline">provider_events</code>. When the client disputes a figure a year later, the provider's own signed payload is your evidence. Retention periods for financial records are set by law; check with the client.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Test with sandboxes, test cards and replayed webhooks</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every serious provider has a sandbox: Stripe's test mode, and sandbox merchant accounts with test cards or test
+        wallets for VNPay, MoMo and ZaloPay (you usually request the credentials from the gateway). The happy path is the
+        least interesting test. The ones that matter are the declined card, the 3-D Secure challenge, the webhook that
+        arrives twice, and the webhook that arrives after the hold expired.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — Stripe CLI against your local server</span>
+        <pre class="code">stripe listen --forward-to localhost:3000/webhooks/stripe
+<span class="cm"># prints a whsec_... secret for local signature checks</span>
+stripe trigger checkout.session.completed
+<span class="cm"># fires a realistic test event through the whole path</span>
+stripe events resend evt_1Q...
+<span class="cm"># replay the SAME event id: your handler must treat it as a duplicate</span>
+
+<span class="cm"># test cards (test mode only), any future expiry and any CVC:</span>
+<span class="cm">#   4242 4242 4242 4242   succeeds</span>
+<span class="cm">#   4000 0000 0000 9995   declined, insufficient funds</span>
+<span class="cm">#   4000 0025 0000 3155   requires 3-D Secure authentication</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For the Vietnamese gateways, an IPN is just a signed HTTP request, so write a small test helper that builds one
+        with the sandbox secret, and send it to your endpoint from integration tests: once, twice, with a wrong amount,
+        with a bad signature, after expiry. Local development needs a public URL for the gateway to reach (a tunnel such
+        as ngrok or cloudflared); never point a sandbox IPN at a teammate's laptop and forget it. Integration-test
+        structure itself is <a href="./qa1.html" class="text-viol underline decoration-viol/40">QA1</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">payments.int.test.ts — the tests that pay for themselves</span>
+        <pre class="code"><span class="fn">it</span>(<span class="st">"applies a duplicate IPN once"</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> ipn = <span class="fn">signedVnpayIpn</span>({ txnRef: <span class="st">`P${payment.id}`</span>, amount: <span class="st">459000</span> * <span class="st">100</span> });
+  <span class="kw">await</span> <span class="fn">send</span>(ipn); <span class="kw">await</span> <span class="fn">send</span>(ipn);
+  <span class="fn">expect</span>(<span class="kw">await</span> <span class="fn">countCaptures</span>(payment.id)).<span class="fn">toBe</span>(<span class="st">1</span>);
+  <span class="fn">expect</span>(<span class="kw">await</span> <span class="fn">outboxEvents</span>(<span class="st">"BookingConfirmed"</span>)).<span class="fn">toHaveLength</span>(<span class="st">1</span>);
+});
+<span class="fn">it</span>(<span class="st">"rejects an IPN whose amount differs from the snapshot"</span>, ...);
+<span class="fn">it</span>(<span class="st">"rejects a bad signature without touching the DB"</span>, ...);
+<span class="fn">it</span>(<span class="st">"refunds a capture that arrives after the hold expired"</span>, ...);
+<span class="fn">it</span>(<span class="st">"GET /payment/return never changes payment status"</span>, ...);  <span class="cm">// ← the free-booking bug</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Alerting and the security checklist</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Payment problems are silent, so you need alerts that look for them. Three are enough for a small system:
+        <strong>reconciliation mismatches</strong> (any, daily); <strong>payments stuck in pending</strong> longer than
+        the hold plus grace; and <strong>webhook signature failures or 5xx responses</strong> on the webhook endpoint
+        above a small threshold (a rotated secret or a deploy that broke parsing shows up here first). Also watch the
+        provider dashboard's failed-delivery view in the first week after launch. Before go-live, walk this list:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Check</th><th class="px-4 py-3">How to verify</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Amount comes from the server snapshot</td><td class="px-4 py-3">Change the price in the request body with dev tools; the charge must not change</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Signatures verified on every IPN / webhook</td><td class="px-4 py-3">Send one with a flipped character; expect 400 and no DB write</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Return URL is read-only</td><td class="px-4 py-3"><code class="inline">grep</code> the handler for writes; the test above</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Secrets per environment, never in the repo</td><td class="px-4 py-3">Sandbox keys in staging, live keys only in production's secret store (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">No card data or full payloads with personal data in logs</td><td class="px-4 py-3">Search logs and the error tracker after a sandbox payment</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Refunds restricted by role, audited, capped</td><td class="px-4 py-3">Try as a receptionist; try refunding more than captured</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Live IPN / webhook URLs registered and reachable</td><td class="px-4 py-3">A real low-value payment in production, refunded, before launch day</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Sandbox green is not production green.</strong> Live mode differs in small ways that break launches:
+        different secrets and endpoints, IPN URLs registered separately (sometimes by the gateway's staff, with lead
+        time), stricter fraud rules, and real settlement delays. Put a real, small, refunded payment in production on
+        the launch checklist, and ask the client early who owns the merchant account and its credentials.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents write payment integrations quickly and they read long gateway specs patiently, which is useful. They also
+        default to the happy path, trust the redirect, and invent API fields that look plausible. Give the agent the
+        gateway's current integration document and your rules, and make it prove the failure cases with tests.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — integrate a gateway against rules you wrote</span>
+        <pre class="code">Integrate VNPay for booking deposits. The spec is docs/vendor/vnpay-2.1.pdf;
+use only fields and codes that appear in it, and cite the page for each.
+Rules (docs/payments.md): amounts are bigint minor units from bookings.total_minor;
+create the payments row before building the URL; only the IPN handler may
+change payment status, via applyCapture(); the return handler is read-only.
+Write integration tests for: duplicate IPN, wrong amount, bad signature,
+IPN after hold expiry. Paste the test output.</pre>
+      </div>
+      <pre class="code mt-3">Audit this repo for money bugs. List file:line for: float or Number arithmetic
+on amounts, amounts read from the request body, any status write reachable from
+a browser redirect, webhook handlers without signature checks, refunds without
+a lock or cap. Don't change code; output a table with severity.</pre>
+      <pre class="code mt-3">Write a daily reconciliation script: fetch yesterday's transactions from the
+Stripe API, match to payments/refunds by provider_ref, and write mismatches to
+recon_issues with a category. Dry-run it against the test-mode account and
+show me the output. It must never modify payments.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Read a long gateway spec and summarise fields, codes and signature rules</li>
+            <li>Write the Money type, pricing function and allocation, with property tests</li>
+            <li>Build the signed-IPN test helper and the failure-case tests</li>
+            <li>Write the webhook inbox, sweeper and reconciliation script</li>
+            <li>Search the codebase for float math and unguarded status writes</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every gateway field, code and ×100 rule against the real, current spec</li>
+            <li>That only the IPN / webhook path changes payment status</li>
+            <li>The pricing order, rounding and tax rate with the client, in writing</li>
+            <li>That the sweeper and webhook share one capture function</li>
+            <li>Which keys are sandbox and which are live, in each environment</li>
+            <li>One real low-value payment and refund in production before launch</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-written payment code:</strong> <code class="inline">price * 1.1</code> or
+        <code class="inline">parseFloat</code> on an amount · <code class="inline">amount</code> taken from
+        <code class="inline">req.body</code> · the success/return route updating a booking or payment · a webhook route
+        behind <code class="inline">express.json()</code> so the raw body is gone, or with no signature check ·
+        <code class="inline">===</code> to compare signatures · an idempotency key made from
+        <code class="inline">Date.now()</code> or a fresh UUID on every retry · a <code class="inline">paid: boolean</code>
+        column · a refund that edits the payment amount · gateway field names or result codes you can't find in the
+        vendor's document · live secret keys in <code class="inline">.env.example</code>.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Stores prices as floats and treats "the user came back to the success page" as payment.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows money should be integers, that webhooks exist and that card data is sensitive, but can't yet spot the return-URL bug or a missing amount check in a diff.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Integrates a hosted checkout or redirect gateway with a mentor reviewing: amounts in minor units with a currency, prices snapshotted, signature and amount verified on the IPN, status changed only by the server-to-server path through a guarded state machine, duplicates handled, and tests for the failure cases.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Designs the whole payment feature alone, including the sweeper, refunds with locks and audit, daily reconciliation and alerts, and runs the production launch checklist with the client.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Decides when a ledger is needed and designs it, works with the client's accountant on tax and invoicing, handles a live money incident calmly, and reviews other teams' payment code.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> in your payment feature, point to the one line that changes a
+        payment to captured, and show that nothing else can. Then show the test where the same IPN arrives twice and
+        the one where its amount is wrong. If the patient closes the tab right after paying, can you explain exactly
+        how their booking still gets confirmed?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Confirming on the redirect</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The return URL is a browser page anyone can open. Confirming there gives away free bookings and loses the ones where the tab closed. Only the signed IPN or webhook changes status.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Trusting the amount in the callback</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A valid signature proves the gateway sent it, not that the amount is what you asked for. Compare amount and currency with your snapshot before capturing.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Assuming "× 100" everywhere</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">VND has no minor unit, Stripe sends it as-is, and VNPay wants it × 100. Hard-coded conversions are how 459,000 đ becomes 45,900,000 đ. Convert in one adapter per gateway, with a test.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ One capture function for every path</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Webhook, sweeper and reconciliation fix-up all call the same guarded <code class="inline">applyCapture</code>. One place to review, one place to test.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep every raw provider event</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An inbox table with a unique event ID gives you dedupe, replay and evidence in one step. It is the cheapest debugging tool in the whole feature.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write docs/payments.md first</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Half a page: currency and storage, pricing order and rounding, states and who may change them, refund rules. It is the agent's brief and the client's sign-off in one.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="money-type"> <span>Stored amounts as integer minor units with an ISO 4217 currency, and wrote a pricing function with one documented rounding rule and a test that allocations always sum to the total.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="state-machine"> <span>Drew the payment state machine for a real or practice feature and implemented transitions as guarded conditional updates.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="webhook-replay"> <span>Replayed a duplicate and an out-of-order webhook (Stripe CLI or a signed test IPN) and showed the payment and booking changed exactly once.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="recon"> <span>Wrote a reconciliation script or query against a sandbox account that lists mismatches by category without modifying any payment.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="deposit-pr"> <span class="font-semibold">Opened a PR that adds a sandbox deposit payment (Stripe Checkout or VNPay/MoMo sandbox) to the clinic booking practice app: payment row before redirect, signed and amount-checked IPN/webhook as the only status writer, read-only return page, a refund endpoint with a cap, and integration tests for duplicate, wrong-amount, bad-signature and late-payment cases, with test output in the description (mentor evidence ✓)</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.stripe.com/payments/checkout" target="_blank" rel="noopener">Stripe — Checkout</a> · <a class="text-coral underline" href="https://docs.stripe.com/payments/paymentintents/lifecycle" target="_blank" rel="noopener">PaymentIntent lifecycle</a> — the hosted flow and the states behind it (Part II).</li>
+        <li><a class="text-coral underline" href="https://docs.stripe.com/webhooks" target="_blank" rel="noopener">Stripe — Webhooks</a> — signatures, retries, duplicate and out-of-order events (Part III).</li>
+        <li><a class="text-coral underline" href="https://docs.stripe.com/currencies" target="_blank" rel="noopener">Stripe — Supported currencies</a> — zero-decimal currencies (VND, JPY) and minimum amounts.</li>
+        <li><a class="text-coral underline" href="https://docs.stripe.com/stripe-cli" target="_blank" rel="noopener">Stripe — Stripe CLI</a> · <a class="text-coral underline" href="https://docs.stripe.com/testing" target="_blank" rel="noopener">Testing</a> — local webhook forwarding, triggers, resends and test cards.</li>
+        <li><a class="text-coral underline" href="https://sandbox.vnpayment.vn/apis/" target="_blank" rel="noopener">VNPay — Integration docs (sandbox)</a> — payment URL, IPN, return URL, query and refund APIs.</li>
+        <li><a class="text-coral underline" href="https://developers.momo.vn/" target="_blank" rel="noopener">MoMo — Developers</a> · <a class="text-coral underline" href="https://docs.zalopay.vn/" target="_blank" rel="noopener">ZaloPay — Docs</a> — the wallet gateways' create, IPN/callback and signature specs.</li>
+        <li><a class="text-coral underline" href="https://www.pcisecuritystandards.org/document_library/" target="_blank" rel="noopener">PCI SSC — Document Library</a> — the current PCI DSS and SAQ A / A-EP forms, straight from the source.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/datatype-numeric.html" target="_blank" rel="noopener">PostgreSQL — Numeric Types</a> — <code class="inline">bigint</code> and exact <code class="inline">numeric</code>, and why not floating point.</li>
+      </ul>

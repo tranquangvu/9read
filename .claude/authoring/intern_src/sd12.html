@@ -1,0 +1,940 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Data Modelling Patterns &amp; Multi-tenancy</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a> taught you to turn nouns into tables
+          and rules into constraints. Real client projects then ask the same dozen follow-up questions: "can we undo a
+          delete?", "who changed this booking?", "each clinic chain wants its own intake fields", "departments inside
+          clinics inside regions". And once the product is sold to more than one customer: "how do we make sure chain A never
+          sees chain B's patients?" This module is the catalogue of standard answers, with the trade-offs of each, for
+          booking apps, shops, SaaS dashboards and internal tools. It also says when a pattern is overkill at that size.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> ask an agent for "soft delete" and it adds a
+          <code class="inline">deleted_at</code> column, then forgets the filter in the report query, the join and the unique
+          constraint. Ask for "multi-tenant" and it adds <code class="inline">tenant_id</code> to the tables it happens to touch,
+          scopes the queries it happens to write, and leaves the cache key, the background job and the file path global.
+          Each mistake passes a demo with one test tenant. The first time anyone notices is when a patient sees another
+          clinic's records. You won't write most of this code yourself. Your job is to know what a complete pattern looks
+          like, so you can see which pieces are missing.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Lifecycle of a row</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Decide how rows are born, change and die before the first migration</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The running example is the <strong>clinic booking app</strong> from
+        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a> and
+        <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>: clinics, doctors, slots, bookings,
+        patients and payments. In this module it grows up. Golden Owl now sells it as SaaS to several
+        <strong>clinic chains</strong>, and each chain is a <em>tenant</em>. Before any of that, every table needs four boring
+        decisions: what its IDs look like, which timestamps it carries, what "delete" means, and whether anyone will ask
+        "who changed this, and when?" Each one is cheap on day one and expensive to add after launch.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">IDs and timestamps: pick conventions once, apply them everywhere</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        SD1 covers surrogate keys and the <code class="inline">bigint</code> vs UUID choice. Two extra points matter here.
+        First, in a multi-tenant product, sequential IDs in URLs leak business volume: a competitor who books twice a
+        month apart can read your growth from <code class="inline">/bookings/18233</code> and <code class="inline">/bookings/19410</code>.
+        Second, <strong>UUID v7</strong> (RFC 9562) starts with a millisecond timestamp, so new IDs are roughly sorted
+        and B-tree indexes stay compact. The flip side is that anyone holding the ID can read when the row was created.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Convention</th><th class="px-4 py-3">Default for a small or medium project</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Primary key</td><td class="px-4 py-3">UUID v7 for anything that appears in a URL or API. <code class="inline">bigint</code> identity is fine for internal-only tables such as join rows and logs.</td><td class="px-4 py-3">No volume leak, safe to generate on the client, index-friendly</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Generating v7</td><td class="px-4 py-3">Postgres 18+ has a built-in <code class="inline">uuidv7()</code>. On older versions, generate it in the app (for example <code class="inline">v7()</code> from the <code class="inline">uuid</code> npm package).</td><td class="px-4 py-3"><code class="inline">gen_random_uuid()</code> is v4 (random), which fragments indexes on big tables</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Instants</td><td class="px-4 py-3"><code class="inline">timestamptz</code>, never plain <code class="inline">timestamp</code></td><td class="px-4 py-3">Stored as UTC and converted on the way out. Plain <code class="inline">timestamp</code> silently drops the offset.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Calendar dates</td><td class="px-4 py-3"><code class="inline">date</code> for birthdays and holidays</td><td class="px-4 py-3">A birthday is not an instant. Stored as an instant, it shifts a day for some time zones.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Names</td><td class="px-4 py-3"><code class="inline">created_at</code>, <code class="inline">updated_at</code>, <code class="inline">cancelled_at</code>: suffix <code class="inline">_at</code> for instants, <code class="inline">_on</code> for dates</td><td class="px-4 py-3">Reviewers and agents can tell the type from the name</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">migrations/0001_conventions.sql — what every table gets</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">patients</span> (
+  id          uuid        <span class="kw">PRIMARY KEY DEFAULT</span> uuidv7(),   <span class="cm">-- PG 18+; else set it in the app</span>
+  tenant_id   uuid        <span class="kw">NOT NULL REFERENCES</span> tenants(id), <span class="cm">-- Part III</span>
+  full_name   text        <span class="kw">NOT NULL</span>,
+  email       text,
+  born_on     date,                                      <span class="cm">-- a date, not an instant</span>
+  created_at  timestamptz <span class="kw">NOT NULL DEFAULT</span> now(),
+  updated_at  timestamptz <span class="kw">NOT NULL DEFAULT</span> now(),
+  deleted_at  timestamptz                                <span class="cm">-- NULL = live (next section)</span>
+);
+
+<span class="cm">-- Postgres does not maintain updated_at for you. Use a trigger, or make sure</span>
+<span class="cm">-- the ORM does it (Prisma @updatedAt, TypeORM @UpdateDateColumn) on EVERY write path.</span>
+<span class="kw">CREATE FUNCTION</span> <span class="fn">touch_updated_at</span>() <span class="kw">RETURNS trigger LANGUAGE</span> plpgsql <span class="kw">AS</span> $$
+<span class="kw">BEGIN</span> NEW.updated_at := now(); <span class="kw">RETURN</span> NEW; <span class="kw">END</span> $$;
+<span class="kw">CREATE TRIGGER</span> patients_touch <span class="kw">BEFORE UPDATE ON</span> patients
+  <span class="kw">FOR EACH ROW EXECUTE FUNCTION</span> touch_updated_at();</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        One subtle point: <code class="inline">now()</code> returns the start time of the <em>transaction</em>, so every row
+        written in one transaction gets the same timestamp. That is usually what you want. Time zones for future
+        appointments (clinic local time, daylight saving) are their own topic in
+        <a href="./sd16.html" class="text-viol underline decoration-viol/40">SD16</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Soft delete: a <code class="inline">deleted_at</code> column and five places to remember it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>soft delete</strong> marks a row as gone (<code class="inline">deleted_at = now()</code>) instead of removing it.
+        Clients want it for "undo", for support ("the receptionist deleted the doctor by mistake"), and because
+        other rows still point at the deleted one: a deleted doctor's past bookings must still appear in last year's revenue
+        report. Adding the column is the easy part. The hard part is that <strong>every read must now remember it</strong>,
+        and so must every unique constraint.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/0007_soft_delete.sql — the pieces agents leave out</span>
+        <pre class="code"><span class="cm">-- 1. Uniqueness only among live rows. A plain UNIQUE (tenant_id, email) would stop</span>
+<span class="cm">--    a deleted patient from ever registering again with the same email.</span>
+<span class="kw">CREATE UNIQUE INDEX</span> patients_email_live
+  <span class="kw">ON</span> patients (tenant_id, lower(email)) <span class="kw">WHERE</span> deleted_at <span class="kw">IS NULL</span>;
+
+<span class="cm">-- 2. A view that most application reads go through, so "live" is the default</span>
+<span class="kw">CREATE VIEW</span> live_patients <span class="kw">WITH</span> (security_invoker = <span class="kw">true</span>) <span class="kw">AS</span>   <span class="cm">-- keeps RLS working (Part IV)</span>
+  <span class="kw">SELECT</span> * <span class="kw">FROM</span> patients <span class="kw">WHERE</span> deleted_at <span class="kw">IS NULL</span>;
+
+<span class="cm">-- 3. Indexes that serve live-only queries stay small</span>
+<span class="kw">CREATE INDEX</span> patients_live_name <span class="kw">ON</span> patients (tenant_id, full_name)
+  <span class="kw">WHERE</span> deleted_at <span class="kw">IS NULL</span>;</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The classic bug is <strong>"forgot the filter"</strong>. The patient list hides deleted patients, but the search
+        box, the CSV export, the <code class="inline">JOIN</code> in the doctor dashboard and the reminder job all query the
+        base table directly. Deleted patients keep getting SMS reminders. Framework helpers reduce the risk:
+        Laravel's <code class="inline">SoftDeletes</code>, Sequelize's <code class="inline">paranoid</code> option and TypeORM's
+        <code class="inline">@DeleteDateColumn</code> add the filter for you, but raw SQL and query builders skip them. The
+        review question is always: <em>which queries in this diff read this table, and does each one mean live rows only?</em>
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">What the client says</th><th class="px-4 py-3">What to build</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">"Cancel this booking"</td><td class="px-4 py-3">A <strong>status</strong> change, not a delete</td><td class="px-4 py-3">A cancelled booking is a real business fact with a reason and a refund</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Remove this doctor"</td><td class="px-4 py-3">Soft delete, or an <code class="inline">active</code> flag</td><td class="px-4 py-3">Their past bookings and payouts must still resolve</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Delete my account and my data"</td><td class="px-4 py-3"><strong>Hard delete</strong> or anonymise the personal fields</td><td class="px-4 py-3">Privacy law (GDPR, Vietnam's personal data protection rules) can require real erasure. A soft delete keeps the data. See <a href="./sd17.html" class="text-viol underline decoration-viol/40">SD17</a> and check the current regulation.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Drafts, OTP codes, sessions, tag links</td><td class="px-4 py-3">Hard delete</td><td class="px-4 py-3">Nobody will ever ask for them back. Soft-deleting them only grows tables.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Keep 7 years, but make the app fast"</td><td class="px-4 py-3">Move old rows to an archive table or cold storage</td><td class="px-4 py-3">Keeps the hot table small without losing history</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Soft delete is a decision per table, not a global setting.</strong> An agent told "use soft deletes" will add
+        <code class="inline">deleted_at</code> to all 30 tables, including join tables where it breaks the primary key the moment
+        someone re-adds a tag. Decide per table, and write the decision in the schema docs.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Audit trail: who changed what, and when</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Sooner or later a clinic manager asks "who moved Mrs Lan's appointment to 4 p.m.?" An <strong>audit trail</strong>
+        answers with four facts: <em>who</em> (the user, not just "the API"), <em>when</em>, <em>what</em> (before and after)
+        and ideally <em>why</em>. There are three common ways to capture it, and they differ in what they can see.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Approach</th><th class="px-4 py-3">Catches</th><th class="px-4 py-3">Misses</th><th class="px-4 py-3">Right when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">App writes an audit row in the service layer</td><td class="px-4 py-3">Intent and reason ("rescheduled at patient's request"), the real user</td><td class="px-4 py-3">Any write path that forgets to call it: scripts, admin tools, raw SQL</td><td class="px-4 py-3">A few important actions need a human-readable history</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Database trigger into an <code class="inline">audit_log</code> table</td><td class="px-4 py-3">Every change to the table, from every path, as a before/after diff</td><td class="px-4 py-3">The user and the reason, unless the app passes them in a session setting</td><td class="px-4 py-3">"Nothing may change unrecorded": medical, financial or admin data</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Domain events (outbox) consumed into a history</td><td class="px-4 py-3">Business meaning, and feeds other features too</td><td class="px-4 py-3">Changes that don't emit an event. Needs queue infrastructure.</td><td class="px-4 py-3">You already publish events (<a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>, <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>). Overkill otherwise.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">migrations/0008_audit.sql — one generic trigger for many tables</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">audit_log</span> (
+  id bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  tenant_id uuid, table_name text <span class="kw">NOT NULL</span>, row_id text <span class="kw">NOT NULL</span>,
+  action text <span class="kw">NOT NULL</span>, actor_id uuid, old_data jsonb, new_data jsonb,
+  at timestamptz <span class="kw">NOT NULL DEFAULT</span> now()
+);
+<span class="kw">CREATE FUNCTION</span> <span class="fn">audit_row</span>() <span class="kw">RETURNS trigger LANGUAGE</span> plpgsql <span class="kw">AS</span> $$
+<span class="kw">DECLARE</span> r record;
+<span class="kw">BEGIN</span>
+  <span class="kw">IF</span> TG_OP = <span class="st">'DELETE'</span> <span class="kw">THEN</span> r := OLD; <span class="kw">ELSE</span> r := NEW; <span class="kw">END IF</span>;
+  <span class="kw">INSERT INTO</span> audit_log (tenant_id, table_name, row_id, action, actor_id, old_data, new_data)
+  <span class="kw">VALUES</span> (r.tenant_id, TG_TABLE_NAME, r.id::text, TG_OP,
+    NULLIF(current_setting(<span class="st">'app.user_id'</span>, <span class="kw">true</span>), <span class="st">''</span>)::uuid,  <span class="cm">-- ← "who", set by the app per transaction</span>
+    <span class="kw">CASE WHEN</span> TG_OP &lt;&gt; <span class="st">'INSERT'</span> <span class="kw">THEN</span> to_jsonb(OLD) <span class="kw">END</span>,
+    <span class="kw">CASE WHEN</span> TG_OP &lt;&gt; <span class="st">'DELETE'</span> <span class="kw">THEN</span> to_jsonb(NEW) <span class="kw">END</span>);
+  <span class="kw">RETURN NULL</span>;                                  <span class="cm">-- AFTER trigger: return value is ignored</span>
+<span class="kw">END</span> $$;
+<span class="kw">CREATE TRIGGER</span> bookings_audit <span class="kw">AFTER INSERT OR UPDATE OR DELETE ON</span> bookings
+  <span class="kw">FOR EACH ROW EXECUTE FUNCTION</span> audit_row();</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        When you review a trigger like this, check three things. <strong>Who:</strong> is <code class="inline">app.user_id</code>
+        really set on every request (the same mechanism as the tenant setting in Part IV)? If not, every row says
+        <code class="inline">NULL</code>. <strong>Privacy:</strong> <code class="inline">to_jsonb(OLD)</code> copies every column, including
+        diagnosis notes and phone numbers, so the audit table needs the same access rules and retention as the source.
+        <strong>Growth:</strong> an audit log on a busy table grows fast, so decide on retention now, not when the disk is full.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Status columns: allowed transitions plus a history table</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <code class="inline">status</code> column is a state machine.
+        <a href="./sd5.html" class="text-viol underline decoration-viol/40">SD5</a> covers the state pattern and the transition
+        table in code. The data-model half is two rules. First, <strong>the database refuses unknown statuses</strong>
+        (a <code class="inline">CHECK</code> or lookup table, Part II). Second, <strong>every transition is recorded</strong> in a
+        narrow history table. "How long do bookings sit in <code class="inline">pending_payment</code>?" and "who marked this
+        patient a no-show?" are questions the business <em>will</em> ask, and a generic audit log answers them badly.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-status.ts — guarded transition and history in one transaction</span>
+        <pre class="code"><span class="kw">const</span> ALLOWED: Record&lt;Status, Status[]&gt; = {         <span class="cm">// the SD5 transition table</span>
+  pending_payment: [<span class="st">"confirmed"</span>, <span class="st">"expired"</span>],
+  confirmed: [<span class="st">"checked_in"</span>, <span class="st">"cancelled"</span>, <span class="st">"no_show"</span>],
+  checked_in: [<span class="st">"completed"</span>], completed: [], cancelled: [], expired: [], no_show: [],
+};
+<span class="kw">export async function</span> <span class="fn">transition</span>(tx: Tx, id: string, from: Status, to: Status, actor: string, reason?: string) {
+  <span class="kw">if</span> (!ALLOWED[from].<span class="fn">includes</span>(to)) <span class="kw">throw new</span> <span class="fn">InvalidTransition</span>(from, to);
+  <span class="kw">const</span> { rowCount } = <span class="kw">await</span> tx.<span class="fn">query</span>(
+    <span class="st">`UPDATE bookings SET status = $1 WHERE id = $2 AND status = $3`</span>,  <span class="cm">// ← "AND status = from"</span>
+    [to, id, from]);
+  <span class="kw">if</span> (rowCount === <span class="st">0</span>) <span class="kw">throw new</span> <span class="fn">StaleState</span>(id, from);   <span class="cm">// someone else moved it first</span>
+  <span class="kw">await</span> tx.<span class="fn">query</span>(
+    <span class="st">`INSERT INTO booking_status_history (booking_id, from_status, to_status, changed_by, reason)
+     VALUES ($1, $2, $3, $4, $5)`</span>, [id, from, to, actor, reason]);
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">AND status = $3</code> is the line to look for. Without it, two receptionists who click
+        "check in" and "cancel" at the same moment both succeed, and the last write wins. With it, the second one gets a
+        clear error. Both writes run in one transaction
+        (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>), so a status never changes without its
+        history row.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Shapes of data</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pick the shape that keeps the database able to say no</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Some data doesn't fit neatly into "one row, fixed columns": custom fields that differ per customer, labels,
+        trees, comments that can attach to anything, lists of allowed values. Each has a standard pattern and at least
+        one tempting anti-pattern. The test for every choice in this Part is the same as in SD1: <strong>can the database
+        still enforce the rules</strong> (foreign keys, uniqueness, types), or have you moved all checking into application
+        code that an agent may forget?
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Flexible attributes: JSONB, used deliberately</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each clinic chain wants its own intake questions: one asks for insurer and policy number, another for referral
+        source, a dermatology chain for skin type. An e-commerce shop has the same problem with product attributes (size
+        for shirts, voltage for kettles). You have four options.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">Right when</th><th class="px-4 py-3">Wrong when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Real columns</td><td class="px-4 py-3">The field is the same for everyone, or you filter, join, sort or sum on it</td><td class="px-4 py-3">Every customer wants different fields. You end up with 80 nullable columns.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A <code class="inline">jsonb</code> column</td><td class="px-4 py-3">Fields vary per tenant or per product type, and are mostly shown and occasionally filtered</td><td class="px-4 py-3">The "flexible" data is actually core: prices, dates you query by, IDs of other rows</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EAV (entity, attribute, value rows)</td><td class="px-4 py-3">Rarely, today. It was the pre-JSONB answer.</td><td class="px-4 py-3">Almost always: every value is text, and one form is dozens of joins</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A separate table per variant</td><td class="px-4 py-3">A few well-known variants with real rules (for example <code class="inline">card_payments</code>, <code class="inline">bank_transfers</code>)</td><td class="px-4 py-3">The variants are defined by customers at runtime</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">migrations/0010_intake_answers.sql — JSONB with guard rails</span>
+        <pre class="code"><span class="kw">ALTER TABLE</span> patients <span class="kw">ADD COLUMN</span> intake jsonb <span class="kw">NOT NULL DEFAULT</span> <span class="st">'{}'</span>
+  <span class="kw">CHECK</span> (jsonb_typeof(intake) = <span class="st">'object'</span>);        <span class="cm">-- at least refuse arrays and strings</span>
+
+<span class="cm">-- "all patients whose intake contains {"insurer": "Bao Viet"}": containment (@&gt;) via GIN</span>
+<span class="kw">CREATE INDEX</span> patients_intake_gin <span class="kw">ON</span> patients <span class="kw">USING</span> gin (intake jsonb_path_ops);
+<span class="kw">SELECT</span> id <span class="kw">FROM</span> patients <span class="kw">WHERE</span> intake @&gt; <span class="st">'{"insurer": "Bao Viet"}'</span>;
+
+<span class="cm">-- One key queried constantly? A B-tree expression index is smaller and faster.</span>
+<span class="kw">CREATE INDEX</span> patients_insurer <span class="kw">ON</span> patients ((intake -&gt;&gt; <span class="st">'insurer'</span>));
+<span class="cm">-- Queried constantly AND the same for everyone? Promote it to a real column.</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">intake.ts — the shape is validated in the app, per tenant</span>
+        <pre class="code"><span class="kw">import</span> { z } <span class="kw">from</span> <span class="st">"zod"</span>;
+
+<span class="cm">// Built from the tenant's form definition (stored in tenant settings, Part IV)</span>
+<span class="kw">function</span> <span class="fn">intakeSchema</span>(fields: FormField[]) {
+  <span class="kw">const</span> shape: Record&lt;string, z.ZodTypeAny&gt; = {};
+  <span class="kw">for</span> (<span class="kw">const</span> f <span class="kw">of</span> fields) {
+    <span class="kw">const</span> base = f.type === <span class="st">"number"</span> ? z.<span class="fn">number</span>() : f.type === <span class="st">"date"</span> ? z.iso.<span class="fn">date</span>() : z.<span class="fn">string</span>().<span class="fn">max</span>(<span class="st">500</span>);
+    shape[f.key] = f.required ? base : base.<span class="fn">optional</span>();
+  }
+  <span class="kw">return</span> z.<span class="fn">object</span>(shape).<span class="fn">strict</span>();   <span class="cm">// ← unknown keys rejected, not silently stored</span>
+}
+<span class="kw">const</span> intake = <span class="fn">intakeSchema</span>(tenant.intakeFields).<span class="fn">parse</span>(req.body.intake);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Postgres has no built-in JSON Schema validation (some hosts ship extensions for it; check what yours supports), so
+        the shape is usually enforced in the app, as above. JSONB is a good tool with a known failure mode: it becomes the
+        place where the agent puts everything it didn't want to write a migration for. In review, ask of every key:
+        <em>is this queried, joined or totalled?</em> If yes, it probably wants to be a column.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Tags and many-to-many: a join table, scoped and unique</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Doctors have several specialties, products sit in several collections, bookings carry labels such as
+        "VIP" or "needs interpreter". Many-to-many is a <strong>join table</strong> with a composite primary key, so the same
+        pair can't be linked twice. For free-form labels that only get displayed and filtered, a
+        <code class="inline">text[]</code> column with a GIN index is a reasonable shortcut.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/0011_specialties.sql</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">specialties</span> (
+  id uuid <span class="kw">PRIMARY KEY DEFAULT</span> uuidv7(),
+  tenant_id uuid <span class="kw">NOT NULL REFERENCES</span> tenants(id),
+  name text <span class="kw">NOT NULL</span>
+);
+<span class="kw">CREATE UNIQUE INDEX</span> specialties_name <span class="kw">ON</span> specialties (tenant_id, lower(name)); <span class="cm">-- "Cardiology" = "cardiology"</span>
+
+<span class="kw">CREATE TABLE</span> <span class="fn">doctor_specialties</span> (
+  doctor_id    uuid <span class="kw">NOT NULL REFERENCES</span> doctors(id) <span class="kw">ON DELETE CASCADE</span>,     <span class="cm">-- a true child row</span>
+  specialty_id uuid <span class="kw">NOT NULL REFERENCES</span> specialties(id) <span class="kw">ON DELETE CASCADE</span>,
+  <span class="kw">PRIMARY KEY</span> (doctor_id, specialty_id)                              <span class="cm">-- no duplicate links</span>
+);
+
+<span class="cm">-- doctors having ALL of the chosen specialties (not ANY): GROUP BY + HAVING</span>
+<span class="kw">SELECT</span> doctor_id <span class="kw">FROM</span> doctor_specialties
+<span class="kw">WHERE</span> specialty_id = <span class="kw">ANY</span>($1) <span class="kw">GROUP BY</span> doctor_id
+<span class="kw">HAVING</span> count(*) = cardinality($1);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two things to check in agent-written tag code: the tag name is unique <em>per tenant and case-insensitively</em>
+        (otherwise you get "VIP", "vip" and "Vip"), and the filter does what the UI promises. "Has any of these tags" and
+        "has all of these tags" are different queries, and agents usually write the first.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Hierarchies: adjacency list first, ltree when you query subtrees a lot</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A large chain is organised as <em>chain → region → clinic → department</em>. Shops have nested categories, and help
+        centres have nested folders. The simplest model is an <strong>adjacency list</strong>: each row stores its
+        <code class="inline">parent_id</code>. To get a whole subtree ("every department under the Hanoi region") you walk it
+        with a <strong>recursive CTE</strong>.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    C["Golden Care chain<br/>path: gc"] --> N["Hanoi region<br/>path: gc.hn"]
+    C --> S["HCMC region<br/>path: gc.hcm"]
+    N --> N1["Cau Giay clinic<br/>gc.hn.cg"]
+    N --> N2["Ba Dinh clinic<br/>gc.hn.bd"]
+    S --> S1["District 1 clinic<br/>gc.hcm.d1"]
+    N1 --> D1["Paediatrics<br/>gc.hn.cg.paed"]
+    N1 --> D2["Dermatology<br/>gc.hn.cg.derm"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">org_units.sql — adjacency list and a subtree query</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">org_units</span> (
+  id uuid <span class="kw">PRIMARY KEY DEFAULT</span> uuidv7(),
+  tenant_id uuid <span class="kw">NOT NULL</span>,
+  parent_id uuid <span class="kw">REFERENCES</span> org_units(id),     <span class="cm">-- NULL = the root (the chain itself)</span>
+  kind text <span class="kw">NOT NULL CHECK</span> (kind <span class="kw">IN</span> (<span class="st">'chain'</span>, <span class="st">'region'</span>, <span class="st">'clinic'</span>, <span class="st">'department'</span>)),
+  name text <span class="kw">NOT NULL</span>
+);
+
+<span class="kw">WITH RECURSIVE</span> subtree <span class="kw">AS</span> (
+  <span class="kw">SELECT</span> id, name, <span class="st">1</span> <span class="kw">AS</span> depth <span class="kw">FROM</span> org_units <span class="kw">WHERE</span> id = $1     <span class="cm">-- start: the Hanoi region</span>
+  <span class="kw">UNION ALL</span>
+  <span class="kw">SELECT</span> o.id, o.name, s.depth + <span class="st">1</span>
+  <span class="kw">FROM</span> org_units o <span class="kw">JOIN</span> subtree s <span class="kw">ON</span> o.parent_id = s.id
+  <span class="kw">WHERE</span> s.depth &lt; <span class="st">10</span>                              <span class="cm">-- ← a depth cap: a cycle can't loop forever</span>
+)
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> subtree;</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The alternative is a <strong>materialized path</strong>: each row stores its full path, like
+        <code class="inline">gc.hn.cg</code>. Postgres's <code class="inline">ltree</code> extension gives you a type for it, an index,
+        and operators such as <code class="inline">path &lt;@ 'gc.hn'</code> ("everything under Hanoi"). Reads are one indexed query.
+        The price is that moving a node means rewriting the path of every descendant.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Model</th><th class="px-4 py-3">Reads a subtree</th><th class="px-4 py-3">Moves a node</th><th class="px-4 py-3">Use for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Adjacency list (<code class="inline">parent_id</code>)</td><td class="px-4 py-3">Recursive CTE, fine for thousands of nodes</td><td class="px-4 py-3">Change one row</td><td class="px-4 py-3">The default: org charts, categories, comment threads</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Materialized path (<code class="inline">ltree</code>)</td><td class="px-4 py-3">One indexed query</td><td class="px-4 py-3">Rewrite all descendants</td><td class="px-4 py-3">Deep trees read far more than they change, and permission checks like "is this clinic under my region?"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Closure table</td><td class="px-4 py-3">One join</td><td class="px-4 py-3">Many rows to update</td><td class="px-4 py-3">Overkill for most client projects. Look it up if a mentor asks for it.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Polymorphic associations: convenient, and the foreign key is gone</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Staff want to attach notes to bookings, patients <em>and</em> doctors. Rails and Laravel make it one line: a
+        <code class="inline">notes</code> table with <code class="inline">notable_type</code> and <code class="inline">notable_id</code>. Agents
+        like this pattern because it is compact. The cost: <strong>no foreign key can point at "one of three tables"</strong>,
+        so Postgres can't stop orphan notes, a typo in the type string, or a note pointing at a row in another tenant.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">notes.sql — an "exclusive arc" keeps real foreign keys</span>
+        <pre class="code"><span class="cm">-- ✗ polymorphic: notable_type text, notable_id uuid → no FK possible</span>
+
+<span class="cm">-- ✓ one nullable FK per parent, and exactly one of them must be set</span>
+<span class="kw">CREATE TABLE</span> <span class="fn">notes</span> (
+  id         uuid <span class="kw">PRIMARY KEY DEFAULT</span> uuidv7(),
+  tenant_id  uuid <span class="kw">NOT NULL</span>,
+  booking_id uuid <span class="kw">REFERENCES</span> bookings(id),
+  patient_id uuid <span class="kw">REFERENCES</span> patients(id),
+  doctor_id  uuid <span class="kw">REFERENCES</span> doctors(id),
+  body       text <span class="kw">NOT NULL</span>,
+  <span class="kw">CHECK</span> (num_nonnulls(booking_id, patient_id, doctor_id) = <span class="st">1</span>)   <span class="cm">-- ← the arc</span>
+);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The exclusive arc works well up to four or five parent types. Beyond that, use one join table per parent
+        (<code class="inline">booking_notes</code>, <code class="inline">patient_notes</code>). If the project already uses polymorphic
+        relations through its ORM, it is not a disaster, but add a cleanup job for orphans and never accept the type string from
+        the request body.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Enums, CHECK constraints or lookup tables</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A column that holds one of a fixed list of values (booking status, payment method, appointment type) can be enforced
+        in three ways. The deciding question is <strong>who changes the list, and whether values carry data of their own</strong>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">Good at</th><th class="px-4 py-3">Awkward at</th><th class="px-4 py-3">Clinic example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">text</code> + <code class="inline">CHECK (x IN (…))</code></td><td class="px-4 py-3">Simple. A migration changes the list either way.</td><td class="px-4 py-3">Nothing much. Our default for developer-owned lists.</td><td class="px-4 py-3"><code class="inline">bookings.status</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Postgres <code class="inline">ENUM</code> type</td><td class="px-4 py-3">Compact, typed, ordered by declaration</td><td class="px-4 py-3">You can add or rename values, but not remove one without recreating the type</td><td class="px-4 py-3"><code class="inline">payment_method</code>, if it truly never shrinks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lookup table + FK</td><td class="px-4 py-3">Values with attributes (label, colour, duration, price), edited by admins, different per tenant</td><td class="px-4 py-3">One more join. The app can't hard-code IDs.</td><td class="px-4 py-3"><code class="inline">appointment_types</code> with duration and price per chain</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Whichever you pick, keep the TypeScript side in sync: a string union or <code class="inline">as const</code> array
+        generated from, or checked against, the schema. When the list lives in a lookup table, the code must not branch on
+        specific rows (<code class="inline">if (type.name === "Consultation")</code>), because the client will rename it next month.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Multi-tenancy models</div>
+      <h2 class="font-display text-2xl font-bold mt-2">One shared schema with a tenant ID is the right default, until a customer pays for more</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <strong>Multi-tenancy</strong> means one deployment of the product serves several customers (tenants) whose data must
+        never mix. For the clinic app, a tenant is a clinic chain: its clinics, doctors, patients, bookings and payments.
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a> introduced the idea as an access-control
+        problem. This Part is about the data model. Part IV is about keeping isolation true in every corner of the code.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>First, check whether you are multi-tenant at all.</strong> A booking app built for <em>one</em> chain with
+        twenty clinics is not multi-tenant. It is multi-clinic: <code class="inline">clinic_id</code> is an ordinary foreign key,
+        and a receptionist seeing another clinic's calendar is a permissions question (SD9), not a data leak between
+        customers. Adding tenant machinery to a single-customer project or an internal tool is pure cost. You need it when
+        the <em>same deployment</em> is sold to organisations that must not see each other.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Three isolation models</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The models differ in <em>where</em> the wall between tenants stands: a column, a schema, or a whole database.
+        The further out the wall, the stronger the isolation and the higher the cost of running many tenants.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 240" class="w-full min-w-[620px]" role="img" aria-label="Three multi-tenancy models: shared tables with a tenant_id column, one schema per tenant in one database, and one database per tenant">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">SHARED SCHEMA · wall = a column</text>
+          <text x="248" y="20" font-size="11" font-weight="700" fill="#6E6B64">SCHEMA PER TENANT · wall = a namespace</text>
+          <text x="490" y="20" font-size="11" font-weight="700" fill="#6E6B64">DATABASE PER TENANT · wall = a server</text>
+          <rect x="12" y="32" width="210" height="160" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5"/>
+          <g class="anim-pulse"><rect x="26" y="46" width="182" height="40" rx="9" fill="#2563EB"/>
+            <text x="117" y="63" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">bookings</text>
+            <text x="117" y="77" text-anchor="middle" fill="#ffffffbb" font-size="9">rows of A, B, C · tenant_id</text></g>
+          <g class="anim-pulse d1"><rect x="26" y="94" width="182" height="40" rx="9" fill="#2563EB"/>
+            <text x="117" y="111" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">patients</text>
+            <text x="117" y="125" text-anchor="middle" fill="#ffffffbb" font-size="9">rows of A, B, C · tenant_id</text></g>
+          <text x="117" y="160" text-anchor="middle" font-size="10" fill="#6E6B64">one Postgres, one schema</text>
+          <text x="117" y="176" text-anchor="middle" font-size="10" fill="#DB2777" class="anim-bounce">RLS + scoped queries</text>
+          <rect x="248" y="32" width="220" height="160" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5"/>
+          <g class="anim-pulse d1"><rect x="260" y="46" width="62" height="96" rx="9" fill="#0D9488"/>
+            <text x="291" y="90" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">tenant_a</text>
+            <text x="291" y="104" text-anchor="middle" fill="#ffffffbb" font-size="9">all tables</text></g>
+          <g class="anim-pulse d2"><rect x="327" y="46" width="62" height="96" rx="9" fill="#0D9488"/>
+            <text x="358" y="90" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">tenant_b</text>
+            <text x="358" y="104" text-anchor="middle" fill="#ffffffbb" font-size="9">all tables</text></g>
+          <g class="anim-pulse d3"><rect x="394" y="46" width="62" height="96" rx="9" fill="#0D9488"/>
+            <text x="425" y="90" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">tenant_c</text>
+            <text x="425" y="104" text-anchor="middle" fill="#ffffffbb" font-size="9">all tables</text></g>
+          <text x="358" y="160" text-anchor="middle" font-size="10" fill="#6E6B64">one Postgres, N schemas</text>
+          <text x="358" y="176" text-anchor="middle" font-size="10" fill="#6E6B64">search_path picks the tenant</text>
+          <g class="anim-pulse d2"><rect x="490" y="36" width="94" height="72" rx="9" fill="#6d5acd"/>
+            <text x="537" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">DB · A</text>
+            <text x="537" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">own server</text></g>
+          <g class="anim-pulse d3"><rect x="594" y="36" width="94" height="72" rx="9" fill="#6d5acd"/>
+            <text x="641" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">DB · B</text>
+            <text x="641" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">own server</text></g>
+          <g class="anim-pulse d4"><rect x="490" y="116" width="94" height="72" rx="9" fill="#6d5acd"/>
+            <text x="537" y="148" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">DB · C</text>
+            <text x="537" y="162" text-anchor="middle" fill="#ffffffbb" font-size="9">own server</text></g>
+          <text x="641" y="150" text-anchor="middle" font-size="10" fill="#6E6B64">router maps</text>
+          <text x="641" y="164" text-anchor="middle" font-size="10" fill="#6E6B64">tenant → DB</text>
+          <line x1="30" y1="222" x2="670" y2="222" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="30" y="214" font-size="10" fill="#A8A49B">cheaper, simpler to operate</text>
+          <text x="670" y="214" text-anchor="end" font-size="10" fill="#A8A49B">stronger isolation, higher cost per tenant</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3"></th><th class="px-4 py-3">Shared schema + <code class="inline">tenant_id</code></th><th class="px-4 py-3">Schema per tenant</th><th class="px-4 py-3">Database per tenant</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Isolation</td><td class="px-4 py-3">Logical. One missing filter can leak, so RLS is the backstop.</td><td class="px-4 py-3">Better. A wrong <code class="inline">search_path</code> still leaks.</td><td class="px-4 py-3">Strongest. Separate credentials, backups and encryption keys are possible.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost per tenant</td><td class="px-4 py-3">Near zero. A new tenant is one row.</td><td class="px-4 py-3">Low, but the catalog grows with every table in every schema</td><td class="px-4 py-3">A server (or managed instance) each, plus connection pools</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Migrations</td><td class="px-4 py-3">Run once</td><td class="px-4 py-3">Run N times. Tenants can end up on different versions after a half-failed run.</td><td class="px-4 py-3">Run N times, across N servers, with tooling to track each one</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Noisy neighbour</td><td class="px-4 py-3">One heavy tenant slows everyone. Needs per-tenant limits (Part IV).</td><td class="px-4 py-3">Same server, so same problem</td><td class="px-4 py-3">Contained</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cross-tenant reporting</td><td class="px-4 py-3">One query</td><td class="px-4 py-3"><code class="inline">UNION</code> across schemas</td><td class="px-4 py-3">An ETL job into a warehouse</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Compliance asks</td><td class="px-4 py-3">Usually acceptable with RLS, audit and encryption at rest</td><td class="px-4 py-3">Easy per-tenant export and deletion</td><td class="px-4 py-3">Data residency ("our data stays in region X"), dedicated keys</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Fits</td><td class="px-4 py-3">SaaS with tens to thousands of small or medium tenants. <strong>Our default.</strong></td><td class="px-4 py-3">Tens of tenants who each need some separation. Rare for new projects.</td><td class="px-4 py-3">A handful of large enterprise or regulated customers</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Real products often end up <strong>hybrid</strong>: everyone on the shared schema, plus a dedicated database for the one
+        hospital group whose contract demands it. Design for that from day one by keeping all tenant lookups behind one
+        function (<code class="inline">dbFor(tenant)</code>), even when it always returns the same pool. Moving one tenant out is
+        then an operations task, not a rewrite.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8"><code class="inline">tenant_id</code> on every tenant-owned table, inside every key</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In the shared-schema model, every table that holds tenant data gets a <code class="inline">tenant_id NOT NULL</code>. That
+        includes child tables such as <code class="inline">booking_status_history</code>, even though you "could get it through the
+        join". Denormalising it on purpose is what makes RLS simple and every index usable. Global tables (plans, countries,
+        feature definitions) don't get one. Write the list down.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/0020_tenant_keys.sql — composite FKs make cross-tenant links impossible</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">slots</span> (
+  id        uuid <span class="kw">NOT NULL DEFAULT</span> uuidv7(),
+  tenant_id uuid <span class="kw">NOT NULL REFERENCES</span> tenants(id),
+  doctor_id uuid <span class="kw">NOT NULL</span>,
+  starts_at timestamptz <span class="kw">NOT NULL</span>,
+  <span class="kw">PRIMARY KEY</span> (id),
+  <span class="kw">UNIQUE</span> (tenant_id, id),                               <span class="cm">-- target for composite FKs</span>
+  <span class="kw">FOREIGN KEY</span> (tenant_id, doctor_id) <span class="kw">REFERENCES</span> doctors (tenant_id, id)
+);
+<span class="kw">CREATE TABLE</span> <span class="fn">bookings</span> (
+  id         uuid <span class="kw">PRIMARY KEY DEFAULT</span> uuidv7(),
+  tenant_id  uuid <span class="kw">NOT NULL</span>,
+  slot_id    uuid <span class="kw">NOT NULL</span>,
+  patient_id uuid <span class="kw">NOT NULL</span>,
+  <span class="kw">FOREIGN KEY</span> (tenant_id, slot_id)    <span class="kw">REFERENCES</span> slots (tenant_id, id),    <span class="cm">-- ← same tenant,</span>
+  <span class="kw">FOREIGN KEY</span> (tenant_id, patient_id) <span class="kw">REFERENCES</span> patients (tenant_id, id)  <span class="cm">--   enforced by Postgres</span>
+);
+<span class="kw">CREATE INDEX</span> bookings_tenant_slot <span class="kw">ON</span> bookings (tenant_id, slot_id);  <span class="cm">-- indexes lead with tenant_id</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        With a plain <code class="inline">slot_id REFERENCES slots(id)</code>, a bug (or an attacker who guessed an ID) can create a
+        booking in chain A for a slot that belongs to chain B, and the database accepts it. The <strong>composite foreign key</strong>
+        says "the slot must exist <em>in the same tenant</em>", so that row can't exist. The same idea applies to unique
+        constraints: <code class="inline">UNIQUE (tenant_id, lower(email))</code>, not <code class="inline">UNIQUE (email)</code>. Otherwise a
+        patient registered at chain A can't register at chain B, and the error message tells chain B that this email exists
+        somewhere else.
+      </p>
+      <div class="mt-4 callout callout-tip">
+        <strong>Decide what a person is.</strong> If Mrs Lan visits two chains, is she one <code class="inline">patient</code> row or two?
+        In most B2B SaaS the answer is two: each chain owns its own records and consents. Login accounts are different: one
+        <code class="inline">users</code> row (global) with a <code class="inline">memberships (user_id, tenant_id, role)</code> table lets a
+        doctor who works at two chains switch between them. Agents usually put <code class="inline">tenant_id</code> directly on
+        <code class="inline">users</code>, which breaks the moment one person belongs to two tenants.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Resolving the tenant on every request</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Before any query runs, the server must know which tenant the request is for, and must <strong>verify that the
+        caller belongs to it</strong>. The tenant can arrive in several ways.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Source</th><th class="px-4 py-3">Example</th><th class="px-4 py-3">Good for</th><th class="px-4 py-3">Watch out</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Subdomain or custom domain</td><td class="px-4 py-3"><code class="inline">goldencare.clinicapp.vn</code></td><td class="px-4 py-3">Patient-facing booking pages, per-tenant branding</td><td class="px-4 py-3">Cookies scoped to the parent domain are shared across tenants. Custom domains need TLS per domain.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Claim in the verified token</td><td class="px-4 py-3"><code class="inline">org_id</code> in the JWT or session</td><td class="px-4 py-3">Staff dashboards and APIs</td><td class="px-4 py-3">Users in two tenants need a way to switch, which issues a new token or session</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Header or path</td><td class="px-4 py-3"><code class="inline">X-Tenant-Id</code>, <code class="inline">/t/goldencare/…</code></td><td class="px-4 py-3">Mobile apps, internal APIs</td><td class="px-4 py-3">Fully client-controlled. Useless without a membership check.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Request body</td><td class="px-4 py-3"><code class="inline">{ "tenantId": … }</code></td><td class="px-4 py-3">Nothing</td><td class="px-4 py-3">Never. This is mass assignment of the most dangerous field (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>).</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">middleware/tenant.ts — resolve, then verify membership</span>
+        <pre class="code"><span class="kw">export async function</span> <span class="fn">resolveTenant</span>(req: Request, res: Response, next: NextFunction) {
+  <span class="kw">const</span> host = req.hostname;                              <span class="cm">// goldencare.clinicapp.vn</span>
+  <span class="kw">const</span> tenant = <span class="kw">await</span> tenants.<span class="fn">findByHost</span>(host);         <span class="cm">// subdomain or custom domain</span>
+  <span class="kw">if</span> (!tenant || tenant.status !== <span class="st">"active"</span>) <span class="kw">return</span> res.<span class="fn">status</span>(<span class="st">404</span>).<span class="fn">end</span>();
+
+  <span class="kw">if</span> (req.user) {                                        <span class="cm">// staff area: must be a member</span>
+    <span class="kw">const</span> m = <span class="kw">await</span> memberships.<span class="fn">find</span>(req.user.id, tenant.id);
+    <span class="kw">if</span> (!m) <span class="kw">return</span> res.<span class="fn">status</span>(<span class="st">404</span>).<span class="fn">end</span>();                  <span class="cm">// ← 404, don't confirm it exists</span>
+    req.role = m.role;
+  }
+  req.tenantId = tenant.id;             <span class="cm">// the ONLY place tenantId is set; handlers never read it from input</span>
+  <span class="fn">next</span>();
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The same resolve-then-verify step works in a Next.js route handler, a NestJS guard or a Laravel middleware. What
+        matters for review is that there is <strong>exactly one</strong> place where the tenant is decided. If you find
+        <code class="inline">req.headers["x-tenant-id"]</code> or <code class="inline">body.tenantId</code> read inside a handler, that is a bug,
+        even if it "works".
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Enforcing &amp; proving isolation</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Assume someone will forget the filter, and make forgetting return nothing</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A shared schema is only as safe as its least careful query. Hundreds of queries, three developers and an agent
+        writing new ones every day: one of them <em>will</em> forget <code class="inline">WHERE tenant_id = $1</code>. Defence in depth
+        means three layers: the app scopes queries by default, the database refuses rows from other tenants anyway, and
+        a test suite tries to break through both.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Row Level Security with a per-transaction tenant setting</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a> shows RLS on Supabase, where policies read the
+        user from the JWT with <code class="inline">auth.uid()</code>. On your own backend the pattern is the same, but the app tells
+        Postgres the current tenant through a <strong>custom setting</strong> at the start of each transaction, and every policy
+        compares against it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/0021_rls.sql — one policy per tenant table</span>
+        <pre class="code"><span class="cm">-- The app connects as app_user: not the table owner, not a superuser, no BYPASSRLS.</span>
+<span class="kw">ALTER TABLE</span> bookings <span class="kw">ENABLE ROW LEVEL SECURITY</span>;
+<span class="kw">ALTER TABLE</span> bookings <span class="kw">FORCE ROW LEVEL SECURITY</span>;   <span class="cm">-- apply to the owner too</span>
+
+<span class="kw">CREATE POLICY</span> <span class="fn">tenant_isolation</span> <span class="kw">ON</span> bookings
+  <span class="kw">USING</span>      (tenant_id = NULLIF(current_setting(<span class="st">'app.tenant_id'</span>, <span class="kw">true</span>), <span class="st">''</span>)::uuid)
+  <span class="kw">WITH CHECK</span> (tenant_id = NULLIF(current_setting(<span class="st">'app.tenant_id'</span>, <span class="kw">true</span>), <span class="st">''</span>)::uuid);
+<span class="cm">-- USING filters reads, updates and deletes. WITH CHECK rejects writes into another tenant.</span>
+<span class="cm">-- Setting missing → NULL → the comparison is never true → zero rows, not all rows.</span>
+
+<span class="cm">-- Safety net for CI: list tenant tables that don't have RLS switched on</span>
+<span class="kw">SELECT</span> c.relname <span class="kw">FROM</span> pg_class c <span class="kw">JOIN</span> information_schema.columns col
+  <span class="kw">ON</span> col.table_schema = <span class="st">'public'</span> <span class="kw">AND</span> col.table_name = c.relname <span class="kw">AND</span> col.column_name = <span class="st">'tenant_id'</span>
+<span class="kw">WHERE</span> c.relnamespace = <span class="st">'public'</span>::regnamespace <span class="kw">AND</span> c.relkind = <span class="st">'r'</span>
+  <span class="kw">AND NOT</span> (c.relrowsecurity <span class="kw">AND</span> c.relforcerowsecurity);   <span class="cm">-- expect: no rows</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">db/with-tenant.ts — set the tenant for exactly one transaction</span>
+        <pre class="code"><span class="kw">export async function</span> <span class="fn">withTenant</span>&lt;T&gt;(ctx: { tenantId: string; userId?: string },
+                                     fn: (tx: PoolClient) =&gt; Promise&lt;T&gt;): Promise&lt;T&gt; {
+  <span class="kw">const</span> client = <span class="kw">await</span> pool.<span class="fn">connect</span>();
+  <span class="kw">try</span> {
+    <span class="kw">await</span> client.<span class="fn">query</span>(<span class="st">"BEGIN"</span>);
+    <span class="cm">// third argument true = LOCAL: the value ends with the transaction, so a pooled</span>
+    <span class="cm">// connection can never carry tenant A's setting into tenant B's request</span>
+    <span class="kw">await</span> client.<span class="fn">query</span>(<span class="st">"SELECT set_config('app.tenant_id', $1, true)"</span>, [ctx.tenantId]);
+    <span class="kw">await</span> client.<span class="fn">query</span>(<span class="st">"SELECT set_config('app.user_id', $1, true)"</span>, [ctx.userId ?? <span class="st">""</span>]);
+    <span class="kw">const</span> result = <span class="kw">await</span> <span class="fn">fn</span>(client);
+    <span class="kw">await</span> client.<span class="fn">query</span>(<span class="st">"COMMIT"</span>);
+    <span class="kw">return</span> result;
+  } <span class="kw">catch</span> (e) { <span class="kw">await</span> client.<span class="fn">query</span>(<span class="st">"ROLLBACK"</span>); <span class="kw">throw</span> e; }
+  <span class="kw">finally</span> { client.<span class="fn">release</span>(); }
+}</pre>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant B as Browser (goldencare.*)
+    participant M as Tenant middleware
+    participant H as Handler
+    participant PG as Postgres (RLS on)
+    B->>M: GET /bookings?date=2026-10-01
+    M->>M: host → tenant, check membership
+    M->>H: req.tenantId = gc
+    H->>PG: BEGIN; set_config('app.tenant_id', gc, true)
+    H->>PG: SELECT * FROM bookings WHERE starts_at::date = $1
+    Note over PG: policy adds<br/>AND tenant_id = gc
+    PG-->>H: only Golden Care rows
+    H->>PG: COMMIT (setting disappears)
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice the query in step 5 has no tenant filter, and still returns only Golden Care's rows. You should
+        <em>still</em> write the filter in application code (it helps the planner use the <code class="inline">tenant_id</code> index and
+        documents intent). RLS is the backstop for the day someone forgets.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>The ways RLS quietly stops protecting you:</strong> the app connects as the table owner without
+        <code class="inline">FORCE</code>, or as a superuser or <code class="inline">BYPASSRLS</code> role (the default local
+        <code class="inline">postgres</code> user is a superuser, so everything "works" in dev) · the setting is made with a plain
+        <code class="inline">SET</code> or <code class="inline">set_config(…, false)</code> on a pooled connection, so the next request inherits
+        it · a view created without <code class="inline">security_invoker = true</code> (Postgres 15+) runs as its owner and skips the
+        policies · a <code class="inline">SECURITY DEFINER</code> function reads tenant tables · a new table is added in a migration
+        with no policy. Test with the same role and pool mode as production.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">ORM default scopes and their holes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The application layer is the first line: a repository, a Prisma client extension, a Rails
+        <code class="inline">acts_as_tenant</code> or a Laravel global scope that adds <code class="inline">tenant_id</code> to every query
+        automatically. Use one. But know where these scopes don't reach, because that's where agent-written code goes around
+        them.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Hole</th><th class="px-4 py-3">What it looks like in a diff</th><th class="px-4 py-3">Covered by RLS?</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Raw SQL</td><td class="px-4 py-3"><code class="inline">$queryRaw</code>, <code class="inline">DB::select</code>, a "quick" report query</td><td class="px-4 py-3">Yes, if it runs inside <code class="inline">withTenant</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Unscoped escape hatch</td><td class="px-4 py-3"><code class="inline">unscoped()</code>, <code class="inline">withoutGlobalScopes()</code>, a second "admin" client</td><td class="px-4 py-3">Only if that client uses the RLS role</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Writes</td><td class="px-4 py-3"><code class="inline">create</code> without <code class="inline">tenantId</code>, <code class="inline">updateMany</code> by ID only</td><td class="px-4 py-3">Yes: <code class="inline">WITH CHECK</code> rejects the wrong tenant</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Background jobs and cron</td><td class="px-4 py-3">No request, so no tenant context. The job queries every tenant's rows.</td><td class="px-4 py-3">Returns nothing, which is a visible bug rather than a leak</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Things outside the database</td><td class="px-4 py-3">Cache keys, file paths, search indexes, analytics events</td><td class="px-4 py-3"><strong>No.</strong> Next section.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The tenant travels with the data: cache, queues, files, search</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        RLS protects Postgres. Every <em>other</em> store is keyed by strings the code builds, and a key without the tenant is
+        a shared key. The rule: <strong>the tenant ID is part of every key, path, payload and index filter</strong>, and it comes
+        from the resolved context, never from the data being processed.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="The tenant ID resolved at the request edge flows into database settings, cache keys, job payloads, file paths and search filters">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">RESOLVED ONCE · CARRIED EVERYWHERE</text>
+          <g class="anim-pulse"><rect x="12" y="84" width="130" height="50" rx="9" fill="#37474F"/>
+            <text x="77" y="105" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Request edge</text>
+            <text x="77" y="120" text-anchor="middle" fill="#ffffffbb" font-size="9">tenantId = gc</text></g>
+          <line x1="142" y1="109" x2="240" y2="44" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="142" y1="109" x2="240" y2="109" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="142" y1="109" x2="240" y2="174" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="142" y1="109" x2="470" y2="44" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="142" y1="109" x2="470" y2="174" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="240" y="24" width="200" height="40" rx="9" fill="#2563EB"/>
+            <text x="340" y="41" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Postgres</text>
+            <text x="340" y="55" text-anchor="middle" fill="#ffffffbb" font-size="9">set_config('app.tenant_id') + RLS</text></g>
+          <g class="anim-pulse d2"><rect x="240" y="89" width="200" height="40" rx="9" fill="#0D9488"/>
+            <text x="340" y="106" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Redis cache</text>
+            <text x="340" y="120" text-anchor="middle" fill="#ffffffbb" font-size="9">t:gc:slots:doctor42:2026-10-01</text></g>
+          <g class="anim-pulse d3"><rect x="240" y="154" width="200" height="40" rx="9" fill="#6d5acd"/>
+            <text x="340" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Job queue</text>
+            <text x="340" y="185" text-anchor="middle" fill="#ffffffbb" font-size="9">{ tenantId: gc, bookingId }</text></g>
+          <g class="anim-pulse d3"><rect x="470" y="24" width="210" height="40" rx="9" fill="#D97757"/>
+            <text x="575" y="41" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Object storage</text>
+            <text x="575" y="55" text-anchor="middle" fill="#ffffffbb" font-size="9">tenants/gc/patients/…/scan.pdf</text></g>
+          <g class="anim-pulse d4"><rect x="470" y="154" width="210" height="40" rx="9" fill="#DB2777"/>
+            <text x="575" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Search index</text>
+            <text x="575" y="185" text-anchor="middle" fill="#ffffffbb" font-size="9">filter: tenant_id = gc, set server-side</text></g>
+          <text x="575" y="110" text-anchor="middle" font-size="10" fill="#DB2777" class="anim-bounce">a key without the tenant is a shared key</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">tenant-keys.ts — one helper per store, so nobody builds keys by hand</span>
+        <pre class="code"><span class="kw">export const</span> cacheKey = (ctx: Ctx, ...parts: string[]) =&gt;
+  [<span class="st">"t"</span>, ctx.tenantId, ...parts].<span class="fn">join</span>(<span class="st">":"</span>);                <span class="cm">// t:gc:slots:doctor42:2026-10-01</span>
+
+<span class="kw">export const</span> fileKey = (ctx: Ctx, ...parts: string[]) =&gt;
+  [<span class="st">"tenants"</span>, ctx.tenantId, ...parts].<span class="fn">join</span>(<span class="st">"/"</span>);         <span class="cm">// check the prefix again before signing a URL</span>
+
+<span class="cm">// Jobs carry the tenant; the worker re-establishes the context before touching data</span>
+<span class="kw">await</span> queue.<span class="fn">add</span>(<span class="st">"send-reminder"</span>, { tenantId: ctx.tenantId, bookingId });
+worker.<span class="fn">process</span>(<span class="st">"send-reminder"</span>, ({ data }) =&gt;
+  <span class="fn">withTenant</span>({ tenantId: data.tenantId }, (tx) =&gt; <span class="fn">sendReminder</span>(tx, data.bookingId)));</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Caching is covered in <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a> and jobs in
+        <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>. For search, the tenant filter must be applied
+        by the server (or baked into a scoped search key that the server issues), never passed as a filter the browser
+        chooses. Search engines are covered in <a href="./sd13.html" class="text-viol underline decoration-viol/40">SD13</a>. Put the tenant in logs and metrics too,
+        so that "the app is slow" can become "the app is slow for one tenant".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Cross-tenant leak tests</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Isolation is a claim, so prove it. The pattern: seed <strong>two tenants</strong> with look-alike data, act as tenant A,
+        and try to reach every tenant-B resource by ID through every endpoint. The expected answer is 404 every time, never
+        200 and never 403 (a 403 confirms the ID exists). Test fixtures with one tenant can't catch any of the bugs in this
+        Part.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">tenant-isolation.test.ts — runs in CI against a real Postgres with RLS</span>
+        <pre class="code"><span class="kw">const</span> A = <span class="kw">await</span> <span class="fn">seedTenant</span>(<span class="st">"golden-care"</span>);
+<span class="kw">const</span> B = <span class="kw">await</span> <span class="fn">seedTenant</span>(<span class="st">"sunrise-clinics"</span>);        <span class="cm">// same shape, different IDs</span>
+
+<span class="kw">const</span> routes = [<span class="st">"/bookings/:id"</span>, <span class="st">"/patients/:id"</span>, <span class="st">"/patients/:id/files"</span>, <span class="st">"/invoices/:id"</span>];
+test.<span class="fn">each</span>(routes)(<span class="st">"A cannot read B via %s"</span>, <span class="kw">async</span> (route) =&gt; {
+  <span class="kw">const</span> res = <span class="kw">await</span> <span class="fn">api</span>(A.staffToken).<span class="fn">get</span>(<span class="fn">fill</span>(route, B.ids));
+  <span class="fn">expect</span>(res.status).<span class="fn">toBe</span>(<span class="st">404</span>);                         <span class="cm">// not 200, not 403</span>
+});
+
+test(<span class="st">"RLS backstop: an unscoped query sees one tenant"</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> rows = <span class="kw">await</span> <span class="fn">withTenant</span>({ tenantId: A.id }, (tx) =&gt;
+    tx.<span class="fn">query</span>(<span class="st">"SELECT DISTINCT tenant_id FROM bookings"</span>));    <span class="cm">// ← deliberately no WHERE</span>
+  <span class="fn">expect</span>(rows.rows).<span class="fn">toEqual</span>([{ tenant_id: A.id }]);
+});</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Also test the paths outside the database: a cached response requested by the other tenant, a file URL, a search
+        query, an exported CSV. The list of routes should be generated from the router where possible, so a new endpoint is
+        covered without anyone remembering to add it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Per-tenant configuration and limits</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Tenants differ: plan, enabled features, branding, intake form, booking rules, time zone. Keep this in a
+        <code class="inline">tenants</code> row plus a validated settings document, read through one cached function. Limits belong
+        here too, because in a shared model one tenant can hurt everyone. A chain that imports 200,000 patients at 9 a.m., or
+        a script hammering the API, is the <strong>noisy neighbour</strong>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">tenant-settings.ts — typed settings with defaults, and a limit check</span>
+        <pre class="code"><span class="kw">const</span> TenantSettings = z.<span class="fn">object</span>({
+  timezone: z.<span class="fn">string</span>().<span class="fn">default</span>(<span class="st">"Asia/Ho_Chi_Minh"</span>),
+  cancelWindowHours: z.<span class="fn">number</span>().<span class="fn">int</span>().<span class="fn">min</span>(<span class="st">0</span>).<span class="fn">default</span>(<span class="st">24</span>),
+  intakeFields: z.<span class="fn">array</span>(FormField).<span class="fn">default</span>([]),         <span class="cm">// Part II's JSONB form</span>
+  limits: z.<span class="fn">object</span>({ doctors: z.<span class="fn">number</span>(), apiPerMinute: z.<span class="fn">number</span>() })
+    .<span class="fn">default</span>({ doctors: <span class="st">20</span>, apiPerMinute: <span class="st">600</span> }),   <span class="cm">// plan limits live with the tenant</span>
+});
+
+<span class="kw">export async function</span> <span class="fn">assertCanAddDoctor</span>(tx: Tx, ctx: Ctx) {
+  <span class="kw">const</span> s = <span class="kw">await</span> <span class="fn">settingsFor</span>(ctx.tenantId);            <span class="cm">// parsed once, cached per tenant</span>
+  <span class="kw">const</span> { rows } = <span class="kw">await</span> tx.<span class="fn">query</span>(<span class="st">"SELECT count(*)::int AS n FROM doctors WHERE deleted_at IS NULL"</span>);
+  <span class="kw">if</span> (rows[<span class="st">0</span>].n &gt;= s.limits.doctors) <span class="kw">throw new</span> <span class="fn">PlanLimitReached</span>(<span class="st">"doctors"</span>);
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Rate limits keyed by tenant (not only by user or IP) come from
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>. Heavy per-tenant work such as imports and exports
+        belongs in a queue with a per-tenant concurrency cap. Finally, plan the <strong>end of a tenant's life</strong> on day one:
+        a chain that leaves will ask for an export and then deletion of its data, everywhere it lives (tables, files, caches,
+        search, backups within their retention). With <code class="inline">tenant_id</code> on every table and every key, that is a
+        script. Without it, it is an archaeology project. Retention and erasure rules are in
+        <a href="./sd17.html" class="text-viol underline decoration-viol/40">SD17</a>.
+      </p>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are very good at the mechanical half of this module: adding a column and its index to thirty tables, writing
+        thirty nearly identical RLS policies, generating a leak test for every route. They are poor at the decisions: which
+        tables are tenant-owned, what "delete" means for each one, which JSONB keys should really be columns. Write those
+        decisions down first, then hand over the typing.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — a tenancy audit before any change</span>
+        <pre class="code">Read db/schema.sql and every file under src/. Don't change anything. Output:
+1. Every table: tenant-owned or global? has tenant_id NOT NULL? RLS enabled + forced?
+2. Every FK between tenant tables that is NOT a composite (tenant_id, id) FK.
+3. Every UNIQUE constraint on a tenant table that doesn't include tenant_id.
+4. Every place tenantId is read from headers, body or query params instead of req.tenantId.
+5. Every cache key, file path, job payload and search call built without the tenant.
+Give file:line for each finding.</pre>
+      </div>
+      <pre class="code mt-3">Add soft delete to patients and doctors ONLY (not join tables) per docs/data-rules.md.
+Include: deleted_at column, partial unique indexes WHERE deleted_at IS NULL, and a
+live_ view with security_invoker. Then list every query in src/ that reads these two
+tables and say, for each, whether it now needs the live-only filter. Don't guess: show the line.</pre>
+      <pre class="code mt-3">Write tests/tenant-isolation.test.ts: seed two tenants with identical shapes, then for
+every GET/PATCH/DELETE route in the router that takes an :id, call it as tenant A with
+tenant B's id and assert 404. Generate the route list from the router, don't hard-code it.
+Run it and paste the output. <span class="cm"># then break one query on purpose and confirm a test fails</span></pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Audit the schema and code against a checklist, with file:line</li>
+            <li>Write the repetitive migrations: columns, composite FKs, indexes, policies</li>
+            <li>Generate audit triggers and status-history tables</li>
+            <li>Build key helpers and replace hand-built cache keys and paths</li>
+            <li>Generate the two-tenant fixtures and leak tests for every route</li>
+            <li>Write recursive CTEs and JSONB queries, then show their <code class="inline">EXPLAIN</code></li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The list of tenant-owned vs global tables, decided by a human</li>
+            <li>Per table: soft delete, hard delete, or status. And who needs real erasure.</li>
+            <li>That the app's database role can't bypass RLS, in production as well as locally</li>
+            <li>That the tenant is set in exactly one place and never read from input</li>
+            <li>That the leak test fails when you remove a filter on purpose</li>
+            <li>What the audit log stores, who can read it, and how long it's kept</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-written data models:</strong> <code class="inline">deleted_at</code> added with the old plain
+        <code class="inline">UNIQUE</code> left in place · <code class="inline">tenant_id</code> on parent tables but not on children ·
+        <code class="inline">UNIQUE (email)</code> on a tenant table · single-column FKs between tenant tables ·
+        <code class="inline">tenantId</code> in a Zod schema for a request body · <code class="inline">SET app.tenant_id</code> without
+        <code class="inline">LOCAL</code> · tests that pass because they run as <code class="inline">postgres</code> · cache keys like
+        <code class="inline">slots:${doctorId}</code> · a <code class="inline">metadata jsonb</code> column that now holds prices and dates
+        · <code class="inline">commentable_type</code> taken from the request · a "fix" that disables RLS or switches to a
+        privileged connection because a query returned no rows.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Deletes rows with <code class="inline">DELETE</code> and has never thought about two customers sharing one database.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can explain soft delete, audit trails, JSONB and the three tenancy models, but doesn't notice the missing partial index or the unscoped cache key in a diff.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Implements soft delete, a status-history table and a tenant-scoped feature with a mentor's review. Uses composite FKs and tenant-leading indexes, runs the RLS policies as the app role, and writes a two-tenant leak test for their endpoints. Needs help with the model choice and the edge cases outside the database.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Makes the per-table data-lifecycle decisions with the client, audits an existing codebase for tenancy holes (cache, jobs, files, search), and keeps the leak suite covering every new route.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Chooses the tenancy model for a new product and plans the hybrid path for enterprise tenants, designs tenant offboarding and per-tenant limits, and reviews other teams' schemas for isolation.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> in your project, remove the tenant filter from one repository query.
+        Does a test fail, and does RLS still return only the right tenant's rows? Then pick one table you soft-delete: can you
+        name every query that reads it and show that each one handles deleted rows on purpose?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Testing isolation with one tenant</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Every query "works" when there is only one tenant's data to return. Seed two look-alike tenants in every integration test database, from the first sprint.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Soft-deleting personal data "for safety"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A patient who asks to be erased is still in the table, the audit log and the backups. Soft delete is for business undo, not for privacy requests.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Schema-per-tenant because it "feels safer"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">You get N migrations per deploy and version drift between tenants, and a wrong <code class="inline">search_path</code> leaks just as a missing <code class="inline">WHERE</code> does. Choose it for a stated requirement, not a feeling.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write a data-rules page</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One table in the repo docs: per table, tenant-owned or global, delete behaviour, audited or not, retention. Point <code class="inline">CLAUDE.md</code> at it and the agent follows it in every migration.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Make the tenant part of the key, not a filter you add</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Composite FKs, <code class="inline">(tenant_id, …)</code> unique constraints and key helpers turn "remember to scope" into "impossible to forget".</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Break it on purpose</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Delete a filter, drop a policy, connect as the superuser: each should turn a test red. A safety net you've never seen catch anything may not be there.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="data-rules"> <span>Wrote a data-rules table for a real or practice project: per table, tenant-owned or global, soft/hard delete or status, audited or not.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="soft-delete"> <span>Implemented soft delete on one table with a partial unique index, and listed every query that reads the table with its live-only decision.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="status-history"> <span>Added a guarded status transition (<code class="inline">WHERE status = from</code>) and a status-history table, written in one transaction.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="jsonb-or-tree"> <span>Modelled either per-tenant custom fields in validated JSONB or a hierarchy with a recursive CTE, and showed the <code class="inline">EXPLAIN</code> output of its main query.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tenant-pr"> <span class="font-semibold">Opened a PR that makes a small clinic booking API multi-tenant: <code class="inline">tenant_id</code> and composite FKs on bookings, slots and patients, forced RLS with a per-transaction setting, tenant-prefixed cache keys, and a two-tenant leak test that fails when one filter or policy is removed. Test output pasted in the description (mentor evidence ✓)</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html" target="_blank" rel="noopener">PostgreSQL — Row Security Policies</a> — <code class="inline">USING</code> vs <code class="inline">WITH CHECK</code>, <code class="inline">FORCE</code>, and which roles bypass RLS.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SET" target="_blank" rel="noopener">PostgreSQL — Configuration Settings Functions</a> — <code class="inline">set_config</code> and <code class="inline">current_setting</code>, used for the tenant and actor settings.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/datatype-json.html" target="_blank" rel="noopener">PostgreSQL — JSON Types</a> · <a class="text-coral underline" href="https://www.postgresql.org/docs/current/gin.html" target="_blank" rel="noopener">GIN Indexes</a> — containment, operator classes and what each index supports.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/queries-with.html" target="_blank" rel="noopener">PostgreSQL — WITH Queries (CTEs)</a> · <a class="text-coral underline" href="https://www.postgresql.org/docs/current/ltree.html" target="_blank" rel="noopener">ltree</a> — the two hierarchy techniques from Part II.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/functions-uuid.html" target="_blank" rel="noopener">PostgreSQL — UUID Functions</a> · <a class="text-coral underline" href="https://www.rfc-editor.org/rfc/rfc9562" target="_blank" rel="noopener">RFC 9562</a> — UUID v7, and which Postgres version generates it natively.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/plpgsql-trigger.html" target="_blank" rel="noopener">PostgreSQL — Trigger Functions</a> — <code class="inline">TG_OP</code>, <code class="inline">OLD</code>/<code class="inline">NEW</code>, and the audit-trigger example.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html" target="_blank" rel="noopener">AWS — SaaS Tenant Isolation Strategies</a> — silo, pool and bridge models (the three models of Part III) in more depth.</li>
+        <li><a class="text-coral underline" href="https://www.prisma.io/docs/orm/prisma-client/client-extensions/query" target="_blank" rel="noopener">Prisma — Client extensions: query</a> — how to build a default tenant scope, and why it doesn't cover raw queries.</li>
+      </ul>

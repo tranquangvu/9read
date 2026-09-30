@@ -1,0 +1,845 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Search &amp; Reporting</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Two requests arrive in almost every client project, usually in the second month: "patients should be able
+          to <em>find</em> a doctor by typing" and "the clinic owner wants a dashboard". Both read lots of rows, and
+          both are easy to build badly on the same database that takes bookings. This module shows how far Postgres
+          alone takes you (full-text search, trigram matching, rollup tables, materialized views), how to recognise
+          the point where a search engine or a warehouse starts to pay for itself, and how to keep the numbers
+          trustworthy once a client starts making decisions from them.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> ask an agent for "search" and you usually get
+          <code class="inline">WHERE name ILIKE '%' || $1 || '%'</code>. Ask for "a revenue dashboard" and you get
+          eight <code class="inline">GROUP BY</code> queries over the whole bookings table, run on the primary every
+          time the page loads. Both demo fine with 200 rows of seed data. With 2 million bookings, the search misses
+          "Nguyen" when the patient types "nguyễn", and the dashboard slows down checkout for everyone. The agent
+          can't see your data volume, your language or who reads the report. You can.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Search inside Postgres</div>
+      <h2 class="font-display text-2xl font-bold mt-2">For most client apps, the database you already run is the search engine</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The running example is the <strong>clinic booking app</strong> from
+        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>, now sold to a chain of clinics.
+        Patients search for doctors ("nha khoa quận 3", "bác sĩ Lan"), receptionists search for patients by name or
+        phone, and the admin searches bookings. A few thousand doctors and a few hundred thousand patients is a small
+        data set for Postgres. You need the right <em>kind</em> of query and the right <em>kind</em> of index, not a
+        new piece of infrastructure.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Why <code class="inline">LIKE '%x%'</code> fails</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">ILIKE '%lan%'</code> has three problems. <strong>Speed:</strong> a normal B-tree index
+        (the kind covered in <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>) can serve
+        <code class="inline">LIKE 'lan%'</code>, but not a pattern that starts with <code class="inline">%</code>,
+        so Postgres reads every row. <strong>Matching:</strong> it compares characters, not words, so "lan" also
+        matches "Lan<em>h</em>" and "Ho<em>lan</em>d", while "nguyen" misses "Nguyễn". <strong>Order:</strong> it
+        says yes or no and gives you no way to put the best match first.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="ILIKE scans every row, while a GIN inverted index jumps from each word straight to the rows that contain it">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">ILIKE '%lan%' · check every row, one by one</text>
+          <g class="anim-pulse"><rect x="20" y="32" width="90" height="36" rx="9" fill="#DB2777"/><text x="65" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">row 1</text></g>
+          <g class="anim-pulse d1"><rect x="125" y="32" width="90" height="36" rx="9" fill="#DB2777"/><text x="170" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">row 2</text></g>
+          <g class="anim-pulse d2"><rect x="230" y="32" width="90" height="36" rx="9" fill="#DB2777"/><text x="275" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">row 3</text></g>
+          <g class="anim-pulse d3"><rect x="335" y="32" width="90" height="36" rx="9" fill="#DB2777"/><text x="380" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">…</text></g>
+          <g class="anim-pulse d4"><rect x="440" y="32" width="120" height="36" rx="9" fill="#DB2777"/><text x="500" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">row 2,000,000</text></g>
+          <text x="630" y="54" text-anchor="middle" font-size="10" fill="#DB2777" class="anim-bounce">O(rows)</text>
+          <text x="12" y="104" font-size="11" font-weight="700" fill="#6E6B64">GIN index · a lookup table from each word to the rows that contain it</text>
+          <g class="anim-pulse"><rect x="20" y="118" width="130" height="42" rx="9" fill="#2563EB"/><text x="85" y="136" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">query: "lan"</text><text x="85" y="150" text-anchor="middle" fill="#ffffffbb" font-size="9">after unaccent, lower</text></g>
+          <line x1="150" y1="139" x2="200" y2="139" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="200" y="118" width="170" height="84" rx="9" fill="#6d5acd"/>
+            <text x="285" y="138" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">GIN posting lists</text>
+            <text x="285" y="156" text-anchor="middle" fill="#ffffffbb" font-size="9">khoa → 12, 40, 977 …</text>
+            <text x="285" y="172" text-anchor="middle" fill="#ffffffbb" font-size="9">lan → 7, 391</text>
+            <text x="285" y="188" text-anchor="middle" fill="#ffffffbb" font-size="9">nguyen → 7, 18, 22 …</text></g>
+          <line x1="370" y1="160" x2="420" y2="160" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="420" y="139" width="140" height="42" rx="9" fill="#0D9488"/><text x="490" y="157" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">rows 7, 391</text><text x="490" y="171" text-anchor="middle" fill="#ffffffbb" font-size="9">then rank, then LIMIT 20</text></g>
+          <text x="630" y="164" text-anchor="middle" font-size="10" fill="#0D9488">O(matches)</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Postgres gives you two tools that fix this, and you will often use both. <strong>Full-text search</strong>
+        matches <em>words</em> and can rank results. <strong>Trigram matching</strong> (the <code class="inline">pg_trgm</code>
+        extension) matches <em>similar strings</em>, which handles typos, partial names and phone numbers.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Technique</th><th class="px-4 py-3">Good for</th><th class="px-4 py-3">Weak at</th><th class="px-4 py-3">Index</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">ILIKE 'x%'</code></td><td class="px-4 py-3">Prefix match on a code or email</td><td class="px-4 py-3">Anything in the middle of the text, typos, ranking</td><td class="px-4 py-3">B-tree with <code class="inline">text_pattern_ops</code>, or trigram</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Full-text (<code class="inline">tsvector</code>)</td><td class="px-4 py-3">Words in names, specialties, descriptions; "all of these words"; ranking</td><td class="px-4 py-3">Typos, fragments inside a word</td><td class="px-4 py-3">GIN on the <code class="inline">tsvector</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Trigram (<code class="inline">pg_trgm</code>)</td><td class="px-4 py-3">Typos ("nguyn"), partial names, autocomplete, phone fragments</td><td class="px-4 py-3">Long documents, multi-word relevance</td><td class="px-4 py-3">GIN or GiST with <code class="inline">gin_trgm_ops</code> / <code class="inline">gist_trgm_ops</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Search engine</td><td class="px-4 py-3">Typo tolerance + facets + relevance tuning, at scale</td><td class="px-4 py-3">Costs a second system to run and keep in sync (Part II)</td><td class="px-4 py-3">Its own</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Full-text search: <code class="inline">tsvector</code>, <code class="inline">tsquery</code> and a GIN index</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <code class="inline">tsvector</code> is a document turned into a sorted list of normalised words
+        (<em>lexemes</em>). A <code class="inline">tsquery</code> is the search turned into the same form, joined
+        with AND / OR / NOT. The <code class="inline">@@</code> operator asks "does this document match this query?",
+        and a <strong>GIN index</strong> (an inverted index: word → rows) makes that fast. Store the vector in a
+        generated column so it can never drift from the source columns, and give each field a
+        <strong>weight</strong> from A (most important) to D.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration — searchable doctors</span>
+        <pre class="code"><span class="kw">ALTER TABLE</span> doctors <span class="kw">ADD COLUMN</span> search tsvector
+  <span class="kw">GENERATED ALWAYS AS</span> (
+    setweight(to_tsvector(<span class="st">'vn_unaccent'</span>, coalesce(full_name, <span class="st">''</span>)), <span class="st">'A'</span>) ||
+    setweight(to_tsvector(<span class="st">'vn_unaccent'</span>, coalesce(specialty, <span class="st">''</span>)), <span class="st">'B'</span>) ||
+    setweight(to_tsvector(<span class="st">'vn_unaccent'</span>, coalesce(bio, <span class="st">''</span>)), <span class="st">'C'</span>)
+  ) <span class="kw">STORED</span>;   <span class="cm">-- recomputed by Postgres on every write: no sync code to forget</span>
+
+<span class="kw">CREATE INDEX</span> doctors_search_idx <span class="kw">ON</span> doctors <span class="kw">USING</span> GIN (search);
+<span class="cm">-- 'vn_unaccent' is a text search configuration we define in a moment</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">query — match, rank, limit</span>
+        <pre class="code"><span class="kw">SELECT</span> d.id, d.full_name, d.specialty,
+       ts_rank(d.search, q) <span class="kw">AS</span> rank
+<span class="kw">FROM</span> doctors d,
+     websearch_to_tsquery(<span class="st">'vn_unaccent'</span>, $1) <span class="kw">AS</span> q   <span class="cm">-- ← safe for raw user input</span>
+<span class="kw">WHERE</span> d.search @@ q
+<span class="kw">ORDER BY</span> rank <span class="kw">DESC</span>, d.id      <span class="cm">-- tie-breaker keeps pages stable</span>
+<span class="kw">LIMIT</span> 20;</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two details to check in agent-written code. First, <code class="inline">websearch_to_tsquery</code> (or
+        <code class="inline">plainto_tsquery</code>) accepts anything a user types, including quotes and
+        <code class="inline">-exclusions</code>. Plain <code class="inline">to_tsquery</code> expects operator syntax
+        and <strong>throws an error</strong> on input like <code class="inline">bác sĩ &amp;</code>, which becomes a
+        500 in production. Second, the query must use the <strong>same configuration</strong> as the vector, or
+        words normalise differently and nothing matches. For "search as you type", a prefix query such as
+        <code class="inline">to_tsquery('vn_unaccent', 'ngu:*')</code> works, but build it from sanitised words,
+        never by gluing raw input into operator syntax.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Ranking and weights: what "best match" means here</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">ts_rank</code> scores how often and how importantly the words appear, using the
+        weights. With the weights above, a doctor <em>named</em> Lan ranks above a doctor whose bio mentions a
+        colleague called Lan. That is text relevance only. Real search pages usually mix in a
+        <strong>business signal</strong>: has free slots this week, rating, distance. Keep it simple and explainable,
+        for example <code class="inline">ORDER BY has_slots_this_week DESC, rank DESC</code>, and write the rule down
+        so the client can argue with it. Ranking needs to score every matching row, so a vague query that matches
+        50,000 rows gets slower. Require at least 2 characters and always <code class="inline">LIMIT</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Trigrams for typos, fragments and autocomplete</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">pg_trgm</code> splits text into three-character chunks ("lan" becomes "lan" plus a few
+        chunks padded with spaces at the word edges) and measures how many two strings share. That gives you a <code class="inline">similarity()</code>
+        score from 0 to 1, a <code class="inline">%</code> operator for "similar enough" (threshold 0.3 by default,
+        set by <code class="inline">pg_trgm.similarity_threshold</code>), and index support for
+        <code class="inline">ILIKE '%x%'</code>. The last point matters: when the receptionist types the middle of a
+        phone number, a trigram index turns the slow scan from the diagram into an index lookup.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration + query — typo-tolerant patient lookup</span>
+        <pre class="code"><span class="kw">CREATE EXTENSION IF NOT EXISTS</span> pg_trgm;
+<span class="kw">CREATE EXTENSION IF NOT EXISTS</span> unaccent;
+
+<span class="cm">-- unaccent() is only STABLE, so indexes can't use it directly: wrap it</span>
+<span class="kw">CREATE FUNCTION</span> <span class="fn">f_unaccent</span>(text) <span class="kw">RETURNS</span> text
+  <span class="kw">LANGUAGE</span> sql <span class="kw">IMMUTABLE PARALLEL SAFE STRICT</span>
+  <span class="kw">AS</span> $$ <span class="kw">SELECT</span> public.unaccent(<span class="st">'public.unaccent'</span>, $1) $$;
+
+<span class="kw">CREATE INDEX</span> patients_name_trgm <span class="kw">ON</span> patients
+  <span class="kw">USING</span> GIN (lower(f_unaccent(full_name)) gin_trgm_ops);
+
+<span class="kw">SELECT</span> id, full_name,
+       similarity(lower(f_unaccent(full_name)), lower(f_unaccent($1))) <span class="kw">AS</span> score
+<span class="kw">FROM</span> patients
+<span class="kw">WHERE</span> clinic_chain_id = $2                              <span class="cm">-- ← tenant filter first, always</span>
+  <span class="kw">AND</span> lower(f_unaccent(full_name)) % lower(f_unaccent($1))   <span class="cm">-- same expression as the index</span>
+<span class="kw">ORDER BY</span> score <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> 10;</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The expression in the <code class="inline">WHERE</code> must match the indexed expression exactly, character
+        for character, or the planner ignores the index. Confirm it with <code class="inline">EXPLAIN ANALYZE</code>
+        (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>): you want a
+        <em>Bitmap Index Scan</em> on <code class="inline">patients_name_trgm</code>, not a <em>Seq Scan</em>. For
+        autocomplete, trigrams on a short field (names, clinic names) plus a 150–300 ms debounce on the client is
+        usually all a small app needs.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Vietnamese text: <code class="inline">unaccent</code> and its limits</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Postgres ships stemming rules for English, French and other languages, but <strong>not Vietnamese</strong>.
+        That is less of a problem than it sounds: Vietnamese words don't change form, so you don't need stemming.
+        What you do need is <strong>diacritic-insensitive</strong> matching, because users type "nguyen" on a phone
+        keyboard and the data says "Nguyễn". The <code class="inline">unaccent</code> extension strips the marks
+        (including đ → d). Build a text search configuration that applies it, on top of the language-neutral
+        <code class="inline">simple</code> configuration:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration — a diacritic-insensitive configuration</span>
+        <pre class="code"><span class="kw">CREATE EXTENSION IF NOT EXISTS</span> unaccent;
+<span class="kw">CREATE TEXT SEARCH CONFIGURATION</span> vn_unaccent (COPY = simple);
+<span class="kw">ALTER TEXT SEARCH CONFIGURATION</span> vn_unaccent
+  <span class="kw">ALTER MAPPING FOR</span> hword, hword_part, word <span class="kw">WITH</span> unaccent, simple;
+
+<span class="kw">SELECT</span> to_tsvector(<span class="st">'vn_unaccent'</span>, <span class="st">'Bác sĩ Nguyễn Thị Lan, Răng Hàm Mặt'</span>);
+<span class="out">'bac':1 'ham':7 'lan':5 'mat':8 'nguyen':3 'rang':6 'si':2 'thi':4</span>
+<span class="cm">-- every syllable is its own lexeme, marks removed, đ → d as well</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">Know what this does <em>not</em> fix:</p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Removing marks merges different words.</strong> "bạn", "bán" and "ban" all become "ban". For
+          names and specialties that is usually fine. For free text it lowers precision. A common refinement is to
+          rank rows that also match the <em>accented</em> query higher.</li>
+        <li><strong>Vietnamese words span several syllables.</strong> "răng hàm mặt" is one concept written as three
+          space-separated syllables, and the parser sees three words. A search for "hàm răng" still matches. When
+          word order matters, use <code class="inline">phraseto_tsquery</code> or quotes in
+          <code class="inline">websearch_to_tsquery</code>.</li>
+        <li><strong>Synonyms are yours to supply.</strong> "nha khoa" and "răng hàm mặt" mean roughly the same to a
+          patient. Postgres won't know unless you add a synonym dictionary or, more simply, a
+          <code class="inline">search_keywords</code> column the clinic can edit.</li>
+      </ul>
+      <div class="mt-4 callout callout-info">
+        <strong>Test with real Vietnamese data, on the real database.</strong> The result depends on the database's
+        encoding and locale and on the <code class="inline">unaccent</code> rules file your host ships. Seed 30 real
+        clinic and doctor names, write the 15 queries receptionists actually type (with and without marks, with
+        typos) and assert the expected top result. That list becomes a regression test for every later change.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Filters, search and pagination in one query</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Real search pages combine free text with filters (district, specialty, "has slots this week") and pages.
+        Put everything in <strong>one parameterised query</strong> so the database can use the most selective index
+        first. Treat each filter as optional, and never build SQL by concatenating the user's text.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">doctor-search.ts — optional filters, bound parameters</span>
+        <pre class="code"><span class="kw">export async function</span> <span class="fn">searchDoctors</span>(f: DoctorSearch) {
+  <span class="kw">const</span> q = f.q?.<span class="fn">trim</span>() ?? <span class="st">""</span>;
+  <span class="kw">if</span> (q.length === <span class="st">1</span>) <span class="kw">return</span> { items: [], hint: <span class="st">"type at least 2 characters"</span> };
+  <span class="kw">const</span> page = Math.<span class="fn">min</span>(f.page ?? <span class="st">1</span>, <span class="st">20</span>);             <span class="cm">// ← cap deep OFFSET pages</span>
+  <span class="kw">const</span> { rows } = <span class="kw">await</span> pool.<span class="fn">query</span>(
+    <span class="st">`SELECT d.id, d.full_name, d.specialty,
+            ts_rank(d.search, websearch_to_tsquery('vn_unaccent', $1)) AS rank
+       FROM doctors d
+      WHERE d.clinic_chain_id = $2
+        AND ($1 = '' OR d.search @@ websearch_to_tsquery('vn_unaccent', $1))
+        AND ($3::text IS NULL OR d.district = $3)
+        AND ($4::text IS NULL OR d.specialty_code = $4)
+      ORDER BY rank DESC, d.id
+      LIMIT 21 OFFSET $5`</span>,                               <span class="cm">// 21: one extra row = "has next page"</span>
+    [q, f.chainId, f.district ?? <span class="kw">null</span>, f.specialty ?? <span class="kw">null</span>, (page - <span class="st">1</span>) * <span class="st">20</span>],
+  );
+  <span class="kw">return</span> { items: rows.<span class="fn">slice</span>(<span class="st">0</span>, <span class="st">20</span>), hasNext: rows.length &gt; <span class="st">20</span> };
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">OFFSET</code> pagination is acceptable for search results, because people rarely go past
+        page 3 and the cap stops bots crawling to page 5,000. Keyset (cursor) pagination is better for long feeds
+        and admin lists sorted by a stored column; the client side of pagination is in
+        <a href="./fe4.html" class="text-viol underline decoration-viol/40">FE4</a>. Also notice what is missing: an
+        exact <code class="inline">COUNT(*)</code> of all matches. Counting forces Postgres to visit every match,
+        often costing more than the page itself. "Next page exists" or "100+ results" is enough for most UIs.
+        The <code class="inline">($3 IS NULL OR …)</code> pattern is readable, but on big tables it can produce a
+        poor generic plan. If <code class="inline">EXPLAIN</code> shows that, have the agent build the
+        <code class="inline">WHERE</code> clause from only the filters that are present, still with bound parameters.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Search engines &amp; keeping them honest</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A search engine is a second copy of your data, and copies go stale</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Dedicated engines give you typo tolerance, facets ("Dentistry (12) · Pediatrics (4)"), synonyms, highlighting
+        and relevance tuning out of the box, often with a nicer developer experience than hand-written SQL. The
+        price is not the licence. It is that you now have <strong>two sources of truth</strong>, a sync pipeline
+        between them, and a new system to monitor, back up and upgrade.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">When to move off Postgres search</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Move when a specific requirement hurts, not because "real apps use Elasticsearch". Typical triggers: the
+        product wants typo-tolerant, faceted, instant search as the <em>main</em> feature (a marketplace or a
+        catalogue), relevance tuning has become a weekly request, or search queries are measurably loading the
+        primary database.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">Right when</th><th class="px-4 py-3">Overkill / wrong when</th><th class="px-4 py-3">Operational cost</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Postgres FTS + pg_trgm</td><td class="px-4 py-3">Up to a few million rows; search is one feature among many; admin and back-office search</td><td class="px-4 py-3">Search <em>is</em> the product and needs facets, synonyms and instant typo tolerance</td><td class="px-4 py-3">None extra. Indexes and a migration.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Meilisearch / Typesense</td><td class="px-4 py-3">Small–medium catalogue or directory where instant, typo-tolerant, faceted search is central</td><td class="px-4 py-3">Complex aggregations, log search, very large data sets</td><td class="px-4 py-3">One small service (or their cloud), plus a sync job</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Elasticsearch / OpenSearch</td><td class="px-4 py-3">Large volumes, heavy aggregations, logs, custom analyzers, a team to run it</td><td class="px-4 py-3">A clinic directory of 3,000 doctors</td><td class="px-4 py-3">A cluster: sizing, shards, upgrades, JVM or a managed service bill</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hosted search (Algolia and similar)</td><td class="px-4 py-3">No one to run infrastructure, budget exists, speed to market matters</td><td class="px-4 py-3">Data can't leave the region, or record/query pricing breaks the budget</td><td class="px-4 py-3">Low ops, usage-based bill: check current pricing</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Whatever you pick, check its Vietnamese support yourself (tokenising, diacritics, typo rules) with the same
+        15 test queries from Part I, rather than trusting a feature list. And remember that patient names and phone
+        numbers are personal data: sending them to a hosted engine is a data-protection decision
+        (<a href="./sd17.html" class="text-viol underline decoration-viol/40">SD17</a>), not just a technical one.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Keeping the index in sync</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The tempting version is a <strong>dual write</strong>: save the doctor in Postgres, then call the search
+        engine in the same request handler. It works until the engine is slow or down, or the process crashes
+        between the two writes. Then the index quietly disagrees with the database, and nobody notices until a
+        patient books a doctor who left last month. This is the dual-write problem from
+        <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>, and the fix is the same: write
+        an event to an <strong>outbox</strong> table in the same transaction, and let a worker push it to the index.
+        At larger scale, <strong>change data capture</strong> (CDC, for example Debezium reading the Postgres
+        write-ahead log) does the same job without touching application code, at the cost of more infrastructure.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant API as Booking API
+    participant DB as Postgres
+    participant W as Index worker
+    participant S as Search engine
+    API->>DB: BEGIN · UPDATE doctors · INSERT outbox(doctor.updated) · COMMIT
+    Note over API,DB: one transaction:<br/>both rows or neither
+    W->>DB: poll outbox (or LISTEN / CDC)
+    W->>DB: re-read doctor 42 (current state)
+    W->>S: upsert document id=42
+    S-->>W: task accepted
+    W->>DB: mark outbox row done
+    Note over W,S: crash anywhere → retry.<br/>Upsert by id makes retries safe.
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">index-worker.ts — outbox consumer for Meilisearch</span>
+        <pre class="code"><span class="kw">import</span> { Meilisearch } <span class="kw">from</span> <span class="st">"meilisearch"</span>;   <span class="cm">// class name differs in older client versions</span>
+<span class="kw">const</span> doctorsIndex = <span class="kw">new</span> <span class="fn">Meilisearch</span>({ host: env.MEILI_URL, apiKey: env.MEILI_KEY })
+  .<span class="fn">index</span>(<span class="st">"doctors"</span>);
+
+<span class="kw">export async function</span> <span class="fn">onDoctorChanged</span>(evt: { doctorId: string }) {
+  <span class="kw">const</span> row = <span class="kw">await</span> repo.<span class="fn">doctorForSearch</span>(evt.doctorId);  <span class="cm">// ← re-read now, don't trust an old payload</span>
+  <span class="kw">if</span> (!row || row.deletedAt || !row.isPublic) {
+    <span class="kw">await</span> doctorsIndex.<span class="fn">deleteDocument</span>(evt.doctorId);     <span class="cm">// removals must sync too</span>
+    <span class="kw">return</span>;
+  }
+  <span class="kw">await</span> doctorsIndex.<span class="fn">addDocuments</span>([<span class="fn">toSearchDoc</span>(row)], { primaryKey: <span class="st">"id"</span> });
+  <span class="cm">// addDocuments replaces by id → idempotent, safe to retry (SD8)</span>
+  <span class="cm">// it returns a task; a failed task only shows up in task status, so monitor it</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Re-reading the current row, instead of indexing the event payload, removes a whole class of ordering bugs:
+        if two updates arrive out of order, both index the latest state. <code class="inline">toSearchDoc</code> is
+        also where you decide what <em>not</em> to index: internal notes, phone numbers, anything the public search
+        page must never return.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Reindexing without downtime</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Sooner or later you change the document shape or the ranking settings and must rebuild everything. Don't
+        wipe the live index and refill it while users search. Build a <strong>new</strong> index next to the old
+        one, backfill it from Postgres in batches, let the outbox keep both up to date during the backfill, then
+        switch readers over in one atomic step: an <em>alias</em> in Elasticsearch/OpenSearch and Typesense, an
+        index <em>swap</em> in Meilisearch. Keep the old index until the new one has served traffic for a day. Also
+        keep a <strong>full reindex script</strong> that you can run any time: it is your repair tool when the sync
+        drifts, and you should be able to say how long it takes.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>The index is derived data. Postgres is the truth.</strong> Never write to the search engine from
+        anywhere except the sync worker and the reindex script, never read from it to make a booking decision
+        (availability, price, permissions), and add a nightly job that compares counts between the two and alerts on
+        drift. A search result is a <em>suggestion</em>; the booking page re-reads the slot from the database.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Relevance tuning and search analytics</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "The search is bad" is not a bug report you can fix. Turn it into data. Log every search, with how many
+        results it returned and what the user clicked, and look at the list weekly. The most useful single report
+        is <strong>zero-result queries</strong>: every row is a patient who wanted something and got nothing.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">query — top zero-result searches last week</span>
+        <pre class="code"><span class="kw">SELECT</span> lower(f_unaccent(query)) <span class="kw">AS</span> normalised, count(*) <span class="kw">AS</span> times
+<span class="kw">FROM</span> search_log
+<span class="kw">WHERE</span> result_count = 0
+  <span class="kw">AND</span> created_at &gt;= now() - interval <span class="st">'7 days'</span>
+<span class="kw">GROUP BY</span> 1
+<span class="kw">ORDER BY</span> times <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> 30;
+<span class="cm">-- typical finds: a synonym ("nha khoa"), a typo, a specialty you don't offer yet</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Tune in small steps against a fixed list: the 15–30 real queries from Part I, each with the result that
+        should come first. The usual levers, in the order to try them: field weights (name above bio), synonyms,
+        typo tolerance per field (on for names, off for codes and phone numbers), then a business signal such as
+        availability. Change one thing, rerun the list, compare. Search logs contain what patients typed, which can
+        include names and symptoms, so give them a retention period
+        (<a href="./sd17.html" class="text-viol underline decoration-viol/40">SD17</a>).
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Reporting on a transactional database</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pre-aggregate the numbers, don't recount the world on every page load</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The clinic chain's owner wants a dashboard: bookings per clinic per day, cancellation and no-show rates,
+        revenue from deposits, the busiest doctors. The data is all in Postgres already. The question is
+        <em>when</em> it gets counted, and on <em>which</em> machine.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">OLTP vs OLAP in plain words</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Your app's database is built for <strong>OLTP</strong> (online transaction processing): many small, fast
+        reads and writes that each touch a few rows ("book slot 812 for patient 5531"). Reports are
+        <strong>OLAP</strong> (online analytical processing): a few big reads that each touch millions of rows ("sum
+        deposits by clinic by month for two years"). Same SQL, opposite workloads.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3"></th><th class="px-4 py-3">OLTP (the app)</th><th class="px-4 py-3">OLAP (reports)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Typical query</td><td class="px-4 py-3">Fetch or change one booking by id</td><td class="px-4 py-3">Aggregate every booking in a date range</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rows per query</td><td class="px-4 py-3">1–100</td><td class="px-4 py-3">Thousands to billions</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Needs to be</td><td class="px-4 py-3">Fresh to the millisecond, fast (&lt; 50 ms)</td><td class="px-4 py-3">Correct and consistent; minutes or hours old is usually fine</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Storage shape</td><td class="px-4 py-3">Row store, normalised (Postgres, MySQL)</td><td class="px-4 py-3">Column store, often denormalised (BigQuery, ClickHouse)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Who waits</td><td class="px-4 py-3">A patient, right now</td><td class="px-4 py-3">A manager, who can wait for a spinner or an email</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The last row is the design principle for this whole Part: <strong>never make the patient wait because a
+        manager opened a dashboard.</strong> For a small or medium client you almost never need a separate OLAP
+        database. You need to stop running OLAP-shaped queries at OLTP time.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Aggregations: <code class="inline">GROUP BY</code>, <code class="inline">FILTER</code> and window functions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most report queries are one <code class="inline">GROUP BY</code> with several counts. Two Postgres features
+        keep them short and correct. <code class="inline">count(*) FILTER (WHERE …)</code> counts a subset inside the
+        same pass, instead of one query per status. <strong>Window functions</strong>
+        (<code class="inline">OVER (…)</code>) compute across neighbouring rows without collapsing them: running
+        totals, moving averages, change versus the previous day, rank within a clinic.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">report — one pass, several numbers</span>
+        <pre class="code"><span class="kw">SELECT</span> b.clinic_id,
+       (b.starts_at <span class="kw">AT TIME ZONE</span> c.timezone)::date            <span class="kw">AS</span> day,   <span class="cm">-- local day, Part IV</span>
+       count(*)                                               <span class="kw">AS</span> bookings,
+       count(*) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> b.status = <span class="st">'cancelled'</span>)      <span class="kw">AS</span> cancelled,
+       count(*) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> b.status = <span class="st">'no_show'</span>)        <span class="kw">AS</span> no_shows,
+       coalesce(sum(b.deposit_vnd) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> b.deposit_paid), 0) <span class="kw">AS</span> deposits_vnd
+<span class="kw">FROM</span> bookings b <span class="kw">JOIN</span> clinics c <span class="kw">ON</span> c.id = b.clinic_id
+<span class="kw">WHERE</span> b.starts_at &gt;= $1 <span class="kw">AND</span> b.starts_at &lt; $2               <span class="cm">-- half-open range: no double-counted midnight</span>
+<span class="kw">GROUP BY</span> 1, 2;</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">report — trends with window functions</span>
+        <pre class="code"><span class="kw">SELECT</span> clinic_id, day, bookings,
+       bookings - lag(bookings) <span class="kw">OVER</span> w                     <span class="kw">AS</span> change_vs_prev_day,
+       round(avg(bookings) <span class="kw">OVER</span> (w <span class="kw">ROWS BETWEEN</span> 6 <span class="kw">PRECEDING AND CURRENT ROW</span>), 1)
+                                                           <span class="kw">AS</span> avg_7d,
+       rank() <span class="kw">OVER</span> (<span class="kw">PARTITION BY</span> day <span class="kw">ORDER BY</span> bookings <span class="kw">DESC</span>) <span class="kw">AS</span> rank_in_chain
+<span class="kw">FROM</span> daily_clinic_stats
+<span class="kw">WINDOW</span> w <span class="kw">AS</span> (<span class="kw">PARTITION BY</span> clinic_id <span class="kw">ORDER BY</span> day);
+<span class="cm">-- ROWS 6 PRECEDING means "6 rows", not "6 days": a missing day silently</span>
+<span class="cm">-- stretches the window. Fill gaps with generate_series or store zero rows.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        When you review a report query an agent wrote, check three things before the numbers reach a client: the
+        date range is half-open (<code class="inline">&gt;= start AND &lt; end</code>), the joins don't multiply rows
+        (joining bookings to payments one-to-many and then summing the deposit counts it twice), and days with no
+        data appear as zeros instead of disappearing from the chart. Then check one number by hand against the
+        admin screen.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Why dashboards kill the primary database</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A single report query is harmless. A dashboard is not a single query. Eight widgets, each a full scan of
+        the bookings table, auto-refreshing every 30 seconds, open in 40 clinic managers' browsers: that is
+        about 10 heavy queries per second, all day, for numbers that change a few times an hour.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 240" class="w-full min-w-[620px]" role="img" aria-label="Before: dashboards and bookings compete for the same primary database. After: a job writes small rollup tables and dashboards read those">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">BEFORE · every widget recounts the raw table</text>
+          <g class="anim-pulse"><rect x="20" y="34" width="130" height="42" rx="9" fill="#2563EB"/><text x="85" y="52" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Patients booking</text><text x="85" y="66" text-anchor="middle" fill="#ffffffbb" font-size="9">small, must be fast</text></g>
+          <g class="anim-pulse d1"><rect x="20" y="86" width="130" height="42" rx="9" fill="#DB2777"/><text x="85" y="104" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">40 dashboards</text><text x="85" y="118" text-anchor="middle" fill="#ffffffbb" font-size="9">8 scans × every 30 s</text></g>
+          <line x1="150" y1="55" x2="230" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="150" y1="107" x2="230" y2="88" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="230" y="58" width="140" height="52" rx="9" fill="#37474F"/><text x="300" y="80" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Primary Postgres</text><text x="300" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">CPU, cache, pool all shared</text></g>
+          <text x="530" y="70" text-anchor="middle" font-size="10" fill="#DB2777" class="anim-bounce">booking p95: 80 ms → 2 s</text>
+          <text x="530" y="90" text-anchor="middle" font-size="9" fill="#A8A49B">scans evict hot pages, hold connections</text>
+          <text x="12" y="158" font-size="11" font-weight="700" fill="#6E6B64">AFTER · count once in a job, read small tables</text>
+          <g class="anim-pulse"><rect x="20" y="172" width="130" height="42" rx="9" fill="#37474F"/><text x="85" y="190" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">bookings</text><text x="85" y="204" text-anchor="middle" fill="#ffffffbb" font-size="9">2 M rows</text></g>
+          <line x1="150" y1="193" x2="200" y2="193" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="200" y="172" width="130" height="42" rx="9" fill="#0D9488"/><text x="265" y="190" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Rollup job</text><text x="265" y="204" text-anchor="middle" fill="#ffffffbb" font-size="9">every 15 min, last 3 days</text></g>
+          <line x1="330" y1="193" x2="380" y2="193" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="380" y="172" width="140" height="42" rx="9" fill="#6d5acd"/><text x="450" y="190" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">daily_clinic_stats</text><text x="450" y="204" text-anchor="middle" fill="#ffffffbb" font-size="9">300 clinics × 730 days</text></g>
+          <line x1="520" y1="193" x2="570" y2="193" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d3"><rect x="570" y="172" width="110" height="42" rx="9" fill="#2563EB"/><text x="625" y="190" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Dashboards</text><text x="625" y="204" text-anchor="middle" fill="#ffffffbb" font-size="9">index lookups, ms</text></g>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Heavy scans hurt in ways that aren't obvious from the query itself. They push the hot booking pages out of
+        memory, hold connections from the shared pool (the bulkhead problem from
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>), and long-running queries keep
+        old row versions alive, which delays vacuum. Caching the dashboard response
+        (<a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>) helps with repeat views, but
+        the first view after each expiry still runs the scan. The durable fix is to <strong>count once, in the
+        background, into a small table</strong>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Summary (rollup) tables updated by a job</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>rollup table</strong> stores pre-computed numbers at a fixed grain, here one row per clinic per
+        local day. A scheduled job (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>)
+        recomputes a <em>recent window</em> of it, not just "today", because data changes after the fact: a booking
+        made yesterday is cancelled this morning, a deposit is refunded next week.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">rollup-job.ts — recompute a window, idempotently</span>
+        <pre class="code"><span class="kw">export async function</span> <span class="fn">rollupDailyClinicStats</span>(fromDay: string, toDay: string) {
+  <span class="kw">await</span> db.<span class="fn">transaction</span>(<span class="kw">async</span> (tx) =&gt; {
+    <span class="cm">// delete + insert the whole window: days that dropped to zero are corrected too</span>
+    <span class="kw">await</span> tx.<span class="fn">query</span>(<span class="st">`DELETE FROM daily_clinic_stats WHERE day &gt;= $1 AND day &lt;= $2`</span>, [fromDay, toDay]);
+    <span class="kw">await</span> tx.<span class="fn">query</span>(<span class="st">`
+      INSERT INTO daily_clinic_stats (clinic_id, day, bookings, cancelled, no_shows, deposits_vnd)
+      SELECT clinic_id, day, count(*), ...          -- the one-pass query above
+        FROM bookings_with_local_day
+       WHERE day &gt;= $1 AND day &lt;= $2
+       GROUP BY 1, 2`</span>, [fromDay, toDay]);
+  });
+}
+<span class="cm">// schedule: every 15 min → last 3 days; nightly → last 35 days (late refunds)</span>
+<span class="cm">// same inputs, same result: safe to rerun after a crash or a bug fix</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Show the refresh time on the dashboard ("updated 09:15") so nobody mistakes it for live data, and alert if
+        the job stops running. A rollup that silently stopped on Tuesday is worse than no dashboard. For a single
+        number that must be live, such as today's booking count on the reception screen, a direct indexed query
+        for <em>today only</em> is fine; it is the multi-month history that belongs in the rollup.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Materialized views and refresh strategies</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>materialized view</strong> is the no-code version of a rollup table: a saved query result that you
+        refresh on demand. <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a> introduced it
+        as a cache for the slot search page. For reports, what matters is <em>how</em> you refresh it, because a
+        refresh always recomputes the <strong>whole</strong> query; core Postgres has no incremental refresh.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration — monthly revenue per clinic</span>
+        <pre class="code"><span class="kw">CREATE MATERIALIZED VIEW</span> <span class="fn">monthly_clinic_revenue</span> <span class="kw">AS</span>
+<span class="kw">SELECT</span> clinic_id, date_trunc(<span class="st">'month'</span>, day)::date <span class="kw">AS</span> month,
+       sum(bookings) <span class="kw">AS</span> bookings, sum(deposits_vnd) <span class="kw">AS</span> deposits_vnd
+<span class="kw">FROM</span> daily_clinic_stats                 <span class="cm">-- ← built on the rollup, not on raw bookings</span>
+<span class="kw">GROUP BY</span> 1, 2;
+
+<span class="kw">CREATE UNIQUE INDEX ON</span> monthly_clinic_revenue (clinic_id, month);  <span class="cm">-- needed for CONCURRENTLY</span>
+
+<span class="kw">REFRESH MATERIALIZED VIEW CONCURRENTLY</span> monthly_clinic_revenue;
+<span class="cm">-- readers keep seeing the old rows until the refresh commits</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Strategy</th><th class="px-4 py-3">How it behaves</th><th class="px-4 py-3">Use when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">REFRESH MATERIALIZED VIEW</code></td><td class="px-4 py-3">Fastest refresh, but locks the view: every dashboard query <strong>waits</strong> until it finishes</td><td class="px-4 py-3">Nightly, when nobody is reading, or the first fill of a view created <code class="inline">WITH NO DATA</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">… CONCURRENTLY</code></td><td class="px-4 py-3">Readers are not blocked. Needs a unique index, and is slower because it computes a diff</td><td class="px-4 py-3">The default for anything read during the day</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rollup table + window job</td><td class="px-4 py-3">Recomputes only recent days, so cost stays flat as history grows</td><td class="px-4 py-3">The source table is large, or a full refresh takes more than a minute or two</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Incremental extensions (e.g. <code class="inline">pg_ivm</code>)</td><td class="px-4 py-3">Updates the view as rows change</td><td class="px-4 py-3">Rarely at this size. Check your managed host supports it first.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Schedule refreshes from your job runner or <code class="inline">pg_cron</code> (available on most managed
+        Postgres services), never from a web request. Two refreshes of the same view can't run at the same time,
+        they queue, so an every-minute schedule for a refresh that takes 90 seconds builds a backlog. Measure the
+        refresh time, log it, and set the schedule well above it.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Where reports run, and whose numbers they are</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Move reporting load step by step, and write down what each metric means</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Rollups fix most dashboards. The next problems are ad-hoc queries (the client's analyst wants "just run SQL"),
+        large exports, and the day two dashboards show two different revenue numbers. Climb this ladder only as far
+        as the pain requires.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    A["1 · Indexed query<br/>on the primary"] -->|"dashboard slows<br/>the app"| B["2 · Rollup tables /<br/>materialized views"]
+    B -->|"ad-hoc SQL, BI tool,<br/>heavy exports"| C["3 · Read replica<br/>for reporting"]
+    C -->|"years of history,<br/>many sources, analysts"| D["4 · Warehouse<br/>BigQuery / ClickHouse"]
+    B -.- N(["most small–medium<br/>clients stop here"])
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Running reports on a read replica</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A read replica (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>) is a
+        copy of the primary that serves read-only queries, so a heavy report can't slow down bookings. It is also
+        the safe place to point a BI tool or an analyst. Three things to know before you rely on it:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>It is slightly stale.</strong> Replication lag is usually well under a second, but can grow to
+          minutes during a big migration. That is fine for "revenue this month" and wrong for "did my booking go
+          through?". Keep user-facing reads-after-writes on the primary.</li>
+        <li><strong>Long queries can be cancelled.</strong> When the primary vacuums away rows that a long replica
+          query still needs, the replica may cancel the query with
+          <code class="inline">canceling statement due to conflict with recovery</code>. Settings such as
+          <code class="inline">hot_standby_feedback</code> and <code class="inline">max_standby_streaming_delay</code>
+          trade this off against bloat and lag on the primary. Read the current docs for your host before
+          changing them.</li>
+        <li><strong>Give reports their own limits.</strong> A separate database role with a
+          <code class="inline">statement_timeout</code> of 30–60 s and its own small connection pool, so one runaway
+          analyst query doesn't take the replica down for everybody.</li>
+      </ul>
+      <div class="mt-4">
+        <span class="code-label">db.ts — route report queries explicitly</span>
+        <pre class="code"><span class="kw">export const</span> primary = <span class="kw">new</span> <span class="fn">Pool</span>({ connectionString: env.DATABASE_URL, max: <span class="st">20</span> });
+<span class="kw">export const</span> reporting = <span class="kw">new</span> <span class="fn">Pool</span>({
+  connectionString: env.REPORTING_DATABASE_URL ?? env.DATABASE_URL,  <span class="cm">// replica if present</span>
+  max: <span class="st">5</span>,                                     <span class="cm">// ← a small bulkhead: reports can't eat the app's pool</span>
+  statement_timeout: <span class="st">60_000</span>,                <span class="cm">// node-postgres option, per connection</span>
+  application_name: <span class="st">"reporting"</span>,           <span class="cm">// shows up in pg_stat_activity</span>
+});
+<span class="cm">// Report code imports `reporting`, never `primary`. A lint rule or code review</span>
+<span class="cm">// keeps it that way; the agent will otherwise pick whichever pool it sees first.</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Time buckets and time zones for daily reports</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Store timestamps as <code class="inline">timestamptz</code> (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>),
+        but "a day" in a report is always <em>someone's local day</em>. Grouping by
+        <code class="inline">date(starts_at)</code> uses the database session's time zone, usually UTC, so a booking
+        at 06:30 in Hanoi (23:30 UTC the previous day) lands on the wrong date. For a chain with clinics in Vietnam
+        and Singapore, the local day even differs per clinic. Convert with the <em>clinic's</em> zone before you bucket,
+        as in the one-pass query above: <code class="inline">(starts_at AT TIME ZONE c.timezone)::date</code>. The
+        wider topic of time zones and scheduling lives in
+        <a href="./sd16.html" class="text-viol underline decoration-viol/40">SD16</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">query — every local day in the range, zeros included</span>
+        <pre class="code"><span class="kw">SELECT</span> d::date <span class="kw">AS</span> day, coalesce(s.bookings, 0) <span class="kw">AS</span> bookings
+<span class="kw">FROM</span> generate_series($1::date, $2::date, interval <span class="st">'1 day'</span>) <span class="kw">AS</span> d
+<span class="kw">LEFT JOIN</span> daily_clinic_stats s
+       <span class="kw">ON</span> s.day = d::date <span class="kw">AND</span> s.clinic_id = $3
+<span class="kw">ORDER BY</span> day;
+<span class="cm">-- without the series, a closed Sunday vanishes from the chart instead of showing 0</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Agree the bucket rules with the client once and write them down: which zone defines "a day", whether a week
+        starts on Monday, whether a booking counts on the day it was <em>made</em> or the day of the
+        <em>appointment</em>. Each choice is reasonable. Two dashboards making different choices is how the client
+        loses trust in both.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Large exports run in the background</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Export all bookings for 2025 to Excel" is a report too, and the agent's first version builds the whole file
+        in memory inside the HTTP request. With 500,000 rows it hits the load balancer timeout, or runs the server
+        out of memory. Treat big exports as a <strong>job</strong>: the request creates an export record and returns
+        at once, a worker streams rows from the reporting pool into a file in object storage, and the user gets a
+        link (in the app or by email) that expires. The full pattern, with progress and retries, is in
+        <a href="./sd15.html" class="text-viol underline decoration-viol/40">SD15</a>. The reporting-specific checks are:
+        stream with a cursor instead of loading all rows, apply the <em>same</em> permission filter as the screen
+        (an export is the easiest way to leak another clinic's patients), and log who exported what.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">When to add a warehouse, a BI tool or event tracking</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        These three are often bundled into one "analytics" request, but they solve different problems. A
+        <strong>BI tool</strong> gives non-developers charts and saved questions. A <strong>warehouse</strong> is a
+        separate, column-oriented database for large history and data from several sources. <strong>Event
+        tracking</strong> records what users <em>did</em> in the UI, which the database never sees.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tool</th><th class="px-4 py-3">Add it when</th><th class="px-4 py-3">Overkill when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">BI tool (Metabase, Apache Superset, Looker Studio)</td><td class="px-4 py-3">The client keeps asking for new charts; an ops person can build their own from views you publish</td><td class="px-4 py-3">Two fixed charts in the admin panel are all anyone looks at</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Warehouse (BigQuery, ClickHouse, Snowflake)</td><td class="px-4 py-3">Hundreds of millions of rows, years of history, joining app data with payments, ads and CRM exports</td><td class="px-4 py-3">One Postgres with a few million bookings: a replica plus rollups is cheaper and simpler</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Event tracking (PostHog, GA4, Mixpanel, Amplitude)</td><td class="px-4 py-3">Questions about behaviour: where patients drop out of the booking funnel, which screen they never open</td><td class="px-4 py-3">Using it for money or booking counts: ad blockers and consent choices drop events, so totals never match the database</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The rule of thumb: <strong>business facts come from the database</strong> (bookings, revenue, no-shows are
+        rows you own and can audit); <strong>behaviour comes from events</strong> (clicks, views, funnel steps).
+        When the client asks "how many bookings last month?", the answer is a SQL query, never an analytics chart.
+        Point a BI tool at the replica and at a set of report views, not at raw tables with patient details, and
+        give it a read-only role. Pricing and free tiers of all these tools change often, so check the vendor's
+        current page before recommending one.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Metric definitions as code</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "No-show rate" sounds obvious until you ask: out of all bookings, or only bookings that weren't cancelled?
+        Does a patient who arrives 40 minutes late count? If the admin dashboard, the weekly email and the BI tool
+        each compute it in their own query, they <em>will</em> disagree, and the client will stop believing any of
+        them. Define each metric <strong>once</strong>, in version control, with the business rule in a comment,
+        and make every consumer read from that definition.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/…_report_views.sql — one definition, reviewed in a PR</span>
+        <pre class="code"><span class="cm">-- Metric: no-show rate (agreed with client ops, 2026-03)</span>
+<span class="cm">-- = no_shows / (bookings - cancelled). Cancelled bookings are excluded.</span>
+<span class="cm">-- Grain: clinic × local appointment day. Owner: booking team.</span>
+<span class="kw">CREATE VIEW</span> <span class="fn">report.clinic_no_show_rate</span> <span class="kw">AS</span>
+<span class="kw">SELECT</span> clinic_id, day,
+       no_shows::numeric / nullif(bookings - cancelled, 0) <span class="kw">AS</span> no_show_rate
+<span class="kw">FROM</span> daily_clinic_stats;                  <span class="cm">-- nullif: a day with 0 bookings is NULL, not a crash</span>
+
+<span class="kw">GRANT SELECT ON ALL TABLES IN SCHEMA</span> report <span class="kw">TO</span> bi_readonly;
+<span class="cm">-- the BI tool sees the report schema only, never patients or payments</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On bigger data teams the same idea shows up as dbt models or a "semantic layer". For a small client, a
+        <code class="inline">report</code> schema of SQL views, a short <code class="inline">docs/metrics.md</code>
+        glossary, and a test that runs each view against fixed seed data with known answers is enough. When an agent
+        writes a new chart, the instruction is "read from <code class="inline">report.*</code>", not "write a query".
+      </p>
+      <div class="mt-4 callout callout-danger">
+        <strong>A wrong number with a chart around it looks right.</strong> A crashing report gets fixed the same day;
+        a report that double-counts refunds can be used for months of decisions, including staff bonuses. Before any
+        new metric ships, reconcile it by hand against a source the client trusts (the payment provider's settlement
+        report, a clinic's own paper log for one day) and note the check in the PR.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents write good SQL once they know the data volume, the language and the business rules. Without that
+        context they default to <code class="inline">ILIKE</code> and live <code class="inline">GROUP BY</code>. Give
+        them the numbers, a golden list of queries or a hand-checked figure, and ask for evidence
+        (<code class="inline">EXPLAIN</code> output, test results) rather than a summary.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — Postgres search with proof</span>
+        <pre class="code">Add doctor search using Postgres full-text search (config vn_unaccent, see
+docs/search.md) plus pg_trgm for name typos. Data: ~3,000 doctors, 200k patients.
+Requirements: diacritic-insensitive, tenant filter on clinic_chain_id, optional
+district/specialty filters, LIMIT 20, no COUNT(*).
+Then: 1) run EXPLAIN ANALYZE on 3 queries against seeded data and paste the plans,
+2) add a test with the 15 queries in docs/search-golden.md and their expected top hit.</pre>
+      </div>
+      <pre class="code mt-3">Find every dashboard/report query in this repo. For each, output:
+file:line | tables scanned | rows touched (estimate from pg_class.reltuples)
+| runs on primary or replica | called per page load or by a job | cached?
+Don't change code. Flag anything that scans bookings on every page load.</pre>
+      <pre class="code mt-3">Create a rollup table daily_clinic_stats (clinic × local day) and a job that
+recomputes the last 3 days every 15 minutes and the last 35 days nightly, using
+delete+insert in one transaction. Use each clinic's timezone for the day.
+Write a test with bookings at 23:30 UTC that must land on the next Hanoi day.</pre>
+      <pre class="code mt-3">Here is the client's definition of no-show rate (docs/metrics.md). Implement it as
+a view in the report schema. Then compute it for clinic 12, March 2026, and show me
+the raw rows behind the numerator and denominator so I can check it by hand.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Write the migrations: extensions, text search config, generated columns, GIN indexes</li>
+            <li>Build the parameterised search query with optional filters</li>
+            <li>Write the outbox worker and the full reindex script</li>
+            <li>Draft rollup tables, jobs and materialized views from your grain and schedule</li>
+            <li>Generate seed data with Vietnamese names, gaps and edge-case times</li>
+            <li>Inventory report queries and where they run</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><code class="inline">EXPLAIN ANALYZE</code> shows the index being used, on realistic data volume</li>
+            <li>Searches with and without diacritics return the same top results</li>
+            <li>The tenant and permission filters are in every search, report and export</li>
+            <li>Deletes and unpublishes reach the search index</li>
+            <li>Day boundaries use the clinic's time zone, and ranges are half-open</li>
+            <li>At least one metric reconciled by hand against a trusted source</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-written search and reporting code:</strong>
+        <code class="inline">ILIKE '%' || $1 || '%'</code> on a big table with no trigram index ·
+        <code class="inline">to_tsquery($1)</code> fed raw user input · SQL built with string concatenation or template
+        literals around user text · search results with no <code class="inline">LIMIT</code>, or an exact
+        <code class="inline">COUNT(*)</code> on every search · the search engine written from the request handler
+        (dual write) · dashboard queries that <code class="inline">GROUP BY</code> the raw bookings table on page load ·
+        <code class="inline">date(created_at)</code> with no time zone · <code class="inline">REFRESH MATERIALIZED VIEW</code>
+        without <code class="inline">CONCURRENTLY</code> during business hours · a CSV export built in memory in the
+        request · revenue computed from analytics events · the same metric defined in two places.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Search means <code class="inline">LIKE</code>; a report means a query in the controller.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows full-text search, trigrams, rollups, materialized views and read replicas exist, and can say why <code class="inline">LIKE '%x%'</code> and live dashboards don't scale. Doesn't yet spot them in a diff.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Ships Postgres FTS or trigram search that is diacritic-insensitive, tenant-filtered and proven with <code class="inline">EXPLAIN</code>. Moves a slow dashboard onto a rollup table or materialized view with a scheduled refresh and correct local-day buckets. Needs a reviewer for engine choice, sync design and metric definitions.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Decides between Postgres search and a search engine with a written trade-off, builds outbox-based sync with a reindex script and drift checks, routes reports to a replica with their own limits, and keeps metric definitions in one reviewed place.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Runs relevance tuning from search analytics with the client, designs the reporting architecture (rollups, replica, warehouse, BI) for a growing product, and settles metric disputes with reconciled numbers.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> for one search box you built, can you show the
+        <code class="inline">EXPLAIN ANALYZE</code> plan using your index, and a test where "nguyen" finds "Nguyễn"?
+        For one dashboard number, can you say which table it reads, how old it can be, which time zone defines its
+        day, and show that you checked it by hand once?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Adding Elasticsearch for 3,000 rows</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A cluster to run, a sync pipeline to debug and a second source of truth, for a directory that Postgres searches in a few milliseconds. Start in Postgres and move when a measured requirement forces it.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Testing search with English seed data</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">"John Smith" passes every test. "Nguyễn Thị Đào" typed as "nguyen thi dao" is the real query, and it fails on launch day if nobody tried it.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Two dashboards, two revenue numbers</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One counts by booking date in UTC, the other by appointment date in Hanoi time, and one forgot refunds. Both are "correct". The client now trusts neither.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep a golden query list</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">15–30 real searches with the expected top result, run as a test. Every change to weights, synonyms or engines is measured against it instead of argued about.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Show "updated at" on every report</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Rollups, views and replicas are all a little behind. Saying so on screen prevents a support ticket every time someone books and doesn't see it in the chart.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Review zero-result searches weekly</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Ten minutes with that list finds missing synonyms, typos and services the client doesn't offer yet. It is the cheapest relevance tuning there is, and clients love seeing it.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="fts-explain"> <span>Replaced an <code class="inline">ILIKE '%x%'</code> search with full-text or trigram search and pasted <code class="inline">EXPLAIN ANALYZE</code> before and after, on at least 100k seeded rows.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="vn-golden"> <span>Wrote a golden list of 15 Vietnamese queries (with and without diacritics, with typos) and a test that asserts each expected top result.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="engine-choice"> <span>Wrote a half-page decision note for a real or practice project: Postgres search vs Meilisearch/Typesense vs Elasticsearch, with data size, sync design and cost.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="metric-def"> <span>Defined one metric as a view in a <code class="inline">report</code> schema with its business rule in a comment, and reconciled one value by hand.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="rollup-pr"> <span class="font-semibold">Opened a PR that moves a clinic dashboard off raw-table queries onto a <code class="inline">daily_clinic_stats</code> rollup (or a materialized view refreshed <code class="inline">CONCURRENTLY</code>) with a scheduled job, clinic-time-zone day buckets, an "updated at" label, a test with a booking at 23:30 UTC, and before/after query timings in the description (mentor evidence ✓)</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/textsearch.html" target="_blank" rel="noopener">PostgreSQL — Full Text Search</a> — tsvector, tsquery, ranking, weights, GIN indexes and configurations (Part I).</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/pgtrgm.html" target="_blank" rel="noopener">PostgreSQL — pg_trgm</a> · <a class="text-coral underline" href="https://www.postgresql.org/docs/current/unaccent.html" target="_blank" rel="noopener">unaccent</a> — similarity operators, index support for LIKE, and diacritic removal.</li>
+        <li><a class="text-coral underline" href="https://www.meilisearch.com/docs" target="_blank" rel="noopener">Meilisearch — Documentation</a> · <a class="text-coral underline" href="https://typesense.org/docs/" target="_blank" rel="noopener">Typesense — Documentation</a> — the two small-to-medium search engines from Part II, including index swaps and aliases.</li>
+        <li><a class="text-coral underline" href="https://www.elastic.co/docs/manage-data/data-store/aliases" target="_blank" rel="noopener">Elastic — Aliases</a> — the zero-downtime reindex pattern, if you end up on Elasticsearch or OpenSearch.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/tutorial-window.html" target="_blank" rel="noopener">PostgreSQL — Window Functions</a> · <a class="text-coral underline" href="https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html" target="_blank" rel="noopener">REFRESH MATERIALIZED VIEW</a> — report queries and refresh locking (Part III).</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/hot-standby.html" target="_blank" rel="noopener">PostgreSQL — Hot Standby</a> — query conflicts on replicas and the settings that trade them off (Part IV).</li>
+        <li><a class="text-coral underline" href="https://www.metabase.com/docs/latest/" target="_blank" rel="noopener">Metabase — Documentation</a> — a self-hostable BI tool that connects to a Postgres replica.</li>
+      </ul>

@@ -1,0 +1,874 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Privacy, Data Protection &amp; Feature Flags</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Two topics that every client project meets sooner or later, usually in the week before launch. The first half
+          is about the people inside your database: what counts as personal data, why the clinic app's health data is
+          the most sensitive thing you will ever store, what the Vietnamese and EU rules ask of you, and how to delete an
+          account so that it is actually gone. The second half is about shipping safely: feature flags that separate
+          deploying code from releasing a feature, a kill switch for when things go wrong, and the discipline to remove
+          flags once they have done their job.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent logs the whole request body "for debugging",
+          so patient phone numbers and symptoms end up in CloudWatch and Sentry. It implements "delete account" as
+          <code class="inline">UPDATE users SET deleted = true</code> and calls it done. It adds a feature flag as an
+          <code class="inline">if</code> in the React component, where anyone can flip it in DevTools, and it never
+          removes a flag. None of this fails a test. It fails an audit, a store review or a patient's complaint months
+          later, and by then the data has already been copied to five places.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Know your data</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Collect less, label what you keep, and know where every copy goes</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Our running example is the <strong>clinic booking app</strong> from
+        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>: clinics, doctors, slots, bookings,
+        patients and payments. Patients type in their name, phone number, date of birth and a "reason for visit" such
+        as <em>"chest pain for 3 days"</em>. That last field changes the whole risk profile of the app. You can't
+        protect data you haven't identified, so the first job is always an inventory.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">What counts as personal data, and why health data is special</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Personal data</strong> (PII, personally identifiable information) is any information about an
+        identifiable person. That is broader than "name and email". An IP address, a device ID, a booking reference
+        or a photo counts if it can be linked back to someone. Both Vietnamese law and the EU's GDPR then define a
+        stricter class, called <strong>sensitive personal data</strong> in Vietnam and <strong>special-category
+        data</strong> in the GDPR. Health data is in that class in both regimes. It needs a stronger legal basis,
+        tighter access and more care in every copy.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Class</th><th class="px-4 py-3">Clinic app examples</th><th class="px-4 py-3">Default handling</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Public / non-personal</td><td class="px-4 py-3">Clinic address, doctor's public profile, slot times</td><td class="px-4 py-3">Cache freely, log freely</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Personal (basic)</td><td class="px-4 py-3">Patient name, phone, email, date of birth, IP address, device ID</td><td class="px-4 py-3">Access control, masked in logs, deletable on request</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sensitive / special-category</td><td class="px-4 py-3">Reason for visit, diagnosis notes, uploaded test results, national ID number</td><td class="px-4 py-3">Explicit consent, field encryption, audited reads, never in logs or analytics</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Financial</td><td class="px-4 py-3">Card details (should never reach you), bank transfer references</td><td class="px-4 py-3">Let the payment provider hold it (<a href="./sd14.html" class="text-viol underline decoration-viol/40">SD14</a>); store only tokens</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Secrets</td><td class="px-4 py-3">Password hashes, API keys, OTP codes</td><td class="px-4 py-3">Not personal data questions at all: see <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Write the classification <em>into the schema</em>, where the agent and the next developer will see it. A
+        column comment costs nothing, and a script can later check that every sensitive column is encrypted and
+        excluded from exports to analytics.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/042_classify_patients.sql — the label lives next to the column</span>
+        <pre class="code"><span class="kw">COMMENT ON COLUMN</span> patients.full_name      <span class="kw">IS</span> <span class="st">'pii'</span>;
+<span class="kw">COMMENT ON COLUMN</span> patients.phone          <span class="kw">IS</span> <span class="st">'pii'</span>;
+<span class="kw">COMMENT ON COLUMN</span> patients.date_of_birth  <span class="kw">IS</span> <span class="st">'pii'</span>;
+<span class="kw">COMMENT ON COLUMN</span> patients.national_id_enc <span class="kw">IS</span> <span class="st">'sensitive; encrypted (Part I)'</span>;
+<span class="kw">COMMENT ON COLUMN</span> bookings.reason_enc     <span class="kw">IS</span> <span class="st">'sensitive: health; encrypted'</span>;
+
+<span class="cm">-- list everything labelled, e.g. for the data map or a CI check</span>
+<span class="kw">SELECT</span> c.table_name, c.column_name, <span class="fn">col_description</span>(
+         (c.table_schema||<span class="st">'.'</span>||c.table_name)::regclass, c.ordinal_position) <span class="kw">AS</span> label
+<span class="kw">FROM</span>   information_schema.columns c
+<span class="kw">WHERE</span>  c.table_schema = <span class="st">'public'</span>
+  <span class="kw">AND</span>  <span class="fn">col_description</span>((c.table_schema||<span class="st">'.'</span>||c.table_name)::regclass, c.ordinal_position) <span class="kw">IS NOT NULL</span>;</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Data minimisation: the cheapest protection is not having it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every field you collect must be protected, exported on request, deleted on request, and explained in the
+        privacy policy. So for each field in a form, ask <strong>"what breaks if we don't collect this?"</strong>
+        Agents add fields generously because a "complete" patient profile looks professional. Push back:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Year of birth instead of full date of birth</strong> if the clinic only needs an age range for triage.</li>
+        <li><strong>No national ID number</strong> unless the client can name the regulation or insurer that requires it.</li>
+        <li><strong>A short, optional "reason for visit"</strong> instead of a free-text medical history. Free text attracts far more than you asked for.</li>
+        <li><strong>Don't copy</strong> the patient's name into <code class="inline">bookings</code>, <code class="inline">payments</code> and <code class="inline">notifications</code>. Reference the patient ID, so deletion has one place to act.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">The data map: every copy of a record</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The row in <code class="inline">patients</code> is the copy you think about. The others are the ones that
+        leak or survive deletion. Draw this map for every client project. It takes an hour, and it answers most of
+        the questions in Part II before anyone asks them.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 260" class="w-full min-w-[620px]" role="img" aria-label="Data map of the clinic app: one patient record is copied to the database, backups, logs, error tracker, analytics, email and SMS vendors and the payment provider">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">ONE PATIENT, MANY COPIES · each arrow needs a rule for masking, retention and deletion</text>
+          <g class="anim-pulse"><rect x="20" y="105" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="85" y="126" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Booking API</text>
+            <text x="85" y="141" text-anchor="middle" fill="#ffffffbb" font-size="9">name · phone · reason</text></g>
+          <line x1="150" y1="130" x2="270" y2="60" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="150" y1="130" x2="270" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="150" y1="130" x2="270" y2="200" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="270" y="38" width="130" height="44" rx="9" fill="#0D9488"/>
+            <text x="335" y="57" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Postgres</text>
+            <text x="335" y="71" text-anchor="middle" fill="#ffffffbb" font-size="9">primary copy</text></g>
+          <g class="anim-pulse d2"><rect x="270" y="108" width="130" height="44" rx="9" fill="#DB2777"/>
+            <text x="335" y="127" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Logs · Sentry</text>
+            <text x="335" y="141" text-anchor="middle" fill="#ffffffbb" font-size="9">accidental copies</text></g>
+          <g class="anim-pulse d3"><rect x="270" y="178" width="130" height="44" rx="9" fill="#6d5acd"/>
+            <text x="335" y="197" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Vendors</text>
+            <text x="335" y="211" text-anchor="middle" fill="#ffffffbb" font-size="9">SMS · email · payments</text></g>
+          <line x1="400" y1="60" x2="520" y2="60" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="400" y1="130" x2="520" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="400" y1="200" x2="520" y2="200" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d4"><rect x="520" y="38" width="160" height="44" rx="9" fill="#37474F"/>
+            <text x="600" y="57" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Backups · replicas</text>
+            <text x="600" y="71" text-anchor="middle" fill="#ffffffbb" font-size="9">kept 7–35 days</text></g>
+          <g class="anim-pulse d1"><rect x="520" y="108" width="160" height="44" rx="9" fill="#37474F"/>
+            <text x="600" y="127" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Analytics · BI export</text>
+            <text x="600" y="141" text-anchor="middle" fill="#ffffffbb" font-size="9">should get IDs, not names</text></g>
+          <g class="anim-pulse d2"><rect x="520" y="178" width="160" height="44" rx="9" fill="#37474F"/>
+            <text x="600" y="197" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Their logs · backups</text>
+            <text x="600" y="211" text-anchor="middle" fill="#ffffffbb" font-size="9">covered by the DPA</text></g>
+          <text x="335" y="245" text-anchor="middle" font-size="10" fill="#DB2777" class="anim-bounce">the middle row is the one nobody planned for</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Also note <strong>where</strong> each box physically lives. If Postgres is in Singapore, Sentry in the US and
+        the email vendor in the EU, the patient's data has crossed three borders. Vietnamese rules on transferring
+        personal data abroad (Part II) care about exactly this, so put the region on the map.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Keep PII out of logs, analytics and error trackers</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Logs are the most common leak in agent-written code, because "log the request so we can debug it" sounds
+        responsible. Logs are then read by the whole team, shipped to a third party, kept for months and almost never
+        included in a deletion. The rule: <strong>log IDs, not people</strong>. <code class="inline">patientId=8c1f…</code>
+        lets you debug. <code class="inline">"Nguyễn Văn A, 0912…, chest pain"</code> is a breach waiting to happen.
+        Enforce it in the logger configuration, not in everyone's memory.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">logger.ts — redaction configured once, applied everywhere (pino)</span>
+        <pre class="code"><span class="kw">import</span> pino <span class="kw">from</span> <span class="st">"pino"</span>;
+
+<span class="kw">export const</span> logger = <span class="fn">pino</span>({
+  redact: {
+    paths: [
+      <span class="st">"req.headers.authorization"</span>, <span class="st">"req.headers.cookie"</span>,
+      <span class="st">"*.phone"</span>, <span class="st">"*.email"</span>, <span class="st">"*.fullName"</span>, <span class="st">"*.dateOfBirth"</span>,
+      <span class="st">"*.reason"</span>, <span class="st">"*.nationalId"</span>,          <span class="cm">// ← sensitive fields, by name</span>
+    ],
+    censor: <span class="st">"[REDACTED]"</span>,
+  },
+});
+
+<span class="cm">// ✗ logger.info({ body: req.body }, "booking created")   ← whole body, whatever it holds</span>
+logger.<span class="fn">info</span>({ bookingId, patientId, clinicId }, <span class="st">"booking created"</span>);  <span class="cm">// ✓ IDs only</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">sentry.server.ts — the error tracker gets the same rule</span>
+        <pre class="code">Sentry.<span class="fn">init</span>({
+  dsn: process.env.SENTRY_DSN,
+  sendDefaultPii: <span class="kw">false</span>,                <span class="cm">// don't attach IPs, cookies, user emails</span>
+  <span class="fn">beforeSend</span>(event) {
+    <span class="kw">if</span> (event.request) <span class="kw">delete</span> event.request.data;   <span class="cm">// ← request bodies hold the form fields</span>
+    <span class="kw">if</span> (event.user) event.user = { id: event.user.id };   <span class="cm">// keep the ID, drop the rest</span>
+    <span class="kw">return</span> event;
+  },
+});</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Redaction by field name is a safety net with holes: a phone number inside an error message string or a
+        free-text field still gets through. Turn on the vendor's server-side scrubbing too (Sentry, Datadog and
+        CloudWatch all have one), and for analytics send <strong>events with IDs and categories</strong>
+        (<code class="inline">booking_created, specialty=cardiology</code>), never the reason text. Client-side
+        monitoring on the web and on mobile has its own settings, covered in
+        <a href="./fe6.html" class="text-viol underline decoration-viol/40">FE6</a> and
+        <a href="./mb5.html" class="text-viol underline decoration-viol/40">MB5</a>. Pasting production data into an
+        AI tool is the same leak by another route: <a href="./co1.html" class="text-viol underline decoration-viol/40">CO1</a>
+        has the rules.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Field-level encryption for the few columns that deserve it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Your managed database is almost certainly already <strong>encrypted at rest</strong> with a KMS key
+        (<a href="./op5.html" class="text-viol underline decoration-viol/40">OP5</a>). That protects against a stolen
+        disk, not against someone who can run <code class="inline">SELECT</code>: a leaked read-only credential, a
+        careless BI export, a support engineer's curiosity. <strong>Field-level encryption</strong> encrypts a
+        column in the application before it reaches the database, so the database only ever sees ciphertext.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">crypto/fields.ts — AES-256-GCM, plus a blind index for exact lookups</span>
+        <pre class="code"><span class="kw">import</span> { createCipheriv, createDecipheriv, createHmac, randomBytes } <span class="kw">from</span> <span class="st">"node:crypto"</span>;
+<span class="cm">// keys: 32 bytes each, from a secret store / KMS, never the repo (SD9). b64/buf: base64 helpers</span>
+
+<span class="kw">export function</span> <span class="fn">encrypt</span>(plain: string): string {
+  <span class="kw">const</span> iv = <span class="fn">randomBytes</span>(<span class="st">12</span>);                         <span class="cm">// ← new IV every time, never reuse</span>
+  <span class="kw">const</span> c = <span class="fn">createCipheriv</span>(<span class="st">"aes-256-gcm"</span>, <span class="fn">keyFor</span>(<span class="st">"v1"</span>), iv);
+  <span class="kw">const</span> body = Buffer.<span class="fn">concat</span>([c.<span class="fn">update</span>(plain, <span class="st">"utf8"</span>), c.<span class="fn">final</span>()]);
+  <span class="kw">return</span> [<span class="st">"v1"</span>, <span class="fn">b64</span>(iv), <span class="fn">b64</span>(c.<span class="fn">getAuthTag</span>()), <span class="fn">b64</span>(body)].<span class="fn">join</span>(<span class="st">"."</span>);  <span class="cm">// v1 = key version</span>
+}
+
+<span class="kw">export function</span> <span class="fn">decrypt</span>(stored: string): string {
+  <span class="kw">const</span> [version, iv, tag, body] = stored.<span class="fn">split</span>(<span class="st">"."</span>);
+  <span class="kw">const</span> d = <span class="fn">createDecipheriv</span>(<span class="st">"aes-256-gcm"</span>, <span class="fn">keyFor</span>(version), <span class="fn">buf</span>(iv));
+  d.<span class="fn">setAuthTag</span>(<span class="fn">buf</span>(tag));                             <span class="cm">// tampering → decrypt throws</span>
+  <span class="kw">return</span> Buffer.<span class="fn">concat</span>([d.<span class="fn">update</span>(<span class="fn">buf</span>(body)), d.<span class="fn">final</span>()]).<span class="fn">toString</span>(<span class="st">"utf8"</span>);
+}
+
+<span class="cm">// Blind index: deterministic HMAC, so WHERE national_id_idx = $1 still works</span>
+<span class="kw">export const</span> <span class="fn">blindIndex</span> = (v: string) =&gt;
+  <span class="fn">createHmac</span>(<span class="st">"sha256"</span>, INDEX_KEY).<span class="fn">update</span>(v.<span class="fn">trim</span>()).<span class="fn">digest</span>(<span class="st">"hex"</span>);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The price is real. An encrypted column <strong>can't be searched with LIKE, sorted, range-filtered or
+        indexed</strong> in a useful way. The blind index gives back exact-match lookups only, and it leaks which
+        rows share a value. So encrypt <em>few</em> columns: national ID numbers, the reason for visit, clinical notes.
+        Don't encrypt patient names if reception staff search by name all day. Protect those with access control and
+        audit instead. Store a key version in every value (the <code class="inline">v1</code> prefix) so you can rotate
+        keys later. Libraries and managed options exist in every stack (for example envelope encryption with AWS KMS),
+        and a vetted library beats hand-rolled crypto. The snippet shows <em>what</em> to look for in review.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>What about Postgres pgcrypto?</strong> <code class="inline">pgp_sym_encrypt(value, key)</code> works,
+        but the key travels to the database inside the SQL statement, and may end up in the database's own query
+        logs. For the clinic app, encrypt in the application, where the key never leaves the process.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Access control and an audit trail of who viewed what</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Row-level permissions, "a doctor sees only their clinic's patients", are the ownership checks from
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>. Health data adds one more
+        requirement: you should be able to answer <strong>"who looked at this patient's record, and when?"</strong>
+        A general audit trail of <em>changes</em> is <a href="./sd12.html" class="text-viol underline decoration-viol/40">SD12</a>'s
+        topic. For sensitive data you also log <em>reads</em>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/043_access_log.sql — append-only record of sensitive reads</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> record_access_log (
+  id          bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  actor_id    uuid        <span class="kw">NOT NULL</span>,          <span class="cm">-- staff user who looked</span>
+  patient_id  uuid        <span class="kw">NOT NULL</span>,
+  action      text        <span class="kw">NOT NULL</span>,          <span class="cm">-- 'view_notes', 'export', 'download_result'</span>
+  reason      text,                          <span class="cm">-- required for "break-glass" access</span>
+  at          timestamptz <span class="kw">NOT NULL DEFAULT</span> now()
+);
+<span class="kw">CREATE INDEX ON</span> record_access_log (patient_id, at <span class="kw">DESC</span>);
+
+<span class="cm">-- the app role may insert, but never change history</span>
+<span class="kw">REVOKE UPDATE, DELETE ON</span> record_access_log <span class="kw">FROM</span> booking_api;</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Log reads of the <em>sensitive</em> screens (clinical notes, test results, exports), not every list page, or
+        the table grows faster than the data it protects. Then make it useful: a clinic admin page that shows the
+        access history for one patient, and an alert when one account opens an unusual number of records in an hour.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Rules and rights</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The law sets the floor; deletion and retention are where apps actually fail</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        You are not the lawyer, and this module is not legal advice. But the law turns into tickets: a consent
+        checkbox, an "export my data" button, a nightly purge job, a vendor contract. You need to know enough to
+        recognise those tickets, ask the right questions early, and build them so they actually work.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Vietnam: Decree 13 and the Personal Data Protection Law</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Vietnam's first comprehensive rule was <strong>Decree 13/2023/ND-CP</strong> on personal data protection,
+        in force from 1 July 2023. The National Assembly then passed a full <strong>Personal Data Protection
+        Law</strong> in 2025, which took effect on 1 January 2026, with implementing decrees that set out the details.
+        The law keeps Decree 13's main ideas (consent, sensitive data, impact assessments, cross-border transfer rules,
+        data subject rights) and adds much larger penalties. Guidance is still being issued and interpreted, so
+        <strong>treat everything here as a checklist of questions, and confirm the current rules with the client's
+        legal counsel</strong> before you build to them.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Topic</th><th class="px-4 py-3">Vietnam (Decree 13 → PDP Law)</th><th class="px-4 py-3">EU GDPR</th><th class="px-4 py-3">What it becomes in the app</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Applies to</td><td class="px-4 py-3">Processing of Vietnamese residents' data, and processing in Vietnam</td><td class="px-4 py-3">Organisations in the EU, and anyone offering services to or monitoring people in the EU</td><td class="px-4 py-3">Ask the client early: do we have (or market to) EU users?</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Health data</td><td class="px-4 py-3">Sensitive personal data: stricter conditions, the subject must be informed</td><td class="px-4 py-3">Special category (Art. 9): processing is prohibited unless an exception such as explicit consent applies</td><td class="px-4 py-3">Separate, explicit consent; encryption; audited reads</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Legal basis</td><td class="px-4 py-3">Consent is central; it must be specific, voluntary and demonstrable, and silence is not consent</td><td class="px-4 py-3">Six bases (consent, contract, legal obligation…); consent is only one of them</td><td class="px-4 py-3">A <code class="inline">consents</code> table per purpose, with timestamps</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rights</td><td class="px-4 py-3">Be informed, access, correct, delete, withdraw consent, object…</td><td class="px-4 py-3">Access, rectification, erasure, portability, objection; answer within one month in most cases</td><td class="px-4 py-3">Export and delete features, plus an admin runbook</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Breaches</td><td class="px-4 py-3">Notify the authority quickly (Decree 13 said 72 hours; check the current rule)</td><td class="px-4 py-3">Notify the supervisory authority within 72 hours where required</td><td class="px-4 py-3">Logs and access records good enough to say <em>what</em> leaked</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Paperwork</td><td class="px-4 py-3">Processing impact assessment; a transfer assessment for data sent abroad</td><td class="px-4 py-3">Records of processing; DPIA for high-risk processing such as health data at scale</td><td class="px-4 py-3">Your data map from Part I is the technical half of these documents</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Don't let the agent be your lawyer.</strong> Ask an agent "is this GDPR compliant?" and it will say yes
+        with confidence, or quote article numbers that don't match the regulation, or describe Decree 13 as if the
+        2026 law didn't exist. Use it to build the data map and the features. Take the legal questions (lawful basis,
+        retention periods, cross-border transfers) to the client and their counsel, and write their answers into
+        the design doc.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Consent and purpose: one checkbox per reason</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Personal data is collected <strong>for a purpose</strong>, and it may only be used for that purpose.
+        The patient gives their phone number so the clinic can send booking reminders. Using it for promotional SMS is
+        a <em>different</em> purpose and needs its own, separate, unticked checkbox. A single "I agree to everything"
+        box, or a pre-ticked one, is the pattern regulators single out. Record consent as data, so you can prove it and
+        honour withdrawal:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/044_consents.sql — consent is a row, not a boolean on users</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> consents (
+  patient_id     uuid        <span class="kw">NOT NULL REFERENCES</span> patients(id) <span class="kw">ON DELETE CASCADE</span>,
+  purpose        text        <span class="kw">NOT NULL</span>,   <span class="cm">-- 'health_data_processing', 'marketing_sms', 'research'</span>
+  policy_version text        <span class="kw">NOT NULL</span>,   <span class="cm">-- which privacy notice text they saw</span>
+  granted_at     timestamptz <span class="kw">NOT NULL DEFAULT</span> now(),
+  withdrawn_at   timestamptz,                <span class="cm">-- ← withdrawal is as easy as granting</span>
+  source         text        <span class="kw">NOT NULL</span>,   <span class="cm">-- 'web_signup', 'mobile_settings', 'reception_paper'</span>
+  <span class="kw">PRIMARY KEY</span> (patient_id, purpose, granted_at)
+);
+
+<span class="cm">-- the marketing job asks this question, every run</span>
+<span class="kw">SELECT</span> patient_id <span class="kw">FROM</span> consents
+<span class="kw">WHERE</span>  purpose = <span class="st">'marketing_sms'</span> <span class="kw">AND</span> withdrawn_at <span class="kw">IS NULL</span>;</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Data subject requests: export and delete, as features</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        People have the right to get a copy of their data, correct it and have it deleted. On a small project the first
+        few requests arrive by email and someone runs SQL by hand. That is fine for a while, as long as it's a
+        <strong>written runbook</strong>, not improvisation. Once there are thousands of users, or the app is on the
+        stores, build it as a feature. Two rules apply either way: <strong>verify identity</strong> before exporting
+        (an export is a gift to an attacker who emails in pretending to be the patient), and <strong>record the
+        request</strong> with its deadline, so nothing is forgotten.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    R["Patient taps<br/>Delete account"] --> V{"Re-authenticate<br/>(OTP / password)"}
+    V -->|ok| G["Grace period<br/>7 days, can cancel"]
+    G --> J["Deletion job<br/>(SD8 queue)"]
+    J --> DB["Postgres: delete or<br/>anonymise per table"]
+    J --> VN["Vendors: SMS, email,<br/>analytics delete APIs"]
+    J --> AUTH["Auth provider:<br/>delete identity"]
+    DB --> LOG["Deletion record<br/>(ID + date, no PII)"]
+    VN --> LOG
+    AUTH --> LOG
+    LOG --> BK["Backups and logs<br/>age out on schedule"]
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The export is the easier half: one JSON (or ZIP) file with the profile, bookings, consents and uploaded files,
+        generated by a background job and delivered through a short-lived signed link. Bulk export mechanics are in
+        <a href="./sd15.html" class="text-viol underline decoration-viol/40">SD15</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Account deletion done right: delete, anonymise, or keep by law</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The agent's first version is <code class="inline">UPDATE users SET deleted_at = now()</code>. That is a
+        <em>soft delete</em> (<a href="./sd12.html" class="text-viol underline decoration-viol/40">SD12</a>), useful for
+        undo, but <strong>the data is all still there</strong>. Real deletion is a decision per table, because some
+        records must outlive the account: the clinic may be legally required to keep medical records, and invoices must
+        be kept for tax purposes. The answer is to separate the <em>person</em> from the <em>record</em>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Data</th><th class="px-4 py-3">On account deletion</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Profile, contact details, consents</td><td class="px-4 py-3"><strong>Delete</strong></td><td class="px-4 py-3">No reason to keep them once the account is gone</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Future bookings</td><td class="px-4 py-3"><strong>Cancel</strong>, free the slot, notify the clinic</td><td class="px-4 py-3">Otherwise doctors wait for a patient who no longer exists</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Past bookings (for clinic stats)</td><td class="px-4 py-3"><strong>Anonymise</strong>: keep clinic, doctor, date, status; null the patient link and reason</td><td class="px-4 py-3">"Bookings per month" still adds up, but nobody can be identified</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clinical notes, results</td><td class="px-4 py-3"><strong>Keep if the clinic must</strong>, owned by the clinic, not visible in the app</td><td class="px-4 py-3">Medical record rules may override deletion. Ask counsel, write it down.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Payments, invoices</td><td class="px-4 py-3"><strong>Keep</strong> for the legal period, with minimal identifying fields</td><td class="px-4 py-3">Accounting and tax law require it (<a href="./sd14.html" class="text-viol underline decoration-viol/40">SD14</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Logs, backups</td><td class="px-4 py-3"><strong>Age out</strong> on their normal schedule</td><td class="px-4 py-3">Editing backups is impractical. Short retention plus "we don't restore deleted users" is the usual answer.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Anonymised</strong> means nobody can re-identify the person, even by combining fields. A booking row
+        with a rare specialty, a small clinic, an exact timestamp and a birth date may still point to one person. Replacing
+        the name with a hash, but keeping the phone number, is <em>pseudonymisation</em>, and pseudonymised data is still
+        personal data. Drop or coarsen fields until the row describes an event, not a person.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">jobs/delete-patient.ts — one job, every copy, idempotent</span>
+        <pre class="code"><span class="kw">export async function</span> <span class="fn">deletePatient</span>(patientId: string) {
+  <span class="kw">await</span> db.<span class="fn">transaction</span>(<span class="kw">async</span> (tx) =&gt; {
+    <span class="kw">await</span> tx.bookings.<span class="fn">cancelFuture</span>(patientId);                 <span class="cm">// frees slots, notifies clinics</span>
+    <span class="kw">await</span> tx.<span class="fn">query</span>(<span class="st">`UPDATE bookings SET patient_id = NULL, reason_enc = NULL
+                    WHERE patient_id = $1`</span>, [patientId]);        <span class="cm">// ← anonymise history</span>
+    <span class="kw">await</span> tx.<span class="fn">query</span>(<span class="st">`DELETE FROM patients WHERE id = $1`</span>, [patientId]); <span class="cm">// consents cascade</span>
+  });
+  <span class="cm">// outside the transaction: third parties, each safe to retry (SD8)</span>
+  <span class="kw">await</span> storage.<span class="fn">deletePrefix</span>(<span class="st">`patients/${patientId}/`</span>);     <span class="cm">// uploaded files</span>
+  <span class="kw">await</span> analytics.<span class="fn">deleteUser</span>(patientId);                     <span class="cm">// vendor deletion API</span>
+  <span class="kw">await</span> emailVendor.<span class="fn">deleteContact</span>(patientId);
+  <span class="kw">await</span> auth.<span class="fn">deleteIdentity</span>(patientId);                      <span class="cm">// last: they can no longer log in</span>
+  <span class="kw">await</span> deletionLog.<span class="fn">record</span>({ subjectId: patientId, at: <span class="kw">new</span> Date() });  <span class="cm">// proof, no PII</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Run it as a background job, not inside the HTTP request: one vendor being down must not leave the deletion half
+        done with nobody noticing. Each step must be safe to run twice. If the app is on the stores, this is not optional:
+        <strong>Apple requires apps that let users create an account to let them start account deletion inside the
+        app</strong>, and <strong>Google Play requires an in-app path and a web link</strong> for deletion requests, both
+        declared in the store listing. The store rules change, so check the current guidelines before release
+        (<a href="./mb5.html" class="text-viol underline decoration-viol/40">MB5</a> covers review rejections).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Retention: decide how long, then let a job enforce it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Keep everything forever" is the default when nobody decides. Every table and every copy on the data map should
+        have a retention period agreed with the client, and a scheduled job that enforces it. A retention policy that
+        lives only in a document is a promise nobody keeps.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">jobs/retention.sql — run nightly by the job scheduler (SD8)</span>
+        <pre class="code"><span class="cm">-- unconfirmed sign-ups: nothing useful after 30 days</span>
+<span class="kw">DELETE FROM</span> patients
+<span class="kw">WHERE</span>  phone_verified_at <span class="kw">IS NULL</span> <span class="kw">AND</span> created_at &lt; now() - <span class="kw">interval</span> <span class="st">'30 days'</span>;
+
+<span class="cm">-- OTP codes and password-reset tokens: hours, not months</span>
+<span class="kw">DELETE FROM</span> otp_codes <span class="kw">WHERE</span> created_at &lt; now() - <span class="kw">interval</span> <span class="st">'1 day'</span>;
+
+<span class="cm">-- access log: kept for the period the client agreed (example: 2 years)</span>
+<span class="kw">DELETE FROM</span> record_access_log <span class="kw">WHERE</span> at &lt; now() - <span class="kw">interval</span> <span class="st">'2 years'</span>;
+
+<span class="cm">-- big tables: delete in batches so one purge doesn't lock the table for minutes</span>
+<span class="kw">DELETE FROM</span> notifications <span class="kw">WHERE</span> id <span class="kw">IN</span> (
+  <span class="kw">SELECT</span> id <span class="kw">FROM</span> notifications <span class="kw">WHERE</span> sent_at &lt; now() - <span class="kw">interval</span> <span class="st">'90 days'</span> <span class="kw">LIMIT</span> <span class="st">5000</span>);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The same decision applies outside Postgres: log retention in CloudWatch or your log vendor (weeks, not
+        "never expire"), object storage lifecycle rules for uploads and exports, backup retention
+        (<a href="./op5.html" class="text-viol underline decoration-viol/40">OP5</a>), and data retention settings in
+        Sentry and analytics tools. Put each number in the data map.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Vendors, processing agreements and where data lives</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every vendor on your data map processes personal data on the client's behalf. The client (the
+        <em>controller</em>) needs a <strong>data processing agreement</strong> (DPA) with each vendor (a
+        <em>processor</em>): what they may do with the data, where it is stored, which sub-processors they use, how they
+        delete it and how fast they report a breach. Large vendors publish a standard DPA you accept in the dashboard.
+        Your job is to keep the list: vendor, what data it receives, region, DPA status, how to delete a user there.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Pick the region deliberately.</strong> For a Vietnamese clinic chain, a Singapore region is common for latency. Storing data abroad can trigger Vietnam's cross-border transfer rules, so it's a question for counsel, not a default in a Terraform file.</li>
+        <li><strong>Check the vendor's region settings, not just yours.</strong> Sentry, PostHog and many email tools offer EU or US data residency, often chosen once at sign-up.</li>
+        <li><strong>Send the minimum.</strong> The SMS provider needs a phone number and a message. It does not need the reason for visit in the text ("Your cardiology appointment…" already says a lot).</li>
+        <li><strong>Overkill at this size:</strong> a data catalogue product, a dedicated privacy engineering team, or multi-region data residency built into the schema. A spreadsheet data map, a vendor list and one deletion job cover most small and medium clients.</li>
+      </ul>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Feature flags</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Deploying code is a technical event; releasing a feature is a business decision</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Without flags, "deploy" and "release" are the same moment: the code goes live and every user gets the new
+        feature at once. If it breaks, the fix is another deploy, which takes 10 minutes on a good day and a store
+        review on a bad one. A <strong>feature flag</strong> is a named switch the code checks at runtime:
+        <code class="inline">if (flags.onlineDeposit) { … }</code>. The code ships dark, and turning it on is a
+        separate, reversible step that doesn't need a developer.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">What flags buy you on a client project</h3>
+      <ul class="mt-2 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Merge early, release later.</strong> An unfinished feature can be merged to <code class="inline">develop</code> behind a flag that is off, instead of living on a branch for three weeks and conflicting with everything (<a href="./co2.html" class="text-viol underline decoration-viol/40">CO2</a>).</li>
+        <li><strong>Kill switch.</strong> When the new deposit flow starts failing on Friday evening, anyone on the team turns it off in seconds. The fix can wait until Monday.</li>
+        <li><strong>Gradual rollout.</strong> Turn it on for staff, then one clinic chain, then 10% of patients, watching errors at each step (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>).</li>
+        <li><strong>Beta programs and client demos.</strong> The client's product owner sees the feature in production, on their own account, before anyone else.</li>
+        <li><strong>Plans and tiers.</strong> "Clinics on the Pro plan get SMS reminders" is also a flag, but a permanent one. Keep reading, because that difference matters.</li>
+      </ul>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 230" class="w-full min-w-[620px]" role="img" aria-label="Lifecycle of a release flag: deploy dark, enable for staff, one tenant, a percentage, everyone, then remove the flag; the kill switch can turn it off at any stage">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">A RELEASE FLAG'S LIFE · online_deposit, clinic app</text>
+          <g class="anim-pulse"><rect x="10" y="40" width="100" height="50" rx="9" fill="#37474F"/>
+            <text x="60" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Deploy</text>
+            <text x="60" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">flag off, code dark</text></g>
+          <line x1="110" y1="65" x2="125" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="125" y="40" width="100" height="50" rx="9" fill="#2563EB"/>
+            <text x="175" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Staff</text>
+            <text x="175" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">internal accounts</text></g>
+          <line x1="225" y1="65" x2="240" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="240" y="40" width="100" height="50" rx="9" fill="#6d5acd"/>
+            <text x="290" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1 tenant</text>
+            <text x="290" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">pilot clinic chain</text></g>
+          <line x1="340" y1="65" x2="355" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d3"><rect x="355" y="40" width="100" height="50" rx="9" fill="#0D9488"/>
+            <text x="405" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">10% → 50%</text>
+            <text x="405" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">watch error rate</text></g>
+          <line x1="455" y1="65" x2="470" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d4"><rect x="470" y="40" width="100" height="50" rx="9" fill="#0D9488"/>
+            <text x="520" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">100%</text>
+            <text x="520" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">a week of calm</text></g>
+          <line x1="570" y1="65" x2="585" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="585" y="40" width="105" height="50" rx="9" fill="#D97757"/>
+            <text x="637" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Remove flag</text>
+            <text x="637" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">delete old path</text></g>
+          <line x1="175" y1="100" x2="175" y2="150" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+          <line x1="290" y1="100" x2="290" y2="150" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+          <line x1="405" y1="100" x2="405" y2="150" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+          <line x1="520" y1="100" x2="520" y2="150" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="150" y="150" width="395" height="40" rx="9" fill="#DB2777"/>
+            <text x="347" y="168" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Kill switch: back to 0% in seconds, no deploy</text>
+            <text x="347" y="182" text-anchor="middle" fill="#ffffffbb" font-size="9">the old path still exists until the last step</text></g>
+          <text x="637" y="215" text-anchor="middle" font-size="10" fill="#D97757" class="anim-bounce">the step everyone forgets</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Four kinds of flag, with different lifetimes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The classic split (from Pete Hodgson's article on martinfowler.com) is by purpose. The purpose decides how long
+        the flag should live and who is allowed to flip it, which is why you name the type when you create one.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Type</th><th class="px-4 py-3">Clinic app example</th><th class="px-4 py-3">Lives for</th><th class="px-4 py-3">Flipped by</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Release</td><td class="px-4 py-3"><code class="inline">online_deposit</code>: new payment step in booking</td><td class="px-4 py-3">Days to weeks. Then removed.</td><td class="px-4 py-3">Dev team with the PO</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ops / kill switch</td><td class="px-4 py-3"><code class="inline">sms_reminders_enabled</code>: stop SMS when the provider misbehaves</td><td class="px-4 py-3">Long-lived, on purpose</td><td class="px-4 py-3">Whoever is on call</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Experiment</td><td class="px-4 py-3"><code class="inline">slot_picker_layout</code>: calendar vs list, measured on bookings completed</td><td class="px-4 py-3">Until the result is significant. Then removed.</td><td class="px-4 py-3">Product, with analytics</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Permission / entitlement</td><td class="px-4 py-3"><code class="inline">sms_reminders</code> for Pro-plan clinics only</td><td class="px-4 py-3">Permanent</td><td class="px-4 py-3">Billing or admin, via the plan</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The last row is where teams get into trouble. A plan entitlement is <strong>product logic</strong>, and it
+        belongs in your own data model (a <code class="inline">plan</code> on the tenant, checked by the authorization
+        layer from <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>), not in a flag service where
+        a mis-click in a dashboard gives every clinic the Pro features for free. Experiments need enough traffic to
+        mean anything. A clinic app with 200 bookings a day rarely has it, so A/B tests are often <strong>overkill at
+        this size</strong>: ship, watch the numbers, talk to users.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Where flags live: env var, a table, or a service</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">Good for</th><th class="px-4 py-3">Limits</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Env var / config file</td><td class="px-4 py-3">A handful of on/off release flags per environment. Zero cost, zero dependencies.</td><td class="px-4 py-3">Changing it means a restart or redeploy. No per-user or per-tenant targeting. Not a real kill switch.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Your own DB table</td><td class="px-4 py-3">Small and medium apps: on/off, per-tenant lists, a percentage. Flipped from your admin panel.</td><td class="px-4 py-3">You build the UI, the audit log and the caching. Gets painful past ~20 active flags or with experiments.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Open-source service: Unleash, Flagsmith, GrowthBook</td><td class="px-4 py-3">Targeting rules, gradual rollout, audit history, SDKs for web and mobile. Self-host or use their cloud.</td><td class="px-4 py-3">One more system to run (if self-hosted) or pay for. GrowthBook's strength is experiments.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">PostHog</td><td class="px-4 py-3">Flags, experiments and product analytics in one tool, so rollout and metrics are side by side</td><td class="px-4 py-3">Choose the cloud region (US/EU) with Part II in mind. Watch usage-based pricing.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">LaunchDarkly</td><td class="px-4 py-3">Large teams: approvals, scheduling, many environments, enterprise compliance</td><td class="px-4 py-3">Usually overkill and expensive for a small client app. Check current pricing.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Mobile apps often use Firebase Remote Config for the same job (<a href="./mb5.html" class="text-viol underline decoration-viol/40">MB5</a>).
+        Whatever you pick, wrap it behind your own small <code class="inline">flags</code> module, or use the vendor-neutral
+        <strong>OpenFeature</strong> SDK, so switching from a table to a service later touches one file. A sensible path
+        for most Golden Owl projects: start with a table, move to a service when the client wants experiments or the
+        product team wants to flip flags without you.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/045_feature_flags.sql — enough for most client apps</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> feature_flags (
+  key          text <span class="kw">PRIMARY KEY</span>,            <span class="cm">-- 'online_deposit'</span>
+  kind         text <span class="kw">NOT NULL CHECK</span> (kind <span class="kw">IN</span> (<span class="st">'release'</span>,<span class="st">'ops'</span>,<span class="st">'experiment'</span>)),
+  enabled      boolean <span class="kw">NOT NULL DEFAULT false</span>,  <span class="cm">-- master switch = kill switch</span>
+  rollout_pct  int  <span class="kw">NOT NULL DEFAULT</span> <span class="st">0</span> <span class="kw">CHECK</span> (rollout_pct <span class="kw">BETWEEN</span> <span class="st">0</span> <span class="kw">AND</span> <span class="st">100</span>),
+  tenant_ids   uuid[] <span class="kw">NOT NULL DEFAULT</span> <span class="st">'{}'</span>,     <span class="cm">-- always on for these clinic chains</span>
+  owner        text <span class="kw">NOT NULL</span>,                <span class="cm">-- a person, not "team"</span>
+  expires_on   date,                         <span class="cm">-- ← required for release flags (Part IV)</span>
+  updated_by   text, updated_at timestamptz <span class="kw">NOT NULL DEFAULT</span> now(),
+  <span class="kw">CHECK</span> (kind &lt;&gt; <span class="st">'release'</span> <span class="kw">OR</span> expires_on <span class="kw">IS NOT NULL</span>)
+);</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Gradual rollout needs consistent bucketing</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Turn it on for 10% of patients" must mean <strong>the same 10% every time</strong>. The agent's first attempt
+        is often <code class="inline">Math.random() &lt; 0.1</code>, evaluated on every request, so a patient sees the new
+        deposit step, refreshes, and sees the old one. The fix is to hash a stable ID into a bucket from 0 to 99. Include the
+        flag key in the hash, so the same 10% of users aren't the guinea pigs for every flag.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">flags/evaluate.ts — deterministic: same user, same answer</span>
+        <pre class="code"><span class="kw">import</span> { createHash } <span class="kw">from</span> <span class="st">"node:crypto"</span>;
+
+<span class="kw">function</span> <span class="fn">bucket</span>(flagKey: string, unitId: string): number {
+  <span class="kw">const</span> h = <span class="fn">createHash</span>(<span class="st">"sha256"</span>).<span class="fn">update</span>(<span class="st">`${flagKey}:${unitId}`</span>).<span class="fn">digest</span>();
+  <span class="kw">return</span> h.<span class="fn">readUInt32BE</span>(<span class="st">0</span>) % <span class="st">100</span>;                <span class="cm">// 0..99, stable forever</span>
+}
+
+<span class="kw">export function</span> <span class="fn">isOn</span>(flag: Flag, ctx: { userId: string; tenantId: string }) {
+  <span class="kw">if</span> (!flag.enabled) <span class="kw">return false</span>;                  <span class="cm">// kill switch wins over everything</span>
+  <span class="kw">if</span> (flag.tenantIds.<span class="fn">includes</span>(ctx.tenantId)) <span class="kw">return true</span>;   <span class="cm">// pilot clinic chain</span>
+  <span class="kw">return</span> <span class="fn">bucket</span>(flag.key, ctx.userId) &lt; flag.rolloutPct;  <span class="cm">// raising 10 → 50 keeps the first 10%</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Pick the <strong>unit</strong> on purpose. Bucketing by user is right for a patient-facing screen. For a change
+        to how a clinic's reception staff work, bucket by <em>tenant</em>, or half the receptionists in one clinic see a
+        different screen from the other half, and the clinic's support calls become very confusing. For logged-out
+        visitors, use a stable anonymous ID stored in a cookie.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Living with flags and config</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every flag is a loan: evaluate it on the server, test both paths, pay it back</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Adding a flag takes five minutes. The cost comes later: two code paths to test, a switch someone can flip at the
+        wrong moment, and dead branches that confuse the next agent that reads the code. This Part is about keeping that
+        cost small.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Evaluate on the server; send the browser answers, not rules</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A flag checked only in the React component or the Flutter widget hides a button. It does not stop anyone from
+        calling the API behind it. Anything in the client can be read and changed with DevTools or a proxy. So the
+        <strong>server decides</strong>: it evaluates the flags for this user and tenant, enforces them in the API, and
+        sends the client a small map of results to render with.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant B as Browser / app
+    participant API as Booking API
+    participant F as Flag store<br/>(table or service)
+    B->>API: GET /me/flags
+    API->>F: rules for online_deposit (cached 30 s)
+    API-->>B: { online_deposit: true }
+    Note over B: renders the deposit step<br/>(no rules, no other tenants' IDs)
+    B->>API: POST /bookings/42/deposit
+    API->>API: isOn("online_deposit", user, tenant)?
+    Note over API: ← checked again here.<br/>Off → 404, whatever the UI showed
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Client-side SDKs from the hosted services follow the same idea: the client key can fetch only evaluated
+        results, while the server key sees the full rules. Two things to watch for in review: a server SDK key in
+        frontend code (that is a secret, see <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>),
+        and targeting rules that contain patient emails or phone numbers. Target by ID or attribute instead, because
+        the flag service is a vendor on your data map too.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Flags and caching</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Reading the flag table on every request is wasteful, so every flag system caches. Hosted SDKs keep rules in
+        memory and refresh them in the background or over a streaming connection. For your own table, a
+        30–60-second in-process cache is enough. The trade-off is that a kill switch now takes up to one cache
+        period to take effect, which is fine if everyone knows the number. Two more traps:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Cached pages.</strong> If a page is cached by a CDN or a Next.js full-route cache (<a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>) and its content depends on a per-user flag, one user's variant gets served to everyone. Keep flag-dependent parts dynamic, or vary the cache on the flag.</li>
+        <li><strong>Flag store down.</strong> Decide the fallback in code: most SDKs return the default you pass in. Make the default the <em>safe</em> value (usually "off" for a new feature), and never let a flag lookup failure take down a booking.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Test both paths, and the flip itself</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        While a flag exists, both branches are production code. Tests must be able to force a flag on or off without a
+        network call, so the flags module needs an override for tests. You don't need every combination of every flag.
+        Test each flag's on and off paths, plus the pairs that actually interact.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking.deposit.test.ts — both sides of the flag</span>
+        <pre class="code"><span class="kw">describe</span>.<span class="fn">each</span>([<span class="kw">true</span>, <span class="kw">false</span>])(<span class="st">"online_deposit = %s"</span>, (on) =&gt; {
+  <span class="fn">beforeEach</span>(() =&gt; flags.<span class="fn">override</span>({ online_deposit: on }));   <span class="cm">// no network, no DB row</span>
+  <span class="fn">afterEach</span>(() =&gt; flags.<span class="fn">reset</span>());
+
+  <span class="fn">it</span>(<span class="st">"creates a booking"</span>, <span class="kw">async</span> () =&gt; {
+    <span class="kw">const</span> res = <span class="kw">await</span> api.<span class="fn">post</span>(<span class="st">"/bookings"</span>, validBooking);
+    <span class="fn">expect</span>(res.status).<span class="fn">toBe</span>(<span class="st">201</span>);
+    <span class="fn">expect</span>(res.body.status).<span class="fn">toBe</span>(on ? <span class="st">"awaiting_deposit"</span> : <span class="st">"confirmed"</span>);
+  });
+
+  <span class="fn">it</span>(<span class="st">"the deposit endpoint respects the flag"</span>, <span class="kw">async</span> () =&gt; {
+    <span class="kw">const</span> res = <span class="kw">await</span> api.<span class="fn">post</span>(<span class="st">"/bookings/42/deposit"</span>, {});
+    <span class="fn">expect</span>(res.status).<span class="fn">toBe</span>(on ? <span class="st">200</span> : <span class="st">404</span>);                <span class="cm">// ← server-side enforcement</span>
+  });
+});</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Also think about the <strong>flip while data is in flight</strong>. A patient starts a booking with the deposit
+        step on, then the kill switch turns it off. What happens to bookings stuck in <code class="inline">awaiting_deposit</code>?
+        A flag that changes a data flow needs an answer for records created under the other setting, usually "the old
+        state machine still handles them" (<a href="./sd14.html" class="text-viol underline decoration-viol/40">SD14</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Flag debt: owners, expiry dates and a failing check</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A release flag at 100% for three months is not a feature. It is dead code with a switch attached, and one day
+        someone flips it "to test something" and half the app goes back to last quarter's behaviour. Removing the flag
+        is part of the feature's Definition of Done (<a href="./qa3.html" class="text-viol underline decoration-viol/40">QA3</a>).
+        Make forgetting impossible rather than relying on memory:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">scripts/check-flags.ts — runs in CI, fails on stale release flags</span>
+        <pre class="code"><span class="kw">const</span> today = <span class="kw">new</span> Date().<span class="fn">toISOString</span>().<span class="fn">slice</span>(<span class="st">0</span>, <span class="st">10</span>);
+<span class="kw">const</span> stale = registry.<span class="fn">filter</span>(
+  (f) =&gt; f.kind === <span class="st">"release"</span> &amp;&amp; f.expiresOn &lt; today,   <span class="cm">// every release flag has one</span>
+);
+<span class="kw">const</span> orphans = registry.<span class="fn">filter</span>((f) =&gt; !<span class="fn">codeReferences</span>(f.key));  <span class="cm">// in the store, not in code</span>
+
+<span class="kw">for</span> (<span class="kw">const</span> f <span class="kw">of</span> stale)
+  console.<span class="fn">error</span>(<span class="st">`✗ ${f.key} expired ${f.expiresOn}, owner ${f.owner}: remove it or extend with a reason`</span>);
+<span class="kw">for</span> (<span class="kw">const</span> f <span class="kw">of</span> orphans) console.<span class="fn">warn</span>(<span class="st">`? ${f.key} is not used in code: delete it from the store`</span>);
+<span class="kw">if</span> (stale.length) process.<span class="fn">exit</span>(<span class="st">1</span>);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Removing a flag is exactly the kind of job to hand to an agent: "remove <code class="inline">online_deposit</code>,
+        keep the <em>on</em> path, delete the off path and its tests". Review that it kept the right branch, then delete the
+        flag from the store <strong>after</strong> the code is deployed, not before, or running servers fall back to the
+        default.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Config, secrets and flags are three different things</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Kind</th><th class="px-4 py-3">Examples</th><th class="px-4 py-3">Changes</th><th class="px-4 py-3">Lives in</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Config</td><td class="px-4 py-3">DB host, API base URL, log level, booking cancellation window</td><td class="px-4 py-3">Per environment; rarely at runtime</td><td class="px-4 py-3">Env vars, validated at startup (<a href="./co5.html" class="text-viol underline decoration-viol/40">CO5</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Secret</td><td class="px-4 py-3">DB password, payment API key, encryption keys from Part I</td><td class="px-4 py-3">On rotation</td><td class="px-4 py-3">Secret manager, injected at runtime (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>, <a href="./op5.html" class="text-viol underline decoration-viol/40">OP5</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Flag</td><td class="px-4 py-3"><code class="inline">online_deposit</code>, <code class="inline">sms_reminders_enabled</code></td><td class="px-4 py-3">Any time, by non-developers, per user or tenant</td><td class="px-4 py-3">Flag table or flag service, with an audit log</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Business setting</td><td class="px-4 py-3">A clinic's opening hours, its own cancellation fee</td><td class="px-4 py-3">By the client's users</td><td class="px-4 py-3">Ordinary tables with a settings screen, not flags</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Mixing them causes real damage. A secret in the flag service is visible to everyone with dashboard access. A
+        clinic's opening hours in a flag service disappear from your backups and your data exports. A flag in an env var
+        can't be flipped during an incident.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Runtime config reload, carefully</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Environment variables are read once at startup, so changing one means a restart, and that is fine for real
+        config. For values that must change without a deploy (a rate limit, the kill switches), read them from the flag
+        store or a config table on a short refresh, and treat each reload like untrusted input: <strong>validate it with
+        the same schema as startup config</strong>, keep the last good value if validation fails, and log what changed
+        and who changed it. A typo that sets the booking rate limit to 0 must not take the clinic app offline.
+      </p>
+      <div class="mt-4 callout callout-danger">
+        <strong>A flag flip is a production change.</strong> Treat it like a deploy: announce it in the team channel,
+        flip during working hours, watch the error rate and the booking funnel for the next 30 minutes, and know how to
+        undo it. Hosted services keep an audit history of who flipped what. If you built your own table, make the admin
+        panel write <code class="inline">updated_by</code> and a history row, or the first incident will start with
+        "who turned this on?"
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are very good at the tedious half of this module: finding every place a field is logged, tracing where a
+        column is copied, writing the deletion job and removing a stale flag across forty files. They are poor at the
+        judgement half: what counts as sensitive for <em>this</em> client, what the law requires, and which branch of a
+        flag is the one to keep. Give them the policy, then check their inventory against reality.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — a personal-data inventory</span>
+        <pre class="code">Build docs/data-map.md for this repo. For every column, request field and
+third-party call that carries personal data, list:
+  where it is stored | copied to (logs, Sentry, analytics, vendors, files)
+  | classification (pii / sensitive-health / none) | retention | how it is deleted
+Search logger calls, Sentry setup, analytics events and outbound HTTP bodies.
+Don't change code. Mark anything you are unsure about as "?" instead of guessing.</pre>
+      </div>
+      <pre class="code mt-3">Implement the patient deletion job described in docs/deletion-policy.md.
+Delete or anonymise per table exactly as the policy says, call the vendor
+deletion APIs through our existing clients, and make every step idempotent.
+Write a test that creates a patient with bookings, files and consents, runs the
+job twice, then greps every table and the captured log output for the phone number.
+<span class="cm"># the grep is the proof: "no rows, no log lines" beats "looks deleted"</span></pre>
+      <pre class="code mt-3">Add a release flag online_deposit using our flags module (flags/evaluate.ts).
+Evaluate it on the server, enforce it in POST /bookings/:id/deposit, expose the
+result via GET /me/flags, and set owner=&lt;me&gt;, expires_on=+6 weeks.
+Tests must cover both values. Do not add any client-only flag checks.</pre>
+      <pre class="code mt-3">Remove the flag online_deposit. Keep the ON behaviour, delete the OFF path,
+its tests and any dead helpers. List every file you changed and show me the
+branch you deleted in each, so I can confirm you kept the right one.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Inventory where personal data is stored, logged and sent</li>
+            <li>Configure log redaction and Sentry scrubbing, and test it</li>
+            <li>Write export and deletion jobs to a policy you agreed</li>
+            <li>Write retention purge jobs with batching</li>
+            <li>Add flags through your flags module, with tests for both paths</li>
+            <li>Remove expired flags and their dead code</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The classification of each field, especially free text</li>
+            <li>The legal questions, answered by the client's counsel, not the agent</li>
+            <li>That deletion reaches files, vendors and the auth provider</li>
+            <li>That no sensitive column is sent to analytics or put in a notification</li>
+            <li>That every flag is enforced on the server and has an owner and expiry</li>
+            <li>That a flag removal kept the right branch</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-written privacy and flag code:</strong> <code class="inline">logger.info(req.body)</code>
+        or <code class="inline">console.log(patient)</code> · <code class="inline">sendDefaultPii: true</code> ·
+        analytics events carrying names, phones or the reason for visit · "delete account" that only sets
+        <code class="inline">deleted_at</code> · a deletion that forgets uploaded files or vendors · pre-ticked consent
+        boxes, or one checkbox for every purpose · hand-rolled crypto with a fixed IV or a key in the repo ·
+        <code class="inline">Math.random()</code> for rollout · a flag checked only in the UI · a server SDK key in
+        frontend code · a release flag with no owner or expiry · confident claims that code is "GDPR compliant" or
+        "compliant with Decree 13".
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Logs whole request bodies, treats "deleted" as a boolean, and ships every feature to everyone at once.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows that health data is sensitive, that users can ask for deletion and what a feature flag is, but doesn't spot a leak into logs or a UI-only flag in a diff.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Keeps PII out of logs and analytics in their own features, can draw the data map for one feature, implements deletion and retention jobs to a policy their lead agreed, and ships a server-side release flag with an owner, an expiry, tests for both paths, and a removal PR afterwards.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Owns the data map for a whole project, chooses which columns to encrypt and explains the search trade-off, prepares the technical input for the client's legal review, and picks the right flag storage for the project's size.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Runs the privacy review with the client and their counsel, handles a data subject request or incident end to end, and sets the team's flag conventions and CI checks.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> pick a patient in your project's staging data. Can you list every
+        place their phone number exists (tables, logs, error tracker, analytics, vendors, backups), and say how each copy
+        is removed when they delete their account? For the last flag you added, can you name its owner, its expiry date
+        and the PR that will remove it?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ "We'll add deletion later"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">By then the name is copied into five tables and three vendors, and the store review is next week. Design deletion with the schema, when "reference the patient ID" is still a free choice.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Encrypting everything</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Encrypting names and phones breaks search, sorting and the reception screen, and adds key management for little gain. Encrypt the few truly sensitive fields; protect the rest with access control and audit.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Plans and permissions as feature flags</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Entitlements in a flag dashboard drift from billing and can be flipped by accident. Put the plan in your data model and check it in the authorization layer.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Grep for a canary</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Create a test patient with a unique fake phone number, run the whole flow, then search logs, Sentry and analytics for it. Whatever you find is a leak with an exact location.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Open the removal ticket with the flag</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">When you create a release flag, create the "remove flag" ticket in the same sprint board with the expiry date on it. Removal becomes planned work, not a favour.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write the legal answers down</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">When the client's counsel answers "how long do we keep invoices?", put the answer, the date and who said it in the design doc. It protects the team and settles the next argument.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="data-map"> <span>Drew the data map for one feature: every copy of the personal data it handles, with classification, region, retention and how each copy is deleted.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="log-canary"> <span>Ran the canary test (a unique fake phone number through the whole flow), found where it leaked into logs, Sentry or analytics, and fixed the redaction.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="retention-job"> <span>Wrote a batched retention purge for at least one table, with the retention period agreed with a lead and written in the data map.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="flag-lifecycle"> <span>Shipped a server-side release flag with an owner, an expiry date and tests for both values, rolled it out in steps, then opened the PR that removed it.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="deletion-pr"> <span class="font-semibold">Opened a PR that adds account deletion to the clinic app (or your project): a background job that deletes or anonymises per table as a written policy says, removes uploaded files and calls stubbed vendor deletion APIs, is safe to run twice, and has a test that greps every table and the captured logs for the patient's phone number afterwards, with docs/deletion-policy.md and the test output in the description (mentor evidence ✓)</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://eur-lex.europa.eu/eli/reg/2016/679/oj" target="_blank" rel="noopener">EUR-Lex — General Data Protection Regulation (EU) 2016/679</a> — the official text; Articles 5, 9, 15–17 and 28 cover most of Part II.</li>
+        <li><a class="text-coral underline" href="https://developer.apple.com/support/offering-account-deletion-in-your-app/" target="_blank" rel="noopener">Apple — Offering account deletion in your app</a> — what App Review expects from in-app deletion.</li>
+        <li><a class="text-coral underline" href="https://support.google.com/googleplay/android-developer/answer/13327111" target="_blank" rel="noopener">Google Play — Account deletion requirements</a> — the in-app path, the web link and the Data safety declaration.</li>
+        <li><a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP — Logging Cheat Sheet</a> — what to log, and what must never be logged.</li>
+        <li><a class="text-coral underline" href="https://docs.sentry.io/security-legal-pii/scrubbing/" target="_blank" rel="noopener">Sentry — Scrubbing sensitive data</a> · <a class="text-coral underline" href="https://getpino.io/#/docs/redaction" target="_blank" rel="noopener">Pino — Redaction</a> — the two configs from Part I.</li>
+        <li><a class="text-coral underline" href="https://martinfowler.com/articles/feature-toggles.html" target="_blank" rel="noopener">Martin Fowler — Feature Toggles (Pete Hodgson)</a> — the four flag types and how to manage their cost.</li>
+        <li><a class="text-coral underline" href="https://openfeature.dev/docs/reference/intro" target="_blank" rel="noopener">OpenFeature — Introduction</a> — the vendor-neutral flag API that keeps you free to switch providers.</li>
+        <li><a class="text-coral underline" href="https://docs.getunleash.io/" target="_blank" rel="noopener">Unleash — Documentation</a> · <a class="text-coral underline" href="https://docs.growthbook.io/" target="_blank" rel="noopener">GrowthBook — Docs</a> — two open-source flag services you can self-host.</li>
+      </ul>

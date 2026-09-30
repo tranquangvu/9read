@@ -1,0 +1,907 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Third-party Integrations &amp; Bulk Data</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Almost every client project ends up talking to systems you don't own: the client's ERP or CRM, a shipping
+          carrier, an SMS or Zalo OA provider, an e-invoice service. Almost every client also asks, sooner or later,
+          "can we import our 40,000 patients from this Excel file?" and "can we export everything to Excel?". This module
+          is about the unglamorous plumbing that decides whether those features work on the first day and stay working
+          for years: adapters around providers, webhooks and sync, bulk import pipelines, and long-running operations
+          that don't make the user stare at a spinner.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent writes integrations from the provider's
+          "quick start" page. It calls the API straight from the controller, trusts the sandbox, parses the webhook body
+          as JSON before checking the signature, and imports a CSV with a <code class="inline">for</code> loop of single
+          <code class="inline">INSERT</code>s inside the HTTP request. Every one of those works in the demo with 20 rows
+          and a friendly sandbox. They fail in production with 40,000 rows, a UTF-8 file saved by Excel on Windows, and
+          a provider that sends the same webhook three times, out of order. Your job is to know where those traps are and
+          to check for them.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Calling other people's systems</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Treat every provider as an unreliable stranger behind your own interface</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Our running example is the <strong>clinic booking app</strong> used across the track
+        (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>,
+        <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>). It has grown: a clinic chain is
+        now a tenant with twelve branches. The chain wants confirmations sent through its Zalo OA, lab kits shipped to
+        patients by a carrier, e-invoices issued for every paid booking, and patient records pushed to its CRM. Four new
+        dependencies, none of them yours.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">What small and medium projects actually integrate with</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The provider names change from client to client, but the categories repeat. Knowing the category tells you most
+        of the traps before you read a line of their docs.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Category</th><th class="px-4 py-3">Typical examples</th><th class="px-4 py-3">What usually bites</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">ERP / accounting</td><td class="px-4 py-3">Odoo, SAP Business One, MISA, a client's in-house system</td><td class="px-4 py-3">Old SOAP or XML APIs, batch windows at night, product and customer codes that differ from yours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CRM</td><td class="px-4 py-3">HubSpot, Salesforce, Zoho</td><td class="px-4 py-3">Strict API quotas per day, custom fields per client, "who owns this field?" arguments</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shipping</td><td class="px-4 py-3">Local carriers (GHN, GHTK, Viettel Post and similar)</td><td class="px-4 py-3">Many status codes to map, status webhooks that arrive late or out of order, address formats</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Messaging</td><td class="px-4 py-3">SMS brandname gateways, Zalo OA / ZNS, email (SES, SendGrid)</td><td class="px-4 py-3">Pre-approved templates, per-message cost, delivery receipts arrive later by webhook</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">E-invoice</td><td class="px-4 py-3">Licensed e-invoice providers in Vietnam (VNPT, Viettel, MISA and others)</td><td class="px-4 py-3">Legal rules on numbering and cancellation, and "issued" cannot be undone with a DELETE</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Payments</td><td class="px-4 py-3">Stripe, VNPay, MoMo</td><td class="px-4 py-3">Covered in <a href="./sd4.html" class="text-viol underline decoration-viol/40">SD4</a> and <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>; the webhook rules in Part II apply to them too</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Legal integrations like e-invoicing follow national rules that change (in Vietnam, decrees on e-invoices have
+        been amended more than once). Don't encode the rules from memory or from an agent's answer:
+        <strong>check the current regulation and the provider's current docs</strong>, and get the client's accountant to
+        sign off on the mapping.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The anti-corruption layer: your domain never sees their shape</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <a href="./sd4.html" class="text-viol underline decoration-viol/40">adapter pattern from SD4</a> is the
+        starting point: define the interface <em>your</em> code wants, and write one adapter per provider. For
+        integrations it has a bigger name, the <strong>anti-corruption layer</strong>: the adapter translates not only
+        method names but <em>concepts</em>. The carrier has 23 status codes; your booking app cares about five. The CRM
+        calls a patient a "contact" with a "lifecycle stage". None of that vocabulary leaks past the adapter.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 230" class="w-full min-w-[620px]" role="img" aria-label="Domain code calls a port; adapters translate to each provider, with logging, rate limiting and retries at the boundary">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">YOUR CODE · speaks your language</text>
+          <text x="470" y="20" font-size="11" font-weight="700" fill="#6E6B64">THEIR SYSTEMS · speak theirs</text>
+          <g class="anim-pulse"><rect x="10" y="90" width="130" height="48" rx="9" fill="#2563EB"/>
+            <text x="75" y="110" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Booking service</text>
+            <text x="75" y="125" text-anchor="middle" fill="#ffffffbb" font-size="9">shipLabKit(booking)</text></g>
+          <line x1="140" y1="114" x2="175" y2="114" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="175" y="90" width="120" height="48" rx="9" fill="#6d5acd"/>
+            <text x="235" y="110" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ShippingProvider</text>
+            <text x="235" y="125" text-anchor="middle" fill="#ffffffbb" font-size="9">port · your interface</text></g>
+          <line x1="295" y1="114" x2="330" y2="60" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="295" y1="114" x2="330" y2="170" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="330" y="36" width="130" height="48" rx="9" fill="#0D9488"/>
+            <text x="395" y="56" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">CarrierAAdapter</text>
+            <text x="395" y="71" text-anchor="middle" fill="#ffffffbb" font-size="9">map 23 codes → 5</text></g>
+          <g class="anim-pulse d2"><rect x="330" y="146" width="130" height="48" rx="9" fill="#0D9488"/>
+            <text x="395" y="166" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">FakeCarrier</text>
+            <text x="395" y="181" text-anchor="middle" fill="#ffffffbb" font-size="9">tests and local dev</text></g>
+          <line x1="460" y1="60" x2="530" y2="60" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d3"><rect x="530" y="36" width="150" height="48" rx="9" fill="#37474F"/>
+            <text x="605" y="56" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Carrier API</text>
+            <text x="605" y="71" text-anchor="middle" fill="#ffffffbb" font-size="9">slow · quota · sandbox quirks</text></g>
+          <text x="495" y="108" text-anchor="middle" font-size="9" fill="#6E6B64">timeout · retry · breaker</text>
+          <text x="495" y="121" text-anchor="middle" font-size="9" fill="#6E6B64">rate limiter · masked log</text>
+          <text x="560" y="175" font-size="10" fill="#D97757" class="anim-bounce">swap providers without</text>
+          <text x="560" y="189" font-size="10" fill="#D97757" class="anim-bounce">touching booking code</text>
+          <text x="350" y="222" text-anchor="middle" font-size="10" fill="#A8A49B">everything provider-specific lives right of the port</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">shipping/carrier-a.adapter.ts — translate concepts, not just calls</span>
+        <pre class="code"><span class="kw">export type</span> ShipmentStatus = <span class="st">"created"</span> | <span class="st">"picked_up"</span> | <span class="st">"in_transit"</span> | <span class="st">"delivered"</span> | <span class="st">"failed"</span>;
+
+<span class="kw">const</span> STATUS_MAP: Record&lt;string, ShipmentStatus&gt; = {
+  ready_to_pick: <span class="st">"created"</span>, picking: <span class="st">"created"</span>, picked: <span class="st">"picked_up"</span>,
+  transporting: <span class="st">"in_transit"</span>, delivering: <span class="st">"in_transit"</span>, delivered: <span class="st">"delivered"</span>,
+  delivery_fail: <span class="st">"failed"</span>, returned: <span class="st">"failed"</span>, <span class="cm">/* … */</span>
+};
+
+<span class="kw">export class</span> <span class="fn">CarrierAAdapter</span> <span class="kw">implements</span> ShippingProvider {
+  <span class="kw">async</span> <span class="fn">getStatus</span>(trackingCode: string): Promise&lt;ShipmentStatus&gt; {
+    <span class="kw">const</span> raw = <span class="kw">await this</span>.http.<span class="fn">get</span>(<span class="st">`/orders/${trackingCode}`</span>);
+    <span class="kw">const</span> s = STATUS_MAP[raw.data.status];
+    <span class="kw">if</span> (!s) <span class="kw">throw new</span> <span class="fn">UnknownProviderStatus</span>(<span class="st">"carrier-a"</span>, raw.data.status); <span class="cm">// ← never guess; alert and fix the map</span>
+    <span class="kw">return</span> s;
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        When you review, search the domain code for the provider's name or field names
+        (<code class="inline">ghn_</code>, <code class="inline">hs_lifecycle</code>, <code class="inline">OrderCode</code>).
+        Every hit outside the adapter folder is a leak, and a future provider switch will have to find it. Also look at
+        the default branch of the status mapping: an unknown status should raise an alert, not silently become
+        <code class="inline">"in_transit"</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Assume they're slow, down and rate limited</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every rule from <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a> applies here:
+        a timeout on every call, retries with backoff only for safe cases, a circuit breaker with a fallback, and
+        side effects moved off the request path into jobs (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>).
+        What is specific to integrations is the other side's <strong>quota</strong>. A CRM might allow a fixed number of
+        calls per 10 seconds and per day; an SMS gateway might cap messages per second. Exceed it and you get 429s, or
+        worse, your API key is suspended during the client's biggest campaign.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">crm/limiter.ts — stay under their quota, shared across all workers</span>
+        <pre class="code"><span class="kw">import</span> Bottleneck <span class="kw">from</span> <span class="st">"bottleneck"</span>;
+
+<span class="kw">export const</span> crmLimiter = <span class="kw">new</span> <span class="fn">Bottleneck</span>({
+  id: <span class="st">"crm-hubspot"</span>,
+  maxConcurrent: <span class="st">4</span>,
+  reservoir: <span class="st">80</span>,                    <span class="cm">// requests allowed per window: set BELOW their documented limit</span>
+  reservoirRefreshAmount: <span class="st">80</span>,
+  reservoirRefreshInterval: <span class="st">10_000</span>,
+  datastore: <span class="st">"ioredis"</span>,              <span class="cm">// ← one shared counter; 3 workers × local limiters = 3× the quota</span>
+  clientOptions: { host: process.env.REDIS_HOST },
+});
+
+<span class="kw">export const</span> <span class="fn">crmCall</span> = &lt;T&gt;(fn: () =&gt; Promise&lt;T&gt;) =&gt; crmLimiter.<span class="fn">schedule</span>(fn);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A limiter smooths traffic, but it doesn't make a daily quota bigger. If a nightly sync of 40,000 contacts would
+        use the whole day's quota, the fix is a <strong>batch endpoint</strong> (most CRMs accept 100 records per call)
+        or an incremental sync (Part II), not a faster loop. Check the quota numbers in the provider's current docs;
+        they differ by plan and change over time.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Credentials, environments and the sandbox lie</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each environment (local, staging, production) gets its <strong>own</strong> provider credentials, stored as
+        secrets (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>), never the production key
+        on a laptop. Then learn what the sandbox does <em>not</em> tell you.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Area</th><th class="px-4 py-3">Sandbox usually…</th><th class="px-4 py-3">Production actually…</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Latency and errors</td><td class="px-4 py-3">Answers in 100 ms, never fails</td><td class="px-4 py-3">Has slow days, maintenance windows and 5xx bursts</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Webhooks</td><td class="px-4 py-3">Sent once, in order, or only when you press "simulate"</td><td class="px-4 py-3">Retried, duplicated, delayed by minutes, out of order</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Validation</td><td class="px-4 py-3">Accepts any phone number or tax code</td><td class="px-4 py-3">Rejects unregistered templates, invalid tax codes, unknown wards</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Quotas</td><td class="px-4 py-3">Generous or unlimited</td><td class="px-4 py-3">Tied to the client's plan and billed per call or per message</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Setup</td><td class="px-4 py-3">Self-service, instant</td><td class="px-4 py-3">Needs the client's contract, approved templates, IP allowlists, sometimes days of paperwork</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Start production onboarding in week one.</strong> Zalo template approval, an SMS brandname
+        registration, or an e-invoice account with the client's tax details can take days or weeks and needs the
+        client to act. Teams that build against the sandbox for a month and request production access on launch week
+        ship late. Put "production credentials obtained and one real call tested" on the plan as its own task.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Record every exchange, with the personal data masked</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When the clinic says "the invoice for booking 8812 never arrived", you need to see exactly what you sent and
+        what the provider answered, weeks later. Log each outbound call and each inbound webhook in an
+        <strong>integration log</strong>: provider, operation, your correlation ID, status, duration, and the request and
+        response bodies with personal data masked. Keep it for a limited time (for example 30–90 days, agreed with the
+        client) because it is still sensitive.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/020_integration_log.sql</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> integration_log (
+  id            bigserial <span class="kw">PRIMARY KEY</span>,
+  provider      text <span class="kw">NOT NULL</span>,          <span class="cm">-- 'carrier-a', 'crm', 'einvoice'</span>
+  direction     text <span class="kw">NOT NULL</span>,          <span class="cm">-- 'out' (we called) | 'in' (webhook)</span>
+  operation     text <span class="kw">NOT NULL</span>,          <span class="cm">-- 'createShipment', 'invoice.issued'</span>
+  correlation   text,                   <span class="cm">-- booking id, import job id … whatever you search by</span>
+  http_status   int,
+  duration_ms   int,
+  request_body  jsonb,                  <span class="cm">-- masked before insert, never raw</span>
+  response_body jsonb,
+  created_at    timestamptz <span class="kw">NOT NULL DEFAULT</span> now()
+);
+<span class="kw">CREATE INDEX ON</span> integration_log (provider, correlation, created_at);</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">integration/mask.ts — mask by key, recursively</span>
+        <pre class="code"><span class="kw">const</span> SENSITIVE = <span class="kw">new</span> <span class="fn">Set</span>([<span class="st">"phone"</span>, <span class="st">"email"</span>, <span class="st">"full_name"</span>, <span class="st">"address"</span>, <span class="st">"id_number"</span>, <span class="st">"token"</span>, <span class="st">"api_key"</span>]);
+
+<span class="kw">export function</span> <span class="fn">mask</span>(v: unknown): unknown {
+  <span class="kw">if</span> (Array.<span class="fn">isArray</span>(v)) <span class="kw">return</span> v.<span class="fn">map</span>(mask);
+  <span class="kw">if</span> (v &amp;&amp; <span class="kw">typeof</span> v === <span class="st">"object"</span>) {
+    <span class="kw">return</span> Object.<span class="fn">fromEntries</span>(Object.<span class="fn">entries</span>(v).<span class="fn">map</span>(([k, x]) =&gt;
+      [k, SENSITIVE.<span class="fn">has</span>(k.<span class="fn">toLowerCase</span>()) ? <span class="fn">redact</span>(x) : <span class="fn">mask</span>(x)]));
+  }
+  <span class="kw">return</span> v;
+}
+<span class="kw">const</span> <span class="fn">redact</span> = (x: unknown) =&gt; <span class="kw">typeof</span> x === <span class="st">"string"</span> ? <span class="st">"***"</span> + x.<span class="fn">slice</span>(-<span class="st">3</span>) : <span class="st">"***"</span>; <span class="cm">// last 3 chars help support</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Key-based masking misses providers that put a phone number in a field called <code class="inline">receiver</code>
+        or <code class="inline">to</code>. Read one real payload per provider and extend the list; don't trust the
+        agent's generic list. Never log <code class="inline">Authorization</code> headers at all.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Contract tests and recorded fixtures</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Tests that hit the real sandbox are slow and flaky, and tests against a mock you invented only prove your
+        mock agrees with your code. The middle path: <strong>record</strong> real sandbox (or masked production) responses
+        once, save them as fixture files, and test the adapter against them. Add a small, separate
+        <strong>contract check</strong> that runs nightly against the sandbox and fails when the provider changes a field.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">carrier-a.adapter.test.ts — the adapter against recorded payloads (Vitest + MSW)</span>
+        <pre class="code"><span class="kw">import</span> delivered <span class="kw">from</span> <span class="st">"./fixtures/carrier-a/order-delivered.json"</span>;   <span class="cm">// recorded, masked</span>
+<span class="kw">import</span> weird <span class="kw">from</span> <span class="st">"./fixtures/carrier-a/order-unknown-status.json"</span>;
+
+<span class="fn">test</span>(<span class="st">"maps a real 'delivered' payload"</span>, <span class="kw">async</span> () =&gt; {
+  server.<span class="fn">use</span>(http.<span class="fn">get</span>(<span class="st">"*/orders/:code"</span>, () =&gt; HttpResponse.<span class="fn">json</span>(delivered)));
+  <span class="fn">expect</span>(<span class="kw">await</span> adapter.<span class="fn">getStatus</span>(<span class="st">"GA123"</span>)).<span class="fn">toBe</span>(<span class="st">"delivered"</span>);
+});
+
+<span class="fn">test</span>(<span class="st">"an unknown status fails loudly"</span>, <span class="kw">async</span> () =&gt; {
+  server.<span class="fn">use</span>(http.<span class="fn">get</span>(<span class="st">"*/orders/:code"</span>, () =&gt; HttpResponse.<span class="fn">json</span>(weird)));
+  <span class="kw">await</span> <span class="fn">expect</span>(adapter.<span class="fn">getStatus</span>(<span class="st">"GA124"</span>)).rejects.<span class="fn">toThrow</span>(UnknownProviderStatus);
+});
+<span class="cm">// plus: 429 with Retry-After, a 30 s hang, and a 500 HTML error page instead of JSON</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        MSW and Vitest themselves are covered in <a href="./fe5.html" class="text-viol underline decoration-viol/40">FE5</a>
+        and <a href="./qa1.html" class="text-viol underline decoration-viol/40">QA1</a>. What matters here is where the
+        fixtures come from: a payload you copied from a real response beats one the agent imagined from the docs, because
+        docs are often out of date.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Data sync &amp; webhooks</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Webhooks tell you something changed; reconciliation tells you the truth</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Once two systems hold overlapping data (your bookings and the carrier's shipments, your patients and the CRM's
+        contacts), they drift. Every sync design answers three questions: <strong>how do I learn about changes</strong>,
+        <strong>what if I miss or repeat one</strong>, and <strong>who wins when both sides changed the same thing</strong>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Polling, webhooks, or both</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Approach</th><th class="px-4 py-3">Right when</th><th class="px-4 py-3">Weakness</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Polling</td><td class="px-4 py-3">The provider has no webhooks (many ERPs), or a delay of minutes is fine</td><td class="px-4 py-3">Wastes quota; latency equals the interval</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Webhooks only</td><td class="px-4 py-3">Prototypes, and low-stakes notifications</td><td class="px-4 py-3">A missed delivery (your deploy, their outage) is lost silently</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Webhooks + periodic reconcile</td><td class="px-4 py-3">Anything involving money, shipments, invoices: the default for client work</td><td class="px-4 py-3">Two code paths, which must converge on the same state</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CDC / event streaming</td><td class="px-4 py-3">Many systems replicating large tables continuously</td><td class="px-4 py-3">Overkill at small and medium size: Kafka, Debezium and their operations cost</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant P as Carrier
+    participant W as Webhook endpoint
+    participant Q as Queue + worker
+    participant DB as Postgres
+    P->>W: POST status=delivered<br/>(signed, event id E1)
+    W->>W: verify signature on raw body
+    W->>DB: INSERT inbox (E1)<br/>ON CONFLICT DO NOTHING
+    W->>Q: enqueue E1 (only if new)
+    W-->>P: 200 in &lt; 1 s
+    Q->>DB: apply if newer than current state
+    Note over Q,DB: nightly: list shipments changed<br/>in last 48 h and fix any drift
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The last note is the reconcile job. It's a scheduled job (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>)
+        that asks the provider for everything changed recently and runs the <em>same</em> apply function the webhook
+        worker uses. It should find nothing most nights. When it does find something, log it: that count is your
+        measure of how reliable their webhooks really are.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Receiving webhooks safely</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A webhook endpoint is a public URL that changes your data, so treat it like a login form. Five rules, in order:
+        <strong>verify</strong> the signature on the raw bytes, <strong>reject stale</strong> timestamps,
+        <strong>store</strong> the event with a unique key so duplicates are no-ops, <strong>respond fast</strong>, and
+        <strong>process later</strong> in a job. Providers retry when you are slow or return non-2xx, so a handler that does
+        the real work inline turns one slow day into a pile of duplicate deliveries.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">webhooks/carrier.ts — verify, store, enqueue, 200 (Express)</span>
+        <pre class="code">app.<span class="fn">post</span>(<span class="st">"/webhooks/carrier-a"</span>, express.<span class="fn">raw</span>({ type: <span class="st">"application/json"</span> }), <span class="kw">async</span> (req, res) =&gt; {
+  <span class="cm">// header names and signing scheme: exactly what THIS provider documents</span>
+  <span class="kw">const</span> ts = req.<span class="fn">header</span>(<span class="st">"x-timestamp"</span>) ?? <span class="st">""</span>;
+  <span class="kw">const</span> sig = Buffer.<span class="fn">from</span>(req.<span class="fn">header</span>(<span class="st">"x-signature"</span>) ?? <span class="st">""</span>, <span class="st">"hex"</span>);
+  <span class="kw">const</span> expected = <span class="fn">createHmac</span>(<span class="st">"sha256"</span>, env.CARRIER_A_WEBHOOK_SECRET)
+    .<span class="fn">update</span>(<span class="st">`${ts}.`</span>).<span class="fn">update</span>(req.body).<span class="fn">digest</span>();           <span class="cm">// ← raw Buffer, not re-serialised JSON</span>
+  <span class="kw">if</span> (sig.length !== expected.length || !<span class="fn">timingSafeEqual</span>(sig, expected)) <span class="kw">return</span> res.<span class="fn">sendStatus</span>(<span class="st">401</span>);
+  <span class="kw">if</span> (Math.<span class="fn">abs</span>(Date.<span class="fn">now</span>() / <span class="st">1000</span> - Number(ts)) &gt; <span class="st">300</span>) <span class="kw">return</span> res.<span class="fn">sendStatus</span>(<span class="st">401</span>); <span class="cm">// replay guard</span>
+
+  <span class="kw">const</span> evt = JSON.<span class="fn">parse</span>(req.body.<span class="fn">toString</span>(<span class="st">"utf8"</span>));
+  <span class="kw">const</span> { rowCount } = <span class="kw">await</span> db.<span class="fn">query</span>(
+    <span class="st">`INSERT INTO webhook_inbox (provider, event_id, payload) VALUES ('carrier-a', $1, $2)
+     ON CONFLICT (provider, event_id) DO NOTHING`</span>, [evt.event_id, evt]);
+  <span class="kw">if</span> (rowCount === <span class="st">1</span>) <span class="kw">await</span> queue.<span class="fn">add</span>(<span class="st">"apply-carrier-event"</span>, { eventId: evt.event_id });
+  res.<span class="fn">sendStatus</span>(<span class="st">200</span>);                                     <span class="cm">// ← duplicates also get 200, or they retry forever</span>
+});</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        If the enqueue fails after the insert, the event sits in the inbox unprocessed. A small sweeper job that picks up
+        inbox rows with <code class="inline">processed_at IS NULL</code> older than a few minutes closes that gap; it is
+        the inbox mirror of the transactional outbox in <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>.
+        If the provider has an official SDK helper for verification (Stripe's <code class="inline">constructEvent</code>,
+        for example), use it instead of hand-rolled HMAC code.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Duplicates and out-of-order events</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Deduplicating by event ID handles repeats. It doesn't handle order: "delivered" can arrive before "in_transit"
+        because the two deliveries raced through different servers. Your apply step must never move state backwards.
+        Two ways to get that: compare the event's own timestamp or version with what you stored, or ignore the payload
+        and <strong>re-fetch</strong> the current state from the provider's API (slower, but always right).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">apply-carrier-event.sql — only move forward</span>
+        <pre class="code"><span class="kw">UPDATE</span> shipments
+<span class="kw">SET</span>    status = $2, status_at = $3, updated_at = now()
+<span class="kw">WHERE</span>  tracking_code = $1
+  <span class="kw">AND</span>  (status_at <span class="kw">IS NULL OR</span> status_at &lt; $3)    <span class="cm">-- ← an older event changes nothing</span>
+  <span class="kw">AND</span>  status &lt;&gt; <span class="st">'delivered'</span>;                  <span class="cm">-- terminal states stay terminal</span>
+<span class="cm">-- 0 rows updated is a normal outcome: log it at debug level, mark the inbox row processed</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Sending webhooks to your own clients</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Sometimes <em>you</em> are the provider: the clinic chain wants a webhook to its own system when a booking is
+        confirmed. Now you owe your subscriber everything you wanted from yours: a signature they can verify, a unique
+        event ID, a timestamp, retries with backoff when their endpoint is down, and a way to see and replay what was sent.
+        The <a class="text-coral underline" href="https://www.standardwebhooks.com/" target="_blank" rel="noopener">Standard Webhooks</a>
+        spec is a good default: it signs <code class="inline">id.timestamp.body</code> and defines the header names, so
+        subscribers can use existing libraries.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/031_webhook_deliveries.sql — the delivery log behind the replay button</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> webhook_deliveries (
+  id              bigserial <span class="kw">PRIMARY KEY</span>,
+  subscription_id bigint <span class="kw">NOT NULL REFERENCES</span> webhook_subscriptions(id),
+  event_id        text <span class="kw">NOT NULL</span>,              <span class="cm">-- same id on every retry, so they can dedupe</span>
+  event_type      text <span class="kw">NOT NULL</span>,              <span class="cm">-- 'booking.confirmed'</span>
+  payload         jsonb <span class="kw">NOT NULL</span>,
+  attempt         int <span class="kw">NOT NULL DEFAULT</span> 0,
+  next_attempt_at timestamptz,               <span class="cm">-- backoff: 1 min, 5 min, 30 min, 2 h … then give up</span>
+  last_status     int,                       <span class="cm">-- their HTTP status, or NULL on timeout</span>
+  last_error      text,
+  delivered_at    timestamptz
+);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Build this yourself when you have a handful of subscribers and a few event types, which is most client projects.
+        A hosted webhook-sending service starts to pay off when many external customers subscribe and ask for self-service
+        endpoint management; compare current offerings and prices before choosing one. Either way, disable a subscription
+        after a long run of failures and email its owner, instead of retrying into the void forever.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Sync state: cursors, conflicts and an owner for every field</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        For pull-based sync, store a <strong>cursor</strong> per stream: the provider's own cursor token if it gives one,
+        otherwise the latest <code class="inline">updated_at</code> you have processed. Re-read a small overlap window each
+        time, because clocks differ and a record can commit with an older timestamp after you already read past it. The
+        overlap causes duplicates, which your upsert must absorb.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">sync/crm-contacts.ts — incremental pull with an overlap window</span>
+        <pre class="code"><span class="kw">const</span> state = <span class="kw">await</span> syncState.<span class="fn">get</span>(<span class="st">"crm-contacts"</span>);
+<span class="kw">const</span> since = <span class="fn">subMinutes</span>(state.cursor, <span class="st">10</span>);            <span class="cm">// ← overlap: clock skew and late commits</span>
+<span class="kw">let</span> maxSeen = state.cursor, after: string | undefined;
+<span class="kw">do</span> {
+  <span class="kw">const</span> page = <span class="kw">await</span> <span class="fn">crmCall</span>(() =&gt; crm.<span class="fn">searchContacts</span>({ updatedSince: since, after, limit: <span class="st">100</span> }));
+  <span class="kw">for</span> (<span class="kw">const</span> c <span class="kw">of</span> page.results) {
+    <span class="kw">await</span> patients.<span class="fn">upsertFromCrm</span>(c);                  <span class="cm">// idempotent: same contact twice = no change</span>
+    <span class="kw">if</span> (c.updatedAt &gt; maxSeen) maxSeen = c.updatedAt;
+  }
+  after = page.nextCursor;
+} <span class="kw">while</span> (after);
+<span class="kw">await</span> syncState.<span class="fn">set</span>(<span class="st">"crm-contacts"</span>, maxSeen);              <span class="cm">// only after the whole run succeeded</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For conflicts, the simplest rule that works is <strong>one source of truth per field</strong>, written down and
+        agreed with the client. "Last write wins" on whole records sounds fair and quietly overwrites good data.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Patient field</th><th class="px-4 py-3">Owner</th><th class="px-4 py-3">Sync direction</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Name, phone, date of birth</td><td class="px-4 py-3">Booking app (patient edits it there)</td><td class="px-4 py-3">App → CRM; CRM edits are overwritten</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Visit count, last visit</td><td class="px-4 py-3">Booking app (computed)</td><td class="px-4 py-3">App → CRM, read-only there</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Marketing consent</td><td class="px-4 py-3">Whichever captured it most recently, with a timestamp and source</td><td class="px-4 py-3">Both ways; a revoke always wins</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sales stage, assigned rep</td><td class="px-4 py-3">CRM</td><td class="px-4 py-3">CRM → app, or not synced at all</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Keep the mapping between your IDs and theirs in a dedicated column or table
+        (<code class="inline">patients.crm_contact_id</code>), with a unique constraint. Matching records by name or phone
+        on every sync creates duplicates the day two patients share a phone number, which in a family clinic is common.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Bulk import</div>
+      <h2 class="font-display text-2xl font-bold mt-2">An import is a pipeline with a report, not a loop over rows</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The clinic chain is moving from spreadsheets. Each branch sends a patient list (5,000 to 40,000 rows), a doctor
+        list and a price list, as CSV or Excel files that someone has edited by hand for years. The agent's first version
+        reads the upload in the request handler and inserts row by row. It times out at row 9,000, leaves 9,000 rows
+        inserted, and the user uploads again, creating 9,000 duplicates. A good import is built so that none of those
+        things can happen.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The shape of an import that survives real files</h3>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="Import pipeline: upload to storage, parse and validate in a job, preview, commit in batches, then report with a downloadable error file">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">REQUEST · fast</text>
+          <text x="170" y="20" font-size="11" font-weight="700" fill="#6E6B64">BACKGROUND JOB · minutes are fine</text>
+          <g class="anim-pulse"><rect x="10" y="40" width="120" height="48" rx="9" fill="#2563EB"/>
+            <text x="70" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1 · Upload</text>
+            <text x="70" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">presigned PUT to storage</text></g>
+          <line x1="130" y1="64" x2="170" y2="64" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="170" y="40" width="120" height="48" rx="9" fill="#6d5acd"/>
+            <text x="230" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">2 · Parse</text>
+            <text x="230" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">stream · encoding · headers</text></g>
+          <line x1="290" y1="64" x2="330" y2="64" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="330" y="40" width="120" height="48" rx="9" fill="#6d5acd"/>
+            <text x="390" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">3 · Validate</text>
+            <text x="390" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">every row · collect errors</text></g>
+          <line x1="450" y1="64" x2="490" y2="64" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d3"><rect x="490" y="40" width="190" height="48" rx="9" fill="#DB2777"/>
+            <text x="585" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">4 · Preview (dry run)</text>
+            <text x="585" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">120 new · 4,310 updated · 37 errors</text></g>
+          <line x1="585" y1="88" x2="585" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="595" y="114" font-size="9" fill="#6E6B64">user clicks Confirm</text>
+          <g class="anim-pulse d4"><rect x="490" y="130" width="190" height="48" rx="9" fill="#0D9488"/>
+            <text x="585" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">5 · Commit in batches</text>
+            <text x="585" y="165" text-anchor="middle" fill="#ffffffbb" font-size="9">upsert by key · COPY · progress %</text></g>
+          <line x1="490" y1="154" x2="450" y2="154" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="250" y="130" width="200" height="48" rx="9" fill="#37474F"/>
+            <text x="350" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">6 · Report</text>
+            <text x="350" y="165" text-anchor="middle" fill="#ffffffbb" font-size="9">summary + errors.csv (row, column, why)</text></g>
+          <text x="20" y="150" font-size="10" fill="#D97757" class="anim-bounce">the user fixes errors.csv</text>
+          <text x="20" y="164" font-size="10" fill="#D97757" class="anim-bounce">and re-uploads: no duplicates</text>
+          <text x="350" y="208" text-anchor="middle" font-size="10" fill="#A8A49B">status lives in an import_jobs row; the page polls it (Part IV)</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Step 1 is the client-side upload pattern from <a href="./fe4.html" class="text-viol underline decoration-viol/40">FE4</a>:
+        the file goes straight to object storage, and your API only records an <code class="inline">import_jobs</code> row
+        and enqueues a job. Everything heavy happens in the worker, where a 3-minute run is normal and doesn't hold an HTTP
+        connection open.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migrations/040_import_jobs.sql</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> import_jobs (
+  id            bigserial <span class="kw">PRIMARY KEY</span>,
+  clinic_id     bigint <span class="kw">NOT NULL REFERENCES</span> clinics(id),
+  kind          text <span class="kw">NOT NULL</span>,                   <span class="cm">-- 'patients' | 'doctors' | 'prices'</span>
+  file_key      text <span class="kw">NOT NULL</span>,                   <span class="cm">-- object storage key, not the bytes</span>
+  file_sha256   text <span class="kw">NOT NULL</span>,                   <span class="cm">-- "you uploaded this exact file yesterday"</span>
+  status        text <span class="kw">NOT NULL DEFAULT</span> <span class="st">'uploaded'</span>, <span class="cm">-- uploaded → validated → importing → done | failed</span>
+  total_rows    int, valid_rows int, error_rows int, processed_rows int <span class="kw">DEFAULT</span> 0,
+  error_file_key text,                          <span class="cm">-- the downloadable errors.csv</span>
+  created_by    bigint <span class="kw">NOT NULL</span>,
+  created_at    timestamptz <span class="kw">NOT NULL DEFAULT</span> now()
+);</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Validate every row, and report errors the user can fix</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Don't stop at the first bad row, and don't report "import failed". Validate every row with the same schema library
+        you use for the API (<a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>), collect the
+        problems, and produce an <strong>error file</strong>: the original row, its row number as the user sees it in
+        Excel, and a plain-language reason. The user fixes it in Excel and uploads only that file again.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">imports/patients.validate.ts — per-row validation with Zod</span>
+        <pre class="code"><span class="kw">const</span> PatientRow = z.<span class="fn">object</span>({
+  code:      z.<span class="fn">string</span>().<span class="fn">trim</span>().<span class="fn">min</span>(<span class="st">1</span>, <span class="st">"Patient code is required"</span>),
+  full_name: z.<span class="fn">string</span>().<span class="fn">trim</span>().<span class="fn">min</span>(<span class="st">1</span>).<span class="fn">transform</span>((s) =&gt; s.<span class="fn">normalize</span>(<span class="st">"NFC"</span>)),
+  phone:     z.<span class="fn">string</span>().<span class="fn">transform</span>(fixPhone).<span class="fn">pipe</span>(z.<span class="fn">string</span>().<span class="fn">regex</span>(<span class="st">/^0\d{9}$/</span>, <span class="st">"Phone must be 10 digits starting with 0"</span>)),
+  dob:       excelDate,                                  <span class="cm">// accepts "1990-05-31", "31/05/1990" or an Excel serial</span>
+});
+
+<span class="kw">const</span> seen = <span class="kw">new</span> <span class="fn">Set</span>&lt;string&gt;();
+<span class="kw">for await</span> (<span class="kw">const</span> { raw, excelRow } <span class="kw">of</span> <span class="fn">readRows</span>(file)) {     <span class="cm">// streaming, never the whole file in memory</span>
+  <span class="kw">const</span> r = PatientRow.<span class="fn">safeParse</span>(raw);
+  <span class="kw">if</span> (!r.success) { errors.<span class="fn">push</span>({ excelRow, ...raw, error: <span class="fn">explain</span>(r.error) }); <span class="kw">continue</span>; }
+  <span class="kw">if</span> (seen.<span class="fn">has</span>(r.data.code)) { errors.<span class="fn">push</span>({ excelRow, ...raw, error: <span class="st">"Duplicate code in this file"</span> }); <span class="kw">continue</span>; }
+  seen.<span class="fn">add</span>(r.data.code);                                <span class="cm">// ← also stops ON CONFLICT hitting one row twice</span>
+  valid.<span class="fn">push</span>(r.data);
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Decide the policy for partially valid files up front, with the client: import the valid rows and report the rest
+        (common for patient lists), or reject the whole file if any row fails (safer for price lists, where a half-applied
+        update is worse than none). Either way, the <strong>dry run</strong> shows the counts before anything is written:
+        "120 new, 4,310 updated, 37 errors. Continue?" is the single most useful screen in an import feature.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Upsert keys, idempotent re-upload and batch inserts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Re-uploading the same file must not create duplicates. That needs a <strong>natural key</strong> for each row,
+        usually the client's own code (patient code, SKU, doctor licence number), scoped to the tenant, with a unique
+        constraint. Then every row is an upsert. For speed, load validated rows into a staging table with
+        <code class="inline">COPY</code> and merge in one statement, instead of 40,000 round-trips.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">imports/patients.commit.sql — COPY into staging, then one upsert</span>
+        <pre class="code"><span class="kw">BEGIN</span>;
+<span class="kw">CREATE TEMP TABLE</span> stage (code text, full_name text, phone text, dob date) <span class="kw">ON COMMIT DROP</span>;
+<span class="kw">COPY</span> stage <span class="kw">FROM STDIN WITH</span> (FORMAT csv);          <span class="cm">-- the worker streams validated rows in</span>
+
+<span class="kw">INSERT INTO</span> patients (clinic_id, code, full_name, phone, dob)
+<span class="kw">SELECT</span> 42, code, full_name, phone, dob <span class="kw">FROM</span> stage     <span class="cm">-- 42 = the import job's clinic</span>
+<span class="kw">ON CONFLICT</span> (clinic_id, code) <span class="kw">DO UPDATE</span>
+  <span class="kw">SET</span> full_name = EXCLUDED.full_name, phone = EXCLUDED.phone, dob = EXCLUDED.dob
+  <span class="kw">WHERE</span> (patients.full_name, patients.phone, patients.dob)
+        <span class="kw">IS DISTINCT FROM</span> (EXCLUDED.full_name, EXCLUDED.phone, EXCLUDED.dob);  <span class="cm">-- skip no-op updates</span>
+<span class="kw">COMMIT</span>;</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Transaction boundary</th><th class="px-4 py-3">Good for</th><th class="px-4 py-3">Watch out for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">One per row</td><td class="px-4 py-3">Nothing at scale</td><td class="px-4 py-3">Slowest option; a crash leaves a random half-import</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">One per batch (500–5,000 rows)</td><td class="px-4 py-3">Large "import the valid rows" jobs, with progress and resume</td><td class="px-4 py-3">Needs upserts so a retried batch is harmless</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">One for the whole file</td><td class="px-4 py-3">All-or-nothing files up to tens of thousands of rows</td><td class="px-4 py-3">Long locks; test the duration against real row counts</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Also store the file's SHA-256 and warn "this exact file was imported on 12 Sep by Lan" before running it again.
+        It's not a correctness guard (the upsert is), but it saves a confused support call.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Encoding, BOM, Excel dates and Vietnamese text</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most import bugs are not in your logic. They are in the file. Collect a few real files from the client in the
+        first week, including the ugliest one, and test against them.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Symptom</th><th class="px-4 py-3">Cause</th><th class="px-4 py-3">Fix</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">First header is <code class="inline">"﻿code"</code>, so "code" is missing</td><td class="px-4 py-3">UTF-8 byte order mark written by Excel</td><td class="px-4 py-3">Strip a leading BOM before parsing headers</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Nguyá»…n" instead of "Nguyễn"</td><td class="px-4 py-3">UTF-8 file read as Windows-1252, or the reverse</td><td class="px-4 py-3">Detect encoding; reject with a clear message and a template file</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Vietnamese letters garbled in a very old file</td><td class="px-4 py-3">Legacy Vietnamese encodings (TCVN3, VNI) from old systems</td><td class="px-4 py-3">Ask for a re-export in Unicode; convert only if the client can't</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Nguyễn" doesn't match "Nguyễn" in search</td><td class="px-4 py-3">Same text, different Unicode forms (NFC vs NFD)</td><td class="px-4 py-3"><code class="inline">normalize("NFC")</code> on every text field</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Phone <code class="inline">901234567</code></td><td class="px-4 py-3">Excel stored it as a number and dropped the leading 0</td><td class="px-4 py-3">Restore 9-digit mobiles; read cells as text; ship a template with text columns</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Date <code class="inline">33024</code>, or 05/03 read as 3 May</td><td class="px-4 py-3">Excel serial dates; day/month order depends on locale</td><td class="px-4 py-3">Convert serials; require one format and state it in the template</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ID <code class="inline">1.23457E+11</code></td><td class="px-4 py-3">Long numeric codes shown in scientific notation, then saved that way</td><td class="px-4 py-3">Treat codes as text; reject values that look like scientific notation</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">imports/excel.ts — the two helpers every Vietnamese import needs</span>
+        <pre class="code"><span class="kw">export function</span> <span class="fn">fromExcelSerial</span>(n: number): string {
+  <span class="cm">// Excel counts days from 1900 and wrongly treats 1900 as a leap year → epoch 1899-12-30</span>
+  <span class="cm">// (valid for dates after Feb 1900; files using the old Mac 1904 system are offset by 1,462 days)</span>
+  <span class="kw">const</span> ms = Date.<span class="fn">UTC</span>(<span class="st">1899</span>, <span class="st">11</span>, <span class="st">30</span>) + Math.<span class="fn">round</span>(n) * <span class="st">86_400_000</span>;
+  <span class="kw">return new</span> <span class="fn">Date</span>(ms).<span class="fn">toISOString</span>().<span class="fn">slice</span>(<span class="st">0</span>, <span class="st">10</span>);                <span class="cm">// a date, no time zone</span>
+}
+
+<span class="kw">export function</span> <span class="fn">fixPhone</span>(v: string): string {
+  <span class="kw">const</span> d = v.<span class="fn">replace</span>(<span class="st">/[\s.\-()]/g</span>, <span class="st">""</span>).<span class="fn">replace</span>(<span class="st">/^\+?84/</span>, <span class="st">"0"</span>);   <span class="cm">// +84 90… → 090…</span>
+  <span class="kw">return</span> <span class="st">/^[1-9]\d{8}$/</span>.<span class="fn">test</span>(d) ? <span class="st">"0"</span> + d : d;                   <span class="cm">// ← Excel ate the leading zero</span>
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Which library?</strong> For CSV in Node, <code class="inline">csv-parse</code> or Papa Parse stream
+        well. For <code class="inline">.xlsx</code>, ExcelJS has a streaming reader for large files, and SheetJS is
+        widely used (check its docs for the current install method, since it is not always published to the public
+        npm registry). Whichever the agent picks, test it with a 50,000-row file and watch the worker's memory; a
+        library that loads the whole workbook can use many times the file size in RAM.
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Bulk export &amp; long-running operations</div>
+      <h2 class="font-display text-2xl font-bold mt-2">If it takes more than a few seconds, hand the user a receipt, not a spinner</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        "Export all bookings for the chain for 2025" is 300,000 rows across twelve branches. Built as a normal
+        <code class="inline">GET</code>, it hits the load balancer's timeout, and the user clicks again, twice, starting
+        three copies of the same heavy query. The fix is the same shape for exports, big bulk updates and anything else
+        slow: accept the request, do the work in a job, and let the client check on it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The long-running operation pattern: 202 and a status resource</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a> lists <code class="inline">202 Accepted</code>
+        among the status codes you need. Here is the full pattern behind it. The <code class="inline">POST</code> creates an
+        operation (an export job) and returns at once with its URL. The client polls that URL, or gets a notification, until
+        it is done. When it is done, the status response carries a <strong>short-lived signed download link</strong>.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant A as API
+    participant W as Export worker
+    participant S as Object storage
+    B->>A: POST /exports {kind: bookings, year: 2025}
+    A-->>B: 202 Accepted<br/>Location: /exports/77
+    A->>W: enqueue export 77
+    loop every 2-5 s
+        B->>A: GET /exports/77
+        A-->>B: {status: running, progress: 0.42}
+    end
+    W->>S: stream CSV to exports/77.csv
+    W->>A: status = done
+    B->>A: GET /exports/77
+    A-->>B: {status: done, downloadUrl (15 min)}
+    B->>S: GET signed URL
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">exports/routes.ts — create, then report status</span>
+        <pre class="code">app.<span class="fn">post</span>(<span class="st">"/exports"</span>, <span class="kw">async</span> (req, res) =&gt; {
+  <span class="kw">const</span> input = ExportRequest.<span class="fn">parse</span>(req.body);
+  <span class="kw">const</span> job = <span class="kw">await</span> exportsRepo.<span class="fn">createOrReuse</span>(req.user, input);   <span class="cm">// ← same user + same filters, still running → reuse it</span>
+  <span class="kw">if</span> (job.isNew) <span class="kw">await</span> queue.<span class="fn">add</span>(<span class="st">"export"</span>, { exportId: job.id });
+  res.<span class="fn">status</span>(<span class="st">202</span>).<span class="fn">location</span>(<span class="st">`/exports/${job.id}`</span>).<span class="fn">json</span>({ id: job.id, status: job.status });
+});
+
+app.<span class="fn">get</span>(<span class="st">"/exports/:id"</span>, <span class="kw">async</span> (req, res) =&gt; {
+  <span class="kw">const</span> job = <span class="kw">await</span> exportsRepo.<span class="fn">findOwned</span>(req.params.id, req.user);  <span class="cm">// ← 404 if not theirs (IDOR, SD9)</span>
+  <span class="kw">const</span> body: Record&lt;string, unknown&gt; = { id: job.id, status: job.status, progress: job.progress };
+  <span class="kw">if</span> (job.status === <span class="st">"done"</span>) body.downloadUrl = <span class="kw">await</span> <span class="fn">getSignedUrl</span>(s3,
+    <span class="kw">new</span> <span class="fn">GetObjectCommand</span>({ Bucket: EXPORTS, Key: job.fileKey }), { expiresIn: <span class="st">900</span> }); <span class="cm">// 15 min, fresh each call</span>
+  <span class="kw">if</span> (job.status === <span class="st">"failed"</span>) body.error = job.publicError;
+  res.<span class="fn">json</span>(body);
+});</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A few details separate a solid version from the demo: the export file lives in a <strong>private</strong> bucket and
+        is deleted by a lifecycle rule after a few days; the link is generated on each status call, so an old email or
+        screenshot doesn't leak data forever; the status endpoint checks ownership; and progress is a real number updated by
+        the worker, not a fake animation. Use the same <code class="inline">import_jobs</code>-style table for imports, so
+        one progress component in the UI serves both.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Stream when you can, and make the file safe to open</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Not every export needs a job. "This month's bookings for one branch" (a few thousand rows) can be a direct download,
+        as long as it is <strong>streamed</strong>: rows flow from a database cursor to the response without building the
+        whole file in memory. The agent's default, <code class="inline">const rows = await db.query(...)</code> then
+        <code class="inline">rows.map(toCsv).join("\n")</code>, loads everything at once and falls over at a size nobody
+        tested.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">exports/bookings-csv.ts — cursor → CSV → response, with BOM and formula guard</span>
+        <pre class="code"><span class="kw">const</span> <span class="fn">safeCell</span> = (s: string) =&gt; <span class="st">/^[=+\-@\t\r]/</span>.<span class="fn">test</span>(s) ? <span class="st">"'"</span> + s : s;  <span class="cm">// ← CSV/formula injection</span>
+
+app.<span class="fn">get</span>(<span class="st">"/branches/:id/bookings.csv"</span>, <span class="kw">async</span> (req, res) =&gt; {
+  <span class="kw">const</span> branch = <span class="kw">await</span> <span class="fn">authorizeBranch</span>(req.user, req.params.id);
+  <span class="kw">const</span> client = <span class="kw">await</span> pool.<span class="fn">connect</span>();
+  <span class="kw">try</span> {
+    <span class="kw">const</span> rows = client.<span class="fn">query</span>(<span class="kw">new</span> <span class="fn">QueryStream</span>(
+      <span class="st">`SELECT b.id, b.starts_at, p.full_name, b.status FROM bookings b JOIN patients p ON p.id = b.patient_id
+       WHERE b.branch_id = $1 AND b.starts_at &gt;= $2 ORDER BY b.id`</span>, [branch.id, monthStart], { batchSize: <span class="st">1000</span> }));
+    res.<span class="fn">setHeader</span>(<span class="st">"Content-Type"</span>, <span class="st">"text/csv; charset=utf-8"</span>);
+    res.<span class="fn">setHeader</span>(<span class="st">"Content-Disposition"</span>, <span class="st">'attachment; filename="bookings.csv"'</span>);
+    res.<span class="fn">write</span>(<span class="st">"﻿"</span>);                                  <span class="cm">// BOM: Excel on Windows then reads Vietnamese correctly</span>
+    <span class="kw">await</span> <span class="fn">pipeline</span>(rows, <span class="fn">stringify</span>({ header: <span class="kw">true</span>, cast: { string: safeCell } }), res);
+  } <span class="kw">finally</span> { client.<span class="fn">release</span>(); }
+});</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The formula guard matters because exports are opened in Excel. A patient who types
+        <code class="inline">=HYPERLINK(...)</code> as their name gets a live formula in the receptionist's spreadsheet.
+        Prefixing cells that start with <code class="inline">= + - @</code>, tab or carriage return with a single quote is
+        the usual defence (see the OWASP page in Resources); agree with the client, since it also changes legitimate values
+        such as <code class="inline">-5</code> in a text column.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Bulk update and delete without regret</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Cancel every booking for Dr. Minh next week", "archive patients with no visit in five years", "move all of branch 3's
+        doctors to branch 5". These are the operations that cause the worst incidents in small systems, because one
+        <code class="inline">WHERE</code> clause decides how much damage is done. The rules:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Preview first.</strong> Show the count and a sample ("214 bookings, 188 patients will be notified") and
+        require a confirmation that includes the count. Same idea as the import dry run.</li>
+        <li><strong>Batches, not one giant statement.</strong> 500–1,000 rows per transaction, walking by primary key, with a
+        short pause between batches, so locks stay short and normal bookings keep working.</li>
+        <li><strong>Side effects go through the queue.</strong> 188 SMS messages are 188 jobs under the provider's rate limit
+        (Part I), not a loop inside the update.</li>
+        <li><strong>Audit and undo.</strong> Record who ran it, with which filter, and the IDs affected. Prefer soft deletes
+        tagged with an operation ID, so undo is one statement.</li>
+      </ul>
+      <div class="mt-4">
+        <span class="code-label">bulk/archive-patients.sql — one batch, tagged for undo</span>
+        <pre class="code"><span class="kw">WITH</span> batch <span class="kw">AS</span> (
+  <span class="kw">SELECT</span> id <span class="kw">FROM</span> patients
+  <span class="kw">WHERE</span>  clinic_id = $1 <span class="kw">AND</span> archived_at <span class="kw">IS NULL AND</span> last_visit_at &lt; now() - interval <span class="st">'5 years'</span>
+    <span class="kw">AND</span>  id &gt; $2                                    <span class="cm">-- keyset: resume after the last id seen</span>
+  <span class="kw">ORDER BY</span> id <span class="kw">LIMIT</span> 500
+)
+<span class="kw">UPDATE</span> patients p
+<span class="kw">SET</span>    archived_at = now(), archived_by_op = $3       <span class="cm">-- ← $3 = bulk_operations.id, for audit and undo</span>
+<span class="kw">FROM</span>   batch <span class="kw">WHERE</span> p.id = batch.id
+<span class="kw">RETURNING</span> p.id;
+
+<span class="cm">-- undo the whole operation later:</span>
+<span class="cm">-- UPDATE patients SET archived_at = NULL, archived_by_op = NULL WHERE archived_by_op = $3;</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Backfills and data migrations in production</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A backfill fills a new column or table from existing data: adding <code class="inline">branch_id</code> to
+        300,000 bookings when a clinic becomes a chain, or splitting <code class="inline">full_name</code> into two fields.
+        Schema migrations themselves belong to <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>.
+        The backfill is the risky middle step, and on a live system it follows <strong>expand, backfill, contract</strong>:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Step</th><th class="px-4 py-3">What ships</th><th class="px-4 py-3">Safe because</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">1 · Expand</td><td class="px-4 py-3">Add <code class="inline">branch_id</code> as nullable; new code writes it for new rows</td><td class="px-4 py-3">Old code ignores the column; nothing reads it yet</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">2 · Backfill</td><td class="px-4 py-3">A resumable job fills old rows in batches, logging progress</td><td class="px-4 py-3">Idempotent: <code class="inline">WHERE branch_id IS NULL</code>, so a restart continues</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">3 · Verify</td><td class="px-4 py-3">A query proves zero rows are left and spot-checks values</td><td class="px-4 py-3">You measure instead of assuming the job finished</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">4 · Contract</td><td class="px-4 py-3">Add <code class="inline">NOT NULL</code>, switch reads, drop the old path</td><td class="px-4 py-3">Done in a later deploy, after step 3 passed</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">scripts/backfill-branch-id.ts — resumable, throttled, observable</span>
+        <pre class="code"><span class="kw">const</span> BATCH = <span class="st">1000</span>;
+<span class="kw">for</span> (;;) {
+  <span class="kw">const</span> { rowCount } = <span class="kw">await</span> db.<span class="fn">query</span>(<span class="st">`
+    UPDATE bookings b SET branch_id = d.branch_id
+    FROM doctors d
+    WHERE b.id IN (SELECT id FROM bookings WHERE branch_id IS NULL ORDER BY id LIMIT $1)
+      AND d.id = b.doctor_id`</span>, [BATCH]);                  <span class="cm">// ← each batch is its own short transaction</span>
+  log.<span class="fn">info</span>({ updated: rowCount }, <span class="st">"backfill batch"</span>);
+  <span class="kw">if</span> (rowCount === <span class="st">0</span>) <span class="kw">break</span>;                                <span class="cm">// careful: a row with no doctor never matches</span>
+  <span class="kw">await</span> <span class="fn">sleep</span>(<span class="st">100</span>);                                        <span class="cm">// leave room for real traffic</span>
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>Rehearse on a copy first.</strong> Run every backfill and bulk operation against a restored copy of
+        production (or a realistic staging snapshot) and time it. Look again at the comment in the loop above: if a
+        thousand old bookings have no matching doctor, a batch eventually contains only those rows, updates zero, and the
+        loop stops early, leaving good rows after them unfilled as well. Step 3 catches it; step 4's
+        <code class="inline">NOT NULL</code> would otherwise fail at deploy time. The robust version walks by
+        <code class="inline">id</code> (keyset, like the bulk update above) and reports the rows it could not fix.
+        Rehearsal finds these edge cases; a Friday-evening production run finds them the other way. Take a backup, or confirm point-in-time recovery works, before you start.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are fast at the mechanical parts of integration work: mapping tables, adapters, fixtures, validation schemas,
+        batching loops. They are weak at the parts that need facts from outside the repo: the provider's real behaviour, the
+        client's messy files, who owns which field. Feed them those facts (a real payload, a real file, the field-ownership
+        table) and ask for tests that use them.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — an adapter from real payloads</span>
+        <pre class="code">Read docs/integrations/carrier-a/ (their API docs PDF, plus 6 recorded, masked
+responses in fixtures/). Implement CarrierAAdapter behind the ShippingProvider
+interface. Map every status code in their docs to our 5 statuses; list any code you
+could not map instead of guessing. Tests use only the recorded fixtures, plus a
+429-with-Retry-After case and a 30 s hang. No provider field names outside src/shipping/.</pre>
+      </div>
+      <pre class="code mt-3">Review src/webhooks/ against this checklist and report file:line for each miss:
+signature verified on the raw body before parsing, timestamp tolerance, dedupe by
+event id with a unique constraint, 2xx returned before any slow work, processing in
+a job, out-of-order events can't move state backwards. Don't change code yet.</pre>
+      <pre class="code mt-3">Build the patient import from docs/imports/patients.md. Test it with the three real
+files in fixtures/imports/ (one has a BOM, one is from Excel with serial dates, one
+has duplicate codes). Show me: the dry-run counts, the first 10 lines of errors.csv,
+and the row count after importing the same file twice.
+<span class="cm"># the "twice" is the idempotency test; don't let it be skipped</span></pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft adapters and status mappings from the provider's docs</li>
+            <li>Turn recorded payloads into fixture-based tests</li>
+            <li>Write the webhook inbox, dedupe and sweeper job</li>
+            <li>Write row validation schemas and the errors.csv writer</li>
+            <li>Write batched, keyset-paged bulk and backfill loops</li>
+            <li>Audit a codebase for leaked provider names or missing timeouts</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every unmapped status or field is flagged, not guessed</li>
+            <li>The signature scheme matches the provider's current docs exactly</li>
+            <li>Quota numbers and legal rules against current official sources</li>
+            <li>Imports against the client's real ugliest file, uploaded twice</li>
+            <li>Field ownership and partial-import policy agreed with the client</li>
+            <li>Bulk operations rehearsed on a copy, with a count and an undo</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-written integration code:</strong> <code class="inline">JSON.parse</code> or a JSON body
+        parser before the signature check · <code class="inline">===</code> to compare signatures · the webhook handler
+        calling the provider back or sending emails before it returns · no unique constraint on the event ID · a status
+        mapping with a silent default · provider field names in domain code · the full request body logged, including
+        phone numbers and tokens · an import that runs inside the HTTP request · one <code class="inline">INSERT</code>
+        per row with no upsert key · <code class="inline">rows.map(...).join("\n")</code> for exports · a bulk
+        <code class="inline">UPDATE</code> or <code class="inline">DELETE</code> with no batch size, no preview and no audit.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Calls provider APIs straight from controllers and imports files with a loop in the request handler.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows the words (adapter, webhook signature, idempotent import, dry run, 202, backfill) but doesn't spot their absence in a diff.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> With a design agreed with a senior, builds an integration behind an adapter with fixture tests, a webhook receiver that verifies, dedupes and enqueues, and an import or export job with a dry run, an error file and progress. Proves re-upload creates no duplicates. Needs review for quota planning, field ownership and production bulk operations.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Designs the sync strategy (webhooks plus reconcile, cursors, field ownership) with the client, plans production onboarding early, and runs rehearsed backfills and bulk operations with audit and undo.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the team's integration template (adapter, logging, masking, fixtures, webhook inbox), negotiates API and file contracts with the client's other vendors, and reviews others' bulk-data designs.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> for one integration you built, can you show where the provider's field
+        names stop, what happens when the same webhook arrives twice and out of order, and the log line that shows what was
+        sent last Tuesday, with the phone number masked? For one import, can you upload the same file twice and show the row
+        count doesn't change?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Trusting webhooks alone</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A deploy during a delivery burst, or a provider outage, drops events silently. Without a reconcile job, the invoice status is wrong until a customer complains.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Testing imports with the file the agent generated</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A clean UTF-8 CSV proves nothing. The client's file has a BOM, merged header cells, phone numbers without the leading zero and dates as serial numbers.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Running a bulk change straight in production</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One wrong <code class="inline">WHERE</code>, no count, no audit, no undo. Small systems rarely die from traffic; they get hurt by a well-meant bulk update.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Ship a template file with every import</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A downloadable <code class="inline">.xlsx</code> with text-formatted code and phone columns, an example row and the date format written in the header prevents half the errors.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write an integration sheet per provider</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One page: environments and who owns the credentials, quotas, webhook events and retries, support contact, sandbox differences you found. The next developer starts in an hour, not a week.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ One job table, one progress UI</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Imports, exports, bulk updates and backfills share the same shape: status, progress, result link, errors. Build it once and every slow feature gets a receipt for free.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="adapter"> <span>Built or reviewed one provider adapter: no provider field names outside it, unknown statuses fail loudly, and tests run on recorded, masked fixtures.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="webhook-in"> <span>Wrote a webhook receiver test that sends a bad signature (401), the same event twice (one row, one job) and an older event after a newer one (state unchanged).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="field-owner"> <span>Wrote a field-ownership table for one sync and had it confirmed by your lead or the client.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="async-export"> <span>Turned one slow export into a 202 + status resource with progress and a signed link that expires, or into a streamed download with a BOM and a formula guard.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="import-pr"> <span class="font-semibold">Opened a PR adding a CSV/Excel patient import to a practice or real project: upload to storage, a background job, per-row validation with a downloadable errors.csv, a dry-run preview, upsert by a tenant-scoped key, and batch inserts. The description includes the results for a file with a BOM, Excel serial dates and a duplicate code, and proof that uploading the same file twice leaves the row count unchanged (mentor evidence ✓)</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://www.standardwebhooks.com/" target="_blank" rel="noopener">Standard Webhooks — Specification</a> — the signing scheme and headers used in Part II for sending webhooks.</li>
+        <li><a class="text-coral underline" href="https://docs.stripe.com/webhooks" target="_blank" rel="noopener">Stripe — Receive webhook events</a> — a well-documented receiver: raw-body signatures, quick 2xx, duplicates and ordering.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/sql-copy.html" target="_blank" rel="noopener">PostgreSQL — COPY</a> · <a class="text-coral underline" href="https://www.postgresql.org/docs/current/sql-insert.html" target="_blank" rel="noopener">INSERT … ON CONFLICT</a> — bulk loading and upserts from Part III.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/populate.html" target="_blank" rel="noopener">PostgreSQL — Populating a Database</a> — why batching and COPY beat row-by-row inserts.</li>
+        <li><a class="text-coral underline" href="https://google.aip.dev/151" target="_blank" rel="noopener">Google AIP-151 — Long-running operations</a> — the operation-resource pattern behind 202 and status polling.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html" target="_blank" rel="noopener">AWS — Sharing objects with presigned URLs</a> — signed, expiring download links for exports.</li>
+        <li><a class="text-coral underline" href="https://owasp.org/www-community/attacks/CSV_Injection" target="_blank" rel="noopener">OWASP — CSV Injection</a> — the formula-injection risk in exported spreadsheets.</li>
+        <li><a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/normalize" target="_blank" rel="noopener">MDN — String.prototype.normalize()</a> — NFC vs NFD, the root of "same name, no match" in Vietnamese text.</li>
+      </ul>

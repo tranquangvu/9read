@@ -95,6 +95,12 @@ this one wins for `intern/`.
 | Sessions vs JWT, OAuth/OIDC, RBAC/ABAC, IDOR, OWASP Top 10, secrets | SD9 |
 | Timeouts, retries/backoff, circuit breaker, rate limiting, idempotency keys, horizontal scaling, read replicas, observability basics | SD10 |
 | End-to-end system design walk-throughs combining SD1–SD10 | SD11 |
+| Soft delete, audit trail, JSONB, hierarchies, multi-tenancy models and isolation | SD12 |
+| Postgres full-text / trigram search, search engines, reporting, materialized views, OLTP vs OLAP | SD13 |
+| Money types, payment gateways and state machine, webhooks, reconciliation, ledger | SD14 |
+| Third-party API integration, webhooks in and out, data sync, bulk import/export, long-running operations | SD15 |
+| Realtime transport and scaling, time zones and scheduling, geo search | SD16 |
+| PII and data protection law, retention and deletion, field encryption, feature flags and config | SD17 |
 | REST design, validation, errors, OpenAPI | BE1 |
 | Unit and integration tests | QA1 |
 | Playwright and Playwright MCP | QA2 |
