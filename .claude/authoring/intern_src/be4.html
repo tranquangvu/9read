@@ -49,7 +49,7 @@
         use the same class for the database row and the API response. The layout below separates the four things
         that change for different reasons: HTTP (routers), API shapes (schemas), storage (models) and rules
         (services). Where business logic should live, in any framework, is covered in
-        <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>.
+        <a href="./sd2.html" class="text-viol underline decoration-viol/40">SD2</a>.
       </p>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
         <svg viewBox="0 0 700 418" class="w-full min-w-[620px]" role="img" aria-label="FastAPI project structure map">
@@ -141,6 +141,54 @@ fastapi run app/main.py          <span class="cm"># production mode, no reload (
         <code class="inline">async def</code> plus a sync session or a sync HTTP client.
       </p>
 
+      <h3 class="font-semibold text-lg mt-8">When a blocking call is unavoidable</h3>
+      <ul class="mt-2 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>The whole endpoint blocks</strong> (boto3, a PDF library): make it a plain <code class="inline">def</code>. It runs in the thread pool, 40 threads by default, shared with every sync endpoint and dependency.</li>
+        <li><strong>One blocking call inside async code:</strong> <code class="inline">await run_in_threadpool(fn, *args)</code> or <code class="inline">await anyio.to_thread.run_sync(fn, *args)</code> moves just that call off the event loop.</li>
+        <li><strong>CPU-heavy work</strong> (rendering an invoice, resizing photos): a Celery task. Threads barely help CPU-bound code on standard CPython because of the GIL.</li>
+        <li><strong>Never</strong> call it directly in <code class="inline">async def</code>: every request on that worker waits.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Organising a larger app: one router per feature</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each feature (bookings, doctors, admin) gets its own <code class="inline">APIRouter</code> module, and
+        <code class="inline">main.py</code> only wires them together. Put shared rules on the router, not on each endpoint:
+        <code class="inline">dependencies=[...]</code> on a router or on <code class="inline">include_router</code> runs for every
+        route in it, so nobody can add an unprotected admin endpoint by forgetting a parameter. Grouping by feature
+        folder (<code class="inline">app/bookings/router.py</code>, <code class="inline">service.py</code>) is equally fine.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/main.py — wiring</span>
+        <pre class="code">app = FastAPI(title=<span class="st">"Clinic API"</span>, lifespan=lifespan, generate_unique_id_function=route_id)
+api = APIRouter(prefix=<span class="st">"/api/v1"</span>)
+api.include_router(bookings.router)                          <span class="cm"># its own prefix="/bookings", tags=["bookings"]</span>
+api.include_router(admin.router, prefix=<span class="st">"/admin"</span>, tags=[<span class="st">"admin"</span>],
+                   dependencies=[Depends(require_role(Role.admin))])   <span class="cm"># every admin route, even future ones</span>
+app.include_router(api)
+app.include_router(health.router)                            <span class="cm"># no /api/v1 prefix, no auth (Part IV)</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Project tooling: uv, Ruff, a type checker, pip-audit</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most new Python projects use <strong>uv</strong> for packages (<code class="inline">pyproject.toml</code> plus a
+        <code class="inline">uv.lock</code> lockfile; vetting dependencies: <a href="./co5.html" class="text-viol underline decoration-viol/40">CO5</a>),
+        <strong>Ruff</strong> to lint and format (it replaces flake8, isort and black), and mypy or pyright to check the same
+        hints FastAPI reads.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — the daily loop</span>
+        <pre class="code">uv add <span class="st">"fastapi[standard]"</span> <span class="st">"sqlalchemy[asyncio]"</span> asyncpg alembic pydantic-settings
+uv add --dev pytest ruff mypy pip-audit
+uv run fastapi dev app/main.py          <span class="cm"># runs in the project's .venv, no activate step</span>
+uv sync --locked                        <span class="cm"># CI and Docker: install exactly uv.lock, fail if it's stale</span>
+uv run ruff check --fix . &amp;&amp; uv run ruff format . &amp;&amp; uv run mypy app
+uv run pip-audit                        <span class="cm"># known vulnerabilities in the installed packages</span>
+
+<span class="cm"># pyproject.toml → [tool.ruff.lint] select = ["E", "F", "I", "B", "ASYNC", "S", "FAST"]</span>
+<span class="cm">#   ASYNC flags blocking calls in async def · S = bandit security checks · FAST = FastAPI rules</span>
+<span class="cm">#   (some rule groups start in preview: check the Ruff docs for your version)</span></pre>
+      </div>
+
       <!-- ═══════════════ PART II ═══════════════ -->
       <div class="kicker text-viol mt-14">Part II · The request lifecycle</div>
       <h2 class="font-display text-2xl font-bold mt-2">Dependencies run first, and the signature is the contract</h2>
@@ -218,6 +266,46 @@ sequenceDiagram
     status: str</pre>
       </div>
 
+      <h3 class="font-semibold text-lg mt-8">Pydantic v2: validators, and a third schema for PATCH</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">Field</code> constraints cover most rules. When a rule needs code, <code class="inline">field_validator</code>
+        checks one field and <code class="inline">model_validator(mode="after")</code> checks fields against each other.
+        Reusable constraints go in an <code class="inline">Annotated</code> alias. For PATCH, add a third schema with every
+        field optional, and apply only the fields the client sent.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/schemas/booking.py — continued</span>
+        <pre class="code">Note = Annotated[str, StringConstraints(strip_whitespace=<span class="kw">True</span>, max_length=<span class="st">500</span>)]
+
+<span class="kw">class</span> <span class="fn">BookingUpdate</span>(BaseModel):                       <span class="cm"># Create / Update / Out: three shapes</span>
+    model_config = ConfigDict(extra=<span class="st">"forbid"</span>)
+    note: Note | <span class="kw">None</span> = <span class="kw">None</span>
+    contact_phone: str | <span class="kw">None</span> = <span class="kw">None</span>
+
+    <span class="kw">@field_validator</span>(<span class="st">"contact_phone"</span>)
+    <span class="kw">@classmethod</span>
+    <span class="kw">def</span> <span class="fn">normalise_phone</span>(cls, v: str | <span class="kw">None</span>) -&gt; str | <span class="kw">None</span>:
+        v = v.replace(<span class="st">" "</span>, <span class="st">""</span>) <span class="kw">if</span> v <span class="kw">is not None else None</span>   <span class="cm"># normalise, then check</span>
+        <span class="kw">if</span> v <span class="kw">is not None and not</span> re.fullmatch(<span class="st">r"\+\d{8,15}"</span>, v):
+            <span class="kw">raise</span> ValueError(<span class="st">"use international format, e.g. +84…"</span>)   <span class="cm"># → 422 with this message</span>
+        <span class="kw">return</span> v
+
+    <span class="kw">@model_validator</span>(mode=<span class="st">"after"</span>)
+    <span class="kw">def</span> <span class="fn">not_empty</span>(self) -&gt; Self:
+        <span class="kw">if not</span> self.model_fields_set:                     <span class="cm"># fields the client actually sent</span>
+            <span class="kw">raise</span> ValueError(<span class="st">"send at least one field"</span>)
+        <span class="kw">return</span> self
+
+<span class="cm"># in the service: apply only what was sent, so omitted fields aren't overwritten with None</span>
+<span class="kw">for</span> field, value <span class="kw">in</span> body.model_dump(exclude_unset=<span class="kw">True</span>).items():
+    setattr(booking, field, value)</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">exclude_unset</code> separates "didn't mention the note" from <code class="inline">"note": null</code>
+        ("clear it"). Its output-side cousin, <code class="inline">response_model_exclude_unset=True</code>, trims unset fields
+        from responses; it changes little for ORM objects read with <code class="inline">from_attributes</code>.
+      </p>
+
       <h3 class="font-semibold text-lg mt-8">Dependency injection with Depends</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         A dependency is any function whose parameters FastAPI can resolve. FastAPI calls it for each request and
@@ -267,7 +355,128 @@ PatientDep = Annotated[Patient, Depends(current_patient)]</pre>
         The service raises a domain error (<code class="inline">SlotTaken</code>) and the router translates it to HTTP.
         That keeps the service usable from a Celery task or a script, where "409" means nothing. For a token
         scheme, choosing JWT or sessions and doing ownership checks, see
-        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Authentication: a chain of small dependencies</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">current_patient</code> above hid <code class="inline">decode_token</code>. Here is what belongs in it.
+        <code class="inline">OAuth2PasswordBearer</code> (or <code class="inline">HTTPBearer</code>) only <em>reads</em> the token
+        from the <code class="inline">Authorization</code> header and returns 401 if it is missing. It verifies nothing.
+        Verification is your code, usually with <strong>PyJWT</strong> (what the current FastAPI docs use); what to verify
+        is in <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>. Each step is a dependency the next builds on.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/deps.py — auth</span>
+        <pre class="code">oauth2_scheme = OAuth2PasswordBearer(tokenUrl=<span class="st">"/api/v1/auth/token"</span>)   <span class="cm"># reads the header, nothing more</span>
+
+<span class="kw">def</span> <span class="fn">decode_token</span>(token: Annotated[str, Depends(oauth2_scheme)], settings: SettingsDep) -&gt; Claims:
+    <span class="kw">try</span>:
+        payload = jwt.decode(token, settings.jwt_secret.get_secret_value(),
+                             algorithms=[<span class="st">"HS256"</span>],   <span class="cm"># pin it: never trust the token's own "alg"</span>
+                             audience=<span class="st">"clinic-api"</span>, options={<span class="st">"require"</span>: [<span class="st">"exp"</span>, <span class="st">"sub"</span>]})
+    <span class="kw">except</span> jwt.InvalidTokenError:                 <span class="cm"># expired, bad signature, wrong audience…</span>
+        <span class="kw">raise</span> HTTPException(<span class="st">401</span>, headers={<span class="st">"WWW-Authenticate"</span>: <span class="st">"Bearer"</span>})
+    <span class="kw">return</span> Claims.model_validate(payload)         <span class="cm"># typed claims, not a raw dict</span>
+
+<span class="kw">async def</span> <span class="fn">current_user</span>(claims: Annotated[Claims, Depends(decode_token)], session: SessionDep) -&gt; User:
+    user = <span class="kw">await</span> session.get(User, int(claims.sub))
+    <span class="kw">if</span> user <span class="kw">is None or not</span> user.is_active:        <span class="cm"># valid token, disabled account: still 401</span>
+        <span class="kw">raise</span> HTTPException(<span class="st">401</span>)
+    <span class="kw">return</span> user
+
+UserDep = Annotated[User, Depends(current_user)]   <span class="cm"># current_patient now depends on this one</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        With an external identity provider, use <code class="inline">HTTPBearer</code> (token in <code class="inline">.credentials</code>)
+        and PyJWT's <code class="inline">PyJWKClient</code> to fetch and cache the provider's RS256 signing keys.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Authorization: roles in dependencies, ownership in the service</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        There are two different checks. A <strong>role</strong> check ("only clinic staff see the day's schedule") doesn't
+        depend on which row, so it is a dependency, ideally attached to the whole router. An <strong>ownership</strong>
+        check ("this booking is yours") depends on the row, so it lives in the service query, like
+        <code class="inline">get_for_patient</code> above, and returns 404 rather than 403 so ids don't leak (the IDOR
+        story is in <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/deps.py — roles</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">require_role</span>(*roles: Role):
+    <span class="kw">async def</span> <span class="fn">check</span>(user: UserDep) -&gt; User:
+        <span class="kw">if</span> user.role <span class="kw">not in</span> roles:
+            <span class="kw">raise</span> HTTPException(<span class="st">403</span>)                 <span class="cm"># authenticated, but not allowed</span>
+        <span class="kw">return</span> user
+    <span class="kw">return</span> check                                     <span class="cm"># a dependency factory</span>
+
+StaffDep = Annotated[User, Depends(require_role(Role.receptionist, Role.doctor))]
+<span class="cm"># day_schedule(clinic_id, user: StaffDep, …) still filters by user.clinic_ids in the query</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Security scopes</strong> (<code class="inline">Security(current_user, scopes=["bookings:write"])</code>, read via
+        <code class="inline">SecurityScopes</code>) suit tokens that carry OAuth scopes, like a partner integration. Most client apps need only roles.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Errors as problem details, in one place</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Catching <code class="inline">SlotTaken</code> in each router rots by the twentieth endpoint. Instead, domain
+        exceptions carry a status and type, and one handler turns them into RFC 9457 problem details
+        (<a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>). Override the default 422 handler too, or
+        validation errors keep FastAPI's <code class="inline">{"detail": [...]}</code> shape.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/errors.py</span>
+        <pre class="code"><span class="kw">class</span> <span class="fn">DomainError</span>(Exception):                          <span class="cm"># services raise these; no FastAPI import</span>
+    status, type, title = <span class="st">400</span>, <span class="st">"about:blank"</span>, <span class="st">"Bad request"</span>
+<span class="kw">class</span> <span class="fn">SlotTaken</span>(DomainError):
+    status, type, title = <span class="st">409</span>, <span class="st">"https://api.clinic.example/problems/slot-taken"</span>, <span class="st">"Slot already booked"</span>
+
+<span class="kw">def</span> <span class="fn">problem</span>(request: Request, status: int, type_: str, title: str, **extra) -&gt; JSONResponse:
+    body = {<span class="st">"type"</span>: type_, <span class="st">"title"</span>: title, <span class="st">"status"</span>: status, <span class="st">"instance"</span>: request.url.path, **extra}
+    <span class="kw">return</span> JSONResponse(body, status_code=status, media_type=<span class="st">"application/problem+json"</span>)
+
+<span class="kw">def</span> <span class="fn">register</span>(app: FastAPI) -&gt; <span class="kw">None</span>:
+    <span class="kw">@app.exception_handler</span>(DomainError)
+    <span class="kw">async def</span> <span class="fn">domain</span>(request: Request, exc: DomainError):
+        <span class="kw">return</span> problem(request, exc.status, exc.type, exc.title)
+    <span class="kw">@app.exception_handler</span>(RequestValidationError)
+    <span class="kw">async def</span> <span class="fn">invalid</span>(request: Request, exc: RequestValidationError):
+        errors = [{<span class="st">"field"</span>: <span class="st">"."</span>.join(map(str, e[<span class="st">"loc"</span>][<span class="st">1</span>:])), <span class="st">"message"</span>: e[<span class="st">"msg"</span>]} <span class="kw">for</span> e <span class="kw">in</span> exc.errors()]
+        <span class="kw">return</span> problem(request, <span class="st">422</span>, <span class="st">"https://api.clinic.example/problems/validation"</span>,
+                       <span class="st">"Invalid request"</span>, errors=errors)</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Call <code class="inline">errors.register(app)</code> in <code class="inline">main.py</code>. Unknown-URL 404s come from Starlette, so also
+        handle <code class="inline">starlette.exceptions.HTTPException</code>; a catch-all 500 handler logs the traceback and never returns <code class="inline">str(exc)</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Middleware: request id, timing and a tight CORS policy</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Middleware wraps every request, even ones that fail validation or match no route, so it suits concerns that
+        apply everywhere and need no dependencies. The <em>last-added</em> middleware runs first.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/main.py — middleware</span>
+        <pre class="code"><span class="kw">@app.middleware</span>(<span class="st">"http"</span>)
+<span class="kw">async def</span> <span class="fn">request_context</span>(request: Request, call_next):
+    rid = request.headers.get(<span class="st">"X-Request-ID"</span>, <span class="st">""</span>)[:<span class="st">64</span>] <span class="kw">or</span> uuid4().hex   <span class="cm"># reuse the proxy's id, capped</span>
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(request_id=rid)    <span class="cm"># every log line in this request carries it</span>
+    start = time.perf_counter()
+    response = <span class="kw">await</span> call_next(request)
+    response.headers[<span class="st">"X-Request-ID"</span>] = rid
+    log.info(<span class="st">"request"</span>, method=request.method, status=response.status_code,
+             ms=round((time.perf_counter() - start) * <span class="st">1000</span>))
+    <span class="kw">return</span> response
+
+app.add_middleware(CORSMiddleware,
+    allow_origins=settings.cors_origins,           <span class="cm"># ["https://app.clinic.example"], per environment</span>
+    allow_credentials=<span class="kw">True</span>,                        <span class="cm"># only with explicit origins, never with ["*"]</span>
+    allow_methods=[<span class="st">"GET"</span>, <span class="st">"POST"</span>, <span class="st">"PATCH"</span>, <span class="st">"DELETE"</span>], allow_headers=[<span class="st">"Authorization"</span>, <span class="st">"Content-Type"</span>])</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        CORS is a browser rule, not API security (curl ignores it), but a loose policy lets any website call your API
+        from a logged-in user's browser. For hot paths, pure ASGI middleware (or asgi-correlation-id) is lighter.
       </p>
 
       <!-- ═══════════════ PART III ═══════════════ -->
@@ -471,6 +680,64 @@ SELECT doctors.* FROM doctors WHERE doctors.id IN ($1, … )</span></pre>
 SettingsDep = Annotated[Settings, Depends(get_settings)]   <span class="cm"># overridable in tests, like any dependency</span></pre>
       </div>
 
+      <h3 class="font-semibold text-lg mt-8">Lifespan: open shared clients once, close them cleanly</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The engine, a Redis pool and an <code class="inline">httpx.AsyncClient</code> are expensive and meant to be shared:
+        create them once per process in the <strong>lifespan</strong> and close them on shutdown. The older
+        <code class="inline">@app.on_event("startup")</code> hooks are deprecated; if an agent writes them, ask for a lifespan.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/main.py — lifespan</span>
+        <pre class="code"><span class="kw">@asynccontextmanager</span>
+<span class="kw">async def</span> <span class="fn">lifespan</span>(app: FastAPI):
+    s = get_settings()                                         <span class="cm"># fails fast if config is missing</span>
+    app.state.engine = create_async_engine(str(s.database_url), pool_size=<span class="st">10</span>, pool_pre_ping=<span class="kw">True</span>)
+    app.state.redis = Redis.from_url(str(s.redis_url), decode_responses=<span class="kw">True</span>)   <span class="cm"># redis.asyncio</span>
+    app.state.http = httpx.AsyncClient(timeout=<span class="st">5.0</span>)             <span class="cm"># always a timeout (SD10)</span>
+    <span class="kw">yield</span>                                                      <span class="cm"># the app serves requests here</span>
+    <span class="kw">await</span> app.state.http.aclose()
+    <span class="kw">await</span> app.state.redis.aclose()
+    <span class="kw">await</span> app.state.engine.dispose()                           <span class="cm"># returns pooled connections</span>
+<span class="cm"># RedisDep = Annotated[Redis, Depends(get_redis)], where get_redis returns request.app.state.redis</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        It runs <strong>once per worker process</strong>: <code class="inline">--workers 4</code> × (pool 10 + overflow 10) is up to
+        80 Postgres connections per container, times replicas (pooling: <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>).
+        <code class="inline">ASGITransport</code> in tests skips the lifespan; use the asgi-lifespan package when a test needs it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Caching and rate limiting with Redis</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Cache-aside (<a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>) is a few lines in the service
+        with <code class="inline">redis.asyncio</code>, part of the <code class="inline">redis</code> package (aioredis was merged
+        into it). Free slots are read constantly and change on a booking: cache for a minute, delete after commit.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/services/availability.py</span>
+        <pre class="code">SlotList = TypeAdapter(list[SlotOut])
+
+<span class="kw">async def</span> <span class="fn">free_slots</span>(session: AsyncSession, redis: Redis, doctor_id: int, day: date) -&gt; list[SlotOut]:
+    key = <span class="st">f"v1:free_slots:{doctor_id}:{day.isoformat()}"</span>      <span class="cm"># v1: change the shape, get new keys</span>
+    <span class="kw">if</span> (hit := <span class="kw">await</span> redis.get(key)) <span class="kw">is not None</span>:
+        <span class="kw">return</span> SlotList.validate_json(hit)
+    rows = <span class="kw">await</span> slots.free_for_doctor(session, doctor_id, day)
+    result = [SlotOut.model_validate(r) <span class="kw">for</span> r <span class="kw">in</span> rows]
+    <span class="kw">await</span> redis.set(key, SlotList.dump_json(result), ex=<span class="st">60</span>)    <span class="cm"># always a TTL</span>
+    <span class="kw">return</span> result
+
+<span class="cm"># in bookings.create, AFTER session.commit() succeeds:</span>
+<span class="cm">#   await redis.delete(f"v1:free_slots:{slot.doctor_id}:{slot.starts_at.date().isoformat()}")</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        fastapi-cache2's <code class="inline">@cache</code> decorator caches whole responses; check it is maintained and that
+        personal data is keyed by user. Rate limits (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>) by scope:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Global per-IP limit:</strong> at the edge (API gateway, load balancer, WAF). Config, not code.</li>
+        <li><strong>Per route:</strong> slowapi's <code class="inline">@limiter.limit("5/minute")</code> with Redis storage. The route must take <code class="inline">request: Request</code>, and behind a proxy the key is the proxy's IP unless forwarded headers are trusted. It is lightly maintained, so check its status (fastapi-limiter is an alternative).</li>
+        <li><strong>Business limits</strong> ("5 OTP texts per phone per hour"): your own dependency doing <code class="inline">INCR</code> + <code class="inline">EXPIRE</code>, keyed by user or phone.</li>
+      </ul>
+
       <h3 class="font-semibold text-lg mt-8">Background work: BackgroundTasks vs Celery</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         <code class="inline">BackgroundTasks</code> runs a function in the same process <em>after</em> the response is sent.
@@ -479,7 +746,7 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]   <span class="cm"># ov
         waiting for needs a real queue. <strong>Celery</strong> with Redis or RabbitMQ is the standard choice. ARQ, a
         smaller asyncio queue, is now in maintenance-only mode, so check before choosing it for a new project.
         Queue design, retries and idempotent consumers are covered in
-        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
+        <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>.
       </p>
       <div class="mt-4">
         <span class="code-label">app/worker.py — a Celery task</span>
@@ -502,6 +769,146 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]   <span class="cm"># ov
         <strong>Enqueue only after the commit succeeds.</strong> If the agent calls <code class="inline">.delay()</code> before
         <code class="inline">session.commit()</code>, a fast worker can run before the row exists, or the commit can fail and
         the patient still gets an SMS for a booking that was never saved. The order is: commit, then enqueue the id.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Scheduled jobs: exactly one thing runs them</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Reminders at 7:00 and unpaid-booking cleanup every 15 minutes (the design is in
+        <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>). The FastAPI trap: anything started in the
+        lifespan runs in <strong>every worker</strong>, so APScheduler with <code class="inline">--workers 4</code> on 3 replicas sends each reminder 12 times.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">Use when</th><th class="px-4 py-3">Duplicate-run risk</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Celery beat</td><td class="px-4 py-3">You already run Celery. The default here</td><td class="px-4 py-3">Run exactly one beat process: two beats enqueue everything twice</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">External cron</td><td class="px-4 py-3">No Celery. A Kubernetes CronJob, ECS scheduled task or EventBridge Scheduler runs <code class="inline">python -m app.jobs.send_reminders</code></td><td class="px-4 py-3">Low, but a slow run can overlap the next one. Forbid concurrency or take a lock</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">APScheduler in-process</td><td class="px-4 py-3">A single-process deployment, such as an internal tool</td><td class="px-4 py-3">High: one copy per worker and per replica unless you add a Redis lock (<code class="inline">SET NX EX</code>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Whatever runs it, make the job idempotent (a lock or a <code class="inline">reminder_sent_at</code> column), and set
+        <code class="inline">celery_app.conf.timezone</code> explicitly: Celery's default is UTC, so "7:00" is 14:00 in Hanoi.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Email: a provider SDK inside a job</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Use a provider's SDK (Amazon SES from <a href="./op5.html" class="text-viol underline decoration-viol/40">OP5</a>, Postmark,
+        Resend, SendGrid) inside a Celery task shaped like <code class="inline">send_booking_confirmation</code>: pass the id,
+        render the Jinja2 template from fresh data, record <code class="inline">sent_at</code> so retries don't resend.
+        <code class="inline">BackgroundTasks</code> is for losable mail only. Tests override the email client with a fake.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">File uploads: check the bytes, not the label</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">UploadFile</code> (needs python-multipart, included in <code class="inline">fastapi[standard]</code>) is a
+        spooled file whose <code class="inline">filename</code> and <code class="inline">content_type</code> the client chose: trust
+        neither. The body arrives before your code runs, so the hard size limit belongs at the proxy (nginx
+        <code class="inline">client_max_body_size</code>). For big files, return a presigned S3 upload URL instead
+        (client side: <a href="./fe4.html" class="text-viol underline decoration-viol/40">FE4</a>), and serve files through
+        short-lived presigned download URLs from a private bucket.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/api/attachments.py</span>
+        <pre class="code">ALLOWED = {<span class="st">"application/pdf"</span>: <span class="st">"pdf"</span>, <span class="st">"image/jpeg"</span>: <span class="st">"jpg"</span>, <span class="st">"image/png"</span>: <span class="st">"png"</span>}
+MAX_BYTES = <span class="st">10</span> * <span class="st">1024</span> * <span class="st">1024</span>
+
+<span class="kw">@router.post</span>(<span class="st">"/{booking_id}/attachments"</span>, status_code=<span class="st">201</span>, response_model=AttachmentOut)
+<span class="kw">async def</span> <span class="fn">upload_attachment</span>(booking_id: int, file: UploadFile, patient: PatientDep,
+                            session: SessionDep, s3: S3Dep):
+    <span class="kw">if await</span> bookings.get_for_patient(session, booking_id, patient.id) <span class="kw">is None</span>:
+        <span class="kw">raise</span> HTTPException(<span class="st">404</span>)                     <span class="cm"># ownership before anything else</span>
+    <span class="kw">if</span> file.size <span class="kw">is None or</span> file.size &gt; MAX_BYTES:
+        <span class="kw">raise</span> HTTPException(<span class="st">413</span>)
+    kind = filetype.guess(<span class="kw">await</span> file.read(<span class="st">2048</span>))       <span class="cm"># sniff the magic bytes</span>
+    <span class="kw">if</span> kind <span class="kw">is None or</span> kind.mime <span class="kw">not in</span> ALLOWED:
+        <span class="kw">raise</span> HTTPException(<span class="st">415</span>)                     <span class="cm"># file.content_type is whatever the client said</span>
+    <span class="kw">await</span> file.seek(<span class="st">0</span>)
+    key = <span class="st">f"attachments/{booking_id}/{uuid4()}.{ALLOWED[kind.mime]}"</span>   <span class="cm"># never the client's filename</span>
+    <span class="kw">await</span> run_in_threadpool(s3.upload_fileobj, file.file, BUCKET, key)   <span class="cm"># boto3 is sync</span>
+    <span class="kw">return await</span> attachments.create(session, booking_id=booking_id, s3_key=key)</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Realtime: WebSockets, auth and Redis pub/sub</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The reception screen shows the waiting-room queue live. Four things differ from HTTP routes. Browsers can't set
+        <code class="inline">Authorization</code> on a WebSocket, so use a cookie or a single-use, short-lived query ticket
+        (query strings reach access logs). Reject with close code 1008 or <code class="inline">WebSocketException</code>, not
+        <code class="inline">HTTPException</code>. A <code class="inline">yield</code> dependency like <code class="inline">SessionDep</code>
+        stays open for the whole connection. And a socket lives in one worker, so other workers reach it only through a
+        shared channel such as Redis pub/sub. For server-to-client only, Server-Sent Events are simpler (check the current docs).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/api/realtime.py</span>
+        <pre class="code"><span class="kw">@router.websocket</span>(<span class="st">"/ws/clinics/{clinic_id}/queue"</span>)
+<span class="kw">async def</span> <span class="fn">queue_feed</span>(ws: WebSocket, clinic_id: int, redis: RedisDep):
+    <span class="kw">async with</span> SessionFactory() <span class="kw">as</span> session:              <span class="cm"># short session, not SessionDep</span>
+        user = <span class="kw">await</span> user_from_ticket(session, redis, ws.query_params.get(<span class="st">"ticket"</span>))
+    <span class="kw">if</span> user <span class="kw">is None or</span> clinic_id <span class="kw">not in</span> user.clinic_ids:
+        <span class="kw">await</span> ws.close(code=status.WS_1008_POLICY_VIOLATION)   <span class="cm"># authz, like any route</span>
+        <span class="kw">return</span>
+    <span class="kw">await</span> ws.accept()
+    pubsub = redis.pubsub()
+    <span class="kw">await</span> pubsub.subscribe(<span class="st">f"clinic:{clinic_id}:queue"</span>)     <span class="cm"># any worker can publish here</span>
+    <span class="kw">try</span>:
+        <span class="kw">async for</span> msg <span class="kw">in</span> pubsub.listen():
+            <span class="kw">if</span> msg[<span class="st">"type"</span>] == <span class="st">"message"</span>:
+                <span class="kw">await</span> ws.send_text(msg[<span class="st">"data"</span>])
+    <span class="kw">except</span> WebSocketDisconnect:
+        <span class="kw">pass</span>
+    <span class="kw">finally</span>:
+        <span class="kw">await</span> pubsub.aclose()                               <span class="cm"># or leak a Redis connection per tab</span>
+
+<span class="cm"># publisher, after commit: await redis.publish(f"clinic:{clinic_id}:queue", event.model_dump_json())</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">OpenAPI: a contract clients can generate from</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        FastAPI writes the spec (why it matters: <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>). Make it
+        good enough for the web and mobile teams to generate typed clients (openapi-typescript or hey-api, openapi-generator
+        for Flutter): readable operation ids, documented errors, no internal routes, and a committed <code class="inline">openapi.json</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/main.py + CI</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">route_id</span>(route: APIRoute) -&gt; str:                 <span class="cm"># every router has tags</span>
+    <span class="kw">return</span> <span class="st">f"{route.tags[0]}-{route.name}"</span>                 <span class="cm"># "bookings-create_booking", not "create_booking_api_v1_bookings_post"</span>
+
+app = FastAPI(generate_unique_id_function=route_id,
+              docs_url=<span class="st">"/docs"</span> <span class="kw">if</span> settings.env != <span class="st">"prod"</span> <span class="kw">else None</span>)   <span class="cm"># public docs are a decision</span>
+<span class="kw">@router.post</span>(<span class="st">""</span>, response_model=BookingOut, status_code=<span class="st">201</span>,
+             responses={<span class="st">409</span>: {<span class="st">"model"</span>: Problem, <span class="st">"description"</span>: <span class="st">"Slot already booked"</span>}})
+<span class="kw">@router.post</span>(<span class="st">"/internal/reindex"</span>, include_in_schema=<span class="kw">False</span>)   <span class="cm"># hidden from docs, NOT protected</span>
+
+<span class="cm"># CI: regenerate the spec and fail if the committed copy is stale</span>
+uv run python -c <span class="st">"import json; from app.main import app; print(json.dumps(app.openapi(), indent=2))"</span> &gt; openapi.json
+git diff --exit-code openapi.json</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Logging and health checks</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Log JSON lines carrying the request id the middleware bound (what to log: <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>),
+        with structlog or std <code class="inline">logging</code> plus a JSON formatter, configured once at startup with uvicorn's
+        loggers routed through it. <strong>Liveness</strong> must not touch the database, or a DB blip restarts every
+        container; <strong>readiness</strong> checks dependencies so the load balancer skips a broken instance.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">app/observability.py + app/api/health.py</span>
+        <pre class="code">structlog.configure(processors=[structlog.contextvars.merge_contextvars,   <span class="cm"># adds request_id</span>
+    structlog.processors.TimeStamper(fmt=<span class="st">"iso"</span>), structlog.processors.JSONRenderer()])
+log.info(<span class="st">"booking.created"</span>, booking_id=b.id, slot_id=b.slot_id)   <span class="cm"># ids, never names or phone numbers</span>
+
+router = APIRouter(prefix=<span class="st">"/health"</span>, tags=[<span class="st">"health"</span>], include_in_schema=<span class="kw">False</span>)
+
+<span class="kw">@router.get</span>(<span class="st">"/live"</span>)
+<span class="kw">async def</span> <span class="fn">live</span>() -&gt; dict[str, str]:
+    <span class="kw">return</span> {<span class="st">"status"</span>: <span class="st">"ok"</span>}                              <span class="cm"># no DB call on purpose</span>
+<span class="kw">@router.get</span>(<span class="st">"/ready"</span>)
+<span class="kw">async def</span> <span class="fn">ready</span>(session: SessionDep, redis: RedisDep) -&gt; dict[str, str]:
+    <span class="kw">await</span> session.execute(text(<span class="st">"SELECT 1"</span>))              <span class="cm"># raises → 500 → out of rotation</span>
+    <span class="kw">await</span> redis.ping()
+    <span class="kw">return</span> {<span class="st">"status"</span>: <span class="st">"ok"</span>}</pre>
       </div>
 
       <h3 class="font-semibold text-lg mt-8">Deploying: one image, two processes</h3>
@@ -535,7 +942,8 @@ flowchart LR
 <span class="kw">COPY</span> alembic.ini .
 <span class="kw">USER</span> nobody                                            <span class="cm"># don't run as root</span>
 <span class="kw">CMD</span> ["fastapi", "run", "app/main.py", "--port", "8000", "--proxy-headers"]
-<span class="cm"># worker: docker run … clinic-api celery -A app.worker worker --loglevel=info</span></pre>
+<span class="cm"># worker: docker run … clinic-api celery -A app.worker worker --loglevel=info</span>
+<span class="cm"># beat:   the same image, exactly one container: celery -A app.worker beat</span></pre>
       </div>
 
       <!-- ═══════════════ Claude Code ═══════════════ -->
@@ -588,11 +996,12 @@ server defaults. Then run upgrade/downgrade/upgrade and paste the output.</pre>
             <li>Every line of each migration's <code class="inline">upgrade()</code> and <code class="inline">downgrade()</code></li>
             <li>Session lifetime: one per request, passed down, never global</li>
             <li>Durable work goes to Celery, not <code class="inline">BackgroundTasks</code></li>
+            <li>Every non-public router has an auth dependency, and every row lookup is scoped to its owner</li>
           </ul>
         </div>
       </div>
       <div class="mt-4 callout callout-warn">
-        <strong>Red flags in agent-written FastAPI:</strong> <code class="inline">requests.get</code> or a sync session inside <code class="inline">async def</code> · <code class="inline">body: dict</code> instead of a model · no <code class="inline">response_model</code> on an endpoint that returns an ORM object · one Pydantic class used for both input and output · <code class="inline">session.query()</code> (1.x style) in new code · a global <code class="inline">session = Session()</code> · <code class="inline">BackgroundTasks</code> for payments or messages · <code class="inline">except Exception: pass</code> · <code class="inline">os.environ["X"]</code> read inside services · an Alembic file that drops a column you meant to rename.
+        <strong>Red flags in agent-written FastAPI:</strong> <code class="inline">requests.get</code> or a sync session inside <code class="inline">async def</code> · <code class="inline">body: dict</code> instead of a model · no <code class="inline">response_model</code> on an endpoint that returns an ORM object · one Pydantic class used for both input and output · <code class="inline">session.query()</code> (1.x style) in new code · a global <code class="inline">session = Session()</code> · <code class="inline">BackgroundTasks</code> for payments or messages · <code class="inline">except Exception: pass</code> · <code class="inline">os.environ["X"]</code> read inside services · an Alembic file that drops a column you meant to rename · <code class="inline">jwt.decode</code> without <code class="inline">algorithms=</code>, or with signature verification turned off · <code class="inline">allow_origins=["*"]</code> next to <code class="inline">allow_credentials=True</code> · a scheduler started in the lifespan of an app that runs with <code class="inline">--workers</code> · an upload trusted by its <code class="inline">content_type</code> or saved under the client's filename.
       </div>
 
       <h3 class="font-semibold text-lg mt-8">Cross-stack concept map</h3>
@@ -621,6 +1030,17 @@ server defaults. Then run upgrade/downgrade/upgrade and paste the output.</pre>
             <tr><td class="px-4 py-3 font-semibold">HTTP-level tests</td><td class="px-4 py-3">Integration / request tests</td><td class="px-4 py-3">Vitest or Jest + supertest</td><td class="px-4 py-3">pytest + <code class="inline">TestClient</code> / httpx</td><td class="px-4 py-3"><code class="inline">httptest</code> + <code class="inline">ServeHTTP</code></td></tr>
             <tr><td class="px-4 py-3 font-semibold">Background jobs</td><td class="px-4 py-3">Active Job + Solid Queue or Sidekiq</td><td class="px-4 py-3">BullMQ (Redis)</td><td class="px-4 py-3"><code class="inline">BackgroundTasks</code>, then Celery</td><td class="px-4 py-3">Goroutine, then asynq (Redis)</td></tr>
             <tr><td class="px-4 py-3 font-semibold">Config &amp; secrets</td><td class="px-4 py-3">Credentials + ENV</td><td class="px-4 py-3"><code class="inline">ConfigModule</code></td><td class="px-4 py-3">pydantic-settings</td><td class="px-4 py-3">Env vars into a config struct</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Authorization</td><td class="px-4 py-3">Pundit or Action Policy</td><td class="px-4 py-3">Guards (+ CASL for rules)</td><td class="px-4 py-3"><code class="inline">require_role</code> dependency + owner-scoped queries; <code class="inline">Security</code> scopes</td><td class="px-4 py-3">Middleware on a group + checks in the handler (Casbin for rules)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">OpenAPI generation</td><td class="px-4 py-3">rswag (from request specs)</td><td class="px-4 py-3"><code class="inline">@nestjs/swagger</code></td><td class="px-4 py-3">Built in: <code class="inline">app.openapi()</code>, <code class="inline">/docs</code></td><td class="px-4 py-3">swaggo/swag comments, or spec-first with oapi-codegen</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Response shaping</td><td class="px-4 py-3">Serializers (Alba, Blueprinter, Jbuilder)</td><td class="px-4 py-3">Response DTOs + <code class="inline">ClassSerializerInterceptor</code></td><td class="px-4 py-3"><code class="inline">response_model</code> / return type</td><td class="px-4 py-3">Response structs with <code class="inline">json:</code> tags</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rate limit · CORS</td><td class="px-4 py-3">Rack::Attack · rack-cors</td><td class="px-4 py-3"><code class="inline">@nestjs/throttler</code> · <code class="inline">app.enableCors()</code></td><td class="px-4 py-3">slowapi or a Redis counter · <code class="inline">CORSMiddleware</code></td><td class="px-4 py-3">ulule/limiter · gin-contrib/cors</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cache</td><td class="px-4 py-3"><code class="inline">Rails.cache</code> (Solid Cache or Redis)</td><td class="px-4 py-3"><code class="inline">@nestjs/cache-manager</code></td><td class="px-4 py-3"><code class="inline">redis.asyncio</code> (fastapi-cache2)</td><td class="px-4 py-3">go-redis</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scheduled jobs</td><td class="px-4 py-3">Solid Queue recurring tasks or sidekiq-cron</td><td class="px-4 py-3"><code class="inline">@nestjs/schedule</code> or BullMQ repeatable jobs</td><td class="px-4 py-3">Celery beat (or external cron)</td><td class="px-4 py-3">asynq scheduler or robfig/cron</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">File upload</td><td class="px-4 py-3">Active Storage</td><td class="px-4 py-3"><code class="inline">FileInterceptor</code> (Multer)</td><td class="px-4 py-3"><code class="inline">UploadFile</code> or presigned S3 URLs</td><td class="px-4 py-3"><code class="inline">c.FormFile()</code> or presigned URLs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Email</td><td class="px-4 py-3">Action Mailer + <code class="inline">deliver_later</code></td><td class="px-4 py-3">Provider SDK or Nodemailer in a BullMQ job</td><td class="px-4 py-3">Provider SDK in a Celery task</td><td class="px-4 py-3">Provider SDK in an asynq task</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Realtime</td><td class="px-4 py-3">Action Cable</td><td class="px-4 py-3"><code class="inline">@WebSocketGateway()</code> (Socket.IO or ws)</td><td class="px-4 py-3"><code class="inline">@router.websocket</code> + Redis pub/sub</td><td class="px-4 py-3">gorilla/websocket or coder/websocket</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Logging · health</td><td class="px-4 py-3">Lograge · <code class="inline">/up</code></td><td class="px-4 py-3">nestjs-pino · <code class="inline">@nestjs/terminus</code></td><td class="px-4 py-3">structlog · <code class="inline">/health/live</code> and <code class="inline">/health/ready</code></td><td class="px-4 py-3"><code class="inline">log/slog</code> · a <code class="inline">/healthz</code> handler</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lint · security scan</td><td class="px-4 py-3">RuboCop · Brakeman · bundler-audit</td><td class="px-4 py-3">ESLint · <code class="inline">npm audit</code></td><td class="px-4 py-3">Ruff + mypy · pip-audit</td><td class="px-4 py-3">golangci-lint · govulncheck</td></tr>
           </tbody>
         </table>
       </div>
@@ -664,8 +1084,8 @@ server defaults. Then run upgrade/downgrade/upgrade and paste the output.</pre>
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Every accidental lazy load becomes a test failure you fix with a loader option, instead of an N+1 you find in production.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Read /docs as a review tool</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The generated OpenAPI page shows every input and output field. Unexpected fields there are unexpected fields in your API.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Commit openapi.json and diff it</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The generated spec shows every input and output field. With a committed copy checked in CI, an unexpected field or a renamed operation shows up in the PR diff instead of breaking the mobile app.</p>
         </div>
       </div>
 
@@ -687,5 +1107,6 @@ server defaults. Then run upgrade/downgrade/upgrade and paste the output.</pre>
         <li><a class="text-coral underline" href="https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html" target="_blank" rel="noopener">SQLAlchemy — Relationship loading techniques</a> · <a class="text-coral underline" href="https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html" target="_blank" rel="noopener">asyncio</a> — loaders, <code class="inline">lazy="raise"</code> and async sessions.</li>
         <li><a class="text-coral underline" href="https://alembic.sqlalchemy.org/en/latest/autogenerate.html" target="_blank" rel="noopener">Alembic — Auto generating migrations</a> — exactly what autogenerate can and can't detect.</li>
         <li><a class="text-coral underline" href="https://fastapi.tiangolo.com/advanced/async-tests/" target="_blank" rel="noopener">FastAPI — Async tests</a> · <a class="text-coral underline" href="https://fastapi.tiangolo.com/advanced/settings/" target="_blank" rel="noopener">Settings</a> — httpx testing and pydantic-settings.</li>
+        <li><a class="text-coral underline" href="https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/" target="_blank" rel="noopener">FastAPI — OAuth2 with JWT</a> · <a class="text-coral underline" href="https://fastapi.tiangolo.com/tutorial/handling-errors/" target="_blank" rel="noopener">Handling Errors</a> · <a class="text-coral underline" href="https://fastapi.tiangolo.com/advanced/events/" target="_blank" rel="noopener">Lifespan Events</a> · <a class="text-coral underline" href="https://docs.astral.sh/ruff/" target="_blank" rel="noopener">Ruff</a> — auth dependencies, exception handlers, startup and shutdown, and linting.</li>
         <li><a class="text-coral underline" href="https://fastapi.tiangolo.com/tutorial/background-tasks/" target="_blank" rel="noopener">FastAPI — Background Tasks</a> · <a class="text-coral underline" href="https://docs.celeryq.dev/en/stable/getting-started/introduction.html" target="_blank" rel="noopener">Celery</a> — the in-process option and the real queue.</li>
       </ul>

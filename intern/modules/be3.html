@@ -40,7 +40,7 @@ tailwind.config = {
     <div class="px-5 py-5 border-b border-line dark:border-linedark">
       <a href="../index.html" class="block">
         <div class="font-display text-lg font-bold leading-tight">AI-Native Developer</div>
-        <div class="text-xs text-mute dark:text-mutedark mt-0.5">12-week Internship Program</div>
+        <div class="text-xs text-mute dark:text-mutedark mt-0.5">9-week Internship Program</div>
       </a>
     </div>
     <nav id="module-nav" class="flex-1 overflow-y-auto px-2 py-3"></nav>
@@ -172,7 +172,7 @@ tailwind.config = {
         needs in its constructor, register it as a provider in a module, and the container builds one instance
         (a singleton by default) and passes it in. That is what makes a service easy to test: the test module
         swaps the real dependency for a fake. The general idea of DI versus singletons is in
-        <a href="./sd5.html" class="text-viol underline decoration-viol/40">SD5</a>.
+        <a href="./sd4.html" class="text-viol underline decoration-viol/40">SD4</a>.
       </p>
       <div class="mt-4">
         <span class="code-label">src/bookings/bookings.module.ts</span>
@@ -197,6 +197,41 @@ nest g filter common/filters/prisma-exception</pre>
         means a module forgot to import the module that exports the provider. The fix is the import, not
         <code class="inline">forwardRef</code> and not a second copy of the provider in another module.
       </p>
+
+      <h3 class="font-semibold text-lg mt-8">Dynamic modules and provider scopes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Library modules need settings, so they expose static methods that return a configured module. By convention
+        <code class="inline">forRoot</code> configures a library once for the whole app, <code class="inline">forFeature</code>
+        or <code class="inline">register</code> adds per-module pieces, and the <code class="inline">…Async</code> variants
+        let you build the settings from injected providers such as <code class="inline">ConfigService</code>. Use the
+        async form whenever a secret is involved: it runs after config has been validated.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">src/auth/auth.module.ts — registerAsync</span>
+        <pre class="code">JwtModule.registerAsync({
+  global: <span class="kw">true</span>,
+  inject: [ConfigService],                  <span class="cm">// resolved by the container first</span>
+  useFactory: (config: ConfigService) =&gt; ({
+    secret: config.getOrThrow&lt;string&gt;(<span class="st">'JWT_SECRET'</span>),
+    signOptions: { expiresIn: <span class="st">'15m'</span> },     <span class="cm">// short-lived access tokens</span>
+  }),
+}),
+<span class="cm">// ✗ JwtModule.register({ secret: process.env.JWT_SECRET }) — read at import time, may be undefined</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Providers are singletons by default. You can change that, but the cost is easy to miss:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Scope</th><th class="px-4 py-3">Instances</th><th class="px-4 py-3">Verdict</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">DEFAULT</code></td><td class="px-4 py-3">One for the whole app</td><td class="px-4 py-3">Use it for almost everything. Keep services stateless: no per-request data in fields.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">REQUEST</code></td><td class="px-4 py-3">A new one per request</td><td class="px-4 py-3">Rarely worth it. The scope <strong>bubbles up</strong>: every provider and controller that injects it also becomes per-request, which costs throughput. For request context (user, request id) use AsyncLocalStorage, for example <code class="inline">nestjs-cls</code>.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">TRANSIENT</code></td><td class="px-4 py-3">A new one per consumer</td><td class="px-4 py-3">For helpers that hold consumer-specific state, such as a logger with a context name</td></tr>
+          </tbody>
+        </table>
+      </div>
 
       <!-- ═══════════════ PART II ═══════════════ -->
       <div class="kicker text-viol mt-14">Part II · The request lifecycle</div>
@@ -250,7 +285,7 @@ sequenceDiagram
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
         These stages are the chain-of-responsibility and decorator patterns that
-        <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a> describes, packaged by the framework.
+        <a href="./sd5.html" class="text-viol underline decoration-viol/40">SD5</a> describes, packaged by the framework.
       </p>
 
       <h3 class="font-semibold text-lg mt-8">DTOs and the ValidationPipe</h3>
@@ -289,7 +324,7 @@ sequenceDiagram
         The controller stays thin: read the validated DTO and the authenticated user, call the service, return the
         result. A guard applied at controller level protects every route in it. An exception filter maps a
         database error to a clean 409 in one place. Choosing JWT versus sessions, and doing ownership checks
-        properly, is covered in <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
+        properly, is covered in <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
       </p>
       <div class="mt-4">
         <span class="code-label">src/bookings/bookings.controller.ts</span>
@@ -328,6 +363,169 @@ sequenceDiagram
         <code class="inline">createParamDecorator</code>. It reads the user that the guard attached to the request.
         Check that it exists and is used: an agent that can't find it will sometimes read
         <code class="inline">patientId</code> from the body instead.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Authentication: one global guard, explicit @Public()</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A class-level <code class="inline">@UseGuards</code> works until someone adds a new controller and forgets it.
+        The safer default on a growing API is <strong>deny by default</strong>: register the auth guard globally with
+        <code class="inline">APP_GUARD</code> and mark the few open routes (login, health, a public doctor list) with a
+        <code class="inline">@Public()</code> decorator. <code class="inline">@nestjs/jwt</code> verifies the token.
+        Passport (<code class="inline">@nestjs/passport</code>) is optional; you'll see it on older projects and where
+        several strategies (JWT, Google, API keys) coexist. Token design itself is in
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">src/common/guards/jwt-auth.guard.ts</span>
+        <pre class="code"><span class="kw">export const</span> Public = () =&gt; SetMetadata(IS_PUBLIC_KEY, <span class="kw">true</span>);
+
+<span class="kw">@Injectable</span>()
+<span class="kw">export class</span> <span class="fn">JwtAuthGuard</span> <span class="kw">implements</span> CanActivate {
+  <span class="kw">constructor</span>(<span class="kw">private</span> jwt: JwtService, <span class="kw">private</span> reflector: Reflector) {}
+
+  <span class="kw">async</span> <span class="fn">canActivate</span>(ctx: ExecutionContext) {
+    <span class="kw">const</span> isPublic = <span class="kw">this</span>.reflector.getAllAndOverride&lt;boolean&gt;(IS_PUBLIC_KEY,
+      [ctx.getHandler(), ctx.getClass()]);        <span class="cm">// method metadata wins over class</span>
+    <span class="kw">if</span> (isPublic) <span class="kw">return true</span>;
+    <span class="kw">const</span> req = ctx.switchToHttp().getRequest();
+    <span class="kw">const</span> token = req.headers.authorization?.replace(<span class="st">/^Bearer /</span>, <span class="st">''</span>);
+    <span class="kw">if</span> (!token) <span class="kw">throw new</span> UnauthorizedException();
+    <span class="kw">try</span> { req.user = <span class="kw">await this</span>.jwt.verifyAsync(token); }   <span class="cm">// checks signature and exp</span>
+    <span class="kw">catch</span> { <span class="kw">throw new</span> UnauthorizedException(); }
+    <span class="kw">return true</span>;
+  }
+}
+<span class="cm">// app.module.ts: providers: [{ provide: APP_GUARD, useClass: JwtAuthGuard }]</span>
+
+<span class="kw">export const</span> CurrentUser = createParamDecorator(
+  (_: unknown, ctx: ExecutionContext) =&gt; ctx.switchToHttp().getRequest().user <span class="kw">as</span> AuthUser);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Review rule: grep for <code class="inline">@Public()</code> in every PR. Each one is a deliberate hole in the
+        wall and deserves a comment saying why.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Authorization: roles in a guard, ownership in the service</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Two different questions, answered in two different places. "Is this user a doctor?" only needs the token, so
+        a <code class="inline">RolesGuard</code> can answer it before the handler runs. "Is this <em>their</em>
+        booking?" needs the row, so it belongs in the service query, where it can't be forgotten on one code path.
+        The models (RBAC, ABAC, ownership) and IDOR are explained in
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">src/common/guards/roles.guard.ts and the service check</span>
+        <pre class="code"><span class="kw">export const</span> Roles = Reflector.createDecorator&lt;Role[]&gt;();
+
+<span class="kw">@Injectable</span>()
+<span class="kw">export class</span> <span class="fn">RolesGuard</span> <span class="kw">implements</span> CanActivate {
+  <span class="kw">constructor</span>(<span class="kw">private</span> reflector: Reflector) {}
+  <span class="fn">canActivate</span>(ctx: ExecutionContext) {
+    <span class="kw">const</span> roles = <span class="kw">this</span>.reflector.getAllAndOverride(Roles, [ctx.getHandler(), ctx.getClass()]);
+    <span class="kw">if</span> (!roles) <span class="kw">return true</span>;                  <span class="cm">// no @Roles: authentication is enough</span>
+    <span class="kw">return</span> roles.includes(ctx.switchToHttp().getRequest().user.role);  <span class="cm">// false → 403</span>
+  }
+}
+<span class="cm">// controller: @Roles(['doctor']) @Get('today') …   register RolesGuard AFTER JwtAuthGuard</span>
+
+<span class="cm">// service: ownership lives in the WHERE clause, not in an if after the fetch</span>
+<span class="kw">const</span> b = <span class="kw">await this</span>.prisma.booking.findFirst({ where: { id, patientId } });
+<span class="kw">if</span> (!b) <span class="kw">throw new</span> NotFoundException();         <span class="cm">// 404, not 403: don't confirm it exists</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Global guards run in the order they are registered, so the auth guard must come first or
+        <code class="inline">req.user</code> is undefined. When rules become conditional ("a receptionist may cancel
+        any booking at their own clinic"), projects often move to <strong>CASL</strong>, which expresses abilities as
+        data and can turn them into query conditions. Don't reach for it on day one.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Response shaping and interceptors</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Whatever the controller returns is serialized as JSON, every field of it. There are two ways to control that.
+        <strong>Explicit response DTOs</strong> (or a Prisma <code class="inline">select</code>, Part III) build exactly
+        the shape you promise. <strong>class-transformer</strong> uses <code class="inline">@Exclude()</code> /
+        <code class="inline">@Expose()</code> on a class plus the global <code class="inline">ClassSerializerInterceptor</code>.
+        The catch: the interceptor only acts on <em>class instances</em>. Prisma returns plain objects, so
+        <code class="inline">@Exclude()</code> on an entity does nothing unless you wrap the result.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">src/patients/patient.entity.ts and a timing interceptor</span>
+        <pre class="code"><span class="kw">export class</span> <span class="fn">PatientEntity</span> {
+  id!: number; name!: string;
+  <span class="kw">@Exclude</span>() passwordHash!: string;          <span class="cm">// dropped from JSON…</span>
+  <span class="kw">constructor</span>(p: Partial&lt;PatientEntity&gt;) { Object.assign(<span class="kw">this</span>, p); }
+}
+<span class="kw">return new</span> PatientEntity(patient);           <span class="cm">// …only because it is an instance now</span>
+
+<span class="kw">@Injectable</span>()
+<span class="kw">export class</span> <span class="fn">TimingInterceptor</span> <span class="kw">implements</span> NestInterceptor {
+  <span class="kw">private</span> log = <span class="kw">new</span> Logger(<span class="st">'HTTP'</span>);
+  <span class="fn">intercept</span>(ctx: ExecutionContext, next: CallHandler) {
+    <span class="kw">const</span> start = Date.now();
+    <span class="kw">return</span> next.handle().pipe(                <span class="cm">// RxJS: runs after the handler returns</span>
+      tap(() =&gt; <span class="kw">this</span>.log.log(<span class="st">`${ctx.getHandler().name} ${Date.now() - start}ms`</span>)));
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Interceptors are right for concerns that wrap <em>every</em> handler the same way: timing, a response
+        envelope, a timeout. They are wrong for business logic or for anything a reader of the controller needs to
+        know about, because it is invisible at the call site. If an agent adds an interceptor for one route, ask
+        whether a plain function call in the service would be clearer.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">OpenAPI from the code with @nestjs/swagger</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        NestJS is code-first: <code class="inline">@nestjs/swagger</code> reads your controllers and DTOs and emits an
+        OpenAPI document. Whether the contract should be written first, and what belongs in it, is
+        <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>'s topic. The practical point here:
+        turn on the <strong>CLI plugin</strong>, which reads your TypeScript types and adds the
+        <code class="inline">@ApiProperty()</code> metadata for you (it looks at files named
+        <code class="inline">*.dto.ts</code> and <code class="inline">*.entity.ts</code>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">src/main.ts — docs, and nest-cli.json</span>
+        <pre class="code"><span class="kw">const</span> config = <span class="kw">new</span> DocumentBuilder()
+  .setTitle(<span class="st">'Clinic API'</span>).setVersion(<span class="st">'1.0'</span>).addBearerAuth().build();
+SwaggerModule.setup(<span class="st">'docs'</span>, app, () =&gt; SwaggerModule.createDocument(app, config));
+<span class="cm">// serves /docs (UI) and /docs-json (the spec); consider hiding it in production</span>
+
+<span class="cm">// nest-cli.json</span>
+{ <span class="st">"compilerOptions"</span>: { <span class="st">"plugins"</span>: [<span class="st">"@nestjs/swagger"</span>] } }
+<span class="cm">// still add by hand: @ApiResponse({ status: 409 }) for error cases, @ApiBearerAuth() on controllers</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Verify it: open <code class="inline">/docs</code>, and check that each endpoint lists its real error statuses.
+        A spec that only shows 200 and 201 is the default output, not a contract. Many teams commit the generated
+        JSON and diff it in CI so an accidental breaking change shows up in review.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">main.ts hardening: throttling, CORS, versioning, shutdown</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A handful of one-liners in bootstrap and <code class="inline">AppModule</code> separate a demo from a service
+        you can put on the internet. Why rate limits exist and where to apply them is in
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">src/main.ts and src/app.module.ts — the production switches</span>
+        <pre class="code"><span class="cm">// app.module.ts</span>
+ThrottlerModule.forRoot([{ ttl: <span class="st">60_000</span>, limit: <span class="st">100</span> }]),   <span class="cm">// ttl in ms (v5+)</span>
+{ provide: APP_GUARD, useClass: ThrottlerGuard },
+<span class="cm">// on login: @Throttle({ default: { limit: 5, ttl: 60_000 } })   on /health: @SkipThrottle()</span>
+
+<span class="cm">// main.ts</span>
+<span class="kw">const</span> app = <span class="kw">await</span> NestFactory.create&lt;NestExpressApplication&gt;(AppModule, { bufferLogs: <span class="kw">true</span> });
+app.set(<span class="st">'trust proxy'</span>, <span class="st">1</span>);                  <span class="cm">// behind a load balancer, or every user shares one IP</span>
+app.enableCors({ origin: [<span class="st">'https://app.clinic.example'</span>], credentials: <span class="kw">true</span> }); <span class="cm">// never origin: '*' with cookies</span>
+app.enableVersioning({ type: VersioningType.URI, defaultVersion: <span class="st">'1'</span> });   <span class="cm">// /v1/bookings</span>
+app.enableShutdownHooks();                     <span class="cm">// SIGTERM → onModuleDestroy: close DB, finish jobs</span>
+<span class="kw">await</span> app.listen(config.getOrThrow(<span class="st">'PORT'</span>));</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The throttler stores counters in memory by default, so with three API replicas a client gets three times the
+        limit. For a real limit across instances, plug in a Redis storage (community packages exist; check the
+        current docs) or enforce it at the gateway. Without <code class="inline">enableShutdownHooks()</code>, a deploy
+        kills in-flight requests and jobs mid-way.
       </p>
 
       <!-- ═══════════════ PART III ═══════════════ -->
@@ -426,7 +624,7 @@ sequenceDiagram
         call to <code class="inline">this.prisma.booking.create</code> or to another service that uses its own injected
         client silently runs outside the transaction and won't roll back. When a transaction spans services, pass
         <code class="inline">tx</code> in explicitly, or use a transaction-aware helper your project has agreed on
-        (the unit-of-work idea in <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>).
+        (the unit-of-work idea in <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>).
       </div>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
@@ -442,6 +640,37 @@ sequenceDiagram
           </tbody>
         </table>
       </div>
+
+      <h3 class="font-semibold text-lg mt-8">Caching reads with CacheModule</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">@nestjs/cache-manager</code> wraps cache-manager, which (from v6) stores data through Keyv,
+        so a Redis store is <code class="inline">@keyv/redis</code>. TTLs are in milliseconds. When to cache, how long
+        and how to invalidate are <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>'s
+        questions; here is the NestJS shape. Check the current docs for the store setup, which has changed across
+        major versions.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">src/doctors/doctors.service.ts — manual cache-aside</span>
+        <pre class="code"><span class="cm">// app.module.ts: CacheModule.registerAsync({ isGlobal: true, inject: [ConfigService],</span>
+<span class="cm">//   useFactory: (c) =&gt; ({ stores: [new KeyvRedis(c.getOrThrow('REDIS_URL'))] }) })</span>
+<span class="kw">constructor</span>(<span class="kw">@Inject</span>(CACHE_MANAGER) <span class="kw">private</span> cache: Cache, <span class="kw">private</span> prisma: PrismaService) {}
+
+<span class="kw">async</span> <span class="fn">openSlots</span>(doctorId: number, day: string) {
+  <span class="kw">const</span> key = <span class="st">`slots:v1:${doctorId}:${day}`</span>;       <span class="cm">// no user data in this value</span>
+  <span class="kw">const</span> hit = <span class="kw">await this</span>.cache.get&lt;SlotView[]&gt;(key);
+  <span class="kw">if</span> (hit) <span class="kw">return</span> hit;
+  <span class="kw">const</span> slots = <span class="kw">await this</span>.prisma.slot.findMany({ where: { doctorId, day,
+    bookings: { none: { status: <span class="st">'booked'</span> } } } });   <span class="cm">// free slots only</span>
+  <span class="kw">await this</span>.cache.set(key, slots, <span class="st">30_000</span>);        <span class="cm">// 30 s; delete the key after a booking commits</span>
+  <span class="kw">return</span> slots;
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">CacheInterceptor</code> is the shortcut: put it on a controller and every GET is cached by
+        URL. That key has no user in it, so on an authenticated route like <code class="inline">GET /me/bookings</code>
+        the second patient receives the first patient's bookings. Use the interceptor only for truly public responses;
+        use the manual form, with keys you designed, for everything else.
+      </p>
 
       <!-- ═══════════════ PART IV ═══════════════ -->
       <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Tests, config, jobs &amp; deploy</div>
@@ -528,7 +757,7 @@ ConfigModule.forRoot({
         queue and adds jobs. A consumer is a class decorated with <code class="inline">@Processor</code> that extends
         <code class="inline">WorkerHost</code>. Retries are a job option, and a job with the default settings is tried
         only once. Retry strategy, dead letters and idempotent consumers are covered in
-        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
+        <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>.
       </p>
       <div class="mt-4">
         <span class="code-label">src/notifications/booking-confirmation.processor.ts</span>
@@ -555,6 +784,115 @@ ConfigModule.forRoot({
         added twice. Processors can run inside the API process, but in production it is usually better to run them
         in a separate worker process started with <code class="inline">NestFactory.createApplicationContext</code>, which
         boots your modules without an HTTP server.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Scheduled jobs, email and in-process events</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Three more ways to run code "not in this request", each with a trap. Pick by asking two questions: must it
+        survive a crash, and how many copies of the app are running?
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tool</th><th class="px-4 py-3">Good for</th><th class="px-4 py-3">The trap</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">@nestjs/schedule</code> <code class="inline">@Cron()</code></td><td class="px-4 py-3">Local housekeeping on a single instance</td><td class="px-4 py-3">Runs in <strong>every</strong> replica: three API pods send the 7 a.m. reminders three times</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">BullMQ job scheduler (repeatable job)</td><td class="px-4 py-3">Anything periodic in a multi-instance app</td><td class="px-4 py-3">Stored in Redis, so exactly one job per tick; still make it idempotent (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">@nestjs/event-emitter</code> <code class="inline">@OnEvent()</code></td><td class="px-4 py-3">Decoupling modules inside one process ("booking.created" → audit, analytics)</td><td class="px-4 py-3">In memory: lost on crash, and fired before commit if emitted inside <code class="inline">$transaction</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">BullMQ job</td><td class="px-4 py-3">Email, SMS, webhooks: anything that must happen and may fail</td><td class="px-4 py-3">Enqueue after commit, pass ids only (above)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">src/reminders/reminders.scheduler.ts — one run per tick, cluster-wide</span>
+        <pre class="code"><span class="kw">@Injectable</span>()
+<span class="kw">export class</span> <span class="fn">RemindersScheduler</span> <span class="kw">implements</span> OnApplicationBootstrap {
+  <span class="kw">constructor</span>(<span class="kw">@InjectQueue</span>(<span class="st">'notifications'</span>) <span class="kw">private</span> queue: Queue) {}
+  <span class="kw">async</span> <span class="fn">onApplicationBootstrap</span>() {
+    <span class="cm">// upsert: every replica calls this, Redis keeps ONE schedule (BullMQ 5.16+; older: repeat option)</span>
+    <span class="kw">await this</span>.queue.upsertJobScheduler(<span class="st">'daily-reminders'</span>,
+      { pattern: <span class="st">'0 7 * * *'</span>, tz: <span class="st">'Asia/Ho_Chi_Minh'</span> },
+      { name: <span class="st">'send-reminders'</span> });
+  }
+}
+<span class="cm">// ✗ @Cron('0 7 * * *') async sendReminders() { … }   in the API module, with 3 replicas</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Email</strong> follows the same rule. Wrap the provider (SES, Resend, SendGrid, or SMTP via
+        nodemailer) in one <code class="inline">MailService</code> with methods such as
+        <code class="inline">sendBookingConfirmation(booking)</code>, and call it only from a processor, never from the
+        request. The request enqueues; the worker renders the template, sends, and retries. Tests then override one
+        provider, and switching vendor touches one file.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">File uploads and WebSocket gateways</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        For small files (a referral letter PDF), <code class="inline">FileInterceptor</code> (multer, Express only) plus a
+        <code class="inline">ParseFilePipe</code> is fine. Recent versions of <code class="inline">FileTypeValidator</code>
+        check the file's magic bytes rather than trusting the client's MIME type; confirm on your version. For large
+        files or images, skip your server entirely with a presigned URL to S3
+        (<a href="./fe4.html" class="text-viol underline decoration-viol/40">FE4</a> covers the client side).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">upload route and a gateway, side by side</span>
+        <pre class="code"><span class="kw">@Post</span>(<span class="st">':id/attachments'</span>) <span class="kw">@UseInterceptors</span>(FileInterceptor(<span class="st">'file'</span>))
+<span class="fn">upload</span>(<span class="kw">@Param</span>(<span class="st">'id'</span>, ParseIntPipe) id: number, <span class="kw">@CurrentUser</span>() user: AuthUser,
+  <span class="kw">@UploadedFile</span>(<span class="kw">new</span> ParseFilePipe({ validators: [
+    <span class="kw">new</span> MaxFileSizeValidator({ maxSize: <span class="st">5 * 1024 * 1024</span> }),     <span class="cm">// 5 MB; fails with 400</span>
+    <span class="kw">new</span> FileTypeValidator({ fileType: <span class="st">'application/pdf'</span> }) ] })) file: Express.Multer.File) {
+  <span class="kw">return this</span>.bookings.attach(id, user.patientId, file);     <span class="cm">// ownership checked in the service</span>
+}
+
+<span class="kw">@WebSocketGateway</span>({ namespace: <span class="st">'schedule'</span>, cors: { origin: [<span class="st">'https://app.clinic.example'</span>] } })
+<span class="kw">export class</span> <span class="fn">ScheduleGateway</span> <span class="kw">implements</span> OnGatewayConnection {
+  <span class="kw">@WebSocketServer</span>() server!: Server;
+  <span class="kw">async</span> <span class="fn">handleConnection</span>(client: Socket) {
+    <span class="kw">const</span> user = <span class="kw">await this</span>.auth.verify(client.handshake.auth?.token).catch(() =&gt; <span class="kw">null</span>);
+    <span class="kw">if</span> (!user) <span class="kw">return</span> client.disconnect();         <span class="cm">// guards don't run on connect</span>
+    client.join(<span class="st">`doctor:${user.doctorId}`</span>);            <span class="cm">// a room per doctor</span>
+  }
+  <span class="fn">slotChanged</span>(doctorId: number) { <span class="kw">this</span>.server.to(<span class="st">`doctor:${doctorId}`</span>).emit(<span class="st">'slots.changed'</span>); }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two gateway facts agents miss. Guards on a gateway protect <em>messages</em>, not the connection, so
+        authenticate in <code class="inline">handleConnection</code>. And with more than one API instance, an emit only
+        reaches sockets on that instance until you add the Socket.IO Redis adapter. Emit "something changed" and let
+        the client refetch, rather than pushing full records.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Logs, health checks and lint gates</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The built-in <code class="inline">Logger</code> (<code class="inline">new Logger(BookingsService.name)</code>) is
+        fine locally, and NestJS 11+ can print JSON with <code class="inline">new ConsoleLogger({ json: true })</code>.
+        Most production projects use <strong>nestjs-pino</strong>: one JSON line per request with a request id,
+        redacted headers, and the same logger injected everywhere. <code class="inline">@nestjs/terminus</code> gives you
+        health endpoints. What to log and what liveness versus readiness mean is in
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">src/app.module.ts and src/health/health.controller.ts</span>
+        <pre class="code">LoggerModule.forRoot({ pinoHttp: {
+  genReqId: (req) =&gt; req.headers[<span class="st">'x-request-id'</span>] ?? randomUUID(),
+  redact: [<span class="st">'req.headers.authorization'</span>, <span class="st">'req.headers.cookie'</span>],   <span class="cm">// no tokens in logs</span>
+}}),
+<span class="cm">// main.ts: app.useLogger(app.get(Logger))  — with bufferLogs: true so boot logs aren't lost</span>
+
+<span class="kw">@Public</span>() <span class="kw">@SkipThrottle</span>() <span class="kw">@Controller</span>(<span class="st">'health'</span>)
+<span class="kw">export class</span> <span class="fn">HealthController</span> {
+  <span class="kw">constructor</span>(<span class="kw">private</span> health: HealthCheckService, <span class="kw">private</span> db: PrismaHealthIndicator,
+              <span class="kw">private</span> prisma: PrismaService) {}
+  <span class="kw">@Get</span>(<span class="st">'live'</span>) <span class="fn">live</span>() { <span class="kw">return</span> { ok: <span class="kw">true</span> }; }         <span class="cm">// process up: no dependencies</span>
+  <span class="kw">@Get</span>(<span class="st">'ready'</span>) <span class="kw">@HealthCheck</span>()
+  <span class="fn">ready</span>() { <span class="kw">return this</span>.health.check([() =&gt; <span class="kw">this</span>.db.pingCheck(<span class="st">'db'</span>, <span class="kw">this</span>.prisma)]); } <span class="cm">// 503 if down</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Gate every PR on lint and dependencies. ESLint with typescript-eslint's type-aware rules (or oxlint on new
+        NestJS 12 projects) catches the async bug agents write most in Nest: a missing <code class="inline">await</code>,
+        flagged by <code class="inline">no-floating-promises</code>. Add <code class="inline">npm audit --omit=dev</code>
+        in CI and turn on Dependabot. Vetting dependencies is in
+        <a href="./co5.html" class="text-viol underline decoration-viol/40">CO5</a>.
       </p>
 
       <h3 class="font-semibold text-lg mt-8">Deploying: one image, two commands</h3>
@@ -645,11 +983,12 @@ and count the queries. If the count grows with the rows, fix it with select/incl
             <li>The SQL in each new <code class="inline">prisma/migrations</code> file</li>
             <li>That every call inside <code class="inline">$transaction</code> uses <code class="inline">tx</code></li>
             <li>Job options: attempts, backoff, and an idempotent processor</li>
+            <li>Every <code class="inline">@Public()</code>, and that no response contains <code class="inline">passwordHash</code> or other private fields</li>
           </ul>
         </div>
       </div>
       <div class="mt-4 callout callout-warn">
-        <strong>Red flags in agent-written NestJS:</strong> <code class="inline">forwardRef</code> added to fix a startup error · a DTO property with no validator, or a DTO declared as an <code class="inline">interface</code> (interfaces don't exist at runtime, so nothing is validated) · <code class="inline">patientId</code> read from <code class="inline">@Body()</code> · <code class="inline">this.prisma</code> used inside a <code class="inline">$transaction</code> callback · <code class="inline">synchronize: true</code> in a TypeORM config · <code class="inline">any</code> types on request data · <code class="inline">process.env.X</code> read inside services · a <code class="inline">try/catch</code> that logs and returns <code class="inline">null</code>.
+        <strong>Red flags in agent-written NestJS:</strong> <code class="inline">forwardRef</code> added to fix a startup error · a DTO property with no validator, or a DTO declared as an <code class="inline">interface</code> (interfaces don't exist at runtime, so nothing is validated) · <code class="inline">patientId</code> read from <code class="inline">@Body()</code> · <code class="inline">this.prisma</code> used inside a <code class="inline">$transaction</code> callback · <code class="inline">synchronize: true</code> in a TypeORM config · <code class="inline">any</code> types on request data · <code class="inline">process.env.X</code> read inside services · a <code class="inline">try/catch</code> that logs and returns <code class="inline">null</code> · <code class="inline">CacheInterceptor</code> on a route that returns the current user's data · <code class="inline">@Cron()</code> in the API process of an app with several replicas · <code class="inline">Scope.REQUEST</code> added to a widely injected provider to "get the user".
       </div>
 
       <h3 class="font-semibold text-lg mt-8">Cross-stack concept map</h3>
@@ -678,6 +1017,17 @@ and count the queries. If the count grows with the rows, fix it with select/incl
             <tr><td class="px-4 py-3 font-semibold">HTTP-level tests</td><td class="px-4 py-3">Integration / request tests</td><td class="px-4 py-3">Vitest or Jest + supertest</td><td class="px-4 py-3">pytest + <code class="inline">TestClient</code> / httpx</td><td class="px-4 py-3"><code class="inline">httptest</code> + <code class="inline">ServeHTTP</code></td></tr>
             <tr><td class="px-4 py-3 font-semibold">Background jobs</td><td class="px-4 py-3">Active Job + Solid Queue or Sidekiq</td><td class="px-4 py-3">BullMQ (Redis)</td><td class="px-4 py-3"><code class="inline">BackgroundTasks</code>, then Celery</td><td class="px-4 py-3">Goroutine, then asynq (Redis)</td></tr>
             <tr><td class="px-4 py-3 font-semibold">Config &amp; secrets</td><td class="px-4 py-3">Credentials + ENV</td><td class="px-4 py-3"><code class="inline">ConfigModule</code></td><td class="px-4 py-3">pydantic-settings</td><td class="px-4 py-3">Env vars into a config struct</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Authorization</td><td class="px-4 py-3"><code class="inline">before_action</code> + Pundit or CanCanCan</td><td class="px-4 py-3"><code class="inline">RolesGuard</code> + ownership in service queries; CASL</td><td class="px-4 py-3"><code class="inline">Depends(require_role)</code> + scoped queries</td><td class="px-4 py-3">Middleware + scoped queries (Casbin optional)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">OpenAPI generation</td><td class="px-4 py-3">rswag (from request specs)</td><td class="px-4 py-3"><code class="inline">@nestjs/swagger</code> + CLI plugin</td><td class="px-4 py-3">Built in: <code class="inline">/docs</code>, <code class="inline">/openapi.json</code></td><td class="px-4 py-3">swaggo/swag comments</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Response shaping</td><td class="px-4 py-3">Serializers (Alba, jbuilder)</td><td class="px-4 py-3">Response DTOs, or class-transformer + <code class="inline">ClassSerializerInterceptor</code></td><td class="px-4 py-3"><code class="inline">response_model</code></td><td class="px-4 py-3">Response structs with <code class="inline">json</code> tags</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rate limit / CORS</td><td class="px-4 py-3"><code class="inline">rate_limit</code> or Rack::Attack + rack-cors</td><td class="px-4 py-3"><code class="inline">@nestjs/throttler</code> + <code class="inline">app.enableCors</code></td><td class="px-4 py-3">slowapi + <code class="inline">CORSMiddleware</code></td><td class="px-4 py-3">Limiter middleware + gin-contrib/cors</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cache</td><td class="px-4 py-3"><code class="inline">Rails.cache</code> (Solid Cache or Redis)</td><td class="px-4 py-3"><code class="inline">CacheModule</code> (cache-manager + Keyv Redis)</td><td class="px-4 py-3">redis-py (<code class="inline">redis.asyncio</code>)</td><td class="px-4 py-3">go-redis</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scheduled jobs</td><td class="px-4 py-3">Solid Queue recurring tasks or sidekiq-cron</td><td class="px-4 py-3"><code class="inline">@nestjs/schedule</code>; BullMQ job schedulers when multi-instance</td><td class="px-4 py-3">Celery beat</td><td class="px-4 py-3">asynq scheduler</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">File upload</td><td class="px-4 py-3">Active Storage</td><td class="px-4 py-3"><code class="inline">FileInterceptor</code> + <code class="inline">ParseFilePipe</code>, or presigned URLs</td><td class="px-4 py-3"><code class="inline">UploadFile</code></td><td class="px-4 py-3"><code class="inline">c.FormFile</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Email</td><td class="px-4 py-3">Action Mailer + <code class="inline">deliver_later</code></td><td class="px-4 py-3"><code class="inline">MailService</code> called from a BullMQ processor</td><td class="px-4 py-3">Provider SDK in a Celery task</td><td class="px-4 py-3">Provider SDK in an asynq task</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Realtime</td><td class="px-4 py-3">Action Cable</td><td class="px-4 py-3"><code class="inline">@WebSocketGateway</code> (Socket.IO) + Redis adapter</td><td class="px-4 py-3">WebSocket routes</td><td class="px-4 py-3">gorilla/websocket or coder/websocket</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Logging / health</td><td class="px-4 py-3">lograge + the built-in <code class="inline">/up</code> route</td><td class="px-4 py-3">nestjs-pino + <code class="inline">@nestjs/terminus</code></td><td class="px-4 py-3">structlog + a <code class="inline">/health</code> route</td><td class="px-4 py-3"><code class="inline">log/slog</code> + a <code class="inline">/healthz</code> route</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lint / security scan</td><td class="px-4 py-3">RuboCop + Brakeman + bundler-audit</td><td class="px-4 py-3">ESLint (typescript-eslint) or oxlint + <code class="inline">npm audit</code> + Dependabot</td><td class="px-4 py-3">Ruff + mypy + pip-audit</td><td class="px-4 py-3">golangci-lint + govulncheck</td></tr>
           </tbody>
         </table>
       </div>
@@ -709,8 +1059,8 @@ and count the queries. If the count grows with the rows, fix it with select/incl
           <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">e2e tests without the global pipes and filters test a different app from the one you deploy. Share one setup function.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ One giant shared module</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Exporting everything from a <code class="inline">SharedModule</code> removes the boundaries modules exist to give you. Import what each feature actually needs.</p>
+          <div class="font-semibold text-rose-500">✗ @Exclude() that never runs</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">ClassSerializerInterceptor</code> ignores plain objects, and Prisma returns plain objects. Wrap results in the entity class, or use <code class="inline">select</code>, then check the JSON in an e2e test.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
           <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Guard at class level</div>
@@ -740,11 +1090,12 @@ and count the queries. If the count grows with the rows, fix it with select/incl
       <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
         <li><a class="text-coral underline" href="https://docs.nestjs.com/first-steps" target="_blank" rel="noopener">NestJS — First steps</a> · <a class="text-coral underline" href="https://docs.nestjs.com/modules" target="_blank" rel="noopener">Modules</a> — the building blocks from Part I.</li>
         <li><a class="text-coral underline" href="https://docs.nestjs.com/faq/request-lifecycle" target="_blank" rel="noopener">NestJS — Request lifecycle</a> — the exact order of middleware, guards, interceptors, pipes and filters.</li>
+        <li><a class="text-coral underline" href="https://docs.nestjs.com/security/authentication" target="_blank" rel="noopener">NestJS — Authentication</a> · <a class="text-coral underline" href="https://docs.nestjs.com/security/authorization" target="_blank" rel="noopener">Authorization</a> · <a class="text-coral underline" href="https://docs.nestjs.com/openapi/introduction" target="_blank" rel="noopener">OpenAPI</a> — the global guard, <code class="inline">@Public()</code>, roles and <code class="inline">@nestjs/swagger</code>.</li>
         <li><a class="text-coral underline" href="https://docs.nestjs.com/techniques/validation" target="_blank" rel="noopener">NestJS — Validation</a> — <code class="inline">ValidationPipe</code> options and the Standard Schema alternative.</li>
         <li><a class="text-coral underline" href="https://docs.nestjs.com/recipes/prisma" target="_blank" rel="noopener">NestJS — Prisma recipe</a> — the Prisma 7 setup with a driver adapter and <code class="inline">PrismaService</code>.</li>
         <li><a class="text-coral underline" href="https://www.prisma.io/docs/orm/prisma-client/queries/transactions" target="_blank" rel="noopener">Prisma — Transactions</a> — interactive transactions and their pitfalls.</li>
         <li><a class="text-coral underline" href="https://docs.nestjs.com/fundamentals/testing" target="_blank" rel="noopener">NestJS — Testing</a> — testing modules, <code class="inline">overrideProvider</code> and e2e with supertest.</li>
-        <li><a class="text-coral underline" href="https://docs.nestjs.com/techniques/queues" target="_blank" rel="noopener">NestJS — Queues</a> · <a class="text-coral underline" href="https://docs.nestjs.com/techniques/configuration" target="_blank" rel="noopener">Configuration</a> — BullMQ and <code class="inline">ConfigModule</code>.</li>
+        <li><a class="text-coral underline" href="https://docs.nestjs.com/techniques/queues" target="_blank" rel="noopener">NestJS — Queues</a> · <a class="text-coral underline" href="https://docs.nestjs.com/techniques/configuration" target="_blank" rel="noopener">Configuration</a> · <a class="text-coral underline" href="https://docs.nestjs.com/techniques/caching" target="_blank" rel="noopener">Caching</a> · <a class="text-coral underline" href="https://docs.nestjs.com/techniques/task-scheduling" target="_blank" rel="noopener">Task scheduling</a> — BullMQ, <code class="inline">ConfigModule</code>, <code class="inline">CacheModule</code> and <code class="inline">@Cron</code>.</li>
       </ul>
 
       <nav id="page-nav" class="mt-14 flex gap-4"></nav>
