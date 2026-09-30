@@ -1,0 +1,639 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">API Design</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          An API is a promise to every client that will ever call it: the web app, the mobile app, a partner's
+          integration, and next year's developer. This module covers how to model resources and use HTTP the way
+          clients expect, how to validate input and report errors in one consistent format, how to paginate,
+          filter, version and make writes safe to retry, and how to keep the whole contract in an OpenAPI file that
+          generates docs and clients. The clinic booking API is the example throughout.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent generates twenty endpoints in minutes, and
+          each one is plausible on its own. Together they are inconsistent: <code class="inline">/getBookings</code> next to
+          <code class="inline">/doctors/list</code>, errors as <code class="inline">{error: "..."}</code> in one place and
+          <code class="inline">{message: "..."}</code> in another, a 200 with <code class="inline">success: false</code>, no
+          pagination. Internal code can be refactored later. A public API can't, because the mobile app already in
+          users' pockets depends on every detail. API review is where your consistency and judgement matter most.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Resources &amp; HTTP semantics</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Design nouns and their state changes, not remote function calls</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        REST in practice means three things: URLs name <strong>resources</strong> (things), HTTP
+        <strong>methods</strong> say what you do to them, and <strong>status codes</strong> say how it went. Clients,
+        proxies, caches and your future teammates all rely on those conventions, so following them makes the API
+        predictable before anyone reads the docs. How HTTP itself works (requests, headers, the network path) is
+        covered in <a href="./co4.html" class="text-viol underline decoration-viol/40">CO4</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Resources and URLs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Start from the data model in <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>: clinics,
+        doctors, slots, patients, bookings. Each becomes a <em>collection</em> URL (plural noun) and an
+        <em>item</em> URL (the collection plus an ID). The verb lives in the HTTP method, never in the path.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Agent-style URL</th><th class="px-4 py-3">Conventional</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">POST /createBooking</code></td><td class="px-4 py-3"><code class="inline">POST /bookings</code></td><td class="px-4 py-3">The method is the verb</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">GET /doctor/list</code></td><td class="px-4 py-3"><code class="inline">GET /doctors</code></td><td class="px-4 py-3">Collections are plural nouns, and a GET on them lists</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">GET /getSlotsByDoctor?id=7</code></td><td class="px-4 py-3"><code class="inline">GET /doctors/7/slots</code></td><td class="px-4 py-3">Nesting shows ownership</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">GET /clinics/1/doctors/7/slots/99/bookings</code></td><td class="px-4 py-3"><code class="inline">GET /slots/99/bookings</code></td><td class="px-4 py-3">Nest one level. Anything with its own ID can be reached directly.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">POST /deleteBooking</code></td><td class="px-4 py-3"><code class="inline">POST /bookings/881/cancel</code></td><td class="px-4 py-3">A business action is not a delete (see below)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/Bookings</code>, <code class="inline">/booking_items</code>, <code class="inline">/bookingItems</code></td><td class="px-4 py-3">Pick one, e.g. <code class="inline">/booking-items</code></td><td class="px-4 py-3">Lowercase, one case style, everywhere</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    C["/clinics"] --> CI["/clinics/12"]
+    CI --> CD["/clinics/12/doctors"]
+    D["/doctors/7"] --> DS["/doctors/7/slots"]
+    B["/bookings"] --> BI["/bookings/881"]
+    BI --> BC["/bookings/881/cancel<br/>action, POST only"]
+    M["/me"] --> MB["/me/bookings<br/>the caller's own"]
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">/me/bookings</code> is worth a note: it returns the <em>caller's</em> bookings, derived from the
+        auth token. That is safer than <code class="inline">/patients/{id}/bookings</code>, where a forgotten ownership check
+        lets anyone read anyone's bookings by changing the ID, the IDOR bug from
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Methods and their promises</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each HTTP method makes promises that infrastructure relies on. <strong>Safe</strong> means it doesn't change
+        anything, so caches and crawlers may call it freely. <strong>Idempotent</strong> means repeating it has the same
+        effect as doing it once, so clients and proxies may retry it after a timeout.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Method</th><th class="px-4 py-3">Safe</th><th class="px-4 py-3">Idempotent</th><th class="px-4 py-3">Booking API example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">GET</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3"><code class="inline">GET /doctors/7/slots?from=…</code>. Never change data in a GET.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">POST</td><td class="px-4 py-3">No</td><td class="px-4 py-3"><strong>No</strong></td><td class="px-4 py-3"><code class="inline">POST /bookings</code> creates one. Twice creates two, unless you add an idempotency key (Part III).</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">PUT</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3"><code class="inline">PUT /me/notification-preferences</code> replaces the whole object</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">PATCH</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Not guaranteed</td><td class="px-4 py-3"><code class="inline">PATCH /doctors/7</code> with <code class="inline">{"bio": "..."}</code> changes one field</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">DELETE</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3"><code class="inline">DELETE /slots/99</code> removes an unbooked slot. The second call returns 404 (or 204), but the state is the same.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Actions that aren't CRUD</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Cancelling a booking is not deleting it: the row stays as history, a refund may be triggered, and the
+        rules depend on how close the appointment is. Two designs are common. <code class="inline">PATCH /bookings/881</code>
+        with <code class="inline">{"status": "cancelled"}</code> looks RESTful but invites clients to set any status, including
+        <code class="inline">"confirmed"</code> without paying. An explicit action,
+        <code class="inline">POST /bookings/881/cancel</code>, names the business operation, runs its rules, and can't be
+        misused to jump to another state. For state transitions with rules, prefer the action. Where business
+        logic like this lives in the code is <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>'s topic.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Status codes you actually need</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Code</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">Booking example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">200 OK</td><td class="px-4 py-3">Success, with a body</td><td class="px-4 py-3">GET a booking, or a cancel that returns the updated booking</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">201 Created</td><td class="px-4 py-3">A new resource exists. Add a <code class="inline">Location</code> header.</td><td class="px-4 py-3"><code class="inline">POST /bookings</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">202 Accepted</td><td class="px-4 py-3">Accepted, will be done later</td><td class="px-4 py-3">"Export my bookings as CSV" handed to a job (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">204 No Content</td><td class="px-4 py-3">Success, nothing to return</td><td class="px-4 py-3"><code class="inline">DELETE /slots/99</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">400 Bad Request</td><td class="px-4 py-3">Malformed: invalid JSON, wrong types</td><td class="px-4 py-3"><code class="inline">slot_id: "abc"</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">401 Unauthorized</td><td class="px-4 py-3">Not authenticated: no token, or it expired</td><td class="px-4 py-3">Missing <code class="inline">Authorization</code> header</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">403 Forbidden</td><td class="px-4 py-3">Authenticated, but not allowed</td><td class="px-4 py-3">A patient calling a clinic-admin endpoint</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">404 Not Found</td><td class="px-4 py-3">Doesn't exist, <em>or you may not know it exists</em></td><td class="px-4 py-3">Another patient's booking: 404, not 403, so IDs can't be probed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">409 Conflict</td><td class="px-4 py-3">Conflicts with the current state</td><td class="px-4 py-3">The slot was just taken, or cancelling an already-cancelled booking</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">422 Unprocessable Content</td><td class="px-4 py-3">Well-formed, but breaks a rule</td><td class="px-4 py-3">A slot in the past, or cancelling less than 24 h before without override</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">429 Too Many Requests</td><td class="px-4 py-3">Rate limited, with <code class="inline">Retry-After</code></td><td class="px-4 py-3">Too many OTP requests (<a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">500 / 503</td><td class="px-4 py-3">Our fault / temporarily unavailable</td><td class="px-4 py-3">Never on purpose for a client mistake</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Never return 200 with <code class="inline">{"success": false}</code>.</strong> Agents do this often. Every
+        HTTP tool, monitoring dashboard, retry library and cache reads the status code, not your body. A failure
+        disguised as a 200 is invisible to your error-rate alerts, cached by the CDN, and treated as success by the
+        client's HTTP library. Use the status code, and put details in the error body (Part II).
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Validation &amp; errors</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Reject bad input at the door, and explain every failure the same way</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Clients will send you everything: missing fields, strings where numbers belong, dates in three formats,
+        extra fields you never asked for, and deliberately hostile input. The API boundary is where that stops.
+        What passes validation should be safe for the rest of the code to trust.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Validate at the boundary with a schema</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Describe each request body as a schema and validate it before any business logic runs. Every stack has a
+        standard tool: Zod or class-validator in TypeScript and NestJS, Pydantic in FastAPI, strong parameters and
+        model validations in Rails, struct tags with a validator in Gin. Your stack module shows the exact form.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">bookings.schema.ts — the request, described once</span>
+        <pre class="code"><span class="kw">const</span> CreateBooking = z.<span class="fn">object</span>({
+  slot_id: z.<span class="fn">number</span>().<span class="fn">int</span>().<span class="fn">positive</span>(),
+  note:    z.<span class="fn">string</span>().<span class="fn">max</span>(<span class="st">500</span>).<span class="fn">optional</span>(),       <span class="cm">// ← always cap string lengths</span>
+}).<span class="fn">strict</span>();                                 <span class="cm">// ← unknown fields are an error</span>
+
+<span class="cm">// NOT in the schema: patient_id, status, price. They come from the auth token
+// and from the server's rules, never from the request body.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That last comment is the most important line in the block. If the request body can contain
+        <code class="inline">patient_id</code> or <code class="inline">status</code>, a client can book for someone else or
+        create a booking that is already confirmed. This is called <strong>mass assignment</strong>, and it happens
+        when an agent passes the whole request body into the ORM's create call. Validation checks the
+        <em>shape</em>; business rules (is the slot in the future, is it free) are checked afterwards in the service
+        layer and return 409 or 422.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">One error format: RFC 9457 problem details</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Clients need to handle errors in code: show the right message, highlight the right form field, decide
+        whether to retry. That only works if every error from every endpoint has the same shape. Rather than invent
+        one, use the IETF standard, <strong>RFC 9457 "Problem Details for HTTP APIs"</strong> (which replaced RFC 7807).
+        It uses the media type <code class="inline">application/problem+json</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">HTTP — 422 for a broken business rule, with field errors</span>
+        <pre class="code">HTTP/1.1 <span class="kw">422 Unprocessable Content</span>
+Content-Type: application/problem+json
+
+{
+  <span class="st">"type"</span>:     <span class="st">"https://api.clinic.example/problems/validation"</span>,
+  <span class="st">"title"</span>:    <span class="st">"Your request has invalid fields"</span>,
+  <span class="st">"status"</span>:   422,
+  <span class="st">"detail"</span>:   <span class="st">"2 fields failed validation"</span>,
+  <span class="st">"instance"</span>: <span class="st">"/bookings"</span>,
+  <span class="st">"errors"</span>: [                                  <span class="cm">// ← an extension member</span>
+    { <span class="st">"pointer"</span>: <span class="st">"#/slot_id"</span>, <span class="st">"detail"</span>: <span class="st">"Slot starts in the past"</span> },
+    { <span class="st">"pointer"</span>: <span class="st">"#/note"</span>,    <span class="st">"detail"</span>: <span class="st">"Must be at most 500 characters"</span> }
+  ],
+  <span class="st">"trace_id"</span>: <span class="st">"4bf92f35..."</span>                    <span class="cm">// ← lets support find the logs (SD11)</span>
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Member</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">Tip</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">type</td><td class="px-4 py-3">A URI that identifies the <em>kind</em> of problem. Defaults to <code class="inline">about:blank</code>.</td><td class="px-4 py-3">This is what client code switches on. Keep a fixed list of them, and ideally make each URI a docs page.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">title</td><td class="px-4 py-3">Short human summary of the type</td><td class="px-4 py-3">The same for every occurrence of that type</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">status</td><td class="px-4 py-3">The HTTP status code, repeated for convenience</td><td class="px-4 py-3">Must match the real status line</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">detail</td><td class="px-4 py-3">What went wrong <em>this time</em></td><td class="px-4 py-3">Helpful to a person. Clients shouldn't parse it.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">instance</td><td class="px-4 py-3">A URI for this specific occurrence</td><td class="px-4 py-3">Optional. The request path or an error ID.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">extensions</td><td class="px-4 py-3">Any extra members, such as <code class="inline">errors</code> or <code class="inline">trace_id</code></td><td class="px-4 py-3">Clients must ignore extensions they don't know, so adding one is safe</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Map errors in one place, and never leak internals</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Handlers and services should throw meaningful domain errors (<code class="inline">SlotTaken</code>,
+        <code class="inline">BookingNotFound</code>, <code class="inline">CancellationWindowClosed</code>). One error-handling
+        middleware turns them into problem details. That gives you one place to keep the format consistent, and one
+        place to make sure a database error never reaches the client as a stack trace.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">error-handler.ts — domain errors to HTTP, in one place</span>
+        <pre class="code"><span class="kw">const</span> MAP = {
+  SlotTaken:                { status: <span class="st">409</span>, type: <span class="st">"slot-taken"</span>,   title: <span class="st">"Slot is no longer available"</span> },
+  BookingNotFound:          { status: <span class="st">404</span>, type: <span class="st">"not-found"</span>,    title: <span class="st">"Booking not found"</span> },
+  CancellationWindowClosed: { status: <span class="st">422</span>, type: <span class="st">"cancel-window"</span>, title: <span class="st">"Too late to cancel online"</span> },
+};
+app.<span class="fn">use</span>((err, req, res, _next) =&gt; {
+  <span class="kw">const</span> m = MAP[err.name];
+  <span class="kw">if</span> (!m) {                                        <span class="cm">// unknown → 500, details only in the logs</span>
+    log.<span class="fn">error</span>({ err, trace_id: req.traceId });
+    <span class="kw">return</span> res.<span class="fn">status</span>(<span class="st">500</span>).<span class="fn">type</span>(<span class="st">"application/problem+json"</span>)
+      .<span class="fn">json</span>({ type: <span class="st">"about:blank"</span>, title: <span class="st">"Internal Server Error"</span>, status: <span class="st">500</span>, trace_id: req.traceId });
+  }
+  res.<span class="fn">status</span>(m.status).<span class="fn">type</span>(<span class="st">"application/problem+json"</span>)
+    .<span class="fn">json</span>({ ...m, type: <span class="st">`${PROBLEMS_BASE}/${m.type}`</span>, detail: err.message, trace_id: req.traceId });
+});</pre>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    R["Request"] --> A{"Authenticated?"}
+    A -->|"no"| E401["401 problem"]
+    A -->|"yes"| V{"Body matches<br/>schema?"}
+    V -->|"no"| E400["400 or 422 problem<br/>with field errors"]
+    V -->|"yes"| Z{"Allowed on<br/>this resource?"}
+    Z -->|"no"| E404["403 or 404 problem"]
+    Z -->|"yes"| S["Service: business rules"]
+    S -->|"domain error"| M["Error middleware<br/>maps to 409 or 422"]
+    S -->|"ok"| OK["200 or 201 with body"]
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The order matters: authenticate first, then validate, then authorise against the specific resource, then run
+        business rules. Validating before authentication lets anonymous callers probe your schema. Checking business
+        rules before authorisation can reveal whether another patient's booking exists.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Lists, change &amp; safety</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every list is paginated, every change is additive, every write is safe to retry</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The decisions in this Part are the expensive ones to change later. Adding pagination to an endpoint that
+        returned everything is a breaking change. So is renaming a field. Get them right in the first version.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Pagination: offset vs cursor</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An endpoint that returns "all bookings" works with 20 rows in development and times out with 200,000 in
+        production. <strong>Every collection endpoint is paginated from day one</strong>, with a default and a maximum
+        page size. There are two main styles.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 230" class="w-full min-w-[620px]" role="img" aria-label="Offset pagination skips or repeats rows when data changes, cursor pagination continues after the last seen row">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">OFFSET · ?limit=3&amp;offset=3 while a new booking is inserted at the top</text>
+          <g class="anim-pulse"><rect x="20" y="34" width="70" height="34" rx="7" fill="#37474F"/><text x="55" y="55" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#906</text></g>
+          <rect x="100" y="34" width="70" height="34" rx="7" fill="#2563EB"/><text x="135" y="55" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#905</text>
+          <rect x="180" y="34" width="70" height="34" rx="7" fill="#2563EB"/><text x="215" y="55" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#904</text>
+          <rect x="260" y="34" width="70" height="34" rx="7" fill="#DB2777"/><text x="295" y="55" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#903</text>
+          <rect x="340" y="34" width="70" height="34" rx="7" fill="#DB2777"/><text x="375" y="55" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#902</text>
+          <rect x="420" y="34" width="70" height="34" rx="7" fill="#DB2777"/><text x="455" y="55" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#901</text>
+          <text x="55" y="84" text-anchor="middle" font-size="9" fill="#6E6B64">new row</text>
+          <text x="175" y="84" text-anchor="middle" font-size="9" fill="#6E6B64">page 1 had 905, 904, 903</text>
+          <text x="375" y="84" text-anchor="middle" font-size="9" fill="#DB2777">page 2 = rows 4 to 6</text>
+          <text x="600" y="55" text-anchor="middle" font-size="10" fill="#DB2777" class="anim-bounce">903 shown twice</text>
+          <text x="12" y="126" font-size="11" font-weight="700" fill="#6E6B64">CURSOR · ?limit=3&amp;cursor=after:903  →  WHERE id &lt; 903 ORDER BY id DESC</text>
+          <rect x="20" y="140" width="70" height="34" rx="7" fill="#37474F"/><text x="55" y="161" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#906</text>
+          <rect x="100" y="140" width="70" height="34" rx="7" fill="#2563EB"/><text x="135" y="161" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#905</text>
+          <rect x="180" y="140" width="70" height="34" rx="7" fill="#2563EB"/><text x="215" y="161" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#904</text>
+          <rect x="260" y="140" width="70" height="34" rx="7" fill="#2563EB"/><text x="295" y="161" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#903</text>
+          <g class="anim-pulse d1"><rect x="340" y="140" width="70" height="34" rx="7" fill="#0D9488"/><text x="375" y="161" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#902</text></g>
+          <g class="anim-pulse d2"><rect x="420" y="140" width="70" height="34" rx="7" fill="#0D9488"/><text x="455" y="161" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#901</text></g>
+          <g class="anim-pulse d3"><rect x="500" y="140" width="70" height="34" rx="7" fill="#0D9488"/><text x="535" y="161" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">#900</text></g>
+          <line x1="330" y1="130" x2="330" y2="184" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="330" y="198" text-anchor="middle" font-size="9" fill="#D97757">cursor: continue after 903</text>
+          <text x="350" y="220" text-anchor="middle" font-size="10" fill="#A8A49B">page 2 is exactly the next rows, no matter what was inserted, and it uses the index instead of skipping rows</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Style</th><th class="px-4 py-3">Good</th><th class="px-4 py-3">Bad</th><th class="px-4 py-3">Use for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Offset <code class="inline">?page=3&amp;limit=20</code></td><td class="px-4 py-3">Simple. "Jump to page 7" and total counts are easy.</td><td class="px-4 py-3">Skips or repeats rows when data changes. Deep pages are slow, because the database still reads and discards all the skipped rows.</td><td class="px-4 py-3">Admin tables with page numbers, small datasets</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cursor <code class="inline">?cursor=…&amp;limit=20</code></td><td class="px-4 py-3">Stable under inserts. Every page is an index lookup, so page 1,000 is as fast as page 1.</td><td class="px-4 py-3">No jumping to page N. The sort must be on a unique, indexed key.</td><td class="px-4 py-3">Feeds, infinite scroll, mobile apps, public APIs, sync jobs</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">GET /me/bookings?limit=20 — a cursor-paginated response</span>
+        <pre class="code">{
+  <span class="st">"data"</span>: [ { <span class="st">"id"</span>: 905, <span class="st">"status"</span>: <span class="st">"confirmed"</span>, <span class="st">"starts_at"</span>: <span class="st">"2026-10-02T09:00:00+07:00"</span> }, ... ],
+  <span class="st">"next_cursor"</span>: <span class="st">"eyJpZCI6ODg2fQ"</span>,   <span class="cm">// opaque: base64 of {"id":886}. null on the last page</span>
+  <span class="st">"has_more"</span>: <span class="kw">true</span>
+}
+<span class="cm">// server: WHERE patient_id = $me AND id &lt; 886 ORDER BY id DESC LIMIT 21
+// fetch limit+1 rows: if you get 21, there is another page (has_more = true)</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Make the cursor <strong>opaque</strong> (encoded, not a raw ID the client builds itself), so you can change what
+        is inside it later. When sorting by a non-unique column such as <code class="inline">starts_at</code>, put a tie-breaker
+        in the cursor: <code class="inline">(starts_at, id)</code>. And check that the index from SD1 matches the sort.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Filtering and sorting</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Keep filters as plain query parameters with names that match the response fields, and allow only a fixed list.
+      </p>
+      <pre class="code mt-3">GET /doctors/7/slots?from=2026-10-01&amp;to=2026-10-07&amp;available=true
+GET /bookings?status=confirmed,cancelled&amp;clinic_id=12&amp;sort=-starts_at
+<span class="cm"># sort=-starts_at → descending. Allow-list sortable fields: an arbitrary
+# sort column is both an SQL-injection risk and an unindexed full scan.</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Use ISO 8601 for dates and times, with an offset or <code class="inline">Z</code> (<code class="inline">2026-10-02T09:00:00+07:00</code>),
+        and document the maximum range: a request for three years of slots should get a 422, not a 30-second query.
+        Ask for each filter "which index serves this?" (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Versioning and evolving without breaking clients</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A mobile app version you shipped last year is still on someone's phone and still calling your API. So the
+        default is <strong>never break existing clients</strong>. Most changes can be additive:
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">Safe (non-breaking)</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Add a new endpoint</li>
+            <li>Add an optional request field</li>
+            <li>Add a field to a response</li>
+            <li>Add a new problem <code class="inline">type</code> (if clients have a default branch)</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-rose-500">Breaking</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Remove or rename a field or endpoint</li>
+            <li>Change a field's type or format (<code class="inline">price</code> from number to string)</li>
+            <li>Make an optional field required</li>
+            <li>Add a new enum value clients don't handle, such as a new booking status</li>
+            <li>Change a status code or the meaning of a field</li>
+          </ul>
+        </div>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        When you truly must break, version. The common choice is a <strong>URL prefix</strong>,
+        <code class="inline">/v1/bookings</code> then <code class="inline">/v2/bookings</code>: visible, easy to route and
+        easy to test. Some APIs use a header or a date-based version instead. Whatever you choose, run the old version
+        alongside the new one, announce a date, and signal it in responses: the <code class="inline">Deprecation</code>
+        header (RFC 9745) and the <code class="inline">Sunset</code> header (RFC 8594) exist for exactly this. Then
+        watch the logs until traffic to the old version reaches zero before removing it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Idempotency and auth headers</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Two headers belong in the contract of almost every write endpoint:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">HTTP — a well-formed booking request</span>
+        <pre class="code">POST /v1/bookings HTTP/1.1
+Authorization: Bearer eyJhbGciOi...        <span class="cm"># who is calling: always a header, never ?token= in the URL</span>
+Idempotency-Key: 2b0c6f6e-3f0a-4c55-9d1e-7a61c0f2e8b4  <span class="cm"># same key on every retry of this one intent</span>
+Content-Type: application/json
+
+{ <span class="st">"slot_id"</span>: 4211, <span class="st">"note"</span>: <span class="st">"First visit"</span> }</pre>
+      </div>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong><code class="inline">Idempotency-Key</code></strong> makes a non-idempotent POST safe to retry: a repeat
+          with the same key returns the original response instead of creating a second booking or charge. How the
+          server stores and checks keys is in <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>.
+          In the API contract, document which endpoints accept it, how long keys are kept, and what happens when
+          a key is reused with a different body.</li>
+        <li><strong><code class="inline">Authorization</code></strong> carries the credential. Tokens in query strings end up in
+          server logs, browser history and <code class="inline">Referer</code> headers. Which token type to use (session
+          cookie or JWT), and how to check permissions per resource, is
+          <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>'s topic. The API design rule is simply:
+          authentication is required by default, and public endpoints are the documented exception.</li>
+      </ul>
+      <div class="mt-4 callout callout-info">
+        <strong>Response shape conventions.</strong> Pick them once and write them in the API style guide: field case
+        (<code class="inline">snake_case</code> or <code class="inline">camelCase</code>, never both), IDs as strings or numbers,
+        timestamps in ISO 8601, money as integer minor units plus a currency (<code class="inline">{"amount": 100000, "currency": "VND"}</code>),
+        and whether lists are wrapped in <code class="inline">{"data": [...]}</code>. Wrapping lets you add
+        <code class="inline">next_cursor</code> later without a breaking change.
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · The contract &amp; its review</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The contract is a file, and docs, clients and tests come from it</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Everything in Parts I–III is a set of decisions. If those decisions live only in code, the frontend team
+        reads handlers to find out what a field is called, and the mobile developer guesses. An
+        <strong>OpenAPI</strong> document is a machine-readable description of the API: paths, methods, parameters,
+        request and response schemas, errors and auth. It is also the best possible input for a coding agent.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">OpenAPI as the contract</h3>
+      <div class="mt-3">
+        <span class="code-label">openapi.yaml — one endpoint, fully described</span>
+        <pre class="code">openapi: 3.1.0
+info: { title: Clinic Booking API, version: 1.0.0 }
+paths:
+  /v1/bookings:
+    post:
+      operationId: createBooking                <span class="cm"># ← becomes the function name in generated clients</span>
+      security: [ { bearerAuth: [] } ]
+      parameters:
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, maxLength: 255 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateBooking" }
+      responses:
+        "201": { description: Booking held, content: { application/json: { schema: { $ref: "#/components/schemas/Booking" } } } }
+        "409": { $ref: "#/components/responses/Problem" }   <span class="cm"># slot taken</span>
+        "422": { $ref: "#/components/responses/Problem" }   <span class="cm"># rule broken</span>
+components:
+  schemas:
+    CreateBooking:
+      type: object
+      additionalProperties: false               <span class="cm"># ← same as .strict() in Part II</span>
+      required: [slot_id]
+      properties:
+        slot_id: { type: integer, minimum: 1 }
+        note:    { type: string, maxLength: 500 }</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        OpenAPI 3.1 aligned its schemas with JSON Schema, and it is what most tools support today (3.2 was released in
+        September 2025 and adds features on top without breaking 3.1 documents). From one file you get:
+        interactive docs (Swagger UI, Redoc), typed clients for the web and mobile apps (openapi-typescript,
+        openapi-generator), request validation middleware, mock servers for the frontend to build against, and
+        linting against your style guide (Spectral).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Design-first vs code-first</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Approach</th><th class="px-4 py-3">How</th><th class="px-4 py-3">Right when</th><th class="px-4 py-3">Risk</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Design-first</td><td class="px-4 py-3">Write <code class="inline">openapi.yaml</code>, review it, then implement (or generate server stubs, e.g. oapi-codegen in Go)</td><td class="px-4 py-3">Several teams (web, mobile, partner) build in parallel. A public or client-facing API.</td><td class="px-4 py-3">Spec and code drift apart unless CI checks responses against the spec</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Code-first</td><td class="px-4 py-3">Annotate the code and generate the spec: FastAPI does it automatically, NestJS with <code class="inline">@nestjs/swagger</code>, Rails with rswag</td><td class="px-4 py-3">One team owns both sides. Fast iteration on an internal API.</td><td class="px-4 py-3">The API's design is decided implicitly, one handler at a time</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        With a coding agent, a hybrid works well: agree the spec for a feature first (the agent drafts it, you
+        review it as a design), then let the agent implement against it, and in CI generate the spec from the code
+        and diff it against the reviewed one. Any unexpected diff is either a bug or an undocumented design change.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    S["openapi.yaml<br/>reviewed in a PR"] --> D["Docs<br/>Swagger UI or Redoc"]
+    S --> TC["Typed client<br/>web and mobile"]
+    S --> MK["Mock server<br/>frontend starts early"]
+    S --> L["Lint in CI<br/>style guide rules"]
+    S --> AG["Coding agent<br/>implements handlers"]
+    AG --> API["API code"]
+    API -->|"generate spec in CI"| DIFF{"Same as the<br/>reviewed spec?"}
+    DIFF -->|"no"| FIX["Fail the build"]
+    DIFF -->|"yes"| SHIP["Merge"]
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">REST, GraphQL or gRPC?</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        REST with JSON is the default for client projects, and nearly always the right one. Know the other two well
+        enough to recognise when they fit, and when an agent suggests them for no reason.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Style</th><th class="px-4 py-3">Shape</th><th class="px-4 py-3">Fits</th><th class="px-4 py-3">Costs</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">REST + JSON</td><td class="px-4 py-3">Resources and HTTP methods. Described with OpenAPI.</td><td class="px-4 py-3">Most web and mobile backends, public and partner APIs. HTTP caching works out of the box.</td><td class="px-4 py-3">Screens may need several calls, or return fields they don't use</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">GraphQL</td><td class="px-4 py-3">One endpoint. The client sends a query naming exactly the fields it wants. Typed schema.</td><td class="px-4 py-3">Many different clients with very different data needs over a rich graph of data</td><td class="px-4 py-3">HTTP caching is harder. Needs query cost limits and per-field authorisation. N+1 queries on the server unless batched.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">gRPC</td><td class="px-4 py-3">Remote procedure calls over HTTP/2 with Protocol Buffers. Contract in <code class="inline">.proto</code> files, code generated.</td><td class="px-4 py-3">Service-to-service calls inside your system, streaming, high throughput</td><td class="px-4 py-3">Browsers can't call it directly without a proxy layer. Binary payloads are harder to debug by hand.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Reviewing an agent-generated API against a checklist</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Review the <strong>spec</strong> (or the list of routes) before the handlers. It is a fraction of the size and holds
+        almost every decision that is expensive to change. Save a checklist like this in the repo and ask the agent to
+        run it too, but go through it yourself.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">docs/api-review-checklist.md</span>
+        <pre class="code">RESOURCES   [ ] plural nouns, no verbs in paths, one case style, nesting ≤ 1 level
+            [ ] business actions (cancel, confirm) are explicit POST actions
+METHODS     [ ] GET never changes data · POST creates · PUT replaces · PATCH updates
+STATUS      [ ] 201 + Location on create · 401 vs 403 vs 404 used correctly · no 200-with-error
+INPUT       [ ] every body has a schema · unknown fields rejected · strings length-capped
+            [ ] no server-owned fields accepted (ids of the caller, status, price, role)
+ERRORS      [ ] every error is application/problem+json · a fixed list of problem types
+            [ ] no stack traces, SQL or internal hostnames in any response
+LISTS       [ ] every collection paginated, with default + max limit · filters/sorts allow-listed
+SAFETY      [ ] auth required by default · object-level ownership checked (SD10)
+            [ ] payment-like POSTs accept Idempotency-Key (SD11) · rate limits on costly endpoints
+EVOLUTION   [ ] versioned prefix · this change is additive, or it's a new version
+CONTRACT    [ ] openapi.yaml updated in the same PR · examples for every response</pre>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> turn the checklist into automation. Most of the RESOURCES, STATUS, ERRORS and
+        LISTS lines can be Spectral rules that run on <code class="inline">openapi.yaml</code> in CI, so humans review the
+        judgement calls (resource boundaries, actions, what's breaking) instead of spelling.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        APIs are where agents are most productive and most inconsistent. Give the agent the contract and the
+        conventions, and it becomes consistent. Put your API style guide and the review checklist where it reads
+        them on every task, such as <code class="inline">CLAUDE.md</code> or a linked doc
+        (<a href="./ag2.html" class="text-viol underline decoration-viol/40">AG2</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — spec first, code later</span>
+        <pre class="code">Read docs/design/booking.md and docs/api-style.md.
+Draft the OpenAPI 3.1 changes for the cancel-booking feature in openapi.yaml:
+paths, request/response schemas, every error as a problem+json response,
+and an example for each response. Don't write handlers yet.
+List any design question you had to guess at.</pre>
+      </div>
+      <pre class="code mt-3">Review openapi.yaml against docs/api-review-checklist.md.
+Output a table: checklist line | pass/fail | path + operation | fix.
+Also list every change in this branch that would break an existing client.</pre>
+      <pre class="code mt-3">Implement POST /v1/bookings/{id}/cancel to match openapi.yaml exactly.
+Write tests for: 200, 401, 404 for another patient's booking, 409 already
+cancelled, 422 inside 24 h. Then generate the spec from the code and show me the
+diff against openapi.yaml. Paste the test output.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft the OpenAPI spec from a design doc</li>
+            <li>Write validation schemas and the error middleware</li>
+            <li>Implement handlers against a reviewed spec</li>
+            <li>Write a test per documented status code</li>
+            <li>Generate typed clients and docs</li>
+            <li>Run the checklist and report violations</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Resource names and boundaries, and which operations are actions</li>
+            <li>That no server-owned field is accepted from the client</li>
+            <li>401 vs 403 vs 404, especially for other users' data</li>
+            <li>That every list is paginated with a maximum</li>
+            <li>Whether the change breaks an existing client</li>
+            <li>That the spec and the code match (the CI diff)</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-generated APIs:</strong> verbs in paths (<code class="inline">/getX</code>,
+        <code class="inline">/updateY</code>) · 200 with <code class="inline">success: false</code> · different error shapes on
+        different endpoints · <code class="inline">create(req.body)</code> passed straight to the ORM · list endpoints with no
+        limit · stack traces or SQL errors in responses · <code class="inline">patient_id</code> taken from the body instead of
+        the token · a GET that changes data · renamed fields in an existing version · an
+        <code class="inline">openapi.yaml</code> that wasn't touched in a PR that changed the API.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has called APIs, but accepts whatever routes and response shapes the agent generates.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows the HTTP methods and common status codes, and can read an OpenAPI file. Doesn't yet notice inconsistency or breaking changes in review.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Designs conventional endpoints for a feature. Needs review to catch mass assignment, missing pagination, wrong 403/404 choices or a breaking change.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Designs a feature's API spec-first: resources and actions, validation schemas, problem-details errors, cursor pagination, idempotency and auth headers. Reviews agent output against the checklist, keeps the OpenAPI file in sync, and can say whether a change breaks clients.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Writes the team's API style guide and lint rules, runs API design reviews, and plans versioning and deprecation for APIs with external clients.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 3:</strong> for an endpoint you built, can you list every status code it
+        returns and the test that proves each one? If the mobile team asks "can we rename <code class="inline">starts_at</code>?",
+        can you explain exactly what breaks and how you would do it safely?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Exposing the database as the API</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Returning ORM models directly leaks internal columns (password hashes, soft-delete flags) and ties every client to your schema. Map to explicit response objects (DTOs, see <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Adding pagination later</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Changing a bare array into <code class="inline">{data, next_cursor}</code> breaks every client. Wrap and paginate from the first version.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Error messages as the contract</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Clients that match on <code class="inline">"Slot is taken"</code> break when someone fixes a typo or translates it. Clients switch on the problem <code class="inline">type</code>; <code class="inline">detail</code> is for people.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write the style guide once</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One page: case style, IDs, dates, money, list wrapper, error format, pagination. It makes every agent-generated endpoint consistent without repeated review comments.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Put examples in the spec</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Realistic request and response examples make the docs readable, feed the mock server, and give the agent concrete targets for tests.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Test the unhappy statuses</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One test per documented error code, including 404 for someone else's resource. Test strategy in general is <a href="./qa1.html" class="text-viol underline decoration-viol/40">QA1</a>.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="resources"> <span>Modelled a feature's resources and actions, and can justify every URL, method and status code.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="problem-json"> <span>Implemented one error middleware that returns RFC 9457 problem details for every error, with no internals leaked on 500.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cursor"> <span>Implemented cursor pagination on a list endpoint with an opaque cursor, a maximum limit and a supporting index.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="api-review"> <span>Reviewed an agent-generated API against the checklist and fixed at least three findings.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="api-pr"> <span class="font-semibold">Opened a PR for the booking API (or a shop's orders API) with a reviewed <code class="inline">openapi.yaml</code>, handlers generated against it, one test per documented status code, a generated typed client, and the CI spec diff showing code and spec match (mentor evidence ✓)</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://www.rfc-editor.org/rfc/rfc9110.html" target="_blank" rel="noopener">RFC 9110 — HTTP Semantics</a> — the source for methods, safety, idempotency and status codes.</li>
+        <li><a class="text-coral underline" href="https://www.rfc-editor.org/rfc/rfc9457.html" target="_blank" rel="noopener">RFC 9457 — Problem Details for HTTP APIs</a> — the error format in Part II.</li>
+        <li><a class="text-coral underline" href="https://spec.openapis.org/oas/latest.html" target="_blank" rel="noopener">OpenAPI Specification</a> — the contract format in Part IV.</li>
+        <li><a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status" target="_blank" rel="noopener">MDN — HTTP response status codes</a> — a readable reference for every code.</li>
+        <li><a class="text-coral underline" href="https://google.aip.dev/158" target="_blank" rel="noopener">Google AIP-158 — Pagination</a> — a well-argued, production-tested set of pagination rules.</li>
+        <li><a class="text-coral underline" href="https://owasp.org/API-Security/" target="_blank" rel="noopener">OWASP — API Security Top 10</a> — object-level authorisation, mass assignment and the other API-specific risks.</li>
+        <li><a class="text-coral underline" href="https://graphql.org/learn/" target="_blank" rel="noopener">GraphQL — Learn</a> · <a class="text-coral underline" href="https://grpc.io/docs/what-is-grpc/introduction/" target="_blank" rel="noopener">gRPC — Introduction</a> — the two alternatives compared in Part IV.</li>
+      </ul>

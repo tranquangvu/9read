@@ -95,7 +95,7 @@ const INTERN_MODULES = [
   { code: "SD10", name: "Authentication, Authorization & Security Design", critical: true, soon: true },
   { code: "SD11", name: "Reliability & Scaling", critical: true },
   { code: "SD12", name: "System Design Case Studies", critical: true },
-  { code: "BE1", name: "API Design", critical: true, soon: true },
+  { code: "BE1", name: "API Design", critical: true },
   { code: "BE2", name: "Ruby on Rails", critical: false, soon: true },
   { code: "BE3", name: "NestJS", critical: false, soon: true },
   { code: "BE4", name: "FastAPI", critical: false, soon: true },
