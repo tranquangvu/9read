@@ -106,6 +106,7 @@ this one wins for `intern/`.
 | Playwright and Playwright MCP | QA2 |
 | Definition of Done, PR evidence, CI gates | QA3 |
 | Docker and GitHub Actions | OP2 |
+| Error tracking (Sentry): SDK setup, releases and source maps, context and scrubbing, alert rules, cron/uptime monitors, triage | OP7 |
 | Ownership, questioning business logic, verifying your own work, bug-bash and regression, after-release follow-up and incidents | PP1 |
 | Product thinking, trade-offs, prioritisation and focus, responsible AI use, ethics, deliberate learning and self-assessment | PP2 |
 | Written and async communication, status and estimates, clients, demos and English, cross-functional work and feedback, mentoring | PP3 |
@@ -113,7 +114,7 @@ this one wins for `intern/`.
 | CSS layout, Tailwind, class composition (cn/cva), shadcn/ui in code, dark mode, motion | FE3 |
 | React Hook Form + Zod, Server Action forms, optimistic UI, URL state, pagination, uploads, realtime on the client | FE4 |
 | Vitest + React Testing Library + MSW, a11y checks, frontend lint/type/CI gates | FE5 |
-| Core Web Vitals, bundle size, hydration errors, error monitoring, SEO, i18n, frontend security | FE6 |
+| Core Web Vitals, bundle size, hydration errors, Next.js-specific error monitoring (general Sentry → OP7), SEO, i18n, frontend security | FE6 |
 | Riverpod / Bloc in depth, go_router tabs and redirects, Flutter forms, theming, adaptive layout, l10n, a11y | MB2 |
 | Dio interceptors and token refresh, secure storage, offline-first, push notifications, deep links, permissions, device features | MB3 |
 | Flutter unit / widget / golden / integration tests, Patrol, analyzer and CI gates | MB4 |

@@ -131,6 +131,7 @@ const INTERN_MODULES = [
   { code: "OP4", name: "Cloud Infrastructure on AWS I: Foundations", critical: true },
   { code: "OP5", name: "Cloud Infrastructure on AWS II: Production Operations", critical: false },
   { code: "OP6", name: "Cloudflare Essentials", critical: true },
+  { code: "OP7", name: "Error Tracking & Observability with Sentry", critical: true },
   { code: "AG6", name: "AI Agent Systems: RAG, Tools, MCP, Memory", critical: true },
   { code: "PP1", name: "Ownership, Verification & Follow-through", critical: true },
   { code: "PP2", name: "Product Thinking, Trade-offs & Growth", critical: true },
