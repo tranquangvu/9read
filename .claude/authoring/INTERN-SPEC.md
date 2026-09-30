@@ -49,7 +49,7 @@ this one wins for `intern/`.
    - a `callout-warn` listing red flags in AI output for this topic
 4. `Skill ladder: what each score looks like`. Labels are 0 No exposure · 1 Awareness ·
    2 Works with support · 3 Works independently · 4 Leads &amp; coaches. `.target` goes on 3 for a Core
-   module and on 2 for an Elective one. Follow it with a `callout-tip` "Self-check before claiming 3:".
+   module and on 2 for an Elective one. Follow it with a `callout-tip` "Self-check before claiming 3:" (or "claiming 2:" for an Elective module).
 5. `Pitfalls &amp; pro tips`: 4–6 cards, ✗ first and then ✓.
 6. `Evidence checklist`: 4–6 `evidence-box` items with stable `data-key`s. The **last** item is
    `font-semibold`, ends with `(mentor evidence ✓)`, and is a small practice task. This task
