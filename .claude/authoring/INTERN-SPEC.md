@@ -76,31 +76,39 @@ this one wins for `intern/`.
 ## Topic ownership (avoid duplication)
 | Topic | Owner |
 |---|---|
+| Tickets, task breakdown, estimation, Scrum / Kanban at an agency | CO1 |
+| Local setup, version managers, lockfiles, semver, env config, vetting and auditing dependencies | CO5 |
+| Naming, functions, code smells, DRY / YAGNI / KISS, safe refactoring, tech debt, practical Big-O | CO6 |
 | Claude Code basics (install, CLAUDE.md, permissions, slash commands, context) | AG2 |
 | Plan mode, specs, verification loops | AG3 |
 | Skills, subagents, hooks, MCP servers in Claude Code, headless / CI | AG5 |
 | RAG, tool use, MCP as a protocol, memory, agent loop concepts | AG6 |
 | ERD, normalisation, indexes, transactions, migrations | SD1 |
-| C4, sequence, deployment, flow diagrams, Mermaid | SD2 |
-| Layered / MVC / clean / hexagonal, dependency rule, where business logic lives | SD3 |
-| Modular monolith vs microservices, service boundaries, event-driven, sync vs async communication | SD4 |
-| GoF creational + structural (factory, builder, singleton vs DI, adapter, decorator, facade, proxy) | SD5 |
-| GoF behavioral (strategy, observer, command, state, template method, chain of responsibility / middleware) | SD6 |
-| Repository, unit of work, service layer, DTO/mapper, CQRS, transactional outbox, saga | SD7 |
-| Cache-aside / write-through, TTL, invalidation, HTTP/CDN caching, Redis | SD8 |
-| Queues, background jobs, retries, DLQ, scheduling, pub/sub, idempotent consumers | SD9 |
-| Sessions vs JWT, OAuth/OIDC, RBAC/ABAC, IDOR, OWASP Top 10, secrets | SD10 |
-| Timeouts, retries/backoff, circuit breaker, rate limiting, idempotency keys, horizontal scaling, read replicas, observability basics | SD11 |
-| End-to-end system design walk-throughs combining SD1–SD11 | SD12 |
+| C4, sequence, deployment, flow diagrams, Mermaid | CO7 |
+| Layered / MVC / clean / hexagonal, dependency rule, where business logic lives | SD2 |
+| Modular monolith vs microservices, service boundaries, event-driven, sync vs async communication | SD3 |
+| GoF creational + structural (factory, builder, singleton vs DI, adapter, decorator, facade, proxy) | SD4 |
+| GoF behavioral (strategy, observer, command, state, template method, chain of responsibility / middleware) | SD5 |
+| Repository, unit of work, service layer, DTO/mapper, CQRS, transactional outbox, saga | SD6 |
+| Cache-aside / write-through, TTL, invalidation, HTTP/CDN caching, Redis | SD7 |
+| Queues, background jobs, retries, DLQ, scheduling, pub/sub, idempotent consumers | SD8 |
+| Sessions vs JWT, OAuth/OIDC, RBAC/ABAC, IDOR, OWASP Top 10, secrets | SD9 |
+| Timeouts, retries/backoff, circuit breaker, rate limiting, idempotency keys, horizontal scaling, read replicas, observability basics | SD10 |
+| End-to-end system design walk-throughs combining SD1–SD10 | SD11 |
 | REST design, validation, errors, OpenAPI | BE1 |
 | Unit and integration tests | QA1 |
 | Playwright and Playwright MCP | QA2 |
 | Definition of Done, PR evidence, CI gates | QA3 |
 | Docker and GitHub Actions | OP2 |
+| EC2, Lambda, ECS auto scaling, SQS/SNS/EventBridge, ElastiCache, SES, CloudWatch alarms, CloudTrail/GuardDuty, KMS, backup/DR, AWS cost management | OP5 |
 | CSS layout, Tailwind, class composition (cn/cva), shadcn/ui in code, dark mode, motion | FE3 |
 | React Hook Form + Zod, Server Action forms, optimistic UI, URL state, pagination, uploads, realtime on the client | FE4 |
 | Vitest + React Testing Library + MSW, a11y checks, frontend lint/type/CI gates | FE5 |
 | Core Web Vitals, bundle size, hydration errors, error monitoring, SEO, i18n, frontend security | FE6 |
+| Riverpod / Bloc in depth, go_router tabs and redirects, Flutter forms, theming, adaptive layout, l10n, a11y | MB2 |
+| Dio interceptors and token refresh, secure storage, offline-first, push notifications, deep links, permissions, device features | MB3 |
+| Flutter unit / widget / golden / integration tests, Patrol, analyzer and CI gates | MB4 |
+| Flutter performance, crash reporting, mobile CI/CD, store release and rollout, forced update, OTA | MB5 |
 
 ## API code
 Anthropic API examples use `claude-opus-5-5` / `claude-sonnet-5-5` / `claude-haiku-4-5-20251001`
