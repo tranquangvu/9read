@@ -78,8 +78,8 @@ this one wins for `intern/`.
 |---|---|
 | Claude Code basics (install, CLAUDE.md, permissions, slash commands, context) | AG2 |
 | Plan mode, specs, verification loops | AG3 |
-| Skills, subagents, hooks, MCP servers in Claude Code, headless / CI | AG4 |
-| RAG, tool use, MCP as a protocol, memory, agent loop concepts | AG5 |
+| Skills, subagents, hooks, MCP servers in Claude Code, headless / CI | AG5 |
+| RAG, tool use, MCP as a protocol, memory, agent loop concepts | AG6 |
 | ERD, normalisation, indexes, transactions, migrations | SD1 |
 | C4, sequence, deployment, flow diagrams, Mermaid | SD2 |
 | Layered / MVC / clean / hexagonal, dependency rule, where business logic lives | SD3 |
