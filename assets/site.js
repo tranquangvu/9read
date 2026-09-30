@@ -114,7 +114,7 @@ const INTERN_MODULES = [
   { code: "OP4", name: "AWS Core Services", critical: true },
   { code: "OP5", name: "Cloudflare Essentials", critical: true },
   { code: "AG5", name: "AI Agent Systems: RAG, Tools, MCP, Memory", critical: true, soon: true },
-  { code: "CP1", name: "Capstone Project", critical: true, soon: true },
+  { code: "CP1", name: "Capstone Project", critical: true },
 ];
 
 /* ---------- program registry ---------- */
