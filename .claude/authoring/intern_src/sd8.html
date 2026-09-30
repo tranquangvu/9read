@@ -1,0 +1,789 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Caching Strategies</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Decide what is worth caching and where: the browser, the CDN, the application's Redis, or the database
+          itself. Pick a read and write pattern, choose TTLs on purpose, and invalidate without serving yesterday's
+          prices. Recognise the failure modes: stampedes, stale reads, and one patient's data served to another.
+          Then prove the cache is earning its keep with a hit-rate number.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> ask an agent to "make this endpoint faster" and it
+          will often wrap it in a cache. The diff is five lines and the benchmark improves, so it looks like a win. The
+          costs arrive later: a key that forgets the user ID, a TTL nobody chose, and a write path that never
+          invalidates. Caching bugs don't fail tests. They show up as "I saw someone else's booking" or "the price
+          was wrong for an hour". You are the one who has to ask what the key is, how long the copy lives, and who
+          clears it.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Why cache, and what it costs</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A cache is a copy you have agreed to let go stale</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A cache stores the result of some expensive work (a query, a render, an API call) somewhere faster, so the
+        next request can skip the work. That is the whole idea. The price is also the whole idea: from the moment you
+        copy the data, there are two versions of it, and they can disagree. Every caching decision is a trade
+        between <strong>speed</strong> and <strong>freshness</strong>, and you should be able to say out loud how
+        stale each cached thing is allowed to be.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The latency numbers that justify it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You don't need exact figures, but you need the orders of magnitude. The rows run roughly from fastest to
+        slowest, and the gap between the top and the bottom is about a million times. Caching moves a request up
+        this table.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Where the data comes from</th><th class="px-4 py-3">Rough time</th><th class="px-4 py-3">Clinic-app example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Browser cache (no network at all)</td><td class="px-4 py-3">~0 ms</td><td class="px-4 py-3">The clinic logo and JS bundle on a repeat visit</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">In-process memory (a map in your app)</td><td class="px-4 py-3">well under 1 µs</td><td class="px-4 py-3">The list of specialties, loaded once at boot</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Redis in the same data centre</td><td class="px-4 py-3">~0.2–1 ms per round trip</td><td class="px-4 py-3">A doctor's public profile</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Indexed Postgres query</td><td class="px-4 py-3">~1–10 ms</td><td class="px-4 py-3">One booking by ID (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a> indexes)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CDN edge near the user</td><td class="px-4 py-3">~10–40 ms, measured from the user</td><td class="px-4 py-3">The public clinic page for a user in Hanoi, served from a nearby edge</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Heavy aggregate query</td><td class="px-4 py-3">100 ms – seconds</td><td class="px-4 py-3">"Free slots per clinic for the next 14 days"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Origin server on another continent</td><td class="px-4 py-3">~150–300 ms per round trip</td><td class="px-4 py-3">A user in Vietnam hitting a server in us-east-1</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Third-party API</td><td class="px-4 py-3">100 ms – several seconds, and rate-limited</td><td class="px-4 py-3">Insurance eligibility check, geocoding an address</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice that an indexed query is already fast. Caching a 3 ms query in Redis saves about 2 ms and adds a
+        whole invalidation problem. Caching a 900 ms aggregate or a rate-limited third-party call is where the
+        payoff is. <strong>Measure first</strong>: find the slow or expensive thing with real timings before you
+        cache anything.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Where caches live</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A request passes through several layers, and each one can answer from a copy instead of passing the request
+        on. The closer to the user a layer is, the faster it is, and the less it knows about who is asking.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Cache layers from browser to database">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">A REQUEST FOR /clinics/7 — EACH LAYER MAY ANSWER FROM A COPY</text>
+          <g class="anim-pulse"><rect x="10" y="44" width="120" height="58" rx="9" fill="#2563EB"/>
+            <text x="70" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Browser</text>
+            <text x="70" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">Cache-Control, ETag</text></g>
+          <g class="anim-pulse d1"><rect x="150" y="44" width="120" height="58" rx="9" fill="#6d5acd"/>
+            <text x="210" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">CDN edge</text>
+            <text x="210" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">shared, public only</text></g>
+          <g class="anim-pulse d2"><rect x="290" y="44" width="120" height="58" rx="9" fill="#0D9488"/>
+            <text x="350" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">App server</text>
+            <text x="350" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">in-process memory</text></g>
+          <g class="anim-pulse d3"><rect x="430" y="44" width="120" height="58" rx="9" fill="#D97757"/>
+            <text x="490" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Redis</text>
+            <text x="490" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">shared by all servers</text></g>
+          <g class="anim-pulse d4"><rect x="570" y="44" width="120" height="58" rx="9" fill="#37474F"/>
+            <text x="630" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Postgres</text>
+            <text x="630" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">buffers, mat. views</text></g>
+          <line x1="130" y1="73" x2="150" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="270" y1="73" x2="290" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="410" y1="73" x2="430" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="550" y1="73" x2="570" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="70" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">one user</text>
+          <text x="210" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">everyone in a region</text>
+          <text x="350" y="128" text-anchor="middle" fill="#6E6B64" font-size="9">one server process</text>
+          <text x="490" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">every server</text>
+          <text x="630" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">the source of truth</text>
+          <text x="12" y="162" font-size="10" fill="#A8A49B">← faster, cheaper, knows less about the user</text>
+          <text x="688" y="162" text-anchor="end" font-size="10" fill="#A8A49B">slower, authoritative, knows everything →</text>
+          <text x="350" y="188" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">a hit at any layer means every layer to its right does no work</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">What is worth caching</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Good candidates share three properties: they are <strong>read far more often than written</strong>, they
+        are <strong>expensive</strong> to produce, and a <strong>little staleness is acceptable</strong>. Go through
+        the data in your app and sort it. For the clinic booking app:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Data</th><th class="px-4 py-3">Read / write ratio</th><th class="px-4 py-3">Staleness allowed</th><th class="px-4 py-3">Verdict</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Clinic profile, opening hours, photos</td><td class="px-4 py-3">Thousands : 1</td><td class="px-4 py-3">Minutes</td><td class="px-4 py-3">Cache at the CDN and in Redis</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">List of specialties</td><td class="px-4 py-3">Huge : almost never</td><td class="px-4 py-3">Hours</td><td class="px-4 py-3">In-process memory, or even a constant</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Free-slot counts on the search page</td><td class="px-4 py-3">High : medium</td><td class="px-4 py-3">Seconds (it's a hint)</td><td class="px-4 py-3">Cache with a short TTL, and <strong>re-check at booking time</strong></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Whether slot 42 is free, at the moment of booking</td><td class="px-4 py-3">—</td><td class="px-4 py-3">None</td><td class="px-4 py-3">Never cache. The database constraint decides (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>).</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A patient's own bookings</td><td class="px-4 py-3">Low : low</td><td class="px-4 py-3">None (they just made one)</td><td class="px-4 py-3">Usually don't cache. The indexed query is fast enough.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Insurance API response</td><td class="px-4 py-3">Medium, and each call costs money</td><td class="px-4 py-3">A day</td><td class="px-4 py-3">Cache per patient in Redis, never at the CDN</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>A cache can show, but must never decide.</strong> It is fine for the search page to say "3 slots
+        left" from a 10-second-old cache. It is not fine for the booking endpoint to trust that number. Any decision
+        that moves money or reserves something reads from the source of truth, inside a transaction.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The cost you sign up for</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every cache adds four things to your system: <strong>a staleness window</strong> (how long users can see old
+        data), <strong>an invalidation path</strong> (code that must run on every write), <strong>a new failure
+        mode</strong> (what happens when Redis is down or empty), and <strong>a memory budget</strong>. If you can't
+        name all four for a cache in your code, you don't yet understand that cache. A good first step is to
+        write them as a comment right next to it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinics/cache.ts — document every cache like this</span>
+        <pre class="code"><span class="cm">/**
+ * CACHE: clinic public profile
+ * key:          clinic:v3:{clinicId}:profile     (no user data inside)
+ * staleness:    up to 5 min, or until invalidated on update
+ * invalidation: ClinicService.update() deletes the key after COMMIT
+ * on failure:   Redis down → read from Postgres, log a warning, don't crash
+ */</span>
+<span class="kw">export const</span> <span class="fn">CLINIC_PROFILE_TTL_S</span> = <span class="st">300</span>;</pre>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · The cache layers</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Cache as close to the user as the data's privacy allows</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Each layer from the diagram above has its own controls and its own risks. The browser and the CDN are
+        driven by <strong>HTTP headers</strong> that your server sends. Redis and in-process caches are driven by
+        <strong>your code</strong>. The database has a few tricks of its own. Start at the outside and move in.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">HTTP caching: Cache-Control and ETag</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every HTTP response can tell browsers and CDNs whether they may keep a copy, who may share it, and for how
+        long. This is the cheapest cache you will ever build, because you write no cache code at all: you set a
+        header. It is also the easiest to get dangerously wrong, because a wrong header on a personal page lets a
+        shared cache hand that page to the next person. (<a href="./co4.html" class="text-viol underline decoration-viol/40">CO4</a>
+        covers HTTP basics.)
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Directive</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">public</code></td><td class="px-4 py-3">Shared caches (CDN, proxies) may store it</td><td class="px-4 py-3">The public clinic page, images</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">private</code></td><td class="px-4 py-3">Only the user's own browser may store it</td><td class="px-4 py-3">"My bookings" JSON, if you cache it at all</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">no-store</code></td><td class="px-4 py-3">Nobody stores it, anywhere</td><td class="px-4 py-3">Medical records, payment pages, anything after login that is sensitive</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">no-cache</code></td><td class="px-4 py-3">You may store it, but must revalidate with the server before each use. It does <em>not</em> mean "don't cache".</td><td class="px-4 py-3">HTML pages that change often, combined with an ETag</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">max-age=N</code></td><td class="px-4 py-3">Fresh for N seconds in any cache</td><td class="px-4 py-3">Everything cacheable</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">s-maxage=N</code></td><td class="px-4 py-3">Overrides <code class="inline">max-age</code> for shared caches only</td><td class="px-4 py-3">Short in the browser, longer at the CDN, where you can purge</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">stale-while-revalidate=N</code></td><td class="px-4 py-3">After expiry, serve the stale copy for up to N more seconds while fetching a fresh one in the background</td><td class="px-4 py-3">Pages where "a few seconds old" beats "slow"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">immutable</code></td><td class="px-4 py-3">It will never change at this URL, so don't even revalidate</td><td class="px-4 py-3">Build assets with a content hash in the filename, such as <code class="inline">app.3f9a1c.js</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        An <strong>ETag</strong> is a fingerprint of a response, such as a hash of the body or a version number.
+        The browser sends it back in <code class="inline">If-None-Match</code>. If nothing changed, the server replies
+        <code class="inline">304 Not Modified</code> with no body. The server still does some work, but the payload
+        doesn't travel again:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant S as API server
+    B->>S: GET /clinics/7
+    S-->>B: 200 OK, body 48 KB<br/>ETag "v42", Cache-Control no-cache
+    Note over B: stores body and ETag
+    B->>S: GET /clinics/7<br/>If-None-Match "v42"
+    Note over S: clinic.version is still 42
+    S-->>B: 304 Not Modified, no body
+    Note over B: reuses the stored 48 KB
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">HTTP responses — three typical header sets</span>
+        <pre class="code"><span class="cm"># Hashed static asset: cache for a year, never revalidate</span>
+Cache-Control: public, max-age=31536000, immutable
+
+<span class="cm"># Public clinic page: 1 min in browsers, 10 min at the CDN, serve stale while refreshing</span>
+Cache-Control: public, max-age=60, s-maxage=600, stale-while-revalidate=60
+ETag: <span class="st">"clinic-7-v42"</span>
+
+<span class="cm"># Anything personal or sensitive: no copies anywhere</span>
+Cache-Control: <span class="kw">no-store</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The CDN: a shared cache at the edge</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A CDN such as Cloudflare or CloudFront keeps copies of your responses in data centres close to users. It
+        makes public pages and assets fast for everyone, and it absorbs traffic spikes before they reach your
+        servers. Setup, cache rules and purging are covered in
+        <a href="./op5.html" class="text-viol underline decoration-viol/40">OP5 Cloudflare Essentials</a>. For design
+        purposes, three ideas matter:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>The cache key.</strong> By default a CDN stores one copy per URL (plus a few details). If the
+          response varies by something that isn't in the URL, such as a cookie, a language header or the logged-in
+          user, then either that thing must be part of the key (the <code class="inline">Vary</code> header, or a CDN
+          rule) or the response must not be shared at all.</li>
+        <li><strong>Purging.</strong> CDNs let you purge by URL, and some also by tag or prefix. A long
+          <code class="inline">s-maxage</code> plus a purge on update gives you fast pages and fresh data at the same
+          time.</li>
+        <li><strong>Only public content.</strong> Treat any response that depends on who is logged in as
+          uncacheable at the CDN, unless you have a very specific, reviewed setup. This is the layer where a leak
+          reaches the most people.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Application caches: in-process vs Redis</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Inside your backend you choose between a cache in the process's own memory and a shared cache server,
+        usually Redis (or a compatible server such as Valkey). Most production apps with more than one server
+        instance use Redis for anything that changes, and in-process memory only for small, near-constant data.
+      </p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Property</th><th class="px-4 py-3">In-process (a map or LRU in the app)</th><th class="px-4 py-3">Redis (shared)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Speed</td><td class="px-4 py-3">Fastest: no network</td><td class="px-4 py-3">One network round trip, well under a millisecond nearby</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shared across servers</td><td class="px-4 py-3">No. Each of 4 instances has its own copy, and they drift apart.</td><td class="px-4 py-3">Yes. One copy, one place to invalidate.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Survives a deploy</td><td class="px-4 py-3">No, every restart starts cold</td><td class="px-4 py-3">Yes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Invalidation</td><td class="px-4 py-3">Hard: you must reach every process</td><td class="px-4 py-3">One <code class="inline">DEL</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Memory</td><td class="px-4 py-3">Competes with your app, so it can cause out-of-memory crashes</td><td class="px-4 py-3">Its own budget, with an eviction policy</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Good for</td><td class="px-4 py-3">Config, feature lists, specialties, compiled templates</td><td class="px-4 py-3">Profiles, computed pages, API responses, sessions, rate-limit counters</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>In-process caches and serverless don't mix well.</strong> On Vercel, Lambda or any autoscaled platform,
+        you may have dozens of short-lived instances. Each one starts empty, and a <code class="inline">new Map()</code>
+        at module level gives you dozens of caches that disagree with each other. If an agent adds a module-level map
+        "as a cache" in serverless code, ask what happens on the other instances.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Database-level caching</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Postgres already keeps recently used data pages in memory (its <em>shared buffers</em>, plus the operating
+        system's file cache), which is why a query often runs faster the second time. But it has <strong>no result
+        cache</strong>: it doesn't store the answer to a query and hand it back. (MySQL had a query cache and removed
+        it in 8.0, because invalidating it hurt more than it helped.) The database-side tool you will actually use
+        is the <strong>materialized view</strong>: a query whose result is saved as a table and refreshed when you
+        choose.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration — a materialized view for the search page</span>
+        <pre class="code"><span class="kw">CREATE MATERIALIZED VIEW</span> <span class="fn">clinic_free_slots_14d</span> <span class="kw">AS</span>
+<span class="kw">SELECT</span> d.clinic_id, date(s.starts_at) <span class="kw">AS</span> day, count(*) <span class="kw">AS</span> free_slots
+<span class="kw">FROM</span> slots s <span class="kw">JOIN</span> doctors d <span class="kw">ON</span> d.id = s.doctor_id
+<span class="kw">WHERE</span> s.starts_at <span class="kw">BETWEEN</span> now() <span class="kw">AND</span> now() + interval <span class="st">'14 days'</span>
+  <span class="kw">AND NOT EXISTS</span> (<span class="kw">SELECT</span> 1 <span class="kw">FROM</span> bookings b <span class="kw">WHERE</span> b.slot_id = s.id <span class="kw">AND</span> b.status = <span class="st">'booked'</span>)
+<span class="kw">GROUP BY</span> 1, 2;
+
+<span class="kw">CREATE UNIQUE INDEX ON</span> clinic_free_slots_14d (clinic_id, day);  <span class="cm">-- required for CONCURRENTLY</span>
+
+<span class="cm">-- run every minute from a scheduled job (SD9); readers are not blocked</span>
+<span class="kw">REFRESH MATERIALIZED VIEW CONCURRENTLY</span> clinic_free_slots_14d;</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The view is exactly as stale as your refresh interval, which suits a search page and does not suit the
+        booking decision. Refreshing is scheduled work, so it belongs in a background job
+        (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>). Adding a read replica is a
+        different tool, for a different problem, covered in <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Framework caches</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most frameworks wrap these layers in their own API. The concepts in this module still apply, but the names
+        change. Know which one your stack uses, and read its docs before you trust its defaults:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Next.js</strong>: with Cache Components enabled, the <code class="inline">'use cache'</code>
+          directive caches a function or component, <code class="inline">cacheLife</code> sets how long,
+          <code class="inline">cacheTag</code> labels entries, and <code class="inline">updateTag</code> /
+          <code class="inline">revalidateTag</code> invalidate them after a mutation. See
+          <a href="./ap2.html" class="text-viol underline decoration-viol/40">AP2</a> and the
+          <a class="text-coral underline" href="https://nextjs.org/docs/app/api-reference/directives/use-cache" target="_blank" rel="noopener">use cache docs</a>.</li>
+        <li><strong>Rails</strong>: <code class="inline">Rails.cache.fetch(key, expires_in:)</code> is cache-aside in one
+          call, and fragment caching with key-based expiry is the Rails idiom for versioned keys
+          (<a href="./be2.html" class="text-viol underline decoration-viol/40">BE2</a>).</li>
+        <li><strong>NestJS</strong>: the cache manager module and an interceptor that caches GET responses
+          (<a href="./be3.html" class="text-viol underline decoration-viol/40">BE3</a>). Check what the key is before you
+          put it on an authenticated route.</li>
+        <li><strong>FastAPI and Gin</strong>: no built-in cache, so you call Redis directly with redis-py or go-redis
+          (<a href="./be4.html" class="text-viol underline decoration-viol/40">BE4</a>,
+          <a href="./be5.html" class="text-viol underline decoration-viol/40">BE5</a>).</li>
+      </ul>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Patterns, TTLs &amp; invalidation</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Decide the write path first, and the read path follows</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Almost every caching bug is a write bug: the data changed and the cache didn't hear about it. So when you
+        review a cache, don't start at the <code class="inline">get</code>. Start by finding every place that
+        <em>writes</em> the underlying data and checking what each one does to the cache.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Cache-aside: the default you'll see 90% of the time</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In <strong>cache-aside</strong> (also called lazy loading), the application manages the cache itself. On a
+        read it tries the cache, and on a miss it loads from the database and stores the result. On a write it
+        updates the database and then <strong>deletes</strong> the cache key, so the next read loads fresh data.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    R["GET clinic 7"] --> C{"key in Redis?"}
+    C -- "hit" --> H["return cached JSON"]
+    C -- "miss" --> D["SELECT from Postgres"]
+    D --> S["SET key with TTL"]
+    S --> H2["return fresh JSON"]
+    W["UPDATE clinic 7"] --> DB["write Postgres, COMMIT"]
+    DB --> X["DEL key"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinics/profile.ts — cache-aside with ioredis</span>
+        <pre class="code"><span class="kw">export async function</span> <span class="fn">getClinicProfile</span>(id: <span class="kw">number</span>) {
+  <span class="kw">const</span> key = <span class="st">`clinic:v3:${id}:profile`</span>;
+  <span class="kw">try</span> {
+    <span class="kw">const</span> hit = <span class="kw">await</span> redis.get(key);
+    <span class="kw">if</span> (hit) <span class="kw">return</span> JSON.parse(hit);
+  } <span class="kw">catch</span> (err) {
+    log.warn({ err }, <span class="st">"redis read failed, falling back to db"</span>); <span class="cm">// cache down ≠ site down</span>
+  }
+  <span class="kw">const</span> profile = <span class="kw">await</span> db.clinic.findPublicProfile(id);
+  <span class="kw">if</span> (profile) {
+    <span class="kw">const</span> ttl = <span class="st">300</span> + Math.floor(Math.random() * <span class="st">60</span>);           <span class="cm">// TTL + jitter (Part IV)</span>
+    <span class="kw">await</span> redis.set(key, JSON.stringify(profile), <span class="st">"EX"</span>, ttl).catch(() =&gt; {});
+  }
+  <span class="kw">return</span> profile;
+}
+
+<span class="kw">export async function</span> <span class="fn">updateClinic</span>(id: <span class="kw">number</span>, input: ClinicUpdate) {
+  <span class="kw">await</span> db.clinic.update(id, input);                <span class="cm">// commits first…</span>
+  <span class="kw">await</span> redis.del(<span class="st">`clinic:v3:${id}:profile`</span>);      <span class="cm">// …then invalidates. Delete, don't set.</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two details separate a good version from a bad one. The good version <strong>deletes</strong> the key on
+        write instead of writing the new value into it: setting it risks racing with a concurrent reader, and it
+        caches a shape that the read path may build differently. It also <strong>survives Redis being down</strong>
+        by falling back to the database. The same pattern in Python and Ruby:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinics/profile.py (redis-py) · clinic.rb (Rails)</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">get_clinic_profile</span>(clinic_id: int) -&gt; dict | None:
+    key = <span class="st">f"clinic:v3:{clinic_id}:profile"</span>
+    <span class="kw">if</span> (hit := r.get(key)) <span class="kw">is not None</span>:
+        <span class="kw">return</span> json.loads(hit)
+    profile = repo.find_public_profile(clinic_id)
+    <span class="kw">if</span> profile:
+        r.set(key, json.dumps(profile), ex=<span class="st">300</span>)
+    <span class="kw">return</span> profile
+
+<span class="cm"># Rails: cache-aside in one call; the block runs only on a miss</span>
+Rails.cache.fetch(<span class="st">"clinic:v3:#{id}:profile"</span>, expires_in: <span class="st">5</span>.minutes) <span class="kw">do</span>
+  Clinic.find(id).public_profile
+<span class="kw">end</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Read-through, write-through and write-behind</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The other named patterns move responsibility around. In <strong>read-through</strong>, a cache library or
+        service loads from the database on a miss, so your code only ever talks to the cache. Rails'
+        <code class="inline">fetch</code> above is close to this. In <strong>write-through</strong>, every write goes
+        to the cache and the database together, so the cache is never stale, but you pay on every write. In
+        <strong>write-behind</strong> (write-back), writes go to the cache and are flushed to the database later,
+        which is fast and risky.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Pattern</th><th class="px-4 py-3">Read path</th><th class="px-4 py-3">Write path</th><th class="px-4 py-3">Staleness</th><th class="px-4 py-3">Right when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Cache-aside</td><td class="px-4 py-3">App checks cache, loads DB on miss</td><td class="px-4 py-3">App writes DB, deletes key</td><td class="px-4 py-3">Up to TTL if an invalidation is missed</td><td class="px-4 py-3">The default for web apps. Simple, and it survives cache outages.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Read-through</td><td class="px-4 py-3">Cache layer loads DB on miss</td><td class="px-4 py-3">Usually paired with delete or write-through</td><td class="px-4 py-3">Same as cache-aside</td><td class="px-4 py-3">A framework or library already provides it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Write-through</td><td class="px-4 py-3">Always from cache</td><td class="px-4 py-3">Write DB and cache in the same operation</td><td class="px-4 py-3">Low, but a failed half-write leaves them different</td><td class="px-4 py-3">Data read immediately after writing, such as a user's settings</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Write-behind</td><td class="px-4 py-3">Always from cache</td><td class="px-4 py-3">Write cache, flush to DB later in batches</td><td class="px-4 py-3">DB lags behind, and a crash can <strong>lose writes</strong></td><td class="px-4 py-3">High-volume counters where losing a few is acceptable: view counts, "last seen"</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>Never use write-behind for anything that matters.</strong> A booking, a payment or an order written
+        only to Redis and "flushed later" is lost if Redis restarts before the flush. If an agent proposes buffering
+        business writes in the cache for speed, the answer is no. Use a queue with durable storage
+        (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>) instead.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Choosing a TTL on purpose</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The TTL (time to live) is your safety net. Even if every invalidation works, a TTL puts an upper bound on how
+        wrong the cache can be when one doesn't. Every key gets one. Pick it from the business question "how stale
+        can this be before a user is harmed or confused?", not from habit:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Data</th><th class="px-4 py-3">TTL</th><th class="px-4 py-3">Also invalidated on write?</th><th class="px-4 py-3">Reasoning</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Specialties list</td><td class="px-4 py-3">1 day</td><td class="px-4 py-3">Yes, on admin edit</td><td class="px-4 py-3">Changes a few times a year</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clinic profile</td><td class="px-4 py-3">5–15 min</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">The TTL only catches a missed invalidation</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Free-slot counts</td><td class="px-4 py-3">10–30 s</td><td class="px-4 py-3">No, too many writers</td><td class="px-4 py-3">A hint only. The booking re-checks.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Exchange rates from an API</td><td class="px-4 py-3">1 hour</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Matches the provider's update rate</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Session data</td><td class="px-4 py-3">The session length, such as 7 days sliding</td><td class="px-4 py-3">Deleted on logout</td><td class="px-4 py-3">The TTL is the security property (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A key with no TTL at all is a bug waiting for a missed invalidation, and it also slowly fills memory with keys
+        for records nobody reads any more. In review, <code class="inline">redis.set(key, value)</code> with no
+        expiry should always prompt the question "why not?".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Four invalidation strategies</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "There are only two hard things in computer science: cache invalidation and naming things." Invalidation
+        is hard because the code that writes data is often far away from the code that caches it. Pick a strategy
+        per cache, deliberately:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Strategy</th><th class="px-4 py-3">How</th><th class="px-4 py-3">Strength</th><th class="px-4 py-3">Weakness</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">TTL only</td><td class="px-4 py-3">Let entries expire</td><td class="px-4 py-3">No write-path code at all</td><td class="px-4 py-3">Always stale for up to the TTL</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Delete on write</td><td class="px-4 py-3">The service that writes deletes the key after commit</td><td class="px-4 py-3">Simple and immediate</td><td class="px-4 py-3">Every writer must remember, including admin scripts and jobs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Event-based</td><td class="px-4 py-3">Writes publish <code class="inline">clinic.updated</code>, and a consumer deletes the keys</td><td class="px-4 py-3">Writers don't need to know about caches</td><td class="px-4 py-3">Needs reliable events: the outbox from <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a> and consumers from <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Versioned keys</td><td class="px-4 py-3">Put a version in the key. A write bumps the version, so old keys are never read again and expire on their own.</td><td class="px-4 py-3">No delete race, and invalidating many keys is one increment</td><td class="px-4 py-3">Old entries occupy memory until their TTL</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tag-based</td><td class="px-4 py-3">Label entries with tags (<code class="inline">clinic:7</code>) and invalidate by tag</td><td class="px-4 py-3">"Everything about clinic 7" in one call</td><td class="px-4 py-3">Needs framework or CDN support, such as Next.js <code class="inline">cacheTag</code> or CDN purge-by-tag</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinics/cache.go — versioned keys with go-redis</span>
+        <pre class="code"><span class="cm">// One counter per clinic. Every cached thing about the clinic embeds it.</span>
+<span class="kw">func</span> <span class="fn">clinicKey</span>(ctx context.Context, id <span class="kw">int64</span>, part <span class="kw">string</span>) <span class="kw">string</span> {
+    ver, _ := rdb.Get(ctx, fmt.Sprintf(<span class="st">"clinic:%d:ver"</span>, id)).Int64() <span class="cm">// missing → 0</span>
+    <span class="kw">return</span> fmt.Sprintf(<span class="st">"clinic:%d:v%d:%s"</span>, id, ver, part)
+}
+
+<span class="cm">// After the DB transaction commits: one INCR invalidates profile, doctors, reviews…</span>
+<span class="kw">func</span> <span class="fn">invalidateClinic</span>(ctx context.Context, id <span class="kw">int64</span>) <span class="kw">error</span> {
+    <span class="kw">return</span> rdb.Incr(ctx, fmt.Sprintf(<span class="st">"clinic:%d:ver"</span>, id)).Err()
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The stale-set race, and why "after commit" matters</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Cache-aside has one well-known race. A slow reader loads old data, a writer updates the database and deletes
+        the key, and then the slow reader puts the old data back. The cache is now wrong until the TTL expires:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    participant R as Reader (slow)
+    participant C as Redis
+    participant DB as Postgres
+    participant W as Writer
+    R->>C: GET clinic:7 → miss
+    R->>DB: SELECT clinic 7 → old hours
+    W->>DB: UPDATE clinic 7, COMMIT
+    W->>C: DEL clinic:7
+    R->>C: SET clinic:7 = old hours
+    Note over C: stale until TTL expires ❌<br/>the TTL is what saves you
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The race is rare and the TTL bounds it, which is why cache-aside is still the default. A related bug is
+        worse and common in agent code: deleting the key <strong>inside</strong> the database transaction, before
+        it commits. A reader can then refill the cache from the not-yet-updated row. Always invalidate
+        <strong>after commit</strong> (ORMs offer after-commit hooks, such as Rails' <code class="inline">after_commit</code>).
+        If the data really can't tolerate the window, use versioned keys, a shorter TTL, or no cache.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Failure modes, keys &amp; measurement</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Caches fail in crowds and leak in silence</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A cache that works on your laptop can still take production down in two ways: everyone misses at once, or the
+        wrong person hits. Neither shows up in a unit test. This Part covers how to recognise both, how to design keys
+        that prevent the second, and how to prove the cache helps at all.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Cache stampede (thundering herd)</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A popular key expires. In the next 50 ms, 500 requests miss at the same time, and all 500 run the same
+        expensive query against the database. The database slows down, so the queries take longer, so even more
+        requests pile up behind them. The same thing happens after a deploy that flushes the cache, or when Redis
+        restarts empty. The cache was hiding how much load the database could really take.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="Cache stampede without and with single-flight">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">KEY "search:hanoi:cardio" EXPIRES AT 09:00:00 — 500 REQUESTS ARRIVE IN THE SAME SECOND</text>
+          <text x="12" y="46" font-size="10" font-weight="700" fill="#DB2777">WITHOUT PROTECTION</text>
+          <g class="anim-pulse"><rect x="10" y="56" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="75" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">500 requests</text>
+            <text x="75" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">all miss</text></g>
+          <g class="anim-pulse d1"><rect x="250" y="56" width="170" height="50" rx="9" fill="#DB2777"/>
+            <text x="335" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">500 × heavy query</text>
+            <text x="335" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">each 900 ms, then slower</text></g>
+          <g class="anim-pulse d2"><rect x="530" y="56" width="160" height="50" rx="9" fill="#37474F"/>
+            <text x="610" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Postgres at 100% CPU</text>
+            <text x="610" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">every page slows down</text></g>
+          <line x1="140" y1="81" x2="250" y2="81" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="420" y1="81" x2="530" y2="81" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="12" y="138" font-size="10" font-weight="700" fill="#0D9488">WITH SINGLE-FLIGHT + STALE-WHILE-REVALIDATE</text>
+          <g class="anim-pulse d1"><rect x="10" y="148" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="75" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">500 requests</text>
+            <text x="75" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">1 wins the lock</text></g>
+          <g class="anim-pulse d2"><rect x="250" y="148" width="170" height="50" rx="9" fill="#0D9488"/>
+            <text x="335" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1 × heavy query</text>
+            <text x="335" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">499 get the stale copy</text></g>
+          <g class="anim-pulse d3"><rect x="530" y="148" width="160" height="50" rx="9" fill="#6d5acd"/>
+            <text x="610" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Cache refilled</text>
+            <text x="610" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">DB barely notices</text></g>
+          <line x1="140" y1="173" x2="250" y2="173" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="420" y1="173" x2="530" y2="173" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Defence</th><th class="px-4 py-3">What it does</th><th class="px-4 py-3">Cost</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">TTL jitter</td><td class="px-4 py-3">Add a random few percent to each TTL, so keys written together don't expire together</td><td class="px-4 py-3">One line. Always do it.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Single-flight (request coalescing)</td><td class="px-4 py-3">Only one caller recomputes a missing key. The rest wait for its result.</td><td class="px-4 py-3">In-process is easy. Across servers you need a short Redis lock.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Serve stale while refreshing</td><td class="px-4 py-3">Keep a "soft" expiry inside the value. After it passes, serve the old value and refresh in the background.</td><td class="px-4 py-3">Users see slightly old data during the refresh</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Early refresh / pre-warming</td><td class="px-4 py-3">Refresh hot keys shortly before they expire, or fill them from a job after a deploy</td><td class="px-4 py-3">Needs to know which keys are hot</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">search/cache.go — single-flight inside one process</span>
+        <pre class="code"><span class="kw">import</span> <span class="st">"golang.org/x/sync/singleflight"</span>
+
+<span class="kw">var</span> group singleflight.Group
+
+<span class="kw">func</span> <span class="fn">FreeSlots</span>(ctx context.Context, city, spec <span class="kw">string</span>) ([]Slot, <span class="kw">error</span>) {
+    key := <span class="st">"search:"</span> + city + <span class="st">":"</span> + spec
+    <span class="kw">if</span> s, ok := cacheGet(ctx, key); ok {
+        <span class="kw">return</span> s, <span class="kw">nil</span>
+    }
+    <span class="cm">// 500 concurrent misses for the same key → one DB query, 500 shared results</span>
+    v, err, _ := group.Do(key, <span class="kw">func</span>() (any, <span class="kw">error</span>) {
+        s, err := db.FreeSlots(ctx, city, spec)
+        <span class="kw">if</span> err == <span class="kw">nil</span> { cacheSet(ctx, key, s, jitter(<span class="st">30</span>*time.Second)) }
+        <span class="kw">return</span> s, err
+    })
+    <span class="kw">if</span> err != <span class="kw">nil</span> { <span class="kw">return nil</span>, err }
+    <span class="kw">return</span> v.([]Slot), <span class="kw">nil</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Across several servers, the same idea uses a short lock in Redis: <code class="inline">SET lock:KEY token NX PX 5000</code>
+        succeeds for exactly one caller, which recomputes. The others briefly wait and retry the cache, or serve the
+        stale copy. Always give the lock an expiry, so a crashed holder can't block the key forever.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">What never to cache, and how keys leak data</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The most serious caching bug is not staleness. It is <strong>serving one user's data to another</strong>. It
+        happens when a response depends on who is asking, but the cache key doesn't include who is asking. The agent
+        wraps <code class="inline">GET /me/bookings</code> in a cache keyed by the URL, the first patient's bookings
+        get cached, and every other patient now sees them.
+      </p>
+      <div class="mt-4 callout callout-danger">
+        <strong>The per-user leak, three ways it ships:</strong> a cache key built from the path only
+        (<code class="inline">cache:/api/me/bookings</code>) · a CDN or proxy caching an authenticated response because
+        it had <code class="inline">Cache-Control: public</code> or no header at all · a framework "cache this page"
+        helper put on a page that reads cookies. The rule: if the response depends on the user, the tenant or the
+        permissions, either that identity is <em>in the key</em>, or the response is <code class="inline">no-store</code>
+        and never shared. For health data, prefer no-store.
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Also keep out of any cache: secrets and tokens (they belong in a secrets manager or a session store with a
+        TTL), full payment details, and anything whose correctness decides money or capacity, such as stock levels or
+        slot availability at the moment of purchase.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Key design</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A good key is <strong>namespaced</strong>, <strong>versioned</strong>, and contains <strong>every input that
+        changes the output</strong>, and nothing else. Use a fixed shape such as
+        <code class="inline">app:entity:version:id:variant</code>, separated by colons, which is the Redis convention.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Bad key</th><th class="px-4 py-3">Problem</th><th class="px-4 py-3">Better key</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">bookings</code></td><td class="px-4 py-3">Same for every user: a data leak</td><td class="px-4 py-3"><code class="inline">clinic:bookings:v1:patient:812</code>, or don't cache it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">clinic_7</code></td><td class="px-4 py-3">No namespace or version. A changed JSON shape after a deploy breaks the readers.</td><td class="px-4 py-3"><code class="inline">clinic:v3:7:profile</code>. Bump <code class="inline">v3</code> when the shape changes.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">search:hanoi</code></td><td class="px-4 py-3">Forgets the specialty, date and language inputs</td><td class="px-4 py-3"><code class="inline">search:v1:hanoi:cardio:2026-10-01:vi</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">search:{JSON of all params}</code></td><td class="px-4 py-3">Params in a different order give a different key, which kills the hit rate</td><td class="px-4 py-3">Normalise: sort params, lowercase, and hash if long</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">report:tenant</code></td><td class="px-4 py-3">Multi-tenant app with no tenant ID in the key</td><td class="px-4 py-3"><code class="inline">t:42:report:v2:monthly:2026-09</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Measure the hit rate, or it's a guess</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Hit rate</strong> = hits ÷ (hits + misses). A cache with a 20% hit rate adds a network hop to 80% of
+        requests and saves little. Hot, well-keyed data usually shows 90% or more. Watch three numbers: hit rate
+        <em>per cache</em> (a global number hides a useless cache), <strong>evictions</strong> (Redis is out of memory
+        and throwing keys away), and the latency of the uncached path.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">redis-cli — global counters, and a per-cache metric in code</span>
+        <pre class="code">$ redis-cli INFO stats | grep -E <span class="st">"keyspace_(hits|misses)|evicted_keys"</span>
+<span class="out">keyspace_hits:1843021
+keyspace_misses:96112          # ≈ 95% global hit rate
+evicted_keys:0                 # &gt; 0 and rising → memory too small</span>
+
+$ redis-cli CONFIG GET maxmemory-policy
+<span class="out">allkeys-lru</span>                    <span class="cm"># for a pure cache: evict least-recently-used keys</span>
+
+<span class="cm">// per-cache counters: emit one metric per hit and miss, labelled with the cache name</span>
+metrics.increment(<span class="st">"cache.lookup"</span>, { cache: <span class="st">"clinic_profile"</span>, result: hit ? <span class="st">"hit"</span> : <span class="st">"miss"</span> });</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Dashboards and alerts are covered in <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>.
+        For a PR, the minimum is before-and-after latency for the endpoint under realistic load, plus the hit rate
+        after a warm-up.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Redis data structures, briefly</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Redis is not just a key-to-string store. Picking the right structure often removes a whole round of
+        serialising and reloading:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Type</th><th class="px-4 py-3">Commands</th><th class="px-4 py-3">Use in the clinic app</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">String</td><td class="px-4 py-3"><code class="inline">GET SET INCR EXPIRE</code></td><td class="px-4 py-3">Cached JSON, version counters, simple rate-limit counters</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hash</td><td class="px-4 py-3"><code class="inline">HGET HSET HGETALL</code></td><td class="px-4 py-3">A clinic's fields, when you update one field at a time</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">List</td><td class="px-4 py-3"><code class="inline">LPUSH LRANGE LTRIM</code></td><td class="px-4 py-3">"Recently viewed clinics", capped at 10</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Set</td><td class="px-4 py-3"><code class="inline">SADD SISMEMBER</code></td><td class="px-4 py-3">Tags: which keys belong to clinic 7, for tag-based invalidation</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sorted set</td><td class="px-4 py-3"><code class="inline">ZADD ZRANGE</code></td><td class="px-4 py-3">Top-rated doctors leaderboard, sliding-window rate limits</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Stream</td><td class="px-4 py-3"><code class="inline">XADD XREADGROUP</code></td><td class="px-4 py-3">A lightweight event log with consumer groups, covered in <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are good at writing the cache plumbing, the load test and the metrics. They are weak at the questions
+        that make caching safe: what the key must contain, how stale is acceptable, and which writers must
+        invalidate. Give the agent those answers, or ask it to find them, before it writes a line.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — caching plan before code</span>
+        <pre class="code">GET /clinics/:id/search-summary is slow (p95 1.2 s, see the trace below).
+Before writing any code, produce a caching plan:
+1. Measure: where the time goes (queries, external calls). Paste EXPLAIN for the top query.
+2. Proposal: which layer (HTTP / CDN / Redis / materialized view) and why.
+3. For each cache: exact key format, TTL + jitter, max staleness in business terms.
+4. List EVERY code path that writes the underlying tables (grep for it) and how
+   each one invalidates. Include jobs, admin actions and seeds.
+5. Does the response vary by user, tenant, role or locale? If yes, say how the key covers it.
+Stop after the plan.</pre>
+      </div>
+      <pre class="code mt-3">Review this diff only for caching risks: keys missing user/tenant/locale, SET without TTL,
+invalidation inside a transaction instead of after commit, Cache-Control on authenticated
+routes, and what happens when Redis is unreachable. Cite file:line for each finding.</pre>
+      <pre class="code mt-3">Write a load test (k6 or autocannon) that hits the endpoint with 200 concurrent users
+right after a cache flush. Report DB query count and p95 with and without the
+single-flight lock. Paste the raw numbers.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Profile the endpoint and find where the time goes</li>
+            <li>Write the cache-aside wrapper, invalidation hooks and key helpers</li>
+            <li>Grep for every writer of a table</li>
+            <li>Add hit and miss metrics, and write the load test</li>
+            <li>Write a test that user A never receives user B's cached response</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>That caching is needed at all: the numbers before and after</li>
+            <li>Every input that changes the output is in the key</li>
+            <li>The TTL matches a staleness the business accepts</li>
+            <li>Every write path invalidates, after commit</li>
+            <li>The <code class="inline">Cache-Control</code> header on every authenticated route</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-written caching:</strong> a cache added with no measurement ("this should be faster")
+        · <code class="inline">set(key, value)</code> with no TTL · a key built from the URL path on an authenticated
+        route · <code class="inline">Cache-Control: public</code> on anything under <code class="inline">/me</code>,
+        <code class="inline">/account</code> or <code class="inline">/admin</code> · a module-level
+        <code class="inline">Map</code> as a cache in serverless code · invalidation only in the API handler, while
+        jobs and admin tools write the same table · caching the result that a booking or payment decision reads ·
+        Redis errors that crash the request instead of falling back.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Thinks of caching as "put it in Redis and it gets faster". Accepts any cache an agent adds.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows cache-aside and TTLs, and can read <code class="inline">Cache-Control</code>. Doesn't yet ask who invalidates, or what the key is missing.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Implements cache-aside with a TTL for a clear case. Needs review to catch a missed writer, a key without the user, or a stampede risk.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Measures before caching. Chooses the layer and pattern with a reason. Designs keys that include every input, sets TTLs from business staleness, invalidates on every write path after commit, handles Redis being down, and reports the hit rate.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the team's key conventions and caching checklist. Designs stampede protection and CDN strategy for high-traffic launches. Spots per-user leaks in other people's reviews.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 3:</strong> for one cache in your project, can you state from memory its key
+        format, its TTL and why, every code path that invalidates it, and what happens when Redis is down? Could you
+        show a test proving two different users never share a cached response?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Caching to hide a missing index</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The query is slow because of a Seq Scan. A cache hides it until the first miss after a deploy. Fix the query first (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>), then cache only if it's still needed.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Trusting the cache for decisions</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A cached "slot is free" or "5 in stock" used to accept a booking or an order. Show from the cache, decide from the database.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Flushing everything on deploy</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">FLUSHALL</code> in a deploy script causes a stampede at the busiest moment. Bump a key version for the caches whose shape changed instead.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write the four facts next to every cache</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Key, staleness, invalidation and failure behaviour, as a comment. Reviewers and future agents can check the code against it.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Add a cross-user test</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Log in as patient A, fetch, log in as patient B, fetch, and assert that the responses differ. It takes ten minutes and catches the worst caching bug there is.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Start with HTTP headers</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">For public pages, a correct <code class="inline">Cache-Control</code> plus the CDN often beats any Redis code, with nothing to invalidate by hand except a purge.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="measure"> <span>Measured an endpoint's latency and found where the time goes before proposing any cache.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="headers"> <span>Set correct <code class="inline">Cache-Control</code> and ETag headers for a public route and <code class="inline">no-store</code> for a personal one, and verified them with <code class="inline">curl -I</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="invalidate"> <span>Listed every writer of a cached table and showed each one invalidates after commit.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="leak-test"> <span>Wrote a test proving two users never receive each other's cached data.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cache-pr"> <span class="font-semibold">Opened a PR that adds a Redis cache-aside layer to one slow, read-heavy endpoint (for example the clinic search summary), with the four facts documented, TTL jitter, a Redis-down fallback, a cross-user test, a hit-rate metric, and before-and-after p95 numbers from a load test (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching" target="_blank" rel="noopener">MDN — HTTP caching</a> — freshness, validation, and how browsers and shared caches treat each header.</li>
+        <li><a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control" target="_blank" rel="noopener">MDN — Cache-Control</a> — the exact meaning of every directive in Part II.</li>
+        <li><a class="text-coral underline" href="https://redis.io/docs/latest/develop/data-types/" target="_blank" rel="noopener">Redis — Data types</a> — strings, hashes, sets, sorted sets and streams, with command references.</li>
+        <li><a class="text-coral underline" href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" rel="noopener">Redis — Key eviction</a> — <code class="inline">maxmemory</code> and choosing an eviction policy for a cache.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/rules-materializedviews.html" target="_blank" rel="noopener">PostgreSQL — Materialized views</a> — creating and refreshing them, including <code class="inline">CONCURRENTLY</code>.</li>
+        <li><a class="text-coral underline" href="https://nextjs.org/docs/app/getting-started/caching" target="_blank" rel="noopener">Next.js — Caching</a> · <a class="text-coral underline" href="https://nextjs.org/docs/app/api-reference/functions/cacheTag" target="_blank" rel="noopener">cacheTag</a> — framework-level caching and tag invalidation (<a class="text-coral underline" href="./ap2.html">AP2</a>).</li>
+        <li><a class="text-coral underline" href="https://developers.cloudflare.com/cache/" target="_blank" rel="noopener">Cloudflare — Cache</a> — CDN cache rules, cache keys and purging (<a class="text-coral underline" href="./op5.html">OP5</a>).</li>
+      </ul>

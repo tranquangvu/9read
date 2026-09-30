@@ -1,0 +1,775 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Authentication, Authorization &amp; Security Design</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Know who the user is (authentication) and what they may do (authorization), and keep those two ideas
+          separate in your head and in your code. Store passwords correctly, choose between sessions and JWTs with
+          reasons, and use OAuth and OIDC or a managed provider instead of inventing login. Then read agent code the
+          way an attacker does: IDOR, injection, SSRF, XSS, CSRF, mass assignment and leaked secrets.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> agents produce code that works for the user in the
+          demo, and security bugs are, by definition, code that also "works" for someone it shouldn't.
+          <code class="inline">GET /bookings/:id</code> that returns any booking to any logged-in user passes every
+          happy-path test. So does a JWT that is decoded but never verified. The agent won't notice, because nothing
+          fails. Security review is the one part of the job you cannot hand back to the tool that wrote the code: you
+          have to ask "what if the caller is someone else?" on every endpoint.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Authentication</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Prove who someone is, then remember it without leaking it</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Two different questions get asked on every request, and bugs happen when code answers one and assumes the
+        other. <strong>Authentication (AuthN)</strong> asks "who are you?" and is answered by a password, a social
+        login or a token. <strong>Authorization (AuthZ)</strong> asks "are you allowed to do <em>this</em>, to
+        <em>this</em> record?" and is answered by your business rules.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">AuthN vs AuthZ, on every request</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Request passes authentication, then authorization, then the handler">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">GET /bookings/91 — TWO GATES BEFORE ANY DATA IS RETURNED</text>
+          <g class="anim-pulse"><rect x="10" y="44" width="130" height="58" rx="9" fill="#2563EB"/>
+            <text x="75" y="67" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Request</text>
+            <text x="75" y="83" text-anchor="middle" fill="#ffffffbb" font-size="9">cookie or Bearer token</text></g>
+          <g class="anim-pulse d1"><rect x="180" y="44" width="150" height="58" rx="9" fill="#6d5acd"/>
+            <text x="255" y="67" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">AuthN: who?</text>
+            <text x="255" y="83" text-anchor="middle" fill="#ffffffbb" font-size="9">valid session → user 812</text></g>
+          <g class="anim-pulse d2"><rect x="370" y="44" width="150" height="58" rx="9" fill="#0D9488"/>
+            <text x="445" y="67" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">AuthZ: allowed?</text>
+            <text x="445" y="83" text-anchor="middle" fill="#ffffffbb" font-size="9">is booking 91 theirs?</text></g>
+          <g class="anim-pulse d3"><rect x="560" y="44" width="130" height="58" rx="9" fill="#D97757"/>
+            <text x="625" y="67" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Handler</text>
+            <text x="625" y="83" text-anchor="middle" fill="#ffffffbb" font-size="9">returns the booking</text></g>
+          <line x1="140" y1="73" x2="180" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="330" y1="73" x2="370" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="520" y1="73" x2="560" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="180" y="128" width="150" height="40" rx="9" fill="#DB2777"/>
+            <text x="255" y="146" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">401 Unauthorized</text>
+            <text x="255" y="160" text-anchor="middle" fill="#ffffffbb" font-size="9">we don't know who you are</text></g>
+          <g class="anim-pulse d3"><rect x="370" y="128" width="150" height="40" rx="9" fill="#DB2777"/>
+            <text x="445" y="146" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">403 or 404</text>
+            <text x="445" y="160" text-anchor="middle" fill="#ffffffbb" font-size="9">we know, and the answer is no</text></g>
+          <line x1="255" y1="102" x2="255" y2="128" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="445" y1="102" x2="445" y2="128" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="625" y="150" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">most agent bugs skip gate 2</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The naming is confusing: HTTP <code class="inline">401 Unauthorized</code> actually means "unauthenticated", and
+        <code class="inline">403 Forbidden</code> means "authenticated but not authorized". For records the user must not
+        even know exist, such as another patient's booking, returning <code class="inline">404</code> is common, so an
+        attacker can't probe which IDs are real.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Password storage: slow hashes, never encryption</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        If you store passwords yourself, store only a <strong>password hash</strong> made with an algorithm that is
+        deliberately <em>slow</em> and <em>salted</em>. When your database leaks (plan for it), a slow hash turns
+        "crack every password in an hour" into "crack a few weak ones in a month". Fast hashes like SHA-256 are designed
+        for speed, which is exactly wrong here. Encryption is also wrong, because anything that can be decrypted
+        will be, by whoever steals the key.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Algorithm</th><th class="px-4 py-3">Verdict</th><th class="px-4 py-3">Notes (OWASP Password Storage Cheat Sheet)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Argon2id</td><td class="px-4 py-3">First choice</td><td class="px-4 py-3">Minimum around 19 MiB memory, 2 iterations, parallelism 1. Memory-hard, so GPUs don't help much.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">scrypt</td><td class="px-4 py-3">Good</td><td class="px-4 py-3">When Argon2id isn't available</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">bcrypt</td><td class="px-4 py-3">Good, and very common</td><td class="px-4 py-3">Cost factor 10 or more. Only the first 72 bytes of input are used, so cap the password length.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">PBKDF2-HMAC-SHA256</td><td class="px-4 py-3">Acceptable when FIPS compliance requires it</td><td class="px-4 py-3">600,000 iterations or more</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">MD5, SHA-1, SHA-256 (even salted)</td><td class="px-4 py-3">Reject in review</td><td class="px-4 py-3">Too fast. Billions of guesses per second on one GPU.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Encrypted or plain text</td><td class="px-4 py-3">Reject, and escalate</td><td class="px-4 py-3">Reversible means one stolen key exposes every password</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">auth/passwords — Node (bcrypt) · Python (argon2-cffi)</span>
+        <pre class="code"><span class="cm">// Node: the salt is generated and stored inside the hash string</span>
+<span class="kw">const</span> hash = <span class="kw">await</span> bcrypt.hash(password, <span class="st">12</span>);             <span class="cm">// cost 12 ≈ 2^12 rounds</span>
+<span class="kw">const</span> ok   = <span class="kw">await</span> bcrypt.compare(attempt, user.passwordHash); <span class="cm">// constant-time compare</span>
+
+<span class="cm"># Python: sensible defaults; check_needs_rehash lets you raise cost over time</span>
+<span class="kw">from</span> argon2 <span class="kw">import</span> PasswordHasher
+ph = PasswordHasher()
+stored = ph.hash(password)
+ph.verify(stored, attempt)            <span class="cm"># raises VerifyMismatchError on a wrong password</span>
+<span class="kw">if</span> ph.check_needs_rehash(stored):
+    stored = ph.hash(attempt)         <span class="cm"># upgrade silently at the next successful login</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The hash is only one part of login. Review the rest of the flow against this list:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Flow</th><th class="px-4 py-3">Good</th><th class="px-4 py-3">Bad version agents write</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Login errors</td><td class="px-4 py-3">One message: "Email or password is incorrect"</td><td class="px-4 py-3">"No account with that email", which lets attackers list your users</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Brute force</td><td class="px-4 py-3">Rate limit per account and per IP (<a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>), with a growing delay</td><td class="px-4 py-3">Unlimited attempts</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Password reset</td><td class="px-4 py-3">Random token from a secure generator, stored hashed, single-use, expires in minutes</td><td class="px-4 py-3">A 6-digit code with no attempt limit, or a token that never expires</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">After login</td><td class="px-4 py-3">Issue a <em>new</em> session ID (prevents session fixation)</td><td class="px-4 py-3">Keeping the pre-login session ID</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Staff accounts</td><td class="px-4 py-3">MFA required for clinic staff and admins</td><td class="px-4 py-3">Same login strength as patients, for accounts that can see every record</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Sessions vs JWTs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        After login, the server has to recognise the user on every later request. There are two main designs. With a
+        <strong>server-side session</strong>, the server stores the session (in the database or Redis) and gives the
+        browser a random, meaningless ID in a cookie. With a <strong>JWT</strong> (JSON Web Token), the server gives
+        the client a signed token that <em>contains</em> the user ID and an expiry, and any server holding the key can
+        verify it without a lookup.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Question</th><th class="px-4 py-3">Server-side session + cookie</th><th class="px-4 py-3">JWT access token</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Log out, or "sign out all devices"</td><td class="px-4 py-3">Delete the session row. It takes effect immediately.</td><td class="px-4 py-3">The token stays valid until it expires, unless you add a denylist, which is a session store again</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ban a user, or change their role</td><td class="px-4 py-3">Immediate</td><td class="px-4 py-3">Old claims live until expiry, so keep access tokens short (5–15 min)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lookup cost per request</td><td class="px-4 py-3">One Redis or DB read</td><td class="px-4 py-3">None: verify the signature locally</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Several services or APIs verify it</td><td class="px-4 py-3">They all need the session store</td><td class="px-4 py-3">Each one only needs the public key. This is the JWT's real strength.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Mobile apps and third-party API clients</td><td class="px-4 py-3">Possible, but cookies are awkward outside browsers</td><td class="px-4 py-3">Natural fit, as a Bearer token</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Typical fit</td><td class="px-4 py-3"><strong>A web app with its own backend</strong>: Rails, Django, Next.js with a server</td><td class="px-4 py-3">Mobile plus API, several services, or a managed auth provider that issues them</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        "JWTs are stateless and therefore better" is the claim to push back on. For a single web app, a session cookie
+        is simpler and easier to revoke. Choose JWTs when you actually need their property, which is verification
+        without a shared store. When you do use them, the standard shape is a <strong>short-lived access token</strong>
+        plus a <strong>long-lived refresh token</strong> that is stored server-side, can be revoked, and is
+        <em>rotated</em> on every use:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant App as Mobile app
+    participant API as API
+    participant DB as Token store
+    App->>API: GET /bookings, access token (expired)
+    API-->>App: 401, token expired
+    App->>API: POST /auth/refresh, refresh token R1
+    API->>DB: R1 valid and unused?
+    DB-->>API: yes. Mark R1 used, store R2
+    API-->>App: new access token + refresh token R2
+    Note over API,DB: If R1 is ever presented again, it was stolen.<br/>Revoke the whole token family and force login.
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Where the token lives</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Wherever the credential is stored, anything that can read it can impersonate the user. In the browser the
+        choice is mainly between JavaScript-readable storage and an <code class="inline">HttpOnly</code> cookie that
+        scripts can't read:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Storage</th><th class="px-4 py-3">XSS can steal it?</th><th class="px-4 py-3">CSRF risk?</th><th class="px-4 py-3">Verdict</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">localStorage</code></td><td class="px-4 py-3">Yes: any injected script reads it</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Avoid for long-lived tokens. It's what agents default to.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">HttpOnly; Secure; SameSite</code> cookie</td><td class="px-4 py-3">No (scripts can still <em>use</em> the session while on the page, but can't take it away)</td><td class="px-4 py-3">Reduced by SameSite, and removed with CSRF tokens (Part IV)</td><td class="px-4 py-3"><strong>Default for web apps</strong></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">JavaScript memory only</td><td class="px-4 py-3">Harder, and lost on reload</td><td class="px-4 py-3">No</td><td class="px-4 py-3">For short access tokens, paired with a refresh token in an HttpOnly cookie</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Mobile Keychain / Keystore</td><td class="px-4 py-3">No</td><td class="px-4 py-3">No</td><td class="px-4 py-3">The right place on iOS and Android (Flutter: a secure-storage plugin)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">HTTP response — a well-formed session cookie</span>
+        <pre class="code">Set-Cookie: <span class="st">__Host-session=9f1c…e2</span>; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800
+<span class="cm"># HttpOnly  → document.cookie can't read it (limits XSS damage)
+# Secure    → only sent over HTTPS
+# SameSite  → not sent on most cross-site requests (first CSRF defence)
+# __Host-   → browser enforces Secure, Path=/ and no Domain (no subdomain can overwrite it)
+# Max-Age   → 7 days; the server-side session should expire too, and rotate its ID at login</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · OAuth, OIDC &amp; managed auth</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Don't build login yourself unless you must</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Password reset, email verification, MFA, social login, brute-force protection, account linking: login is a
+        product in its own right, and every piece has well-known ways to go wrong. For most client projects the
+        right move is a standard protocol and a managed provider, so your code only has to <em>verify</em> identity,
+        not produce it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">OAuth 2.0 vs OpenID Connect</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>OAuth 2.0</strong> is about <em>delegated authorization</em>: a user lets your app act on their behalf at
+        another service ("let the clinic app add events to my Google Calendar"). The result is an
+        <strong>access token</strong> for that service's API. <strong>OpenID Connect (OIDC)</strong> is a layer on top
+        of OAuth that adds <em>authentication</em>: it also returns an <strong>ID token</strong>, a JWT that says who
+        the user is. "Sign in with Google" is OIDC. Calendar access is OAuth.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Token</th><th class="px-4 py-3">From</th><th class="px-4 py-3">Meant for</th><th class="px-4 py-3">Common mistake</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">ID token (OIDC)</td><td class="px-4 py-3">The identity provider</td><td class="px-4 py-3">Your app, to learn who logged in</td><td class="px-4 py-3">Sending it to your API as if it were an access token</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Access token</td><td class="px-4 py-3">The authorization server</td><td class="px-4 py-3">The API named in its <code class="inline">aud</code> (audience) claim</td><td class="px-4 py-3">Accepting a token issued for a <em>different</em> API because the signature is valid</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Refresh token</td><td class="px-4 py-3">The authorization server</td><td class="px-4 py-3">Getting new access tokens</td><td class="px-4 py-3">Storing it in <code class="inline">localStorage</code>, or never rotating it</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Authorization code flow with PKCE</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        This is the flow to use for web apps, single-page apps and mobile apps. The older "implicit" flow, which returned
+        tokens directly in the URL, is deprecated. <strong>PKCE</strong> (Proof Key for Code Exchange, pronounced
+        "pixie") stops a stolen authorization code from being useful: the app invents a random secret, sends only
+        its hash at the start, and must present the original secret to exchange the code.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U as Patient's browser
+    participant App as Clinic app
+    participant IdP as Google (OIDC)
+    App->>App: make code_verifier (random)<br/>code_challenge = SHA256(verifier)
+    App->>U: redirect to IdP with client_id, redirect_uri,<br/>state, code_challenge
+    U->>IdP: log in and consent
+    IdP->>U: redirect to redirect_uri with code and state
+    U->>App: code, state
+    App->>App: check state matches (CSRF defence)
+    App->>IdP: POST /token with code + code_verifier
+    IdP-->>App: ID token, access token
+    App->>App: verify ID token signature, iss, aud, exp, nonce
+    App-->>U: set own session cookie
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You should almost never hand-write this. Use your provider's SDK or a maintained library (Auth.js, Devise with
+        OmniAuth, Authlib, a Go OIDC library). What you <em>review</em> is the configuration: an exact-match allowlist of
+        redirect URIs, <code class="inline">state</code> and PKCE switched on, and ID tokens verified rather than just
+        decoded.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Social login and account linking</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The dangerous part of social login is not the protocol. It is the code that decides <em>which local account</em>
+        a social identity maps to. A classic agent-written bug is "find the user by email, and log them in". If a
+        provider lets someone sign up with an email address they don't control, that is an account takeover.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Link identities by the provider's stable subject ID</strong> (<code class="inline">sub</code>), stored
+          next to the provider name, not by email.</li>
+        <li><strong>Only auto-link by email when the provider says it is verified</strong>
+          (<code class="inline">email_verified: true</code>), and preferably ask the user to confirm with their existing
+          login first.</li>
+        <li><strong>Treat profile data as untrusted input</strong>: names and avatars from providers go through the same
+          validation and escaping as a form field.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Managed auth providers</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A managed provider runs the login UI, password storage, MFA, social login and token issuing. Your backend
+        verifies the tokens it issues and keeps your own <code class="inline">users</code> table for app data.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Provider</th><th class="px-4 py-3">Fits when</th><th class="px-4 py-3">Watch for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Supabase Auth</td><td class="px-4 py-3">You already use Supabase Postgres (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>). User JWTs work directly with Postgres Row Level Security.</td><td class="px-4 py-3">RLS must be enabled and correct on every exposed table (Part III)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Auth0</td><td class="px-4 py-3">Enterprise needs: SSO with clients' identity providers, rich rules, many apps</td><td class="px-4 py-3">Pricing grows with users and features</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Amazon Cognito</td><td class="px-4 py-3">You are all-in on AWS (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>)</td><td class="px-4 py-3">A steeper developer experience, and some settings are hard to change later</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clerk and similar</td><td class="px-4 py-3">A Next.js app that wants ready-made UI components</td><td class="px-4 py-3">Lock-in of your user store to the vendor</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Framework built-ins</td><td class="px-4 py-3">Rails authentication generator or Devise, Django auth: a single web app with sessions</td><td class="px-4 py-3">You now own reset flows, MFA and lockout</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Managed auth answers "who", never "may they".</strong> Supabase, Auth0 or Cognito can tell you the
+        request comes from user 812 with role <code class="inline">patient</code>. Whether user 812 may cancel booking 91
+        is still your code's decision, and that is where the serious bugs live.
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Putting Parts I and II together, most client projects land on one of a few designs. Walk it from the top, and
+        write the answer into the project's decision log:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    A["New project needs login"] --> B{"Already on Supabase,<br/>or need SSO for enterprise clients?"}
+    B -->|"Supabase"| S["Supabase Auth + RLS"]
+    B -->|"enterprise SSO"| M["Auth0 or Cognito"]
+    B -->|"neither"| C{"Clients besides one web app?<br/>mobile, partners, several services"}
+    C -->|"no, one web app"| W["Framework sessions<br/>HttpOnly cookie"]
+    C -->|"yes"| J["Managed provider issuing JWTs<br/>short access + rotated refresh"]
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Verifying a JWT properly</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Whichever provider issues the tokens, your API must <strong>verify</strong> each one: the signature against the
+        provider's published keys, the algorithm you expect, the issuer, the audience, and the expiry. "Decode" is not
+        "verify". A decoded but unverified JWT is just a JSON object the attacker wrote.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">auth/verify.ts — using the jose library</span>
+        <pre class="code"><span class="kw">import</span> { createRemoteJWKSet, jwtVerify } <span class="kw">from</span> <span class="st">"jose"</span>;
+
+<span class="kw">const</span> JWKS = createRemoteJWKSet(<span class="kw">new</span> URL(<span class="st">`${ISSUER}/.well-known/jwks.json`</span>)); <span class="cm">// cached public keys</span>
+
+<span class="kw">export async function</span> <span class="fn">authenticate</span>(token: <span class="kw">string</span>) {
+  <span class="kw">const</span> { payload } = <span class="kw">await</span> jwtVerify(token, JWKS, {
+    issuer: ISSUER,                <span class="cm">// tokens from another tenant or provider → rejected</span>
+    audience: <span class="st">"clinic-api"</span>,        <span class="cm">// tokens minted for another API → rejected</span>
+    algorithms: [<span class="st">"RS256"</span>],        <span class="cm">// never let the token choose its own algorithm</span>
+  });                              <span class="cm">// exp and nbf are checked automatically</span>
+  <span class="kw">return</span> { userId: payload.sub!, role: payload.role };
+}
+<span class="cm">// ✗ red flag: jwt.decode(token) or JSON.parse(atob(token.split(".")[1])) used for auth</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Authorization</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every query must answer "whose is this?"</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Broken access control is number one in the OWASP Top 10 (2025), and it has been at or near the top for years.
+        It is also the category agents produce most reliably, because the model writes the endpoint the prompt asked
+        for and nothing in the prompt says "and only for the owner".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Three models: roles, attributes, ownership</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Model</th><th class="px-4 py-3">Rule looks like</th><th class="px-4 py-3">Clinic example</th><th class="px-4 py-3">Limit</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">RBAC (role-based)</td><td class="px-4 py-3">Role → allowed actions</td><td class="px-4 py-3"><code class="inline">clinic_admin</code> may edit doctors. <code class="inline">patient</code> may create bookings.</td><td class="px-4 py-3">Says nothing about <em>which</em> clinic or booking</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ownership (resource-based)</td><td class="px-4 py-3">The record belongs to the user</td><td class="px-4 py-3">A patient may view and cancel <em>their own</em> bookings</td><td class="px-4 py-3">Needs every query to be scoped</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ABAC (attribute-based)</td><td class="px-4 py-3">A policy over user, resource and context attributes</td><td class="px-4 py-3">A doctor may view a booking if it is at their clinic <em>and</em> within their working hours <em>and</em> the booking isn't older than a year</td><td class="px-4 py-3">More power, more to test. Often a policy library.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Real apps combine them: a <strong>role</strong> check ("is this a clinic admin?") <em>and</em> a
+        <strong>scope</strong> check ("of <em>this</em> clinic?"). Most security bugs are a role check with the scope
+        check missing: the admin of clinic A can edit doctors at clinic B.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">IDOR: the bug you will find in agent code this month</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Insecure Direct Object Reference</strong>: the endpoint takes an ID from the request and loads that
+        record without checking that it belongs to the caller. Because IDs are sequential
+        (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>), an attacker just counts:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Minh (patient 812)
+    participant API as Clinic API
+    participant DB as Postgres
+    M->>API: GET /bookings/9101 (his own)
+    API->>DB: SELECT * FROM bookings WHERE id = 9101
+    API-->>M: 200, his booking ✅
+    M->>API: GET /bookings/9100 (edits the URL)
+    API->>DB: SELECT * FROM bookings WHERE id = 9100
+    API-->>M: 200, Lan's booking, doctor, diagnosis note ❌
+    Note over M,DB: a loop from 1 to 9101 downloads every patient
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">bookings/routes.ts — vulnerable vs fixed (Express)</span>
+        <pre class="code"><span class="cm">// ✗ authenticated, but not authorized: any logged-in user reads any booking</span>
+router.get(<span class="st">"/bookings/:id"</span>, requireAuth, <span class="kw">async</span> (req, res) =&gt; {
+  <span class="kw">const</span> booking = <span class="kw">await</span> db.booking.findUnique({ where: { id: +req.params.id } });
+  res.json(booking);
+});
+
+<span class="cm">// ✓ the owner is part of the query itself: another user's ID simply finds nothing</span>
+router.get(<span class="st">"/bookings/:id"</span>, requireAuth, <span class="kw">async</span> (req, res) =&gt; {
+  <span class="kw">const</span> booking = <span class="kw">await</span> db.booking.findFirst({
+    where: { id: +req.params.id, patientId: req.user.id },   <span class="cm">// scope from the SESSION, not the request</span>
+  });
+  <span class="kw">if</span> (!booking) <span class="kw">return</span> res.sendStatus(<span class="st">404</span>);                   <span class="cm">// don't reveal that 9100 exists</span>
+  res.json(booking);
+});</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The same fix in other stacks is the same idea: <strong>start the query from the current user</strong>, so the
+        scope cannot be forgotten.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">scoped lookups — Rails · FastAPI</span>
+        <pre class="code"><span class="cm"># Rails: go through the association; RecordNotFound becomes a 404</span>
+@booking = current_user.bookings.find(params[:id])
+
+<span class="cm"># FastAPI: the current user comes from a dependency, never from the body</span>
+<span class="kw">@router.get</span>(<span class="st">"/bookings/{booking_id}"</span>)
+<span class="kw">def</span> <span class="fn">get_booking</span>(booking_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    booking = db.scalar(select(Booking).where(Booking.id == booking_id,
+                                              Booking.patient_id == user.id))
+    <span class="kw">if not</span> booking:
+        <span class="kw">raise</span> HTTPException(status_code=<span class="st">404</span>)
+    <span class="kw">return</span> booking</pre>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>UUIDs don't fix IDOR.</strong> Random IDs make guessing harder, but IDs leak through URLs, emails, logs,
+        shared screenshots and other API responses. They are defence in depth, not access control. The check must be
+        in the query or the policy.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Where to enforce it: one place, deny by default</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Checks copied into every handler get forgotten in the fortieth one. Put authorization in <strong>one
+        layer</strong> that every request passes through, and make the default answer "no". Framework options include
+        Pundit or Action Policy (Rails), guards and CASL (NestJS), dependencies (FastAPI), middleware (Gin), and Postgres
+        Row Level Security as a database-level backstop. Where business rules live in your layers is covered in
+        <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>, and the middleware pattern in
+        <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Then test it as a <strong>matrix</strong>: every role against every sensitive action, including "someone else's
+        record". A table like this, turned into tests (<a href="./qa1.html" class="text-viol underline decoration-viol/40">QA1</a>),
+        is the single most useful security artifact on a project:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Action</th><th class="px-4 py-3">Anonymous</th><th class="px-4 py-3">Patient (owner)</th><th class="px-4 py-3">Other patient</th><th class="px-4 py-3">Doctor, same clinic</th><th class="px-4 py-3">Admin, other clinic</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">View booking 91</td><td class="px-4 py-3">401</td><td class="px-4 py-3">200</td><td class="px-4 py-3">404</td><td class="px-4 py-3">200</td><td class="px-4 py-3">404</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cancel booking 91</td><td class="px-4 py-3">401</td><td class="px-4 py-3">200</td><td class="px-4 py-3">404</td><td class="px-4 py-3">200</td><td class="px-4 py-3">404</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Edit doctor's schedule</td><td class="px-4 py-3">401</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403 (own schedule only: 200)</td><td class="px-4 py-3">404</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Export all patients</td><td class="px-4 py-3">401</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Multi-tenancy isolation, in brief</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        If one deployment serves many clinics (tenants), a missing tenant filter leaks one clinic's patients to another
+        clinic. The common design is a <code class="inline">clinic_id</code> (tenant ID) on every tenant-owned table, set
+        from the authenticated user and never from the request body, applied by a default scope or repository, and
+        backed by Postgres <strong>Row Level Security</strong> so that a forgotten <code class="inline">WHERE</code> returns
+        nothing instead of everything. Remember the tenant in cache keys too
+        (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration — RLS as the backstop (Supabase-style)</span>
+        <pre class="code"><span class="kw">ALTER TABLE</span> bookings <span class="kw">ENABLE ROW LEVEL SECURITY</span>;
+
+<span class="cm">-- patients see only their own bookings; auth.uid() is the user id from the verified JWT</span>
+<span class="kw">CREATE POLICY</span> <span class="fn">patient_reads_own</span> <span class="kw">ON</span> bookings <span class="kw">FOR SELECT</span>
+  <span class="kw">USING</span> (patient_user_id = auth.uid());
+
+<span class="cm">-- with RLS enabled and no matching policy, the answer is zero rows: deny by default</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On Supabase this matters doubly, because the browser can query tables directly with the public key. A table
+        exposed without RLS is readable by anyone who opens the developer tools. Stronger isolation options, such as a
+        schema or database per tenant, trade simplicity for isolation and are an architecture decision for your mentor.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Mass assignment</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The quiet cousin of IDOR. The handler passes the whole request body to the ORM, so the attacker adds fields
+        the form never had: <code class="inline">"role": "admin"</code>, <code class="inline">"patientId": 5</code>, or
+        <code class="inline">"status": "paid"</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">profile update — vulnerable vs allowlisted</span>
+        <pre class="code"><span class="cm">// ✗ every column is writable from the request</span>
+<span class="kw">await</span> db.user.update({ where: { id: req.user.id }, data: req.body });
+
+<span class="cm">// ✓ an explicit schema: only these fields, with types; everything else is dropped</span>
+<span class="kw">const</span> ProfileUpdate = z.object({ fullName: z.string().max(<span class="st">100</span>), phone: z.string().max(<span class="st">20</span>) });
+<span class="kw">await</span> db.user.update({ where: { id: req.user.id }, data: ProfileUpdate.parse(req.body) });
+
+<span class="cm"># Rails equivalent: params.require(:user).permit(:full_name, :phone)
+# FastAPI: a Pydantic model with only the allowed fields (BE1 covers validation)</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Reviewing agent code for security</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Read every diff as the attacker would</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The OWASP Top 10 is a ranked list of the most common and damaging web application risks. You don't need to
+        memorise it. You need to turn it into questions you ask of every diff. The 2025 edition, mapped to what to look
+        for in code an agent wrote:
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">OWASP Top 10 (2025) as a review checklist</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Category</th><th class="px-4 py-3">What to check in the diff</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A01 Broken Access Control</td><td class="px-4 py-3">Every ID from the request is scoped to the caller (IDOR). Role <em>and</em> tenant checks. Deny by default. It now also includes SSRF and CSRF.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A02 Security Misconfiguration</td><td class="px-4 py-3">Debug mode or stack traces in production, CORS <code class="inline">*</code> with credentials, default passwords, public storage buckets, missing security headers</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A03 Software Supply Chain Failures</td><td class="px-4 py-3">New dependencies the agent added: do they exist, are they maintained, is the name spelled right? Lockfile committed? CI actions pinned?</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A04 Cryptographic Failures</td><td class="px-4 py-3">Fast hashes for passwords, home-made crypto, secrets in code, HTTP instead of HTTPS, <code class="inline">Math.random()</code> for tokens</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A05 Injection</td><td class="px-4 py-3">String-built SQL, shell commands or HTML. <code class="inline">eval</code>. Raw queries in ORMs.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A06 Insecure Design</td><td class="px-4 py-3">Missing business limits: unlimited bookings per patient, reset codes with no attempt limit, no rate limits on costly actions</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A07 Authentication Failures</td><td class="px-4 py-3">JWT decoded but not verified, sessions not rotated at login, no brute-force protection, user enumeration in error messages</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A08 Software or Data Integrity Failures</td><td class="px-4 py-3">Unverified webhooks (check the provider's signature), deserialising untrusted data, auto-updates without integrity checks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A09 Security Logging and Alerting Failures</td><td class="px-4 py-3">No log of logins, permission denials and admin actions. Or the opposite: passwords, tokens and health data written to logs.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A10 Mishandling of Exceptional Conditions</td><td class="px-4 py-3">Errors that "fail open" (the permission check throws, and the catch block lets the request through), leaked error details, swallowed exceptions</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Injection: never build queries or commands with strings</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Injection happens whenever user input is pasted into something that will be <em>interpreted</em>: SQL, a shell
+        command, HTML, a template. The fix is always the same idea: pass data as <strong>parameters</strong>, separately
+        from the code. ORMs do this for you until someone reaches for the raw-query escape hatch, which agents do when a
+        query gets complicated.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">search — injectable vs parameterised</span>
+        <pre class="code"><span class="cm">// ✗ q = "x' OR '1'='1" returns every patient; worse inputs can drop tables</span>
+<span class="kw">await</span> db.$queryRawUnsafe(<span class="st">`SELECT * FROM patients WHERE name ILIKE '%${q}%'`</span>);
+
+<span class="cm">// ✓ parameterised: the driver sends q as data, never as SQL</span>
+<span class="kw">await</span> db.$queryRaw<span class="st">`SELECT * FROM patients WHERE name ILIKE ${"%" + q + "%"}`</span>;
+
+<span class="cm"># ✗ shell injection: filename = "a.pdf; rm -rf /"</span>
+os.system(<span class="st">f"convert {filename} out.png"</span>)
+<span class="cm"># ✓ argument list, no shell</span>
+subprocess.run([<span class="st">"convert"</span>, filename, <span class="st">"out.png"</span>], check=<span class="kw">True</span>)</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">XSS and CSRF</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Cross-site scripting (XSS)</strong> is injection into HTML: a patient's "notes to the doctor" field
+        contains a <code class="inline">&lt;script&gt;</code>, and it runs in the doctor's browser with the doctor's
+        session. React, Vue, Rails views and Jinja escape output by default, so XSS comes back through the escape
+        hatches: <code class="inline">dangerouslySetInnerHTML</code>, <code class="inline">v-html</code>,
+        <code class="inline">html_safe</code> / <code class="inline">raw</code>, <code class="inline">| safe</code>, and
+        building HTML strings for emails. If rich text is truly needed, sanitise it with a maintained library, and add a
+        Content-Security-Policy header as a second layer.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Cross-site request forgery (CSRF)</strong> works the other way round. A malicious site makes the victim's
+        browser send a request to your app, and the browser attaches your session cookie automatically. Defences, in
+        layers: <code class="inline">SameSite=Lax</code> or <code class="inline">Strict</code> cookies, the framework's CSRF
+        token on every state-changing form (Rails, Django and Laravel have it on by default, so don't let an agent
+        disable it "to make the API work"), and never changing state on a <code class="inline">GET</code>. APIs that
+        authenticate only with a Bearer header, not cookies, aren't exposed to CSRF in the same way.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Attack</th><th class="px-4 py-3">Victim's browser is tricked into</th><th class="px-4 py-3">Main defence</th><th class="px-4 py-3">Agent red flag</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">XSS</td><td class="px-4 py-3">Running the attacker's script on <em>your</em> page</td><td class="px-4 py-3">Output escaping, sanitising, CSP</td><td class="px-4 py-3"><code class="inline">dangerouslySetInnerHTML={{ __html: note }}</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CSRF</td><td class="px-4 py-3">Sending a request to your app from <em>another</em> site</td><td class="px-4 py-3">SameSite cookies, CSRF tokens</td><td class="px-4 py-3"><code class="inline">skip_forgery_protection</code>, <code class="inline">@csrf_exempt</code>, a GET that cancels a booking</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">SSRF: when your server fetches a URL someone gave it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Server-side request forgery</strong> appears whenever your backend fetches a user-supplied URL: "import
+        avatar from URL", a webhook endpoint a clinic configures, a link-preview feature, or an AI tool that "reads this
+        web page". The attacker supplies an internal address instead, such as
+        <code class="inline">http://169.254.169.254/</code> (the cloud metadata service, which can hand out credentials)
+        or <code class="inline">http://localhost:6379</code>, and your server fetches it from <em>inside</em> your
+        network.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Allowlist</strong> destinations when you can (only <code class="inline">https</code>, only known
+          domains).</li>
+        <li>Otherwise, <strong>resolve the hostname and reject private, loopback and link-local addresses</strong>, and
+          re-check after redirects (or disable redirects).</li>
+        <li>On AWS, require <strong>IMDSv2</strong> for instance metadata, and give the fetching service no credentials it
+          doesn't need (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>).</li>
+        <li>Set short timeouts and a response size limit, and never return the raw response body to the user.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Webhooks and headers: two quick wins</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A webhook endpoint (from a payment provider, an SMS gateway, a calendar) is a public URL that changes data. If
+        you don't verify that the request really came from the provider, anyone can POST
+        <code class="inline">{"status": "paid"}</code> to it. Providers sign each request with a shared secret, and your
+        code must check that signature before trusting anything in the body (OWASP A08):
+      </p>
+      <div class="mt-4">
+        <span class="code-label">webhooks/verify.py — HMAC signature check</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">verify_webhook</span>(raw_body: bytes, signature: str, secret: bytes) -&gt; bool:
+    expected = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+    <span class="kw">return</span> hmac.compare_digest(expected, signature)   <span class="cm"># constant-time, never ==</span>
+<span class="cm"># Use the RAW body bytes, before JSON parsing. Also reject old timestamps if the
+# provider sends one (replay protection). Prefer the provider's SDK helper when it has one.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Security headers are the other cheap layer, and they are easy to check with <code class="inline">curl -I</code>.
+        Most frameworks have a middleware that sets sensible defaults (Helmet for Express, and the defaults built into
+        Rails and Django):
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Header</th><th class="px-4 py-3">Protects against</th><th class="px-4 py-3">Typical value</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Strict-Transport-Security</td><td class="px-4 py-3">Downgrade to plain HTTP</td><td class="px-4 py-3"><code class="inline">max-age=31536000; includeSubDomains</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Content-Security-Policy</td><td class="px-4 py-3">XSS impact: limits which scripts may run</td><td class="px-4 py-3">Start with <code class="inline">default-src 'self'</code> and loosen deliberately</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">X-Content-Type-Options</td><td class="px-4 py-3">Browsers guessing a file is a script</td><td class="px-4 py-3"><code class="inline">nosniff</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">frame-ancestors (CSP) or X-Frame-Options</td><td class="px-4 py-3">Clickjacking in a hidden iframe</td><td class="px-4 py-3"><code class="inline">frame-ancestors 'none'</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Access-Control-Allow-Origin (CORS)</td><td class="px-4 py-3">Other sites reading your API responses with the user's cookies</td><td class="px-4 py-3">An explicit list of your front-end origins, never <code class="inline">*</code> with credentials</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Secrets management</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        API keys, database passwords and signing keys never go in the repository, in client-side code, in logs, or in
+        a job payload. Locally they live in an uncommitted <code class="inline">.env</code>. In production they live in
+        the platform's secret store, such as AWS Secrets Manager or SSM Parameter Store
+        (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>) or Vercel and Supabase environment
+        variables (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>), and are injected at
+        runtime.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Leak path</th><th class="px-4 py-3">How agents cause it</th><th class="px-4 py-3">Prevention</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Committed to git</td><td class="px-4 py-3">"I added your key to config.ts so it works"</td><td class="px-4 py-3"><code class="inline">.env</code> in <code class="inline">.gitignore</code>, GitHub secret scanning and push protection, a pre-commit secret scanner</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shipped to the browser</td><td class="px-4 py-3">Server-only key given a public prefix (<code class="inline">NEXT_PUBLIC_</code>, <code class="inline">VITE_</code>) to fix an "undefined" error</td><td class="px-4 py-3">Only publishable keys get public prefixes. Secret calls go through your server.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Written to logs</td><td class="px-4 py-3">Logging the full request, headers or config while debugging</td><td class="px-4 py-3">Redact <code class="inline">authorization</code>, cookies, passwords and tokens in the logger</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Pasted into a chat or prompt</td><td class="px-4 py-3">The key is in the terminal output the agent reads</td><td class="px-4 py-3">Keep production secrets off your laptop. Use scoped, revocable dev keys.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>A leaked secret is rotated, not deleted.</strong> Removing the key in a new commit doesn't help: it is in
+        git history, forks and CI logs, and bots scan public repos within minutes. Revoke and reissue the key first,
+        then clean up, then tell your mentor. Rotating quickly is normal. Hiding a leak is the real incident.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code ships a built-in <code class="inline">/security-review</code> command, which analyses the changes on
+        your current branch (the diff against the default branch on <code class="inline">origin</code>) for risks such as
+        injection, auth issues and data exposure. Run it before every PR that touches auth, data access, uploads or
+        external calls. It is a strong second reader, not a substitute for your own authorization matrix, because it
+        can't know your business rules ("doctors may only see bookings at their own clinic") unless you tell it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — targeted access-control review</span>
+        <pre class="code">Act as a penetration tester reviewing this branch. Our rules (docs/authz.md):
+patients see only their bookings; doctors see bookings at their clinic;
+clinic admins manage only their clinic. For EVERY route changed in this diff:
+- which ID(s) come from the request, and how each is scoped to the caller
+- the role check AND the clinic (tenant) check, with file:line
+- fields accepted from the body (mass assignment?)
+Output a table: route | inputs | scoping | verdict. Don't fix anything yet.</pre>
+      </div>
+      <pre class="code mt-3">Turn docs/authz-matrix.md into integration tests: for each action, call it as
+anonymous, owner, other patient, same-clinic doctor and other-clinic admin, and assert
+the status code in the matrix. Run them and paste the results.</pre>
+      <pre class="code mt-3">/security-review
+<span class="cm"># then, for each finding: explain the attack in one sentence, show a request that
+# exploits it, and write a failing test before you fix it</span></pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Integrate the auth provider's SDK and JWT verification</li>
+            <li>Run <code class="inline">/security-review</code> and explain each finding</li>
+            <li>Generate the authorization test matrix from your rules</li>
+            <li>Write scoped queries, policies and RLS policies</li>
+            <li>Grep for raw SQL, <code class="inline">dangerouslySetInnerHTML</code>, CSRF exemptions and secrets</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every route with an ID: try another user's ID yourself</li>
+            <li>That the tenant and owner come from the session, never the body</li>
+            <li>Token verification settings: issuer, audience, algorithm, expiry</li>
+            <li>Cookie flags and where tokens are stored</li>
+            <li>No secret in the diff, the client bundle or the logs</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-written security code:</strong> <code class="inline">findUnique({ where: { id } })</code>
+        on a user-owned resource with no owner filter · <code class="inline">jwt.decode</code> where
+        <code class="inline">verify</code> belongs · tokens in <code class="inline">localStorage</code> · <code class="inline">req.body</code>
+        passed straight to <code class="inline">update</code> · <code class="inline">userId</code> or
+        <code class="inline">clinicId</code> read from the request body · CSRF protection disabled "to fix a 422" ·
+        CORS <code class="inline">origin: "*"</code> with credentials · a catch block around an auth check that
+        continues · a new dependency you've never heard of · an API key in a file, a test fixture or a
+        <code class="inline">NEXT_PUBLIC_</code> variable · tests that only ever log in as an admin.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Treats "the user is logged in" as "the user may do this". Has never tried someone else's ID.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can explain AuthN vs AuthZ, sessions vs JWT, and what IDOR is. Doesn't yet find these issues in a diff unprompted.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Integrates a managed auth provider and scopes the obvious queries. Needs review to catch a missing tenant check, mass assignment, or a weak token setting.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses sessions or JWTs with reasons and stores tokens correctly. Verifies tokens fully. Scopes every query to owner and tenant, enforces authorization in one layer, and backs it with a tested role-by-action matrix. Reviews diffs against the OWASP list, runs <code class="inline">/security-review</code>, and handles secrets without leaks.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Designs the authorization model and tenant isolation for a new product, runs threat-modelling sessions, leads the response to a leaked secret or a reported vulnerability, and teaches IDOR hunting to other interns.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 3:</strong> pick any endpoint in your project that takes an ID. Can you say,
+        without looking, what stops user B from reading user A's record, and point to the test that proves it? Can you
+        say where each secret your app uses is stored, and how you would rotate it today?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Hiding the button instead of checking the API</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The "Delete clinic" button is hidden for non-admins, but <code class="inline">DELETE /clinics/7</code> works for anyone with curl. The UI is a convenience. The server is the security boundary.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Testing only as the admin</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Seeded as <code class="inline">admin@example.com</code>, everything works, and every missing check stays invisible. Seed at least two patients and two clinics.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Rolling your own crypto or tokens</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Home-made "encrypted" IDs, reset tokens from <code class="inline">Math.random()</code>, or a custom JWT parser. Use the platform's secure random generator and maintained libraries.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write docs/authz.md first</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Half a page of "who may do what" gives the agent the rules it can't guess, gives <code class="inline">/security-review</code> context, and becomes your test matrix.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Make the safe path the easy path</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A <code class="inline">currentUser.bookings</code>-style scoped repository means the secure query is also the shortest one to write, for you and for the agent.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Put security in the Definition of Done</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A <code class="inline">/security-review</code> run and the cross-user test belong in the PR checklist for any auth or data-access change (<a href="./qa3.html" class="text-viol underline decoration-viol/40">QA3</a>).</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="auth-choice"> <span>Wrote down for my project whether it uses sessions or JWTs and why, where tokens are stored, and how logout and revocation work.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="idor"> <span>Found (or ruled out) an IDOR by requesting another user's record, and fixed any hit with a scoped query plus a test.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="authz-matrix"> <span>Turned a role-by-action authorization matrix into passing integration tests, including "other user" and "other tenant" columns.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="secrets"> <span>Confirmed that no secret is in the repo, the client bundle or the logs, and know how each production secret is stored and rotated.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="security-pr"> <span class="font-semibold">Ran a security review of one feature (for example clinic booking): <code class="inline">docs/authz.md</code> with the rules and matrix, <code class="inline">/security-review</code> output plus your own OWASP-checklist notes, at least one real finding fixed with a failing-then-passing test, and the matrix tests in CI, all in one PR (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://top10.owasp.org/2025/" target="_blank" rel="noopener">OWASP — Top 10:2025</a> — the categories in Part IV, each with examples and prevention advice.</li>
+        <li><a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP — Password Storage Cheat Sheet</a> — algorithms and parameters for Part I.</li>
+        <li><a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP — Session Management Cheat Sheet</a> — cookie flags, session expiry and rotation.</li>
+        <li><a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP — IDOR Prevention Cheat Sheet</a> · <a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html" target="_blank" rel="noopener">SSRF Prevention</a> — the two bugs agents produce most.</li>
+        <li><a class="text-coral underline" href="https://datatracker.ietf.org/doc/html/rfc9700" target="_blank" rel="noopener">IETF — RFC 9700, OAuth 2.0 Security Best Current Practice</a> — why PKCE everywhere and no implicit flow.</li>
+        <li><a class="text-coral underline" href="https://supabase.com/docs/guides/auth" target="_blank" rel="noopener">Supabase — Auth</a> · <a class="text-coral underline" href="https://supabase.com/docs/guides/database/postgres/row-level-security" target="_blank" rel="noopener">Row Level Security</a> — managed auth plus database-enforced authorization (<a class="text-coral underline" href="./op3.html">OP3</a>).</li>
+        <li><a class="text-coral underline" href="https://code.claude.com/docs/en/security" target="_blank" rel="noopener">Claude Code — Security</a> · <a class="text-coral underline" href="https://code.claude.com/docs/en/commands" target="_blank" rel="noopener">Commands</a> — <code class="inline">/security-review</code> and safe use of the agent itself.</li>
+      </ul>
