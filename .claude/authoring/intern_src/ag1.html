@@ -1,0 +1,538 @@
+<!-- meta: days=1 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">How LLMs &amp; Coding Agents Work</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          You will spend most of this internship working next to a coding agent. This module gives you a working mental
+          model of what is on the other side of the prompt. It covers tokens and context windows, next-token prediction,
+          why a model can be fluent and wrong in the same sentence, and how a model plus a handful of tools becomes an
+          agent that can read, edit and run your code.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> you can't judge output from a system you don't understand.
+          Once you know that the model predicts plausible text, only sees what is in its context window, and gives
+          different answers to the same prompt, most agent behaviour stops being surprising. You'll know when to trust it,
+          when to check it, and what to give it so it gets things right the first time.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Inside the model</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A very good autocomplete, not a database of facts</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A large language model (LLM) is a function trained on a huge amount of text and code. Given some text, it
+        outputs a probability for every possible next piece of text. That is the whole trick. Everything else, including
+        chat, code generation, planning and tool use, is built by calling that function in a loop.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Tokens: the unit of everything</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Models don't read characters or words. They read <strong>tokens</strong>: common chunks of text that a tokenizer
+        splits your input into. A common English word is often one token. A rare identifier or a long number may be
+        several. Everything is measured in tokens: the size of the context window, the length of the answer, the price
+        and the time it takes.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">illustration — how text becomes tokens (split is approximate)</span>
+        <pre class="code">"Cancel booking 4812 for patient Nguyen"
+ → [Cancel] [ booking] [ 48] [12] [ for] [ patient] [ Ng] [uyen]
+<span class="cm"># ~8 tokens. Common words = 1 token. Numbers and rare names split up.</span>
+
+"bookingService.cancelIfMoreThan24hBefore(slot)"
+ → [booking] [Service] [.cancel] [If] [More] [Than] [24] [h] [Before] [(slot)]
+<span class="cm"># Code is dense: identifiers and symbols cost more tokens per character.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A rough rule of thumb is three to four characters of English per token, and fewer for code, logs and JSON. You
+        don't need the exact number. You need the instinct that <strong>a 3,000-line log file pasted into a chat is not
+        free</strong>. It takes up space the model could have used for your code.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Next-token prediction, drawn</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Generation is a loop. The model scores every candidate next token, one is picked, it is appended to the text,
+        and the whole thing runs again. A 200-line file is a few thousand trips around this loop.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 210" class="w-full min-w-[620px]" role="img" aria-label="Next-token prediction loop">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">ONE TOKEN AT A TIME</text>
+          <g class="anim-pulse"><rect x="10" y="50" width="150" height="54" rx="9" fill="#2563EB"/>
+            <text x="85" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Text so far</text>
+            <text x="85" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">"if slot.starts_at &lt;"</text></g>
+          <g class="anim-pulse d1"><rect x="205" y="50" width="130" height="54" rx="9" fill="#6d5acd"/>
+            <text x="270" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Model</text>
+            <text x="270" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">billions of weights</text></g>
+          <g class="anim-pulse d2"><rect x="380" y="40" width="160" height="74" rx="9" fill="#0D9488"/>
+            <text x="460" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Probabilities</text>
+            <text x="460" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">" now" 0.61 · " Time" 0.22</text>
+            <text x="460" y="90" text-anchor="middle" fill="#ffffffbb" font-size="9">" datetime" 0.09 · …</text></g>
+          <g class="anim-pulse d3"><rect x="585" y="50" width="105" height="54" rx="9" fill="#D97757"/>
+            <text x="637" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Pick one</text>
+            <text x="637" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">→ " now"</text></g>
+          <line x1="160" y1="77" x2="205" y2="77" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="335" y1="77" x2="380" y2="77" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="540" y1="77" x2="585" y2="77" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <path d="M 637 104 Q 637 170 350 170 Q 85 170 85 106" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 5"/>
+          <text x="350" y="190" text-anchor="middle" font-size="10" fill="#A8A49B">append the token, run the model again, until a stop token or the length limit</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice what is <em>not</em> in the picture: a step that looks anything up. The model has no built-in check of
+        whether <code class="inline">now</code> is the right function in <em>your</em> codebase. It only knows it is
+        the most likely continuation given everything it has seen.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Why models are confidently wrong</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>hallucination</strong> is output that is fluent, plausible and false. It happens because the model is
+        optimised to produce likely text, and a made-up function name that <em>looks</em> right is very likely text. The
+        tone doesn't change when the model is wrong. There is no stutter. In code, hallucinations have a recognisable
+        shape:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Hallucination</th><th class="px-4 py-3">What it looks like</th><th class="px-4 py-3">How you catch it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Invented API</td><td class="px-4 py-3"><code class="inline">prisma.booking.softDelete()</code>, a method that sounds real but doesn't exist</td><td class="px-4 py-3">Type-checker, build, or opening the library's docs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Wrong version</td><td class="px-4 py-3">Code for an older major version of your framework, such as a removed config option</td><td class="px-4 py-3">Compare with the version in <code class="inline">package.json</code> or <code class="inline">Gemfile.lock</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Fake CLI flag</td><td class="px-4 py-3"><code class="inline">--skip-locked-rows</code> on a tool that never had it</td><td class="px-4 py-3">Run <code class="inline">--help</code>, or read the tool's docs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Imagined file or column</td><td class="px-4 py-3">Imports <code class="inline">src/lib/auth.ts</code> or queries <code class="inline">bookings.cancelled_by</code>, neither of which exists</td><td class="px-4 py-3">Ask for <code class="inline">file:line</code> citations and open them</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">False success report</td><td class="px-4 py-3">"All tests pass" with no test output shown</td><td class="px-4 py-3">Demand the command and its output (<a href="./ag3.html" class="text-viol underline decoration-viol/40">AG3</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>Confidence is not evidence.</strong> A model's certainty tells you nothing about correctness, because it
+        sounds equally sure either way. The only things that count as evidence are a compiler, a test run, a query
+        result, a doc page you opened, or your own eyes on the running feature.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Non-determinism: same prompt, different answer</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The "pick one" step samples from the probabilities instead of always taking the top token. So the same prompt can
+        produce a different variable name today, a different approach tomorrow, and occasionally a different bug. In an
+        agent, small early differences compound: a different first file read leads to a different plan.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Don't treat one good run as proof.</strong> "It worked when I tried it" says nothing about the next run. Tests say something.</li>
+        <li><strong>Pin down what must not vary.</strong> Conventions go in <code class="inline">CLAUDE.md</code>, decisions go in a plan file, and correctness goes in tests. Then variation only affects things that don't matter.</li>
+        <li><strong>Use variation on purpose.</strong> If you ask for three designs, you get three genuinely different ones. That is useful when you are exploring.</li>
+      </ul>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · The context window</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The model only knows what is in the window</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The <strong>context window</strong> is everything the model can see in one call: instructions, conversation,
+        file contents, tool output. It is measured in tokens and it has a hard limit. The model has no memory between
+        calls. Every time the agent takes a step, the relevant history is sent again. If a fact isn't in the window,
+        the model doesn't know it. It will fill the gap with the most plausible guess.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">What fills the window in a coding session</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In a Claude Code session the window fills up from several sources, and you control most of them. Run
+        <code class="inline">/context</code> in a session to see the real breakdown
+        (<a href="./ag2.html" class="text-viol underline decoration-viol/40">AG2</a>).
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Source</th><th class="px-4 py-3">Loaded when</th><th class="px-4 py-3">Who controls it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">System prompt and tool definitions</td><td class="px-4 py-3">Every call</td><td class="px-4 py-3">The tool vendor, plus the tools and servers you enable</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Project instructions (<code class="inline">CLAUDE.md</code>)</td><td class="px-4 py-3">Session start</td><td class="px-4 py-3">You and your team</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Your messages</td><td class="px-4 py-3">As you type them</td><td class="px-4 py-3">You</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Files the agent read</td><td class="px-4 py-3">When it opens them</td><td class="px-4 py-3">The agent, steered by your prompt</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tool output (tests, logs, grep)</td><td class="px-4 py-3">After each command</td><td class="px-4 py-3">The agent. Big logs are the usual reason the window fills up.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Context quality decides output quality</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The model is the same in both prompts below. What changes is what it gets to see. The first leaves it guessing
+        about your stack, conventions and constraints. The second puts the answers in the window.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — thin context</span>
+        <pre class="code">add a cancel booking endpoint
+<span class="cm"># Which framework? Which auth? Soft or hard delete? 24h rule? Tests where?</span>
+<span class="cm"># Every unanswered question becomes a guess.</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">prompt — rich context</span>
+        <pre class="code">Add POST /bookings/:id/cancel.
+Read first: @src/bookings/booking.service.ts @src/bookings/booking.controller.ts
+Rules: only the booking's patient or an admin may cancel (403 otherwise);
+not allowed within 24h of the slot (422); set status='cancelled', don't delete.
+Follow the error format in @src/common/http-errors.ts.
+Tests go in test/bookings/, run with: npm test -- bookings
+<span class="cm"># Same model. Far fewer guesses. The @ mentions pull those files into the window.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Writing the second prompt takes two minutes. Reviewing and fixing the output of the first usually takes much
+        longer. Turning this into a repeatable plan is the subject of
+        <a href="./ag3.html" class="text-viol underline decoration-viol/40">AG3</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">More context is not always better</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A bigger window helps only if what goes into it is relevant. Long, noisy sessions degrade in predictable ways:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Distraction.</strong> Three abandoned approaches still in the history pull the model back toward them.</li>
+        <li><strong>Buried instructions.</strong> A rule you gave 80 messages ago competes with everything since, and it tends to lose.</li>
+        <li><strong>Compaction loss.</strong> When the window fills up, tools summarise older history to make room, and details disappear. Claude Code does this automatically, and re-reads the root <code class="inline">CLAUDE.md</code> afterwards, which is why durable rules belong there and not in chat.</li>
+      </ul>
+      <div class="mt-4 callout callout-info">
+        <strong>The practical rule:</strong> one task per session. When a task is finished and committed, start fresh
+        instead of stacking the next task on top. How to do that in Claude Code (<code class="inline">/clear</code>,
+        <code class="inline">/compact</code>, plan files) is in <a href="./ag2.html" class="text-viol underline decoration-viol/40">AG2</a>.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Training cutoff vs your versions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A model learns from data up to a <strong>training cutoff</strong>. Anything released after that date, such as a
+        new framework major version or a renamed API, isn't in its weights. And even for older libraries, it has seen
+        many versions mixed together. The fix is to put the facts in the window: the lockfile, the docs page, an
+        existing example from your repo.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — anchor the version</span>
+        <pre class="code">We're on the versions in @package.json (check next, prisma, zod).
+Before using any API from these libraries, find an existing usage in this
+repo or fetch the official docs page for that version. Tell me which.
+<span class="cm"># Forces the agent to ground library calls in evidence, not memory.</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · The agent loop</div>
+      <h2 class="font-display text-2xl font-bold mt-2">An agent is a model in a loop with tools</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A chat model can only answer with text. A <strong>coding agent</strong> is the same model wrapped in a program
+        (sometimes called a <em>harness</em>) that gives it tools, runs the tools it asks for, and feeds the results back
+        in. The model decides; the harness acts; the result becomes new context. Claude Code's docs describe the cycle
+        as <em>gather context → take action → verify results</em>, repeated until the task is done.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Model + tools + observations</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Here is one real-shaped loop: "the booking tests are failing, fix them". Every arrow back to the model is an
+        <strong>observation</strong>, a fact from the real world that the model didn't have to guess.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Y as You
+    participant M as Model
+    participant H as Harness (Claude Code)
+    participant R as Your repo
+    Y->>M: "booking tests fail, fix them"
+    M->>H: tool call: Bash "npm test -- bookings"
+    H->>R: run command
+    R-->>H: 2 failed: expected 422, got 200
+    H-->>M: observation (test output)
+    M->>H: tool call: Grep "cancel(" in src/
+    H-->>M: observation: booking.service.ts:41
+    M->>H: tool call: Read booking.service.ts
+    H-->>M: observation: file contents
+    M->>H: tool call: Edit (add 24h check)
+    M->>H: tool call: Bash "npm test -- bookings"
+    H-->>M: observation: 14 passed
+    M-->>Y: summary + diff + test output
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This is why an agent beats a chat window for coding. It doesn't have to <em>remember</em> your code, because it
+        reads it. It doesn't have to <em>believe</em> its fix works, because it runs the tests. The observations keep
+        pulling it back to reality. When an agent skips them ("I've fixed it" without running anything), it is back to
+        guessing.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The tools a coding agent has</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Tool sets differ between products, but they fall into a few families. The risk column is the reason permission
+        prompts exist (<a href="./ag2.html" class="text-viol underline decoration-viol/40">AG2</a>).
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Family</th><th class="px-4 py-3">Examples</th><th class="px-4 py-3">What it gives the model</th><th class="px-4 py-3">Risk</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Read &amp; search</td><td class="px-4 py-3">Read a file, glob, grep</td><td class="px-4 py-3">Ground truth about your code</td><td class="px-4 py-3">Low. It can still read secrets like <code class="inline">.env</code>.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Edit &amp; write</td><td class="px-4 py-3">Edit a file, create a file</td><td class="px-4 py-3">The ability to change things</td><td class="px-4 py-3">Medium. Reversible with git and checkpoints.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Execute</td><td class="px-4 py-3">Shell: tests, build, git, package managers</td><td class="px-4 py-3">Real feedback from real programs</td><td class="px-4 py-3">High. Anything you can run, it can run.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Web</td><td class="px-4 py-3">Search, fetch a URL</td><td class="px-4 py-3">Current docs past the training cutoff</td><td class="px-4 py-3">Medium. Fetched pages can carry injected instructions.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">External systems</td><td class="px-4 py-3">MCP servers: browser, GitHub, database</td><td class="px-4 py-3">Eyes and hands outside the repo</td><td class="px-4 py-3">Varies. It depends on the credentials you hand over (<a href="./ag4.html" class="text-viol underline decoration-viol/40">AG4</a>).</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">New powers, new failure modes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The loop fixes some chat problems and creates new ones. Learn to recognise these in a running session:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Compounding errors.</strong> A wrong assumption at step 2 ("auth lives in middleware") shapes steps 3 to 20. The later steps look competent, but they are built on sand.</li>
+        <li><strong>Thrashing.</strong> The same test fails, the agent tries a new "fix", and it fails again. Each attempt adds noise to the context. Interrupt after two or three rounds (<a href="./ag3.html" class="text-viol underline decoration-viol/40">AG3</a>).</li>
+        <li><strong>Goal substitution.</strong> Asked to make tests pass, it edits the test. Asked to silence an error, it catches and ignores it. The literal goal is met and the real one is lost.</li>
+        <li><strong>Side effects.</strong> A shell command can reach far beyond the task: installing packages, touching a shared database, pushing to a remote.</li>
+        <li><strong>Prompt injection.</strong> Text the agent reads (a web page, an issue comment, a README) can contain instructions. The model may follow them as if you had typed them.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Reading an agent transcript</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Skimming the tool calls is the fastest way to know whether a result is grounded. Read the transcript the way you
+        read a colleague's lab notebook: what did it actually look at, and what did it actually run?
+      </p>
+      <div class="mt-4">
+        <span class="code-label">annotated transcript — a grounded run</span>
+        <pre class="code">● Bash(npm test -- bookings)          <span class="cm"># ✓ reproduced the failure first</span>
+  └ 2 failed · expected 422, received 200
+● Grep("cancel\(", src/)               <span class="cm"># ✓ located code instead of assuming a path</span>
+● Read(src/bookings/booking.service.ts)
+● Edit(src/bookings/booking.service.ts) <span class="cm"># ✓ one file, matches the failure</span>
+● Bash(npm test -- bookings)          <span class="cm"># ✓ re-ran the same check</span>
+  └ <span class="out">14 passed</span>
+<span class="cm"># Red flags would be: Edit before any Read, an edit to *.test.ts,</span>
+<span class="cm"># a final message that claims success with no second test run.</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Choosing &amp; spending</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pick the model, the task and the budget like an engineer</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents cost money and time, and they are good at some jobs and bad at others. A professional knows roughly what
+        a session costs, which model a task needs, and which tasks shouldn't be handed to an agent at all.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Model tiers: capability vs speed vs cost</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Model families come in tiers. For Claude these are Opus, Sonnet and Haiku, and Claude Code exposes them as
+        aliases in <code class="inline">/model</code>. Exact versions and prices change often, so check the models
+        page. The trade-off itself stays stable:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tier</th><th class="px-4 py-3">Strengths</th><th class="px-4 py-3">Costs</th><th class="px-4 py-3">Reach for it when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Largest (Opus)</td><td class="px-4 py-3">Hard reasoning, long multi-step tasks, subtle bugs, design trade-offs</td><td class="px-4 py-3">Highest price per token, slower</td><td class="px-4 py-3">Planning a feature, debugging a race condition, reviewing a risky change</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Mid (Sonnet)</td><td class="px-4 py-3">Strong everyday coding at good speed</td><td class="px-4 py-3">Moderate</td><td class="px-4 py-3">Implementing a well-specified plan step, writing tests, refactors</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Small (Haiku)</td><td class="px-4 py-3">Fast and cheap, good at narrow tasks</td><td class="px-4 py-3">Lowest</td><td class="px-4 py-3">Classification, summaries, simple edits, high-volume automation</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A good habit is to <strong>match the model to the step, not the project</strong>: a stronger model to plan, and
+        a faster one to execute a clear plan. Claude Code even ships an <code class="inline">opusplan</code> alias
+        that does exactly this. Your team may also standardise on one default. Follow it unless you have a reason not to.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Cost and latency awareness</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You pay per token, both input and output. The expensive surprise is input: because the model has no memory,
+        <strong>every step of the loop re-sends the growing context</strong>. Providers soften this with prompt caching,
+        but the shape is still worth feeling once:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">back-of-envelope — why long sessions get expensive</span>
+        <pre class="code">step  1: context  20k tokens  → reply 1k
+step 10: context  60k tokens  → reply 1k   <span class="cm"># files + test logs piled up</span>
+step 30: context 150k tokens  → reply 1k   <span class="cm"># same small reply, 7× the input</span>
+<span class="cm"># Total input ≈ sum of every step's context, not the final size.</span>
+<span class="cm"># Levers: fresh session per task · don't paste huge logs · smaller model</span>
+<span class="cm"># for mechanical steps · check /usage in Claude Code.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Latency follows the same curve: bigger context and bigger models mean slower steps. If a session feels sluggish
+        and unfocused, it usually needs a clean restart more than it needs more patience.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Thinking and effort: paying for deliberation</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Current models can <strong>think before they answer</strong>. They generate reasoning tokens you may or may not
+        see, and then the final output. More thinking usually means better answers on hard problems, and always means
+        more tokens and more waiting. Claude Code exposes this as an effort level that you set with
+        <code class="inline">/effort</code> (from <code class="inline">low</code> up to <code class="inline">max</code>),
+        separately from the model choice.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Task</th><th class="px-4 py-3">Model</th><th class="px-4 py-3">Effort</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Rename a prop across 12 files</td><td class="px-4 py-3">Mid or small</td><td class="px-4 py-3">Low</td><td class="px-4 py-3">Mechanical, and the type-checker verifies it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Implement plan step 3 of 5</td><td class="px-4 py-3">Mid</td><td class="px-4 py-3">Medium</td><td class="px-4 py-3">The thinking was done in the plan, and tests verify it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Plan double-booking prevention</td><td class="px-4 py-3">Largest</td><td class="px-4 py-3">High</td><td class="px-4 py-3">Concurrency trade-offs; a mistake is expensive</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Intermittent test failure nobody understands</td><td class="px-4 py-3">Largest</td><td class="px-4 py-3">High or max</td><td class="px-4 py-3">Needs many hypotheses and careful elimination</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Treat this table as a starting point, not a rule. Your team's defaults win, and the right answer changes as
+        models improve. What matters is making the choice on purpose instead of running everything at maximum.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">What agents are good and bad at</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        This list will shift as models improve, but the pattern holds: agents are strong where the answer can be
+        <em>checked</em> and the pattern is <em>common</em>. They are weak where the answer depends on facts that
+        aren't in the window, or on judgement nobody wrote down.
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Strong
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(delegate, then verify)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Explaining unfamiliar code and tracing a request through it</li>
+            <li>Boilerplate and well-known patterns: CRUD, forms, migrations</li>
+            <li>Writing tests for behaviour you describe</li>
+            <li>Mechanical refactors across many files</li>
+            <li>Reading an error or stack trace and finding the cause</li>
+            <li>Drafting plans, docs and PR descriptions</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">Weak
+            <span class="font-normal text-xs text-mute dark:text-mutedark">(you lead, it assists)</span></div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Business rules that exist only in someone's head</li>
+            <li>Choosing between trade-offs it can't measure, such as cost or team skill</li>
+            <li>Security and concurrency edge cases nobody asked about</li>
+            <li>Knowing when to stop, push back, or say "this requirement is wrong"</li>
+            <li>Very new libraries, or versions after its training cutoff</li>
+            <li>Anything where "looks right" and "is right" are hard to tell apart without a test</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">A two-question check before you delegate</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Before handing a task over, ask two questions: is the context in the window, and can the result be checked?
+        The answers tell you how to proceed.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    A["New task"] --> B{"Is the needed context<br/>in the repo or prompt?"}
+    B -- "no" --> C["Write it down first:<br/>rules, versions, examples"]
+    C --> B
+    B -- "yes" --> D{"Can the result be checked<br/>by tests or a quick look?"}
+    D -- "yes" --> E["Delegate, then verify<br/>with evidence"]
+    D -- "no" --> F["Plan it with the agent,<br/>you decide, add a check"]
+    F --> E
+        </pre>
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Use these prompts in your first week to <em>see</em> the ideas in this module rather than take them on trust.
+        Each one makes the agent show you its context, its evidence, or its uncertainty.
+      </p>
+      <pre class="code mt-3">Before you answer: list the files you read to reach this conclusion, and
+mark each claim as VERIFIED (you saw it in code/output) or ASSUMED.
+<span class="cm"># exposes guessing: the ASSUMED lines are where hallucinations live</span></pre>
+      <pre class="code mt-3">Which version of prisma is this repo on? Show me where you found it, then
+show me the official docs page for the API you're about to use.
+<span class="cm"># anchors library calls to the real version, not training-data memory</span></pre>
+      <pre class="code mt-3">Run the failing test first and paste the output. Don't edit anything
+until you can explain the failure in one sentence.
+<span class="cm"># forces an observation before action: the loop working as designed</span></pre>
+      <pre class="code mt-3">/context
+<span class="cm"># see what is filling the window right now: memory files, tools, conversation</span></pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Read and search the codebase before answering</li>
+            <li>Run commands to reproduce problems and check fixes</li>
+            <li>Look up current docs for the library version you use</li>
+            <li>Explain its reasoning and label what it assumed</li>
+            <li>Mechanical, checkable work at speed</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every API, flag or file it names that you haven't seen before</li>
+            <li>That "done" comes with command output, not just a sentence</li>
+            <li>That the transcript shows reads before edits</li>
+            <li>That context is fresh: a new task gets a new session</li>
+            <li>Which model is running, and what the session is costing</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent output:</strong> a method or CLI flag you can't find in the docs · confident claims
+        with no files read · "should work" or "this fixes it" with no test run · the same fix attempted a third time ·
+        an edit to a test file when you asked for a code fix · instructions that seem to come from a web page or
+        issue rather than from you.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Treats the agent as an oracle. Pastes its output without reading it.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows models "hallucinate" and have a context limit, but can't explain why, or predict when it will happen.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Can explain tokens, the context window and the agent loop. Catches obvious hallucinations when the build breaks. Still writes thin prompts and runs very long sessions.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Writes context-rich prompts by default. Reads transcripts for reads-before-edits and evidence. Picks a model per step and keeps sessions focused. Spots invented APIs and false success claims before they reach a PR.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Explains agent failures to others in terms of context and observations. Improves the team's <code class="inline">CLAUDE.md</code> and prompts after each recurring mistake. Knows the cost profile of the team's workflows.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 3:</strong> can you explain to a non-engineer, in two minutes, why the agent said
+        a function existed when it didn't? Can you name the last hallucination you caught, and say how you caught it? Do
+        you know roughly how many tokens your typical session uses?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Trusting tone</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The model sounds equally sure when it is right and when it is wrong. Judge the evidence it shows, never the confidence of the prose.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ One endless session</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Stacking five tasks in one conversation fills the window with stale attempts. Quality drops, cost rises, and early instructions get lost.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ "It worked once"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Output is non-deterministic. A single good run is an anecdote. A passing test is evidence that survives the next run.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Put facts in the window</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">@-mention the relevant files, state the versions, link the docs page. Every fact you provide is one less guess.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Ask for VERIFIED vs ASSUMED</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Making the agent label its claims costs one line of prompt and shows you exactly where to spend your checking time.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Read the tool calls, not just the summary</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The final message is the agent's story. The tool calls are what it actually did. When they disagree, the tool calls are right.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="explain-loop"> <span>Can explain tokens, the context window, next-token prediction and the agent loop to my mentor in my own words, with no notes.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="caught-halluc"> <span>Caught at least one hallucinated API, flag, file or version in agent output, and wrote down how I caught it.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="context-ab"> <span>Ran the same task with a thin prompt and a context-rich prompt, and compared the diffs.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="read-transcript"> <span>Reviewed a full agent transcript and marked each tool call as observation, action or unsupported claim.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="agent-field-notes"> <span class="font-semibold">Wrote a one-page "agent field notes" report on a sample repo. Run one task three times in fresh sessions and record the differences (non-determinism). Include one hallucination you caught and how, the <code class="inline">/context</code> breakdown at the end of a session, and a model choice you made with the reason (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://code.claude.com/docs/en/how-claude-code-works" target="_blank" rel="noopener">Anthropic — How Claude Code works</a> — the agentic loop, tools and context window, described by the people who built it.</li>
+        <li><a class="text-coral underline" href="https://platform.claude.com/docs/en/build-with-claude/context-windows" target="_blank" rel="noopener">Anthropic — Context windows</a> — how the window is counted and what happens as it fills.</li>
+        <li><a class="text-coral underline" href="https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-hallucinations" target="_blank" rel="noopener">Anthropic — Reduce hallucinations</a> — techniques such as grounding in quotes and allowing "I don't know".</li>
+        <li><a class="text-coral underline" href="https://platform.claude.com/docs/en/about-claude/models/overview" target="_blank" rel="noopener">Anthropic — Models overview</a> — current Opus, Sonnet and Haiku versions, context sizes and prices.</li>
+        <li><a class="text-coral underline" href="https://code.claude.com/docs/en/costs" target="_blank" rel="noopener">Anthropic — Claude Code costs</a> — what drives token usage in a session and how to reduce it.</li>
+        <li><a class="text-coral underline" href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Anthropic Engineering — Building effective agents</a> — workflows vs agents, and when the loop is worth its cost (<a class="text-coral underline" href="./ag5.html">AG5</a> builds one).</li>
+        <li><a class="text-coral underline" href="../../aifde/modules/fn7.html">AIFDE FN7 — AI-assisted Development</a> — the senior-level view of working with coding agents.</li>
+      </ul>
