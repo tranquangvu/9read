@@ -7,6 +7,7 @@ Read-only. Exits non-zero if any FAIL is reported.
     python3 .claude/authoring/qa.py aifde/modules/ai4.html
     python3 .claude/authoring/qa.py --all --density      # add the density gates
     python3 .claude/authoring/qa.py --registry           # registry + counts only
+    python3 .claude/authoring/qa.py --program intern --all   # intern/ program (qa_intern.py)
 """
 from __future__ import annotations
 import argparse, json, os, re, sys
@@ -33,7 +34,7 @@ def warn(page: str, msg: str) -> None:
 # ── registry ────────────────────────────────────────────────────────────────
 def load_modules() -> list[dict]:
     src = SITE_JS.read_text()
-    block = re.search(r"const MODULES = \[(.*?)\n\];", src, re.S).group(1)
+    block = re.search(r"const AIFDE_MODULES = \[(.*?)\n\];", src, re.S).group(1)
     out = []
     for code, name, crit in re.findall(
         r'\{\s*code:\s*"([^"]+)",\s*name:\s*"([^"]+)",\s*critical:\s*(true|false)\s*\}', block
@@ -383,6 +384,17 @@ def print_table(paths: list[Path]) -> None:
 
 
 def main() -> int:
+    if "--program" in sys.argv:
+        i = sys.argv.index("--program")
+        prog = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        rest = sys.argv[1:i] + sys.argv[i + 2:]
+        if prog == "intern":
+            sys.path.insert(0, str(Path(__file__).parent))
+            import qa_intern
+            return qa_intern.main(rest)
+        if prog != "aifde":
+            print(f"unknown program: {prog}"); return 2
+        sys.argv = [sys.argv[0]] + rest
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="*")
     ap.add_argument("--all", action="store_true")

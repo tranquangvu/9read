@@ -1,6 +1,7 @@
-/* AIFDE Mastery — shared runtime: module registry, sidebar, theme, mermaid, checklists */
+/* 9read — shared runtime: program registry, sidebar, theme, mermaid, checklists */
 
-const GROUPS = [
+/* ---------- AIFDE Mastery ---------- */
+const AIFDE_GROUPS = [
   { key: "FN", name: "AI & Data Foundations", color: "#2563EB" },
   { key: "AI", name: "AI Application Engineering", color: "#7C3AED" },
   { key: "PR", name: "Production & Integration", color: "#0D9488" },
@@ -8,7 +9,7 @@ const GROUPS = [
 ];
 
 /* Order = recommended learning order (matrix column order). */
-const MODULES = [
+const AIFDE_MODULES = [
   { code: "FN1", name: "Python for AI", critical: true },
   { code: "FN2", name: "LLM Fundamentals", critical: true },
   { code: "FN3", name: "Embeddings & Vector Search", critical: true },
@@ -59,6 +60,76 @@ const MODULES = [
   { code: "FD12", name: "Business English & Cross-cultural Communication", critical: true },
 ];
 
+
+/* ---------- AI-Native Developer Internship ---------- */
+const INTERN_GROUPS = [
+  { key: "CO", name: "Engineering Foundations", color: "#2563EB" },
+  { key: "AG", name: "AI-native Development", color: "#C2410C" },
+  { key: "SD", name: "System & Data Design", color: "#7C3AED" },
+  { key: "BE", name: "Backend", color: "#0D9488" },
+  { key: "AP", name: "App Development", color: "#DB2777" },
+  { key: "QA", name: "Quality Ownership", color: "#16A34A" },
+  { key: "OP", name: "DevOps & Deployment", color: "#A16207" },
+  { key: "CP", name: "Capstone", color: "#475569" },
+];
+
+/* Order = recommended 12-week order. critical = Core (everyone), else Elective (path-dependent).
+   soon = page not written yet: listed but not linked. Remove the flag when the page ships. */
+const INTERN_MODULES = [
+  { code: "CO1", name: "The Developer Role in the AI Era", critical: true, soon: true },
+  { code: "CO2", name: "Git, GitHub Flow & Code Review", critical: true, soon: true },
+  { code: "CO3", name: "Reading & Debugging Code You Didn't Write", critical: true, soon: true },
+  { code: "CO4", name: "HTTP, APIs & How the Web Works", critical: true, soon: true },
+  { code: "AG1", name: "How LLMs & Coding Agents Work", critical: true, soon: true },
+  { code: "AG2", name: "Claude Code Fundamentals", critical: true, soon: true },
+  { code: "AG3", name: "Plan → Execute → Verify", critical: true },
+  { code: "SD1", name: "Database Design", critical: true },
+  { code: "SD2", name: "Reading & Drawing System Diagrams", critical: true, soon: true },
+  { code: "SD3", name: "Layered, MVC & Clean Architecture", critical: true, soon: true },
+  { code: "SD4", name: "Monolith, Microservices & Event-driven", critical: true, soon: true },
+  { code: "SD5", name: "Design Patterns I: Creational & Structural", critical: true, soon: true },
+  { code: "SD6", name: "Design Patterns II: Behavioral", critical: true, soon: true },
+  { code: "SD7", name: "Backend Patterns: Repository, CQRS, Outbox & Saga", critical: true, soon: true },
+  { code: "SD8", name: "Caching Strategies", critical: true, soon: true },
+  { code: "SD9", name: "Queues, Background Jobs & Async Processing", critical: true, soon: true },
+  { code: "SD10", name: "Authentication, Authorization & Security Design", critical: true, soon: true },
+  { code: "SD11", name: "Reliability & Scaling", critical: true, soon: true },
+  { code: "SD12", name: "System Design Case Studies", critical: true, soon: true },
+  { code: "BE1", name: "API Design", critical: true, soon: true },
+  { code: "BE2", name: "Ruby on Rails", critical: false, soon: true },
+  { code: "BE3", name: "NestJS", critical: false, soon: true },
+  { code: "BE4", name: "FastAPI", critical: false, soon: true },
+  { code: "BE5", name: "Gin (Go)", critical: false, soon: true },
+  { code: "AP1", name: "React Mental Model", critical: false, soon: true },
+  { code: "AP2", name: "Next.js App Router", critical: false, soon: true },
+  { code: "AP3", name: "Flutter Essentials", critical: false, soon: true },
+  { code: "AP4", name: "AI Design Tools", critical: true, soon: true },
+  { code: "QA1", name: "Testing Strategy & AI-written Unit Tests", critical: true, soon: true },
+  { code: "QA2", name: "E2E Testing with Playwright", critical: true, soon: true },
+  { code: "QA3", name: "Definition of Done: Self-verify Before QA", critical: true, soon: true },
+  { code: "AG4", name: "Advanced Claude Code", critical: true, soon: true },
+  { code: "OP1", name: "Linux, Shell & Networking Basics", critical: true, soon: true },
+  { code: "OP2", name: "Docker & CI/CD with GitHub Actions", critical: true, soon: true },
+  { code: "OP3", name: "Fast Deploy: Vercel + Supabase", critical: true, soon: true },
+  { code: "OP4", name: "AWS Core Services", critical: true, soon: true },
+  { code: "OP5", name: "Cloudflare Essentials", critical: true, soon: true },
+  { code: "AG5", name: "AI Agent Systems: RAG, Tools, MCP, Memory", critical: true, soon: true },
+  { code: "CP1", name: "Capstone Project", critical: true, soon: true },
+];
+
+/* ---------- program registry ---------- */
+/* One entry per program folder (<slug>/index.html + <slug>/modules/*.html). */
+const PROGRAMS = {
+  aifde: {
+    groups: AIFDE_GROUPS, modules: AIFDE_MODULES, checkPrefix: "fde-check",
+    labels: { on: "Critical", off: "Supporting", onTarget: "3 — independent production", offTarget: "2 — works with support" },
+  },
+  intern: {
+    groups: INTERN_GROUPS, modules: INTERN_MODULES, checkPrefix: "intern-check",
+    labels: { on: "Core", off: "Elective", onTarget: "3 — works independently", offTarget: "2 — works with support" },
+  },
+};
+
 /* ---------- topics (root hub) ---------- */
 /* One entry per subject area. Add a folder + a row here and the hub picks it up. */
 const TOPICS = [
@@ -70,9 +141,21 @@ const TOPICS = [
       "A 48-module curriculum taking an engineer from Python and LLM fundamentals to shipping, " +
       "operating and selling AI systems inside a customer's stack — each module with hands-on labs " +
       "and an evidence artifact.",
-    meta: `${MODULES.length} modules`,
-    tags: GROUPS.map((g) => g.name),
+    meta: `${AIFDE_MODULES.length} modules`,
+    tags: AIFDE_GROUPS.map((g) => g.name),
     accent: "#D97757",
+    status: "live",
+  },
+  {
+    slug: "intern",
+    name: "AI-Native Developer Internship",
+    tagline: "12 weeks · intern to professional",
+    blurb:
+      "A 12-week program for interns who already know basic programming: let coding agents write the syntax, " +
+      "and learn to design databases, systems and apps, verify that what you built works, and deploy it yourself.",
+    meta: `${INTERN_MODULES.length} modules`,
+    tags: INTERN_GROUPS.map((g) => g.name),
+    accent: "#2563EB",
     status: "live",
   },
 ];
@@ -83,6 +166,10 @@ const IN_MODULES_DIR = PATH.includes("/modules/");
 const ROOT = IN_MODULES_DIR ? "../" : "./";
 const IN_TOPIC = TOPICS.some((t) => PATH.includes(`/${t.slug}/`));
 const SITE_ROOT = IN_MODULES_DIR ? "../../" : IN_TOPIC ? "../" : "./";
+const PROGRAM_SLUG = TOPICS.find((t) => PATH.includes(`/${t.slug}/`))?.slug || "aifde";
+const PROGRAM = PROGRAMS[PROGRAM_SLUG];
+const GROUPS = PROGRAM.groups;
+const MODULES = PROGRAM.modules;
 const CURRENT = (location.pathname.split("/").pop() || "index.html").replace(".html", "").toUpperCase();
 
 function moduleHref(code) {
@@ -131,6 +218,14 @@ function buildSidebar() {
         <span class="text-[11px] font-semibold uppercase tracking-wider text-mute dark:text-mutedark">${g.name}</span>
       </div>`;
     for (const m of mods) {
+      if (m.soon) {
+        html += `
+        <div class="flex items-baseline gap-2 px-3 py-1.5 rounded-lg text-[13px] opacity-50 cursor-default" title="Coming soon">
+          <span class="font-mono text-[11px] w-9 shrink-0 gtx-${g.key}">${m.code}</span>
+          <span class="leading-snug">${m.name} <span class="text-[10px] uppercase tracking-wide">· soon</span></span>
+        </div>`;
+        continue;
+      }
       const cur = CURRENT === m.code ? "current" : "";
       html += `
         <a href="${moduleHref(m.code)}" class="side-link ${cur} flex items-baseline gap-2 px-3 py-1.5 rounded-lg text-[13px] hover:bg-sand dark:hover:bg-sanddark">
@@ -148,8 +243,8 @@ function buildPageNav() {
   if (!el) return;
   const i = MODULES.findIndex((m) => m.code === CURRENT);
   if (i === -1) return;
-  const prev = MODULES[i - 1];
-  const next = MODULES[i + 1];
+  const prev = MODULES.slice(0, i).reverse().find((m) => !m.soon);
+  const next = MODULES.slice(i + 1).find((m) => !m.soon);
   const card = (m, label, align) =>
     m
       ? `<a href="${moduleHref(m.code)}" class="flex-1 rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark px-5 py-4 hover:border-coral transition-colors ${align}">
@@ -215,7 +310,7 @@ function renderMermaid() {
 function bindChecklists() {
   const page = (location.pathname.split("/").pop() || "index").replace(".html", "");
   document.querySelectorAll("input.evidence-box").forEach((cb, i) => {
-    const key = `fde-check-${page}-${cb.dataset.key || i}`;
+    const key = `${PROGRAM.checkPrefix}-${page}-${cb.dataset.key || i}`;
     cb.checked = localStorage.getItem(key) === "1";
     cb.addEventListener("change", () => localStorage.setItem(key, cb.checked ? "1" : "0"));
   });
@@ -228,15 +323,25 @@ function buildIndexCards() {
     if (!wrap) continue;
     const mods = MODULES.filter((m) => groupOf(m.code) === g);
     wrap.innerHTML = mods
-      .map(
-        (m) => `
+      .map((m) =>
+        m.soon
+          ? `
+      <div class="rounded-xl border border-dashed border-line dark:border-linedark p-4 opacity-60 cursor-default" title="Coming soon">
+        <div class="flex items-center justify-between">
+          <span class="font-mono text-xs font-bold px-2 py-0.5 rounded-md text-white gbg-${g.key}">${m.code}</span>
+          <span class="text-[10px] uppercase tracking-wide text-mute dark:text-mutedark">Coming soon</span>
+        </div>
+        <div class="mt-2.5 font-semibold text-[15px] leading-snug">${m.name}</div>
+        <div class="mt-1.5 text-xs text-mute dark:text-mutedark">${m.critical ? PROGRAM.labels.on : PROGRAM.labels.off} · target ${m.critical ? 3 : 2}</div>
+      </div>`
+          : `
       <a href="${moduleHref(m.code)}" class="group rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4 hover:border-coral hover:shadow-sm transition-all">
         <div class="flex items-center justify-between">
           <span class="font-mono text-xs font-bold px-2 py-0.5 rounded-md text-white gbg-${g.key}">${m.code}</span>
-          ${m.critical ? '<span class="text-[10px] font-semibold uppercase tracking-wide text-coral">Critical</span>' : '<span class="text-[10px] uppercase tracking-wide text-mute dark:text-mutedark">Supporting</span>'}
+          ${m.critical ? `<span class="text-[10px] font-semibold uppercase tracking-wide text-coral">${PROGRAM.labels.on}</span>` : `<span class="text-[10px] uppercase tracking-wide text-mute dark:text-mutedark">${PROGRAM.labels.off}</span>`}
         </div>
         <div class="mt-2.5 font-semibold text-[15px] leading-snug group-hover:text-coral transition-colors">${m.name}</div>
-        <div class="mt-1.5 text-xs text-mute dark:text-mutedark">Target ${m.critical ? "3 — independent production" : "2 — works with support"}</div>
+        <div class="mt-1.5 text-xs text-mute dark:text-mutedark">Target ${m.critical ? PROGRAM.labels.onTarget : PROGRAM.labels.offTarget}</div>
       </a>`
       )
       .join("");

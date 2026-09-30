@@ -1,0 +1,469 @@
+<!-- meta: days=3 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Database Design</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Model a real domain as tables, keys and constraints. Read an ERD and spot what is missing. Choose the
+          indexes a query actually needs. Know when a transaction is required. Ship schema changes as safe
+          migrations. We use PostgreSQL throughout, and the ideas transfer to MySQL and any ORM.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent can generate a schema in seconds, and it
+          will look fine. Code can be rewritten in an afternoon. A schema with real customer data in it can't: every
+          missing constraint becomes corrupt rows, and every wrong relationship becomes a painful migration. The
+          database is where your design judgement has the longest-lasting effect, so it is the part you must
+          review hardest.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · From requirements to entities</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Nouns become tables, rules become constraints</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Our running example is a <strong>clinic booking app</strong>. Clinics have doctors. Doctors publish time
+        slots. Patients book a slot, and a booking can be cancelled. Every design step below starts from those
+        sentences, not from code.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Find entities, attributes and relationships</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Underline the nouns in the requirements. Nouns with their own identity and lifecycle become
+        <strong>entities</strong>, which become tables. Nouns that only describe something become
+        <strong>attributes</strong>, which become columns. The verbs between entities become
+        <strong>relationships</strong>, which become foreign keys. For each relationship, ask "one or many?" in
+        both directions.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Sentence</th><th class="px-4 py-3">Relationship</th><th class="px-4 py-3">How it's stored</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A clinic has many doctors</td><td class="px-4 py-3">1 : N</td><td class="px-4 py-3"><code class="inline">doctors.clinic_id</code> → <code class="inline">clinics.id</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A doctor publishes many slots</td><td class="px-4 py-3">1 : N</td><td class="px-4 py-3"><code class="inline">slots.doctor_id</code> → <code class="inline">doctors.id</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A slot has at most one active booking</td><td class="px-4 py-3">1 : 0..1 (active)</td><td class="px-4 py-3"><code class="inline">bookings.slot_id</code> plus a partial unique index (Part III)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A doctor has many specialties, and a specialty has many doctors</td><td class="px-4 py-3">N : M</td><td class="px-4 py-3">A join table <code class="inline">doctor_specialties(doctor_id, specialty_id)</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A patient has one profile</td><td class="px-4 py-3">1 : 1</td><td class="px-4 py-3">Usually just more columns on <code class="inline">patients</code>. Split only for a real reason, such as sensitive data.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Draw the ERD before any code</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An Entity-Relationship Diagram is the one-page summary of the schema. Reviewers read it far faster than
+        migrations. Mermaid can render one from text, so it lives in the repo next to the code
+        (<a href="./sd2.html" class="text-viol underline decoration-viol/40">SD2</a> covers the other diagram types).
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+erDiagram
+    CLINICS ||--o{ DOCTORS : employs
+    DOCTORS ||--o{ SLOTS : publishes
+    DOCTORS }o--o{ SPECIALTIES : "has (via doctor_specialties)"
+    PATIENTS ||--o{ BOOKINGS : makes
+    SLOTS ||--o{ BOOKINGS : "booked by (≤1 active)"
+    BOOKINGS {
+        bigint id PK
+        bigint slot_id FK
+        bigint patient_id FK
+        text status "booked | cancelled"
+        timestamptz cancelled_at
+        timestamptz created_at
+    }
+    SLOTS {
+        bigint id PK
+        bigint doctor_id FK
+        timestamptz starts_at
+        timestamptz ends_at
+    }
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        How to read the crow's feet: <code class="inline">||</code> means exactly one, <code class="inline">o{</code>
+        means zero or many, and <code class="inline">|{</code> means one or many. Read each line from both ends: "one
+        slot has zero or many bookings; each booking belongs to exactly one slot".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Keys: surrogate vs natural</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Give every table a <strong>surrogate primary key</strong>: a <code class="inline">bigint</code> identity or a
+        UUID with no business meaning. Business identifiers such as an email or a clinic's tax code change more
+        often than people expect. Store them as ordinary columns with a <strong>unique constraint</strong>, not as
+        the primary key.
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-sky-600 dark:text-sky-400">bigint identity</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Small and fast, and indexes stay compact</li>
+            <li>Easy to read in logs and URLs</li>
+            <li>Guessable, so never rely on an ID being secret (see IDOR in <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>)</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">UUID (prefer v7)</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Can be generated on the client or across services with no collisions</li>
+            <li>Doesn't reveal how many rows you have</li>
+            <li>Bigger. Random v4 UUIDs fragment indexes, while time-ordered v7 UUIDs avoid most of that.</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Normalisation &amp; integrity</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Store each fact once, and let the database refuse bad data</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Normalisation sounds academic. It comes down to one practical rule: <strong>every fact is stored in exactly
+        one place</strong>. If the same fact lives in two places, the two copies will disagree one day, and nothing
+        will tell you which one is right.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The three normal forms in plain words</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Form</th><th class="px-4 py-3">Rule</th><th class="px-4 py-3">Violation you'll see from an agent</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">1NF</td><td class="px-4 py-3">One value per cell. No lists inside a column.</td><td class="px-4 py-3"><code class="inline">doctors.specialties = 'cardio,peds'</code> as text, which you can't join, index or validate</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">2NF</td><td class="px-4 py-3">Non-key columns depend on the <em>whole</em> key</td><td class="px-4 py-3"><code class="inline">doctor_specialties.doctor_name</code>, which depends only on <code class="inline">doctor_id</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">3NF</td><td class="px-4 py-3">Non-key columns depend on nothing <em>but</em> the key</td><td class="px-4 py-3"><code class="inline">bookings.clinic_address</code>, which is copied from the clinic and goes stale when the clinic moves</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">When denormalising is right</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        There are two legitimate reasons to copy data. The first is a <strong>historical snapshot</strong>: an
+        invoice must keep the price at the time of purchase, even if the product price changes later. The second
+        is <strong>measured read performance</strong>, such as a cached counter. In both cases the copy is
+        intentional, named clearly (<code class="inline">price_at_purchase</code>), and has a documented owner that
+        keeps it correct. "The agent did it" is not one of the reasons.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Constraints are free tests that never skip</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Application validation runs only when the request goes through that one code path. A constraint is
+        checked on every write: from the API, the admin panel, a background job, a data fix someone runs by hand,
+        or a new service built next year. Put every rule that must <em>always</em> hold in the database.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">schema.sql — the constraints that matter</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">slots</span> (
+  id         bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  doctor_id  bigint <span class="kw">NOT NULL REFERENCES</span> doctors(id),   <span class="cm">-- FK: no orphan slots</span>
+  starts_at  timestamptz <span class="kw">NOT NULL</span>,
+  ends_at    timestamptz <span class="kw">NOT NULL</span>,
+  <span class="kw">CHECK</span> (ends_at &gt; starts_at),                          <span class="cm">-- no negative-length slots</span>
+  <span class="kw">UNIQUE</span> (doctor_id, starts_at)                           <span class="cm">-- no duplicate slot</span>
+);
+
+<span class="kw">CREATE TABLE</span> <span class="fn">bookings</span> (
+  id           bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  slot_id      bigint <span class="kw">NOT NULL REFERENCES</span> slots(id),
+  patient_id   bigint <span class="kw">NOT NULL REFERENCES</span> patients(id),
+  status       text   <span class="kw">NOT NULL DEFAULT</span> <span class="st">'booked'</span>
+               <span class="kw">CHECK</span> (status <span class="kw">IN</span> (<span class="st">'booked'</span>, <span class="st">'cancelled'</span>)),
+  cancelled_at timestamptz,
+  created_at   timestamptz <span class="kw">NOT NULL DEFAULT</span> now(),
+  <span class="kw">CHECK</span> ((status = <span class="st">'cancelled'</span>) = (cancelled_at <span class="kw">IS NOT NULL</span>))  <span class="cm">-- state stays consistent</span>
+);</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Constraint</th><th class="px-4 py-3">Guarantees</th><th class="px-4 py-3">ON DELETE choice</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">NOT NULL</td><td class="px-4 py-3">The value always exists</td><td class="px-4 py-3">—</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">FOREIGN KEY</td><td class="px-4 py-3">References point at real rows</td><td class="px-4 py-3"><code class="inline">RESTRICT</code> (the default and the safest) · <code class="inline">CASCADE</code> only for true children, such as line items of an order · <code class="inline">SET NULL</code> for optional links</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">UNIQUE</td><td class="px-4 py-3">No duplicates, even under concurrent requests</td><td class="px-4 py-3">—</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CHECK</td><td class="px-4 py-3">A business rule on one row</td><td class="px-4 py-3">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Watch agent-generated <code class="inline">ON DELETE CASCADE</code>.</strong> On
+        <code class="inline">patients → bookings</code> it means deleting one patient silently deletes their whole
+        booking history, including rows your finance report depends on. Most business data should be
+        <em>soft-deleted</em> (a <code class="inline">deleted_at</code> column) or <code class="inline">RESTRICT</code>ed.
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Indexes &amp; queries</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Index for the queries you actually run</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An index is a sorted copy of some columns that points back to the rows. Think of the index at the back of
+        a book. It makes lookups on those columns fast, but every write gets a little slower and the index takes
+        disk space. Agents tend to make one of two mistakes: no indexes at all, or an index on every column. The
+        right set comes from your <strong>query patterns</strong>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Start from the query list</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        List the queries each screen and endpoint runs, then design indexes that match their
+        <code class="inline">WHERE</code> and <code class="inline">ORDER BY</code> clauses:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Screen / endpoint</th><th class="px-4 py-3">Query shape</th><th class="px-4 py-3">Index</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Doctor's calendar</td><td class="px-4 py-3"><code class="inline">WHERE doctor_id = ? AND starts_at BETWEEN ? AND ?</code></td><td class="px-4 py-3"><code class="inline">(doctor_id, starts_at)</code>, which the UNIQUE constraint already created</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">My bookings</td><td class="px-4 py-3"><code class="inline">WHERE patient_id = ? ORDER BY created_at DESC</code></td><td class="px-4 py-3"><code class="inline">(patient_id, created_at DESC)</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Login</td><td class="px-4 py-3"><code class="inline">WHERE lower(email) = ?</code></td><td class="px-4 py-3">A unique index on <code class="inline">lower(email)</code> (an expression index)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Is the slot free?</td><td class="px-4 py-3"><code class="inline">WHERE slot_id = ? AND status = 'booked'</code></td><td class="px-4 py-3">A partial unique index (below)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Column order in a composite index matters.</strong> <code class="inline">(doctor_id, starts_at)</code>
+        helps queries filtered by <code class="inline">doctor_id</code>, or by <code class="inline">doctor_id</code> and a
+        time range. It does not help a query filtered only by <code class="inline">starts_at</code>. It works like a
+        phone book sorted by last name, then first name: you can't use it to find everyone called "An". Put
+        equality columns first and range or sort columns last.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">A partial unique index can enforce a business rule</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "A slot has at most one <em>active</em> booking" can't be a plain UNIQUE constraint, because cancelled
+        bookings must stay in the table as history. A partial unique index enforces uniqueness only over the rows
+        that match a condition:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration — one active booking per slot</span>
+        <pre class="code"><span class="kw">CREATE UNIQUE INDEX</span> <span class="fn">bookings_one_active_per_slot</span>
+  <span class="kw">ON</span> bookings (slot_id)
+  <span class="kw">WHERE</span> status = <span class="st">'booked'</span>;
+<span class="cm">-- Two concurrent "book slot 42" requests: the second INSERT fails with
+-- unique_violation. The app turns that into "Sorry, this slot was just taken".</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This single line removes a whole class of race conditions that application code alone gets wrong
+        (Part IV explains why). It is the best example of "let the database refuse bad data".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Prove it with EXPLAIN</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Don't guess whether an index is used. Ask Postgres:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">psql — before and after</span>
+        <pre class="code"><span class="kw">EXPLAIN ANALYZE</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> bookings <span class="kw">WHERE</span> patient_id = 812 <span class="kw">ORDER BY</span> created_at <span class="kw">DESC LIMIT</span> 20;
+
+<span class="cm">-- before:</span>  Seq Scan on bookings  (rows=1,204,331)   <span class="kw">Execution Time: 412 ms</span>
+<span class="cm">-- after :</span>  Index Scan using bookings_patient_created_idx  <span class="out">Execution Time: 0.09 ms</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">Seq Scan</code> on a large table in a hot query is the thing to look for. On a table with
+        50 rows a sequential scan is fine, and often faster. Test with realistic data volumes: seed a few hundred
+        thousand rows, which an agent can script for you in a minute.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The N+1 query</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The most common performance bug in ORM code: load a list of 50 bookings, then run one more query per
+        booking to fetch its doctor. That's 51 queries where 1 or 2 would do. It is invisible with 5 rows in
+        development and slow with 5,000 in production. Look for a query inside a loop, and fix it with the ORM's
+        eager-loading method (<code class="inline">includes</code> in Rails, <code class="inline">relations</code> in
+        TypeORM, <code class="inline">selectinload</code> in SQLAlchemy, <code class="inline">Preload</code> in GORM).
+        Your stack module shows the exact form.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Transactions &amp; migrations</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Concurrency and change are where schemas break</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A schema that is correct for one user at a time can still fail under two simultaneous requests, or during
+        the thirty seconds a migration runs on a live table. These are the bugs that pass every local test and
+        then show up in production.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Transactions: all or nothing</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When one operation changes several rows, for example "create the booking <em>and</em> charge the deposit
+        <em>and</em> write the audit log", wrap it in a transaction. Either every change is saved or none is. The
+        failure it prevents is a booking without a payment, or a payment without a booking.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The check-then-write race</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        This is the classic bug in agent-written booking code: <em>check</em> whether the slot is free with a
+        SELECT, then <em>write</em> the booking with an INSERT. Two requests can pass the check at the same time:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    participant A as Request A (Lan)
+    participant DB as Postgres
+    participant B as Request B (Minh)
+    A->>DB: SELECT … slot 42 booked? → no
+    B->>DB: SELECT … slot 42 booked? → no
+    A->>DB: INSERT booking(slot 42)
+    B->>DB: INSERT booking(slot 42)
+    Note over DB: without a constraint:<br/>two bookings, one slot ❌
+    Note over DB: with the partial unique index:<br/>B gets unique_violation ✅
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        There are three correct fixes, from the most preferred down: <strong>a constraint</strong> that makes the
+        second write fail (Part III), <strong>a row lock</strong> (<code class="inline">SELECT … FOR UPDATE</code>
+        inside a transaction) when the rule can't be expressed as a constraint, or <strong>an atomic
+        update</strong> such as <code class="inline">UPDATE … SET stock = stock - 1 WHERE stock &gt; 0</code> for
+        counters. "Check in the code first" on its own is never enough.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Migrations: versioned, reversible, zero-downtime</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every schema change is a migration file in the repo, applied in order by your framework's migration
+        tool. Never change a production schema by hand. For a table that is live and in use, follow the
+        <strong>expand → migrate → contract</strong> pattern so old and new code can both run during a deploy:
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 150" class="w-full min-w-[620px]" role="img" aria-label="Expand, migrate, contract migration pattern">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">RENAME patients.phone → phone_e164 WITHOUT DOWNTIME</text>
+          <g class="anim-pulse"><rect x="10" y="40" width="210" height="62" rx="9" fill="#2563EB"/>
+            <text x="115" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1 · Expand (deploy 1)</text>
+            <text x="115" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">add nullable phone_e164</text>
+            <text x="115" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">code writes BOTH columns</text></g>
+          <g class="anim-pulse d1"><rect x="245" y="40" width="210" height="62" rx="9" fill="#0D9488"/>
+            <text x="350" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">2 · Migrate data</text>
+            <text x="350" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">backfill in batches (job)</text>
+            <text x="350" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">code reads phone_e164</text></g>
+          <g class="anim-pulse d2"><rect x="480" y="40" width="210" height="62" rx="9" fill="#D97757"/>
+            <text x="585" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">3 · Contract (deploy 3)</text>
+            <text x="585" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">set NOT NULL</text>
+            <text x="585" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">drop old column</text></g>
+          <line x1="220" y1="71" x2="245" y2="71" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="455" y1="71" x2="480" y2="71" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="350" y="130" text-anchor="middle" font-size="10" fill="#A8A49B">at every moment, the running code and the schema are compatible</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Risky migration</th><th class="px-4 py-3">Why</th><th class="px-4 py-3">Safer form</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Rename or drop a column in one step</td><td class="px-4 py-3">Old app instances still running during the deploy crash</td><td class="px-4 py-3">Expand → migrate → contract</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Add a NOT NULL column with no default to a big table</td><td class="px-4 py-3">Fails on existing rows</td><td class="px-4 py-3">Add it nullable, backfill, then set NOT NULL</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">CREATE INDEX</code> on a big, busy table</td><td class="px-4 py-3">Blocks writes while it builds</td><td class="px-4 py-3"><code class="inline">CREATE INDEX CONCURRENTLY</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Data fix inside a schema migration</td><td class="px-4 py-3">Long lock, hard to retry</td><td class="px-4 py-3">A separate, batched, idempotent job</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>Always test the down path.</strong> Before you open the PR, run migrate → rollback → migrate on a local
+        copy with seed data. A migration that can't be rolled back turns a five-minute bad deploy into an
+        incident.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are very good at turning a design you have already decided into DDL, migrations, seed data and
+        EXPLAIN experiments. They are unreliable at deciding the design by themselves. Split the work that way.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — design review, not design generation</span>
+        <pre class="code">Here are our requirements (below) and my draft ERD (docs/erd.md).
+Act as a strict database reviewer. For each table list:
+- missing NOT NULL / FK / UNIQUE / CHECK constraints
+- facts stored in more than one place
+- relationships whose cardinality looks wrong
+- the queries from docs/queries.md that have no supporting index
+Don't write migrations yet.</pre>
+      </div>
+      <pre class="code mt-3">Write a script that seeds 200k bookings across 50 doctors, then run EXPLAIN ANALYZE
+on each query in docs/queries.md and show me which ones Seq Scan.</pre>
+      <pre class="code mt-3">Generate the migration for step 1 of the plan. It must be reversible. Run
+migrate → rollback → migrate on the dev DB and paste the output.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft the ERD in Mermaid from your requirements</li>
+            <li>Review your design against the checklist</li>
+            <li>Write migrations, seed scripts and model files</li>
+            <li>Run EXPLAIN and summarise the plans</li>
+            <li>Write a concurrency test that fires two requests at once</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every relationship's cardinality against the requirements</li>
+            <li>That every "always" rule is a constraint</li>
+            <li>Every <code class="inline">ON DELETE</code> clause</li>
+            <li>That the migration is reversible and safe on a live table</li>
+            <li>That any denormalised column is intentional and named clearly</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-generated schemas:</strong> no foreign keys ("the ORM handles it") · status as free
+        text with no CHECK · money stored as <code class="inline">float</code> (use <code class="inline">numeric</code> or
+        integer minor units) · time stored as <code class="inline">timestamp</code> without a time zone · comma-separated
+        lists in one column · <code class="inline">ON DELETE CASCADE</code> everywhere · a migration that edits a file
+        that has already been applied, instead of adding a new one.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has written SELECTs in class, and accepts whatever schema the agent or the ORM generates.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can read an ERD and knows what PKs, FKs and indexes are. Can't yet say what is <em>missing</em> from a schema.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Designs a normalised schema for a small feature. Needs review to catch missing constraints, wrong cascades or unindexed queries.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Goes from requirements to ERD to constraints to indexes for a real feature. Proves index use with EXPLAIN. Handles the check-then-write race correctly. Ships reversible migrations and uses expand/contract on live tables.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Reviews other people's schemas and migrations. Leads zero-downtime changes on large tables. Writes the team's schema conventions.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 3:</strong> without the agent, can you explain every constraint and index in
+        your capstone schema, and name the query or rule each one serves? Could you describe what happens when two
+        users book the last slot at the same millisecond?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Validation only in the app</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The admin script, the background job and next year's microservice all skip it. Rules that must always hold belong in constraints.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Hard delete for business records</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Deleted bookings leave holes in revenue reports and audit trails. Use a status or <code class="inline">deleted_at</code> column, and delete for real only when privacy law requires it.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Testing with 10 rows</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Missing indexes and N+1 queries are invisible until the data is realistic. Seed volume before you judge performance.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write the query list first</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Ten lines in <code class="inline">docs/queries.md</code> drive your indexes, and they give the agent a concrete target to EXPLAIN against.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Use timestamptz and numeric</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Store times in UTC with a time zone, and money as exact numbers. These two defaults prevent a whole category of client-reported bugs.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep the ERD in the repo</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A Mermaid ERD next to the migrations is reviewable in PRs, and it gives the agent context on every future task.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="erd"> <span>Turned a written requirement into a Mermaid ERD with cardinalities, and my mentor agreed with it.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="constraints"> <span>Every "always" rule in my schema is a NOT NULL, FK, UNIQUE or CHECK constraint, and I can justify every <code class="inline">ON DELETE</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="explain"> <span>Seeded realistic volume and used EXPLAIN ANALYZE to show a Seq Scan turning into an Index Scan.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="race"> <span>Reproduced the double-booking race with a concurrent test, then fixed it with a constraint or a lock.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="schema-pr"> <span class="font-semibold">Opened a PR for a small domain (for example clinic booking or a shop's orders) with the ERD, <code class="inline">docs/queries.md</code>, reversible migrations (migrate → rollback → migrate output pasted), and the EXPLAIN evidence (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/ddl-constraints.html" target="_blank" rel="noopener">PostgreSQL — Constraints</a> — the reference for everything in Part II.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/indexes.html" target="_blank" rel="noopener">PostgreSQL — Indexes</a> — multicolumn, partial and expression indexes, and when each one is used.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener">PostgreSQL — Using EXPLAIN</a> — how to read a query plan.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/transaction-iso.html" target="_blank" rel="noopener">PostgreSQL — Transaction isolation</a> — why check-then-write races happen, and what each isolation level promises.</li>
+        <li><a class="text-coral underline" href="https://mermaid.js.org/syntax/entityRelationshipDiagram.html" target="_blank" rel="noopener">Mermaid — ER diagram syntax</a> — for drawing ERDs that live in the repo.</li>
+        <li><a class="text-coral underline" href="https://martinfowler.com/bliki/ParallelChange.html" target="_blank" rel="noopener">Martin Fowler — Parallel Change</a> — the expand/contract pattern behind zero-downtime migrations.</li>
+      </ul>
