@@ -1,0 +1,648 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Linux, Shell &amp; Networking Basics</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Every server, container and CI runner you will touch is a Linux machine you can't see. This module gives you
+          the working minimum: where things live on disk, who is allowed to do what, how services start and log,
+          the dozen commands that answer most questions, SSH, and enough networking (IPs, ports, DNS, TLS) to debug
+          "the site is down" in a calm, methodical way.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> Claude Code works <em>through</em> the shell. It runs
+          your tests, reads logs, installs packages and, if you let it, deletes files. If you can't read a command, you
+          can't judge whether it is safe to approve. And when a deploy fails, the agent will suggest ten plausible
+          fixes. Only you, with <code class="inline">dig</code>, <code class="inline">ss</code> and
+          <code class="inline">curl -v</code>, can find out which one is actually true.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · The machine your code runs on</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A server is a Linux box with no screen, so learn its map</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Our running example is the <strong>clinic booking app</strong> from
+        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>: a Node API, a Postgres database and
+        a small worker that sends reminder emails. In this module we imagine it running on one Ubuntu VM. Later
+        modules put it in containers (<a href="./op2.html" class="text-viol underline decoration-viol/40">OP2</a>) and
+        on managed platforms (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>,
+        <a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>), but everything underneath is still
+        this Linux.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The filesystem layout: where to look first</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Linux has one tree that starts at <code class="inline">/</code>. There are no drive letters. The directory names
+        follow a convention (the Filesystem Hierarchy Standard), so once you know it you can find your way around any
+        server:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Path</th><th class="px-4 py-3">What lives there</th><th class="px-4 py-3">When you go there</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/etc</code></td><td class="px-4 py-3">System-wide configuration: nginx, SSH, systemd units, hosts</td><td class="px-4 py-3">"Which port is nginx configured on?"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/var/log</code></td><td class="px-4 py-3">Log files from services that write to files</td><td class="px-4 py-3">"Why did nginx return 502?"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/home/&lt;user&gt;</code>, <code class="inline">~</code></td><td class="px-4 py-3">Each user's files, including <code class="inline">~/.ssh</code> and shell config</td><td class="px-4 py-3">Setting up keys and aliases</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/usr/bin</code>, <code class="inline">/usr/local/bin</code></td><td class="px-4 py-3">Installed programs</td><td class="px-4 py-3">"Which node is this?" (<code class="inline">which node</code>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/opt</code>, <code class="inline">/srv</code></td><td class="px-4 py-3">Conventional homes for your own app</td><td class="px-4 py-3">Deploying the clinic API by hand</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/tmp</code></td><td class="px-4 py-3">Scratch space, often cleared on reboot</td><td class="px-4 py-3">Never for anything you need tomorrow</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/proc</code></td><td class="px-4 py-3">A virtual view of running processes and the kernel</td><td class="px-4 py-3">Tools like <code class="inline">top</code> read it for you</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Users, permissions and sudo</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every file has an <strong>owner</strong>, a <strong>group</strong> and three sets of permissions: read, write and
+        execute for the owner, the group and everyone else. Every process runs <em>as</em> some user, and can only touch
+        what that user can touch. That is the whole security model, and it is why your app should run as its own
+        unprivileged user, not as <code class="inline">root</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — reading permissions</span>
+        <pre class="code">$ ls -l /srv/clinic-api
+-rw-r--r--  1 clinic clinic   812 Sep 30 09:12 package.json
+-rw-------  1 clinic clinic   244 Sep 30 09:12 .env        <span class="cm"># only the owner can read: good</span>
+drwxr-xr-x  4 clinic clinic  4096 Sep 30 09:12 dist
+<span class="cm">#  └┬┘└┬┘└┬┘     owner  group</span>
+<span class="cm">#  user group other      r=4 w=2 x=1, so rw- = 6, r-- = 4</span>
+
+$ chmod 600 .env               <span class="cm"># owner read/write, nobody else</span>
+$ sudo chown clinic:clinic .env <span class="cm"># sudo = run ONE command as root</span>
+$ chmod 777 .env               <span class="kw"># never: world-writable secrets</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">sudo</code> runs a single command as root and records it. Use it for the one step that needs
+        it, such as installing a package or restarting a service. <code class="inline">chmod -R 777</code> "to fix a
+        permission error" is the classic agent-suggested fix that turns a small problem into a security hole. The real
+        fix is almost always a correct owner.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Processes, signals and systemd services</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A running program is a <strong>process</strong> with a PID. You stop processes by sending <strong>signals</strong>:
+        <code class="inline">SIGTERM</code> (15) politely asks it to finish its work and exit, <code class="inline">SIGINT</code>
+        (2) is what Ctrl+C sends, and <code class="inline">SIGKILL</code> (9) ends it instantly with no cleanup. Well-written
+        servers catch SIGTERM, stop accepting requests, finish the ones in flight and close database connections.
+        Docker and every orchestrator send SIGTERM first, then SIGKILL after a grace period.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On a server you don't start the app in a terminal and hope. You hand it to <strong>systemd</strong>, the service
+        manager on most Linux distributions. It starts the app on boot, restarts it when it crashes, runs it as the right
+        user, and sends its output to the <strong>journal</strong>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">/etc/systemd/system/clinic-api.service</span>
+        <pre class="code">[Unit]
+Description=Clinic booking API
+After=network.target
+
+[Service]
+<span class="cm"># run as an unprivileged user, never root</span>
+User=clinic
+WorkingDirectory=/srv/clinic-api
+<span class="cm"># secrets come from a chmod 600 file, not from the unit itself</span>
+EnvironmentFile=/srv/clinic-api/.env
+ExecStart=/usr/bin/node dist/server.js
+<span class="cm"># crash → restart automatically</span>
+Restart=on-failure
+
+[Install]
+<span class="cm"># start on boot</span>
+WantedBy=multi-user.target</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">terminal — the systemctl / journalctl loop</span>
+        <pre class="code">$ sudo systemctl daemon-reload            <span class="cm"># after editing a unit file</span>
+$ sudo systemctl enable --now clinic-api  <span class="cm"># start now and on every boot</span>
+$ systemctl status clinic-api             <span class="cm"># running? since when? last log lines</span>
+$ journalctl -u clinic-api -f             <span class="cm"># follow this service's logs live</span>
+$ journalctl -u clinic-api --since "10 min ago" -p err   <span class="cm"># only errors, recent</span>
+$ sudo systemctl restart clinic-api</pre>
+      </div>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 170" class="w-full min-w-[620px]" role="img" aria-label="systemd starts the app, restarts it on crash and sends output to the journal">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">WHO KEEPS YOUR APP ALIVE ON A VM</text>
+          <g class="anim-pulse"><rect x="10" y="44" width="150" height="58" rx="9" fill="#37474F"/>
+            <text x="85" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">systemd</text>
+            <text x="85" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">reads clinic-api.service</text></g>
+          <g class="anim-pulse d1"><rect x="275" y="44" width="150" height="58" rx="9" fill="#2563EB"/>
+            <text x="350" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">node server.js</text>
+            <text x="350" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">User=clinic · PID 4121</text></g>
+          <g class="anim-pulse d2"><rect x="540" y="44" width="150" height="58" rx="9" fill="#0D9488"/>
+            <text x="615" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">journal</text>
+            <text x="615" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">journalctl -u clinic-api</text></g>
+          <line x1="160" y1="66" x2="275" y2="66" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="217" y="58" text-anchor="middle" font-size="9" fill="#6E6B64">start · SIGTERM</text>
+          <line x1="425" y1="73" x2="540" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="482" y="65" text-anchor="middle" font-size="9" fill="#6E6B64">stdout / stderr</text>
+          <path d="M350 102 Q 220 150 85 102" fill="none" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+          <text x="217" y="150" text-anchor="middle" font-size="10" fill="#DB2777" class="anim-bounce">crash → exit code → Restart=on-failure</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Package managers and environment variables</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        System packages come from the distribution's package manager: <code class="inline">apt</code> on Ubuntu and
+        Debian, <code class="inline">dnf</code> on Fedora and Amazon Linux, <code class="inline">brew</code> on your Mac.
+        Language packages (<code class="inline">npm</code>, <code class="inline">pip</code>, <code class="inline">bundle</code>)
+        are a separate layer that lives inside your project. Don't mix them: installing Python libraries with
+        <code class="inline">sudo pip</code> into the system Python is a well-known way to break the OS's own tools.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Environment variables</strong> are key-value pairs a process inherits from whatever started it. They are
+        how the same code gets a different database URL in dev, staging and production. <code class="inline">PATH</code>
+        is the most important one: it is the list of directories the shell searches when you type a command name.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — environment basics</span>
+        <pre class="code">$ echo $PATH                         <span class="cm"># where commands are looked up, in order</span>
+$ export DATABASE_URL=postgres://localhost/clinic   <span class="cm"># this shell and its children</span>
+$ LOG_LEVEL=debug npm start          <span class="cm"># just for this one command</span>
+$ env | grep -i database             <span class="cm"># what does this process actually see?</span>
+$ which node &amp;&amp; node --version       <span class="cm"># "works on my machine" usually starts here</span></pre>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Where secrets go</strong> is its own topic, owned by
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>. The Linux-level rules are simple: a
+        <code class="inline">.env</code> file is <code class="inline">chmod 600</code> and listed in
+        <code class="inline">.gitignore</code>, and you never paste a secret on the command line, because it lands in
+        your shell history and in the process list that every user on the box can read.
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · The shell as a debugging tool</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Small tools joined by pipes answer most production questions</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The Unix idea is that each command does one thing and reads and writes plain text. You combine them with pipes.
+        You don't need to memorise flags. You need to know <em>which tool answers which question</em>, so you can ask
+        for it, or recognise it when the agent runs it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The essential commands, by question</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Question</th><th class="px-4 py-3">Command</th><th class="px-4 py-3">Typical use</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Where is this text?</td><td class="px-4 py-3"><code class="inline">grep -rn "SLOT_TAKEN" src/</code></td><td class="px-4 py-3">Find every place an error code is thrown</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where is this file?</td><td class="px-4 py-3"><code class="inline">find . -name "*.sql" -mtime -1</code></td><td class="px-4 py-3">Migrations changed in the last day</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">What is happening right now?</td><td class="px-4 py-3"><code class="inline">tail -f</code> · <code class="inline">journalctl -f</code></td><td class="px-4 py-3">Watch logs while you reproduce a bug</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Is the disk full?</td><td class="px-4 py-3"><code class="inline">df -h</code> · <code class="inline">du -sh * | sort -h</code></td><td class="px-4 py-3">"Postgres stopped accepting writes"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">What is using CPU or memory?</td><td class="px-4 py-3"><code class="inline">top</code> · <code class="inline">htop</code> · <code class="inline">free -h</code></td><td class="px-4 py-3">"The server is slow"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Is this process running?</td><td class="px-4 py-3"><code class="inline">ps aux | grep node</code> · <code class="inline">pgrep -a node</code></td><td class="px-4 py-3">Before you restart anything</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">What does the endpoint return?</td><td class="px-4 py-3"><code class="inline">curl -i https://api…/health</code></td><td class="px-4 py-3">Status code and headers, not just the body</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Pipes and redirection</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every process has three streams: <strong>stdin</strong> (0), <strong>stdout</strong> (1) and
+        <strong>stderr</strong> (2). A pipe <code class="inline">|</code> connects one command's stdout to the next
+        command's stdin. Redirection sends a stream to a file. The detail that trips everyone up is that errors go to
+        stderr, so a plain pipe or <code class="inline">&gt;</code> doesn't capture them.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — "which errors happened most today?"</span>
+        <pre class="code"><span class="cm"># logs → keep only the error code → count each → most frequent first</span>
+$ journalctl -u clinic-api --since today \
+    | grep -o '"code":"[A-Z_]*"' \
+    | sort | uniq -c | sort -rn | head
+<span class="out">    41 "code":"SLOT_TAKEN"
+     7 "code":"DB_TIMEOUT"</span>
+
+$ npm test &gt; test.log 2&gt;&amp;1     <span class="cm"># stdout AND stderr into the file</span>
+$ npm test 2&gt;&amp;1 | tee test.log <span class="cm"># same, and still show it on screen</span>
+$ ./migrate.sh &gt;&gt; deploy.log    <span class="cm"># &gt;&gt; appends, &gt; overwrites</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read <code class="inline">2&gt;&amp;1</code> as "send stream 2 to wherever stream 1 is going right now". When an agent
+        says "the tests pass" and pastes only a few lines, ask it to rerun with <code class="inline">2&gt;&amp;1 | tail -30</code>
+        so the failure summary, which is often on stderr, is included.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Reading logs without drowning</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Logs are only useful if you can narrow them. Three habits cover most cases: <strong>filter by time</strong>
+        (<code class="inline">--since</code>), <strong>filter by severity or keyword</strong>
+        (<code class="inline">-p err</code>, <code class="inline">grep -i timeout</code>) and <strong>keep the context</strong>
+        around a match (<code class="inline">grep -C 5</code> shows five lines before and after). Then correlate by a
+        request ID, if your app logs one, instead of by timestamp guessing.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — follow one failing request</span>
+        <pre class="code">$ tail -f /var/log/nginx/error.log                    <span class="cm"># live, in a second terminal</span>
+$ grep -C 5 "req_8f2a" /var/log/nginx/access.log      <span class="cm"># context around one request</span>
+$ journalctl -u clinic-api | grep req_8f2a            <span class="cm"># same request, app side</span>
+$ df -h / &amp;&amp; du -sh /var/log/* | sort -h | tail -5     <span class="cm"># and is the disk filling up?</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Bash scripting: enough to read and review</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Agents write a lot of small shell scripts: deploy helpers, seed scripts, CI steps. Bash's defaults are
+        dangerously forgiving. A failed command doesn't stop the script, and a misspelt variable is silently an empty
+        string. Look for the safety header and quoted variables:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">scripts/backup-db.sh</span>
+        <pre class="code"><span class="cm">#!/usr/bin/env bash</span>
+<span class="kw">set -euo pipefail</span>   <span class="cm"># -e stop on error · -u unset var = error · pipefail: a failed pipe stage fails</span>
+
+BACKUP_DIR=<span class="st">"${BACKUP_DIR:-/var/backups/clinic}"</span>   <span class="cm"># default if not set</span>
+STAMP=<span class="st">"$(date +%Y%m%d-%H%M)"</span>
+
+mkdir -p <span class="st">"$BACKUP_DIR"</span>
+pg_dump <span class="st">"$DATABASE_URL"</span> | gzip &gt; <span class="st">"$BACKUP_DIR/clinic-$STAMP.sql.gz"</span>
+
+<span class="cm"># keep the last 7 backups; always quote paths</span>
+ls -1t <span class="st">"$BACKUP_DIR"</span>/*.sql.gz | tail -n +8 | xargs -r rm --
+echo <span class="st">"backup ok: clinic-$STAMP.sql.gz"</span></pre>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>The one-line disaster:</strong> <code class="inline">rm -rf "$BUILD_DIR/"*</code> without
+        <code class="inline">set -u</code>. If <code class="inline">BUILD_DIR</code> is unset or misspelt, it expands to
+        <code class="inline">rm -rf /*</code>. Any script an agent writes that deletes things must have
+        <code class="inline">set -euo pipefail</code>, quoted variables, and ideally a guard such as
+        <code class="inline">: "${BUILD_DIR:?must be set}"</code>.
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · SSH</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Keys instead of passwords, a config file instead of memory</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        SSH gives you an encrypted shell on a remote machine. You will use it to reach VMs and bastion hosts, to
+        authenticate to GitHub, and to open tunnels to databases that are deliberately not on the public internet.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Key pairs: the private half never leaves your laptop</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An SSH key is a pair. The <strong>public key</strong> (<code class="inline">.pub</code>) goes onto every server and
+        service you want to access, and it is safe to share. The <strong>private key</strong> stays in
+        <code class="inline">~/.ssh</code> on your machine, protected by a passphrase. The server proves you hold the
+        private key without it ever being sent.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — create and install a key</span>
+        <pre class="code">$ ssh-keygen -t ed25519 -C "lan@goldenowl.asia"   <span class="cm"># modern key type; set a passphrase</span>
+$ ls -l ~/.ssh
+-rw-------  id_ed25519        <span class="cm"># PRIVATE: 600, never copy, never commit, never paste</span>
+-rw-r--r--  id_ed25519.pub    <span class="cm"># public: this is what you hand out</span>
+
+$ ssh-copy-id deploy@203.0.113.10     <span class="cm"># appends the .pub to the server's ~/.ssh/authorized_keys</span>
+$ ssh deploy@203.0.113.10             <span class="cm"># no password prompt now</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        If SSH complains that the permissions on your key are "too open", it is protecting you: fix it with
+        <code class="inline">chmod 600 ~/.ssh/id_ed25519</code>. On servers you manage, turn off password login
+        (<code class="inline">PasswordAuthentication no</code> in <code class="inline">/etc/ssh/sshd_config</code>) once keys work,
+        because bots try passwords on every public IP around the clock.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">~/.ssh/config: name your hosts once</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Typing users, IPs and key paths every time leads to mistakes, such as connecting to production when you meant
+        staging. The config file gives every host a short, readable name, and scripts and agents can use the same names.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/.ssh/config</span>
+        <pre class="code">Host clinic-bastion
+    HostName 203.0.113.10
+    User deploy
+    IdentityFile ~/.ssh/id_ed25519
+
+<span class="cm"># private IP, not reachable directly, so hop through the bastion</span>
+Host clinic-staging
+    HostName 10.0.1.25
+    User deploy
+    ProxyJump clinic-bastion
+
+<span class="cm"># now: ssh clinic-staging   ·   scp dump.sql clinic-staging:/tmp/</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Tunnels: reach a private database safely</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The production database should not accept connections from the internet. When you genuinely need to look at
+        it, for example to run a read-only query during an incident, a <strong>local port forward</strong> makes a port
+        on your laptop lead, through the encrypted SSH connection, to the database inside the private network.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — local forward</span>
+        <pre class="code">$ ssh -N -L 5433:db.internal:5432 clinic-bastion
+<span class="cm">#       │  └ my port : target host as seen FROM the bastion : target port</span>
+<span class="cm">#       └ -N = no shell, just the tunnel</span>
+
+$ psql "postgres://readonly@localhost:5433/clinic"   <span class="cm"># in another terminal</span></pre>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    L["Your laptop<br/>psql → localhost:5433"] -->|"encrypted SSH on port 22"| B["Bastion<br/>public IP"]
+    B -->|"plain TCP inside the VPC"| D[("Postgres<br/>db.internal:5432")]
+    X["Internet"] -.->|"blocked by security group"| D
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Use a read-only database user for this, close the tunnel when you're done, and never give an agent a standing
+        tunnel to production. <a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a> shows the
+        AWS-native alternative (Session Manager), which avoids opening port 22 at all.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Networking for developers</div>
+      <h2 class="font-display text-2xl font-bold mt-2">"It doesn't work" is usually DNS, a port, a bind address or a certificate</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A request from a browser to the clinic API goes through a chain: resolve the name to an IP, open a TCP
+        connection to a port, negotiate TLS, then speak HTTP (which
+        <a href="./co4.html" class="text-viol underline decoration-viol/40">CO4</a> covers). Each link fails in its own
+        recognisable way. Debugging is simply checking the links in order.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">IPs, ports, TCP and UDP</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An <strong>IP address</strong> identifies a machine's network interface. A <strong>port</strong> (0–65535)
+        identifies one program on that machine. Private ranges such as <code class="inline">10.x</code>,
+        <code class="inline">172.16–31.x</code> and <code class="inline">192.168.x</code> only work inside a network.
+        Most of what you build uses TCP.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3"></th><th class="px-4 py-3">TCP</th><th class="px-4 py-3">UDP</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Guarantee</td><td class="px-4 py-3">A connection. Ordered, retransmitted, nothing lost silently.</td><td class="px-4 py-3">Individual packets. May be lost, duplicated or reordered.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Used by</td><td class="px-4 py-3">HTTP/1.1, HTTP/2, Postgres (5432), Redis (6379), SSH (22)</td><td class="px-4 py-3">DNS lookups (53), video calls, games, and HTTP/3 (QUIC, which adds its own reliability)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Typical failure</td><td class="px-4 py-3">"Connection refused" (nothing listening) or a timeout (a firewall drops the packets)</td><td class="px-4 py-3">Silence, so you need timeouts</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>"Connection refused" and "timeout" mean different things.</strong> Refused is fast: the machine answered
+        and said nothing listens on that port. A timeout is slow: something in between, usually a firewall or security
+        group, dropped the packets. Knowing the difference halves your debugging time.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">DNS records you will actually set</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        DNS maps names to answers. You will edit records when you connect a domain to Vercel
+        (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>), verify a domain for an email
+        provider, or put a site behind Cloudflare (<a href="./op5.html" class="text-viol underline decoration-viol/40">OP5</a>).
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Record</th><th class="px-4 py-3">Maps</th><th class="px-4 py-3">Clinic example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A / AAAA</td><td class="px-4 py-3">Name → IPv4 / IPv6 address</td><td class="px-4 py-3"><code class="inline">api.clinic.example → 203.0.113.10</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CNAME</td><td class="px-4 py-3">Name → another name (an alias). Not allowed on the bare apex domain in standard DNS.</td><td class="px-4 py-3"><code class="inline">www.clinic.example → the hosting provider's hostname</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">MX</td><td class="px-4 py-3">Which servers receive email for the domain, with priorities</td><td class="px-4 py-3">Set by your email provider (Google Workspace, etc.)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">TXT</td><td class="px-4 py-3">Free text, used for proofs and email policy</td><td class="px-4 py-3">Domain verification tokens, SPF (<code class="inline">v=spf1 …</code>), DKIM, DMARC</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">terminal — ask DNS directly</span>
+        <pre class="code">$ dig +short api.clinic.example A
+<span class="out">203.0.113.10</span>
+$ dig +short www.clinic.example CNAME           <span class="cm"># is the alias set?</span>
+$ dig +short clinic.example TXT                 <span class="cm"># did the verification record land?</span>
+$ dig @1.1.1.1 api.clinic.example               <span class="cm"># ask a specific public resolver</span>
+$ nslookup api.clinic.example                   <span class="cm"># older tool, same question, also on Windows</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Each record has a <strong>TTL</strong>, the number of seconds resolvers may cache it. That is why a DNS change
+        can "work for me but not for the client" for a while. Lower the TTL a day before a planned migration, and query
+        a public resolver to see what the world sees, not what your laptop cached.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">localhost vs 0.0.0.0: the bind address</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When a server starts, it <em>binds</em> to an address and a port. <code class="inline">127.0.0.1</code>
+        (localhost) means "accept connections only from this same machine". <code class="inline">0.0.0.0</code> means
+        "accept on every network interface". This one setting explains a whole family of bugs: the app works with curl
+        on the server, but not from your browser, and not from another container.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="An app bound to 127.0.0.1 is reachable only from the same machine; bound to 0.0.0.0 it is reachable from outside">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">SAME APP, TWO BIND ADDRESSES</text>
+          <rect x="250" y="34" width="440" height="150" rx="12" fill="none" stroke="#A8A49B" stroke-dasharray="4 4"/>
+          <text x="470" y="52" text-anchor="middle" font-size="10" fill="#6E6B64">server / container</text>
+          <g class="anim-pulse"><rect x="290" y="66" width="170" height="44" rx="9" fill="#DB2777"/>
+            <text x="375" y="85" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">listen 127.0.0.1:3000</text>
+            <text x="375" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">only local callers</text></g>
+          <g class="anim-pulse d1"><rect x="290" y="126" width="170" height="44" rx="9" fill="#0D9488"/>
+            <text x="375" y="145" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">listen 0.0.0.0:3000</text>
+            <text x="375" y="159" text-anchor="middle" fill="#ffffffbb" font-size="9">all interfaces</text></g>
+          <g class="anim-pulse d2"><rect x="520" y="96" width="150" height="44" rx="9" fill="#37474F"/>
+            <text x="595" y="115" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">curl localhost:3000</text>
+            <text x="595" y="129" text-anchor="middle" fill="#ffffffbb" font-size="9">on the same box: both work</text></g>
+          <g class="anim-pulse d3"><rect x="20" y="96" width="150" height="44" rx="9" fill="#2563EB"/>
+            <text x="95" y="115" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Browser / other container</text>
+            <text x="95" y="129" text-anchor="middle" fill="#ffffffbb" font-size="9">from outside</text></g>
+          <line x1="170" y1="110" x2="290" y2="88" stroke="#DB2777" stroke-width="2" stroke-dasharray="3 5"/>
+          <text x="225" y="88" text-anchor="middle" font-size="12" fill="#DB2777" font-weight="700">✗ refused</text>
+          <line x1="170" y1="126" x2="290" y2="148" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="225" y="160" text-anchor="middle" font-size="12" fill="#0D9488" font-weight="700">✓</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">terminal — who is listening where?</span>
+        <pre class="code">$ sudo ss -tlnp        <span class="cm"># -t TCP · -l listening · -n numeric · -p show the process</span>
+State   Local Address:Port   Process
+LISTEN  127.0.0.1:3000       users:(("node",pid=4121))     <span class="cm"># local only: fine behind nginx</span>
+LISTEN  0.0.0.0:22           users:(("sshd",pid=801))
+LISTEN  0.0.0.0:5432         users:(("postgres",pid=990))  <span class="kw"># DB open on every interface: check the firewall!</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The rule of thumb: inside a container the app must bind <code class="inline">0.0.0.0</code>, or nothing outside
+        the container can reach it (<a href="./op2.html" class="text-viol underline decoration-viol/40">OP2</a>). On a VM
+        behind a reverse proxy, bind <code class="inline">127.0.0.1</code> so only the proxy can reach it. A database
+        should never be on a public interface without a firewall rule in front.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">TLS certificates: what curl -v tells you</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        HTTPS is HTTP inside TLS. The server presents a <strong>certificate</strong> that says "I am api.clinic.example",
+        signed by a certificate authority your machine trusts, and valid for a date range. Three things go wrong: it
+        expired, it was issued for a different name, or the chain is incomplete. <code class="inline">curl -v</code>
+        prints every step (output trimmed):
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — curl -v https://api.clinic.example/health</span>
+        <pre class="code">* Host api.clinic.example:443 was resolved.        <span class="cm"># 1 · DNS ok</span>
+* Connected to api.clinic.example (203.0.113.10) port 443   <span class="cm"># 2 · TCP ok</span>
+* SSL connection using TLSv1.3 / …                   <span class="cm"># 3 · TLS handshake ok</span>
+*  subject: CN=api.clinic.example                    <span class="cm">#     name matches?</span>
+*  expire date: Dec 12 23:59:59 2026 GMT             <span class="cm">#     still valid?</span>
+*  SSL certificate verify ok.
+&gt; GET /health HTTP/2                                  <span class="cm"># 4 · request sent</span>
+&lt; HTTP/2 200                                         <span class="cm"># 5 · the app answered</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The fix for a certificate error is never <code class="inline">curl -k</code> or
+        <code class="inline">NODE_TLS_REJECT_UNAUTHORIZED=0</code> in real code. Both switch verification off, which is
+        exactly what an attacker in the middle needs. Managed platforms issue and renew certificates automatically. On
+        your own VM, use Let's Encrypt with automatic renewal.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Firewalls, security groups and the debugging ladder</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>firewall</strong> decides which packets may reach which ports. On a VM it's
+        <code class="inline">ufw</code> or <code class="inline">nftables</code>. In AWS it's a <strong>security group</strong>
+        attached to the instance or database, which allows traffic in by port and source
+        (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>). The healthy default is "deny
+        everything in, then open 443 to the world, 22 only from your IP or the bastion, and 5432 only from the app's
+        security group". When something is unreachable, walk down this ladder and stop at the first failing step:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    A["dig +short host"] -->|"no answer / wrong IP"| A1["DNS: record, TTL, typo"]
+    A -->|"right IP"| B["nc -vz host 443"]
+    B -->|"refused"| B1["Nothing listening:<br/>service down or wrong bind address"]
+    B -->|"timeout"| B2["Firewall / security group<br/>dropping packets"]
+    B -->|"connected"| C["curl -v https://host"]
+    C -->|"certificate error"| C1["TLS: expired, wrong name, chain"]
+    C -->|"5xx"| C2["App: journalctl, app logs"]
+    C -->|"200"| D["Network is fine.<br/>The bug is in the app or the client"]
+        </pre>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-3 move:</strong> when you report a production issue, paste the evidence from each rung ("dig
+        returns the right IP, nc connects, curl -v shows HTTP 502") instead of "the site is broken". Your mentor can act on
+        that in a minute, and so can the agent.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Two separate skills meet here. First, let the agent run shell commands <em>safely</em>: it should run your tests
+        and read logs without asking, but it should never delete, push or reach production without you.
+        <a href="./ag2.html" class="text-viol underline decoration-viol/40">AG2</a> covers the permission system itself;
+        below is the shell-specific part. Second, use the agent as a patient debugging partner that runs the ladder
+        from Part IV and shows its evidence.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">.claude/settings.json — shell rules for the clinic repo</span>
+        <pre class="code">{
+  <span class="st">"permissions"</span>: {
+    <span class="st">"allow"</span>: [<span class="st">"Bash(npm run test *)"</span>, <span class="st">"Bash(npm run lint)"</span>, <span class="st">"Bash(git diff *)"</span>],
+    <span class="st">"ask"</span>:   [<span class="st">"Bash(git push *)"</span>, <span class="st">"Bash(docker compose down *)"</span>],
+    <span class="st">"deny"</span>:  [<span class="st">"Bash(sudo *)"</span>, <span class="st">"Bash(rm -rf *)"</span>, <span class="st">"Bash(ssh *)"</span>,
+              <span class="st">"Read(./.env)"</span>, <span class="st">"Read(./.env.*)"</span>]
+  }
+}
+</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read it this way: <strong>deny beats ask, and ask beats allow</strong>. For a compound command such as
+        <code class="inline">npm run test &amp;&amp; git push</code>, each part must be allowed on its own. But these rules
+        match the command <em>text</em>: <code class="inline">/bin/rm</code> or <code class="inline">sh -c 'rm …'</code> can slip
+        past a <code class="inline">Bash(rm *)</code> deny rule. When you need a real boundary, turn on the OS-level
+        sandbox with <code class="inline">/sandbox</code>, which limits the files and network hosts every shell command
+        can reach.
+      </p>
+      <pre class="code mt-3">The staging API returns 502 since the last deploy. Debug it read-only.
+Walk the ladder: dig, nc -vz on 443, curl -v, then systemctl status and
+journalctl -u clinic-api --since "30 min ago". Paste the output of each step
+and stop at the first failing rung. Do not restart or change anything.</pre>
+      <pre class="code mt-3">Explain this command line by line before I approve it, and tell me what it
+deletes or changes if a variable is empty:
+  find "$LOG_DIR" -name "*.log" -mtime +7 -delete</pre>
+      <pre class="code mt-3">Review scripts/*.sh as a strict reviewer: missing set -euo pipefail,
+unquoted variables, rm without a guard, secrets passed as arguments,
+anything that assumes GNU vs macOS flags. List findings, don't fix yet.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Explain an unfamiliar command, flag or log line</li>
+            <li>Run read-only diagnostics and summarise the output</li>
+            <li>Write shell scripts and systemd units from your spec</li>
+            <li>Build the grep / sort / uniq pipeline for a log question</li>
+            <li>Draft the SSH config and firewall rules for your review</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every command that deletes, moves, restarts or pushes, before you approve it</li>
+            <li>That scripts have the safety header and quoted variables</li>
+            <li>Bind addresses and firewall rules: nothing private is on a public port</li>
+            <li>That no secret appears in a command, a log or the transcript</li>
+            <li>One diagnostic step rerun by you, so you know the evidence is real</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent shell output:</strong> <code class="inline">chmod -R 777</code> or
+        <code class="inline">sudo</code> to "fix" a permission error · <code class="inline">curl … | sudo bash</code> from an
+        unknown URL · <code class="inline">rm -rf</code> with an unquoted or unguarded variable ·
+        <code class="inline">curl -k</code> or disabling TLS verification · a database or Redis bound to
+        <code class="inline">0.0.0.0</code> with the port opened to <code class="inline">0.0.0.0/0</code> · a secret in a
+        command line · <code class="inline">kill -9</code> as the first resort · "the server is up" with no
+        <code class="inline">curl</code> output pasted.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Uses a terminal only to run <code class="inline">npm start</code>. Approves agent commands without reading them.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows the common commands and what DNS and ports are. Gets lost on a remote server or when a request "just hangs".</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Navigates a server over SSH, reads logs with journalctl and grep, and runs a service under systemd. Needs help to tell a DNS problem from a firewall or TLS problem.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Uses SSH keys, config and tunnels confidently. Deploys a service with a correct user, permissions and unit file. Debugs "unreachable" by walking DNS → port → TLS → HTTP with evidence. Reads every agent shell command before approving, and keeps safe permission rules in the repo.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Writes the team's server hardening and on-call debugging runbooks, reviews other people's scripts and firewall rules, and leads the network side of an incident.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 3:</strong> without the agent, can you explain the difference between
+        "connection refused" and a timeout, and name the tool that proves which one it is? Given a fresh VM, could you
+        run the clinic API as a non-root systemd service, reachable only through nginx, and show its logs?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Running the app as root</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One bug in a file-upload handler then becomes full control of the machine. Give each service its own user and the smallest set of permissions it needs.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ "It works on the server" with curl localhost</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Testing from the same box skips DNS, the firewall and TLS, which is where most real failures are. Always test from outside, the way users arrive.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Changing DNS and expecting it instantly</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Old answers stay cached until the TTL expires. Lower the TTL ahead of time, and check with <code class="inline">dig @1.1.1.1</code>, not only your browser.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep an ~/.ssh/config and a runbook</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Named hosts prevent "wrong server" mistakes. A short <code class="inline">docs/runbook.md</code> with the exact status and log commands makes every incident faster, for you and for the agent.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Read before you press Enter</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">For any command that changes state, ask yourself "what does this delete or restart, and on which machine?" If you can't answer, ask the agent to explain it first.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Handle SIGTERM in your server</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Stop accepting requests, finish the in-flight ones, close the DB pool, then exit. Every deploy on every platform relies on this, and agents often forget it.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="log-pipeline"> <span>Answered a real question from logs with a pipeline (grep, sort, uniq, or journalctl filters) and can explain every stage.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="ssh-setup"> <span>Set up an ed25519 key, a <code class="inline">~/.ssh/config</code> with a ProxyJump host, and used an <code class="inline">-L</code> tunnel to reach a private database with a read-only user.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dns-tls"> <span>Used <code class="inline">dig</code> and <code class="inline">curl -v</code> to read a domain's A, CNAME and TXT records and its certificate's name and expiry date.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="safe-shell"> <span>Committed a <code class="inline">.claude/settings.json</code> with allow, ask and deny shell rules for my project, and can explain what the rules can and can't stop.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="vm-deploy"> <span class="font-semibold">Deployed a small API to a Linux VM (or a local Multipass/UTM VM) as a non-root systemd service bound to 127.0.0.1 behind nginx, with a firewall allowing only 22 and 443, then wrote <code class="inline">docs/runbook.md</code> with the ladder output (dig → nc → curl -v → journalctl) from a deliberately broken and then fixed state (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://www.gnu.org/software/bash/manual/bash.html" target="_blank" rel="noopener">GNU — Bash Reference Manual</a> — redirections, expansions and the <code class="inline">set</code> builtin from Part II.</li>
+        <li><a class="text-coral underline" href="https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html" target="_blank" rel="noopener">systemd — systemd.service</a> · <a class="text-coral underline" href="https://www.freedesktop.org/software/systemd/man/latest/journalctl.html" target="_blank" rel="noopener">journalctl</a> — unit file options and log filtering.</li>
+        <li><a class="text-coral underline" href="https://man.openbsd.org/ssh_config" target="_blank" rel="noopener">OpenSSH — ssh_config(5)</a> — every option for <code class="inline">~/.ssh/config</code>, including ProxyJump and LocalForward.</li>
+        <li><a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Glossary/DNS" target="_blank" rel="noopener">MDN — DNS</a> · <a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Transport_Layer_Security" target="_blank" rel="noopener">Transport Layer Security</a> — clear background on names and certificates.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html" target="_blank" rel="noopener">AWS — Security groups</a> — how the cloud firewall from Part IV works (more in OP4).</li>
+        <li><a class="text-coral underline" href="https://code.claude.com/docs/en/permissions" target="_blank" rel="noopener">Claude Code — Permissions</a> · <a class="text-coral underline" href="https://code.claude.com/docs/en/sandboxing" target="_blank" rel="noopener">Sandboxing</a> — Bash rule syntax, its limits, and the OS-level sandbox.</li>
+      </ul>
