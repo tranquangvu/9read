@@ -1,0 +1,724 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Data, Offline &amp; Device Features</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          This is the week your patient app stops talking to mocks and starts talking to the real API, on real
+          phones, on real networks. This module covers the data layer you need for that: a Dio client with
+          interceptors and token refresh, typed errors, secure token storage, a local database with offline sync,
+          push notifications, deep links, permissions, the camera and uploads, and realtime updates that survive the
+          app going to the background.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent writes networking code for the happy path
+          on fast office Wi-Fi. Your users are in a lift, on 3G, with the app suspended for two hours and a token that
+          expired an hour ago. The agent's code logs them out, loses the booking they made offline, stores the refresh
+          token in plain text, and opens the wrong screen when they tap a reminder. None of that shows up in a
+          simulator demo. You have to know where to look.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Talking to a real API</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The network is slow, flaky and sometimes wrong, so the data layer must expect it</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        In <a href="./mb1.html" class="text-viol underline decoration-viol/40">MB1</a> you built the patient app as
+        View → ViewModel → Repository → Service, with a simple <code class="inline">http</code> call in the service.
+        That layering stays. What changes this week is everything inside the service and repository: the API now
+        needs a real login, returns real errors, and sits behind a mobile network. Whatever state approach your
+        project uses (<a href="./mb2.html" class="text-viol underline decoration-viol/40">MB2</a>), none of this code
+        belongs in a widget.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">One Dio client, with interceptors in a known order</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Once you need tokens, refresh, retries and logging, switch from <code class="inline">http</code> to
+        <code class="inline">dio</code>. Its <strong>interceptors</strong> run on every request, response and error,
+        so cross-cutting behaviour lives in one place instead of being copied into every call. Create
+        <strong>one</strong> configured client for the whole app and inject it. An agent that writes
+        <code class="inline">Dio()</code> inside a repository method has just created a client with no timeouts, no
+        auth and no logging.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/data/api_client.dart — the single configured client</span>
+        <pre class="code">Dio buildApiClient(AppConfig config, TokenStore tokens) {
+  <span class="kw">final</span> dio = Dio(BaseOptions(
+    baseUrl: config.apiBaseUrl,                        <span class="cm">// from the flavor, never hard-coded</span>
+    connectTimeout: <span class="kw">const</span> Duration(seconds: <span class="st">10</span>),
+    receiveTimeout: <span class="kw">const</span> Duration(seconds: <span class="st">20</span>),
+    headers: {<span class="st">'Accept'</span>: <span class="st">'application/json'</span>},
+  ));
+  dio.interceptors.addAll([
+    AuthInterceptor(tokens),                           <span class="cm">// 1. attach the access token</span>
+    RefreshInterceptor(dio, tokens),                   <span class="cm">// 2. on 401: refresh once, replay</span>
+    RetryInterceptor(dio),                             <span class="cm">// 3. retry idempotent calls on network errors</span>
+    <span class="kw">if</span> (config.isDev) SafeLogInterceptor(),             <span class="cm">// 4. log, with tokens redacted</span>
+  ]);
+  <span class="kw">return</span> dio;
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Interceptor</th><th class="px-4 py-3">Its one job</th><th class="px-4 py-3">What agents get wrong</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Auth</td><td class="px-4 py-3">Read the access token and set <code class="inline">Authorization: Bearer …</code></td><td class="px-4 py-3">Sends the token to third-party hosts too (an S3 upload URL). Only add it when the request goes to your API.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Refresh</td><td class="px-4 py-3">On 401, get a new access token once and replay the failed request</td><td class="px-4 py-3">Five parallel requests trigger five refreshes. The refresh call itself gets a 401 and loops.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Retry</td><td class="px-4 py-3">Retry timeouts and connection errors with backoff</td><td class="px-4 py-3">Retries a <code class="inline">POST /bookings</code> and books the slot twice. Retries 4xx errors that will never succeed.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Logging</td><td class="px-4 py-3">Print method, path, status and duration in dev builds</td><td class="px-4 py-3">Logs full headers and bodies, including tokens and patient data, in production.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Retry is the dangerous one. <strong>Only retry requests that are safe to repeat</strong>: GET, and writes that
+        carry an idempotency key the server honours. Why that key matters, and how the server stores it, is in
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>. Use exponential backoff with a
+        small cap (three attempts), and never retry a 4xx.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Token refresh: exactly one refresh in flight</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The app opens after two hours, the access token has expired, and the home screen fires four requests at
+        once. All four get 401. The correct behaviour is: the first 401 starts a refresh, the other three
+        <strong>wait for it</strong>, then all four replay with the new token. If the refresh itself fails, the
+        user is logged out once, not four times. The concepts (access vs refresh tokens, rotation) are in
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant S as Screen (4 calls)
+    participant R as RefreshInterceptor
+    participant A as API
+    S->>A: GET /me, /bookings, /clinics, /notifications
+    A-->>R: 401 × 4 (access token expired)
+    Note over R: first 401 starts ONE refresh<br/>the other three are queued
+    R->>A: POST /auth/refresh (refresh token)
+    A-->>R: 200 new access + rotated refresh
+    R->>R: save both to secure storage
+    R->>A: replay all 4 with new token
+    A-->>S: 200 × 4
+    Note over R,S: refresh fails → clear tokens,<br/>emit "signed out" once → router goes to /login
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">lib/data/refresh_interceptor.dart — the shape to look for</span>
+        <pre class="code"><span class="kw">class</span> <span class="fn">RefreshInterceptor</span> <span class="kw">extends</span> QueuedInterceptor {  <span class="cm">// queued: errors handled one at a time</span>
+  RefreshInterceptor(<span class="kw">this</span>._dio, <span class="kw">this</span>._tokens);
+  <span class="kw">final</span> Dio _dio;
+  <span class="kw">final</span> TokenStore _tokens;
+
+  @override
+  Future&lt;<span class="kw">void</span>&gt; onError(DioException err, ErrorInterceptorHandler handler) <span class="kw">async</span> {
+    <span class="kw">final</span> isAuthCall = err.requestOptions.path.startsWith(<span class="st">'/auth/'</span>);
+    <span class="kw">if</span> (err.response?.statusCode != <span class="st">401</span> || isAuthCall) <span class="kw">return</span> handler.next(err); <span class="cm">// no loops</span>
+
+    <span class="kw">final</span> sent = err.requestOptions.headers[<span class="st">'Authorization'</span>];
+    <span class="kw">if</span> (sent == <span class="st">'Bearer ${await _tokens.access}'</span>) {    <span class="cm">// nobody refreshed while we queued</span>
+      <span class="kw">final</span> ok = <span class="kw">await</span> _tokens.refresh();              <span class="cm">// uses a separate Dio without this interceptor</span>
+      <span class="kw">if</span> (!ok) { _tokens.signOut(); <span class="kw">return</span> handler.next(err); }
+    }
+    <span class="kw">final</span> retry = err.requestOptions..headers[<span class="st">'Authorization'</span>] = <span class="st">'Bearer ${await _tokens.access}'</span>;
+    handler.resolve(<span class="kw">await</span> _dio.fetch(retry));           <span class="cm">// replay with the fresh token</span>
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three review checks: the refresh call can't trigger itself (separate client or path check), queued requests
+        compare tokens so they don't refresh a second time, and a failed refresh leads to exactly one sign-out that
+        the router reacts to (<a href="./mb2.html" class="text-viol underline decoration-viol/40">MB2</a> covers auth
+        redirects). Test it for real: set the access-token lifetime to 30 seconds on staging, wait, and pull to
+        refresh a screen that makes several calls.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Tokens live in secure storage, and nowhere else</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">shared_preferences</code> is a plain file. Anyone with a backup, a rooted phone or a
+        debug build can read it. Tokens go in <code class="inline">flutter_secure_storage</code>, which uses the iOS
+        Keychain and Android Keystore-backed encryption. Keep an in-memory copy for speed, and treat the storage as
+        the durable source.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/data/token_store.dart</span>
+        <pre class="code"><span class="kw">const</span> _storage = FlutterSecureStorage();
+
+Future&lt;<span class="kw">void</span>&gt; save(AuthTokens t) <span class="kw">async</span> {
+  <span class="kw">await</span> _storage.write(key: <span class="st">'access_token'</span>, value: t.access);
+  <span class="kw">await</span> _storage.write(key: <span class="st">'refresh_token'</span>, value: t.refresh);  <span class="cm">// ✓ Keychain / Keystore</span>
+}
+<span class="cm">// ✗ prefs.setString('refresh_token', t.refresh)   plain text on disk</span>
+<span class="cm">// ✗ print('login ok: $tokens')                       now it's in device logs and crash reports</span>
+<span class="cm">// Note: iOS Keychain items can survive an uninstall. Clear them on first launch after install</span>
+<span class="cm">// if a fresh install must mean a fresh login.</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Errors become typed results the UI can switch on</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <code class="inline">DioException</code> reaching a widget is a bug. Convert it at the repository edge into
+        a small set of failures your screens know how to show. The API's error body format is defined in
+        <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a> (problem details). Read the
+        <code class="inline">code</code> or field errors from it, not the English message.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">What happened</th><th class="px-4 py-3">Failure type</th><th class="px-4 py-3">What the patient sees</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Timeout, no connection</td><td class="px-4 py-3"><code class="inline">Offline</code></td><td class="px-4 py-3">Cached data with an "offline" banner, or "Saved, will send when online" for writes (Part II)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">401 after a failed refresh</td><td class="px-4 py-3"><code class="inline">SignedOut</code></td><td class="px-4 py-3">Login screen, once, with the place they were going remembered</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">403</td><td class="px-4 py-3"><code class="inline">Forbidden</code></td><td class="px-4 py-3">"You don't have access to this booking." No retry button.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">409 slot taken</td><td class="px-4 py-3"><code class="inline">Conflict</code></td><td class="px-4 py-3">"09:30 was just booked by someone else", and the slot list refreshed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">422 validation</td><td class="px-4 py-3"><code class="inline">Invalid(fieldErrors)</code></td><td class="px-4 py-3">Errors next to the fields in the form (<a href="./mb2.html" class="text-viol underline decoration-viol/40">MB2</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">5xx</td><td class="px-4 py-3"><code class="inline">ServerError</code></td><td class="px-4 py-3">"Something went wrong on our side" with Retry, and the error reported (<a href="./mb5.html" class="text-viol underline decoration-viol/40">MB5</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">lib/data/api_failure.dart — sealed, so every screen must handle every case</span>
+        <pre class="code"><span class="kw">sealed class</span> <span class="fn">ApiFailure</span> { <span class="kw">const</span> ApiFailure(); }
+<span class="kw">class</span> <span class="fn">Offline</span> <span class="kw">extends</span> ApiFailure {}
+<span class="kw">class</span> <span class="fn">Conflict</span> <span class="kw">extends</span> ApiFailure { Conflict(<span class="kw">this</span>.code); <span class="kw">final</span> String code; }
+<span class="cm">// … SignedOut, Forbidden, Invalid(fieldErrors), ServerError</span>
+
+ApiFailure toFailure(DioException e) =&gt; <span class="kw">switch</span> (e.type) {
+  DioExceptionType.connectionTimeout ||
+  DioExceptionType.receiveTimeout ||
+  DioExceptionType.connectionError =&gt; Offline(),
+  DioExceptionType.badResponse =&gt; <span class="kw">switch</span> (e.response!.statusCode) {
+      <span class="st">403</span> =&gt; Forbidden(),
+      <span class="st">409</span> =&gt; Conflict(e.response!.data[<span class="st">'code'</span>] <span class="kw">as</span> String),
+      <span class="st">422</span> =&gt; Invalid.fromProblem(e.response!.data),
+      _ =&gt; ServerError(e.response!.statusCode),
+    },
+  _ =&gt; ServerError(<span class="kw">null</span>),
+};</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Models: generate the parsing, never trust the shape</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        With a real backend, JSON shapes drift: a field becomes nullable, an enum gains a value, a number arrives as
+        a string. Generate immutable models with <code class="inline">freezed</code> and
+        <code class="inline">json_serializable</code>, and decide on purpose what happens with unknown values. An
+        app that crashes because the backend added a new booking status can't be fixed until the next store release.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/data/models/booking.dart</span>
+        <pre class="code">@freezed
+<span class="kw">abstract class</span> <span class="fn">Booking</span> <span class="kw">with</span> _$Booking {           <span class="cm">// freezed 3: the class must be abstract (or sealed)</span>
+  <span class="kw">const factory</span> Booking({
+    <span class="kw">required</span> String id,
+    <span class="kw">required</span> DateTime startsAt,
+    @JsonKey(unknownEnumValue: BookingStatus.unknown)  <span class="cm">// ✓ new server value → "unknown", not a crash</span>
+    <span class="kw">required</span> BookingStatus status,
+    String? doctorNote,                                 <span class="cm">// nullable because the API says so, not "to be safe"</span>
+  }) = _Booking;
+  <span class="kw">factory</span> Booking.fromJson(Map&lt;String, Object?&gt; json) =&gt; _$BookingFromJson(json);
+}
+<span class="cm">// Regenerate after edits: dart run build_runner build --delete-conflicting-outputs</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Check the generated models against the OpenAPI spec from
+        <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>, not against one sample
+        response the agent saw. An agent that makes every field nullable "to be safe" moves the crash from parsing
+        to a <code class="inline">!</code> three screens later.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Local data and offline</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The local database is the source of truth, and the network is a sync job</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A web page that can't reach the server shows an error. A phone app is expected to open instantly and show
+        the patient's upcoming bookings in a basement clinic with no signal. That changes the architecture: the UI
+        reads from a <strong>local store</strong>, and a sync process keeps the local store and the server in step.
+        Not every app needs full offline writes, but every app needs a decision about it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Pick the store by the shape of the data</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Store</th><th class="px-4 py-3">Good for</th><th class="px-4 py-3">Wrong for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">shared_preferences</td><td class="px-4 py-3">A few small settings: theme, last selected clinic, "onboarding seen"</td><td class="px-4 py-3">Lists of records, anything secret, anything you query</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">flutter_secure_storage</td><td class="px-4 py-3">Tokens and small secrets</td><td class="px-4 py-3">Bulk data: it's slow and not meant for it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Drift (on SQLite)</td><td class="px-4 py-3">Relational data you filter, sort and join: bookings, doctors, clinics. Typed queries, migrations, reactive <code class="inline">watch()</code> streams.</td><td class="px-4 py-3">A single settings flag</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">sqflite</td><td class="px-4 py-3">Raw SQL when the team prefers it, or an existing schema</td><td class="px-4 py-3">Teams that want type-checked queries</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Key-value / object stores (Hive and similar)</td><td class="px-4 py-3">Caching JSON blobs by key, very fast reads</td><td class="px-4 py-3">Data with relations and queries. Check the package is actively maintained before adopting one.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A local database has a schema, so it has <strong>migrations</strong>, just like the server
+        (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>). The difference is that you
+        can't run them on users' phones yourself: version 1.6 must open a database created by 1.2. Drift's
+        <code class="inline">schemaVersion</code> and migration steps exist for this. Always test upgrading from the
+        previous store version, not only a fresh install.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Reads: show local data now, refresh from the network behind it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The repository exposes a <strong>stream from the local database</strong>. The screen renders whatever is
+        there immediately. In parallel the repository fetches from the API and writes the result into the database,
+        and the stream emits again. The UI never merges network and cache by hand: it only ever reads one place.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="Offline-first data flow: UI reads a stream from the local database, a sync process writes API results into it and sends queued writes from an outbox">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">OFFLINE-FIRST · the UI only reads the local DB</text>
+          <g class="anim-pulse"><rect x="10" y="60" width="130" height="56" rx="9" fill="#2563EB"/>
+            <text x="75" y="84" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Screen</text>
+            <text x="75" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">renders the stream</text></g>
+          <g class="anim-pulse d1"><rect x="200" y="60" width="140" height="56" rx="9" fill="#0D9488"/>
+            <text x="270" y="84" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Local DB (Drift)</text>
+            <text x="270" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">bookings · doctors · outbox</text></g>
+          <g class="anim-pulse d2"><rect x="400" y="60" width="130" height="56" rx="9" fill="#6d5acd"/>
+            <text x="465" y="84" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Sync</text>
+            <text x="465" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">on start · resume · online</text></g>
+          <g class="anim-pulse d3"><rect x="580" y="60" width="110" height="56" rx="9" fill="#37474F"/>
+            <text x="635" y="84" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">REST API</text>
+            <text x="635" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">server truth</text></g>
+          <line x1="200" y1="88" x2="140" y2="88" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="340" y1="80" x2="400" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="400" y1="98" x2="340" y2="98" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="530" y1="80" x2="580" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="580" y1="98" x2="530" y2="98" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="170" y="140" text-anchor="middle" font-size="10" fill="#A8A49B">watch() stream</text>
+          <text x="370" y="140" text-anchor="middle" font-size="10" fill="#A8A49B">upsert results · read outbox</text>
+          <text x="555" y="140" text-anchor="middle" font-size="10" fill="#A8A49B">GET · replay writes</text>
+          <path d="M 75 116 Q 75 190 270 190 L 270 120" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 5"/>
+          <text x="420" y="198" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">user action → write to local DB + outbox first, the screen updates instantly</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">lib/data/booking_repository.dart — read path</span>
+        <pre class="code">Stream&lt;List&lt;Booking&gt;&gt; watchUpcoming() {
+  _refreshUpcoming();                                   <span class="cm">// fire the network refresh, don't await it</span>
+  <span class="kw">return</span> _db.bookingsDao.watchUpcoming();             <span class="cm">// the UI listens to the DB, not the API</span>
+}
+
+Future&lt;<span class="kw">void</span>&gt; _refreshUpcoming() <span class="kw">async</span> {
+  <span class="kw">try</span> {
+    <span class="kw">final</span> fresh = <span class="kw">await</span> _api.getUpcomingBookings();
+    <span class="kw">await</span> _db.bookingsDao.replaceUpcoming(fresh);       <span class="cm">// one transaction: stream emits once</span>
+  } <span class="kw">on</span> DioException <span class="kw">catch</span> (e) {
+    _status.add(toFailure(e));                          <span class="cm">// banner: "offline, showing saved data"</span>
+  }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Writes: an outbox, and a plan for conflicts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        For writes that may happen offline (adding a note to a booking, cancelling one), save the change locally
+        and add a row to an <strong>outbox</strong> table in the same transaction. The sync process sends outbox rows
+        in order when the network is back, and deletes each one only after the server confirms. Every outbox row
+        carries an <strong>idempotency key</strong> generated when the user acted, so a request that timed out and is
+        sent again doesn't cancel or create twice. This is the client-side twin of the outbox pattern in
+        <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/data/booking_repository.dart — write path</span>
+        <pre class="code">Future&lt;<span class="kw">void</span>&gt; cancel(String bookingId) =&gt; _db.transaction(() <span class="kw">async</span> {
+  <span class="kw">await</span> _db.bookingsDao.markCancelling(bookingId);     <span class="cm">// UI shows "Cancelling…" at once</span>
+  <span class="kw">await</span> _db.outboxDao.add(OutboxEntry(
+    id: _uuid.v4(),                                     <span class="cm">// idempotency key, sent as a header</span>
+    method: <span class="st">'POST'</span>, path: <span class="st">'/bookings/$bookingId/cancel'</span>,
+    createdAt: DateTime.now(),
+  ));
+});
+<span class="cm">// Sync: for each entry in order → send with Idempotency-Key → on 2xx delete entry + apply server copy</span>
+<span class="cm">//       on 409/422 → mark the booking "needs attention" and tell the user; never retry forever</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Decide the conflict rule per action, with your mentor, before coding. Some actions can't be offline at
+        all: <strong>booking a slot</strong> depends on live availability, so when offline the app should say
+        "You're offline, booking needs a connection" rather than queue it and fail an hour later. Cancelling or
+        adding a note can queue safely. A rejected queued write must become something the user sees, not a row that
+        silently disappears.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>Connectivity is not reachability.</strong> <code class="inline">connectivity_plus</code> tells you the
+        phone has Wi-Fi or mobile data, not that your API is reachable: hotel Wi-Fi with a login page, a VPN, or an API
+        outage all report "connected". Use it only as a hint to <em>try</em> syncing. The real signal is whether a
+        request succeeds. Never block a request because the plugin says "offline", and never assume success because
+        it says "online".
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Push notifications and deep links</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A notification is a link that arrives uninvited, so route it like one</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        "Your appointment with Dr. Lan is tomorrow at 09:30" is the notification the clinic cares most about. Tapping
+        it must open that booking, whether the app was open, in the background, or killed. A link in a confirmation
+        email must do the same. Both are the same problem: an external event that ends in a
+        <code class="inline">go_router</code> path.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">How a push reaches the phone</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Your backend never talks to the phone directly. It sends a message to <strong>Firebase Cloud Messaging</strong>
+        (FCM) addressed to a device token. FCM delivers to Android itself and hands iOS messages to Apple's
+        <strong>APNs</strong>, which needs an APNs key uploaded to your Firebase project. The app's job is to get the
+        token, send it to your backend, and react when a message arrives or is tapped.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 190" class="w-full min-w-[620px]" role="img" aria-label="Push notification path: backend job sends to FCM, FCM delivers to Android directly and to iOS through APNs, the app routes the tap">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">BOOKING REMINDER · one day before</text>
+          <g class="anim-pulse"><rect x="10" y="60" width="120" height="54" rx="9" fill="#37474F"/>
+            <text x="70" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Backend job</text>
+            <text x="70" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">SD8 scheduled job</text></g>
+          <g class="anim-pulse d1"><rect x="180" y="60" width="120" height="54" rx="9" fill="#D97757"/>
+            <text x="240" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">FCM</text>
+            <text x="240" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">by device token</text></g>
+          <g class="anim-pulse d2"><rect x="350" y="30" width="120" height="46" rx="9" fill="#0D9488"/>
+            <text x="410" y="52" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Android</text>
+            <text x="410" y="66" text-anchor="middle" fill="#ffffffbb" font-size="9">direct</text></g>
+          <g class="anim-pulse d2"><rect x="350" y="100" width="120" height="46" rx="9" fill="#6d5acd"/>
+            <text x="410" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">APNs → iOS</text>
+            <text x="410" y="136" text-anchor="middle" fill="#ffffffbb" font-size="9">needs APNs key</text></g>
+          <g class="anim-pulse d3"><rect x="530" y="60" width="160" height="54" rx="9" fill="#2563EB"/>
+            <text x="610" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Tap → router</text>
+            <text x="610" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">/bookings/981</text></g>
+          <line x1="130" y1="87" x2="180" y2="87" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="300" y1="80" x2="350" y2="55" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="300" y1="95" x2="350" y2="120" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="470" y1="55" x2="530" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="470" y1="120" x2="530" y2="95" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="350" y="178" text-anchor="middle" font-size="10" fill="#A8A49B">payload carries an ID and a route, never patient details: lock screens are public</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The scheduling of the reminder is a backend job (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>).
+        What you control in the app is shown below. Note that the app behaves differently depending on its state, and
+        that FCM has two kinds of message:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">App state</th><th class="px-4 py-3">"Notification" message (title + body)</th><th class="px-4 py-3">Handler for the tap / data</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Foreground</td><td class="px-4 py-3">Not shown by the system on Android; you decide (in-app banner, or <code class="inline">flutter_local_notifications</code>). iOS shows it only if you set foreground presentation options.</td><td class="px-4 py-3"><code class="inline">FirebaseMessaging.onMessage</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Background</td><td class="px-4 py-3">Shown by the system</td><td class="px-4 py-3">Tap: <code class="inline">onMessageOpenedApp</code>. Data: top-level <code class="inline">onBackgroundMessage</code> handler.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Terminated</td><td class="px-4 py-3">Shown by the system</td><td class="px-4 py-3">Tap: <code class="inline">getInitialMessage()</code> at startup. Easy to forget, and the most common bug.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Data-only messages</strong> (no title or body) wake your code instead of showing anything. They are
+        useful for "sync now" signals, but delivery in the background is not guaranteed, especially on iOS, which
+        throttles them. Never rely on a silent push for anything the patient must see.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Ask for permission when it makes sense, and register the token</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        iOS, and Android 13 and later, require the user to allow notifications. You get one good chance: an
+        agent will call <code class="inline">requestPermission()</code> in <code class="inline">main()</code>, so the
+        first thing a new user sees is a system dialog with no context, and many say no. Ask right after the first
+        booking, when "Remind me the day before?" makes obvious sense.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/notifications/push_service.dart</span>
+        <pre class="code">Future&lt;<span class="kw">void</span>&gt; enableReminders() <span class="kw">async</span> {             <span class="cm">// called after the first booking</span>
+  <span class="kw">final</span> fm = FirebaseMessaging.instance;
+  <span class="kw">final</span> settings = <span class="kw">await</span> fm.requestPermission();
+  <span class="kw">if</span> (settings.authorizationStatus == AuthorizationStatus.denied) <span class="kw">return</span>;
+
+  <span class="kw">final</span> token = <span class="kw">await</span> fm.getToken();
+  <span class="kw">if</span> (token != <span class="kw">null</span>) <span class="kw">await</span> _api.registerDevice(token, platform: _platform);
+  fm.onTokenRefresh.listen((t) =&gt; _api.registerDevice(t, platform: _platform)); <span class="cm">// tokens rotate</span>
+}
+<span class="cm">// On sign-out: unregister the token on the backend, or the next user of this phone</span>
+<span class="cm">// receives the previous patient's reminders.</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Tap → route, from every app state</h3>
+      <div class="mt-4">
+        <span class="code-label">lib/notifications/push_routing.dart</span>
+        <pre class="code">Future&lt;<span class="kw">void</span>&gt; wirePushRouting(GoRouter router) <span class="kw">async</span> {
+  <span class="kw">void</span> open(RemoteMessage m) {
+    <span class="kw">final</span> route = m.data[<span class="st">'route'</span>];                       <span class="cm">// e.g. "/bookings/981"</span>
+    <span class="kw">if</span> (route <span class="kw">is</span> String &amp;&amp; route.startsWith(<span class="st">'/'</span>)) router.go(route); <span class="cm">// only our own paths</span>
+  }
+  <span class="kw">final</span> initial = <span class="kw">await</span> FirebaseMessaging.instance.getInitialMessage();
+  <span class="kw">if</span> (initial != <span class="kw">null</span>) open(initial);                    <span class="cm">// app was killed</span>
+  FirebaseMessaging.onMessageOpenedApp.listen(open);          <span class="cm">// app was in background</span>
+}
+
+@pragma(<span class="st">'vm:entry-point'</span>)                                     <span class="cm">// keep it after tree shaking</span>
+Future&lt;<span class="kw">void</span>&gt; onBackgroundMessage(RemoteMessage m) <span class="kw">async</span> { <span class="cm">/* top-level, no UI, no context */</span> }</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The route goes through the same router, so the auth redirect from
+        <a href="./mb2.html" class="text-viol underline decoration-viol/40">MB2</a> still applies: a signed-out user
+        tapping a reminder sees the login screen first, then the booking. And the booking screen must load the
+        booking by ID itself, because it can be the first screen the app shows.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Deep links: App Links and Universal Links</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A custom scheme like <code class="inline">clinicapp://bookings/981</code> is easy but any app can claim it,
+        and it's a dead link on a laptop. Prefer <strong>verified https links</strong>
+        (<code class="inline">https://clinic.example.com/bookings/981</code>): Android <strong>App Links</strong> and iOS
+        <strong>Universal Links</strong> open the app if it's installed and your website otherwise. Verification needs
+        a file on your domain, and that is where most deep-link bugs are.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3"></th><th class="px-4 py-3">Android App Links</th><th class="px-4 py-3">iOS Universal Links</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">In the app</td><td class="px-4 py-3"><code class="inline">intent-filter</code> with <code class="inline">android:autoVerify="true"</code>, host and path in <code class="inline">AndroidManifest.xml</code></td><td class="px-4 py-3">Associated Domains capability: <code class="inline">applinks:clinic.example.com</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">On the website</td><td class="px-4 py-3"><code class="inline">/.well-known/assetlinks.json</code> with the package name and the <strong>signing</strong> certificate SHA-256</td><td class="px-4 py-3"><code class="inline">/.well-known/apple-app-site-association</code> with Team ID + bundle ID and paths, served as JSON over HTTPS with no redirect</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Classic failure</td><td class="px-4 py-3">The fingerprint of the debug key is in the file, but Play re-signs releases with a different key</td><td class="px-4 py-3">The file sits behind a redirect or login, so Apple's CDN can't fetch it</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">terminal — test a link without sending an email</span>
+        <pre class="code"><span class="cm"># Android emulator or device</span>
+adb shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE \
+  -d "https://clinic.example.com/bookings/981" com.goldenowl.clinic
+adb shell pm get-app-links com.goldenowl.clinic      <span class="cm"># is the domain "verified"?</span>
+
+<span class="cm"># iOS simulator</span>
+xcrun simctl openurl booted "https://clinic.example.com/bookings/981"</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Flutter's built-in deep-link handling passes the path to <code class="inline">go_router</code>, so
+        <code class="inline">/bookings/981</code> needs a matching route and nothing else. If the project uses a
+        plugin such as <code class="inline">app_links</code> instead, the built-in handling must be switched off so the
+        two don't both navigate. Test every link from three states: app killed, in background, and already on
+        another screen.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Device features and realtime</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every device feature is a permission, a platform file and a failure mode</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The insurance card photo is a small feature on the ticket: "patient can photograph their card". On a phone
+        it means a camera permission with the right wording on iOS, a user who says no, a 9 MB photo on a slow
+        connection, and an upload that must not go through your API server. Agents write the happy path in ten
+        lines. The rest is your job.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Permissions: design the "no" before the "yes"</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every sensitive feature needs two platform entries (a usage string in <code class="inline">Info.plist</code>,
+        a permission in <code class="inline">AndroidManifest.xml</code> when required) and a runtime request.
+        <code class="inline">permission_handler</code> gives you one API for the request and the status.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Status</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">What the screen does</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">granted / limited</td><td class="px-4 py-3">Allowed (limited = only some photos on iOS)</td><td class="px-4 py-3">Continue</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">denied</td><td class="px-4 py-3">Said no, but you may ask again (Android)</td><td class="px-4 py-3">Explain why, offer an alternative ("choose from gallery", "enter the card number")</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">permanentlyDenied</td><td class="px-4 py-3">The system won't show the dialog again. On iOS this is the state after the first "no".</td><td class="px-4 py-3">Button to <code class="inline">openAppSettings()</code>, plus the alternative</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">restricted</td><td class="px-4 py-3">Blocked by parental controls or device policy</td><td class="px-4 py-3">Alternative only, no settings button</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The iOS usage string is shown to the user and read by App Review. "This app needs camera access" is weak.
+        "Photograph your insurance card so the clinic can verify it before your visit" is what reviewers expect.
+        A missing string crashes the app the moment the permission is requested, and only on iOS, which is why
+        agents who tested on Android never see it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Camera and uploads: shrink on the phone, send straight to storage</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Two rules. First, <strong>resize and compress before uploading</strong>: a phone camera produces far more
+        pixels than the clinic needs to read a card. Second, <strong>upload directly to object storage</strong> with a
+        short-lived presigned URL from your API, the same pattern the web app uses
+        (<a href="./fe4.html" class="text-viol underline decoration-viol/40">FE4</a>). Your API server only issues the
+        URL and records the result.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/insurance/card_upload.dart</span>
+        <pre class="code"><span class="kw">final</span> photo = <span class="kw">await</span> ImagePicker().pickImage(
+  source: ImageSource.camera,
+  maxWidth: <span class="st">1600</span>, imageQuality: <span class="st">80</span>,                  <span class="cm">// ✓ ~300 KB instead of ~9 MB</span>
+);
+<span class="kw">if</span> (photo == <span class="kw">null</span>) <span class="kw">return</span>;                              <span class="cm">// user cancelled: not an error</span>
+
+<span class="kw">final</span> target = <span class="kw">await</span> _api.createCardUpload(contentType: <span class="st">'image/jpeg'</span>); <span class="cm">// {url, fileKey}</span>
+<span class="kw">await</span> _uploadDio.put(                                    <span class="cm">// a Dio WITHOUT the auth interceptor</span>
+  target.url,
+  data: File(photo.path).openRead(),
+  options: Options(headers: {
+    Headers.contentTypeHeader: <span class="st">'image/jpeg'</span>,
+    Headers.contentLengthHeader: <span class="kw">await</span> File(photo.path).length(),
+  }),
+  onSendProgress: (sent, total) =&gt; _progress.value = sent / total,  <span class="cm">// show a real progress bar</span>
+);
+<span class="kw">await</span> _api.confirmCardUpload(target.fileKey);             <span class="cm">// server checks size/type, links it to the patient</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note the separate client: your auth interceptor would otherwise attach the patient's access token to a
+        request going to a storage provider. Location works the same way as the camera (a permission, a usage string,
+        a denied path). With <code class="inline">geolocator</code>, ask for "while in use" location only, and only on
+        the screen that sorts clinics by distance.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">When no plugin exists: platform channels and Pigeon</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most device features have a maintained plugin on pub.dev. Check its publisher, last release date and open
+        issues before adding it. When none fits (a clinic's Bluetooth card reader SDK, say), Dart talks to Kotlin and
+        Swift through <strong>platform channels</strong>. Use <strong>Pigeon</strong> to generate those channels from
+        a Dart interface, so both sides are type-checked instead of passing string method names and untyped maps.
+        This is mentor-level work. Your job at score 2 is to recognise when a ticket needs it and flag it early,
+        because it doubles the testing (two native codebases).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Realtime and the app lifecycle</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When another patient books 09:30, the slot picker should update. Whether the source is Supabase Realtime, a
+        WebSocket or a server-sent event, treat an incoming event as a <strong>signal to refetch</strong> (or to
+        re-sync the local DB), not as data to patch into the UI by hand. The difference from the web is the
+        <strong>lifecycle</strong>: the OS suspends your app in the background and kills sockets. When the app comes
+        back, reconnect and refresh, because you missed every event in between.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/booking/slot_live_updates.dart</span>
+        <pre class="code"><span class="kw">late final</span> _lifecycle = AppLifecycleListener(
+  onResume: () { _subscribe(); _repo.refreshSlots(); },   <span class="cm">// missed events → refetch</span>
+  onPause: _unsubscribe,                                   <span class="cm">// don't hold a socket in background</span>
+);
+
+<span class="kw">void</span> _subscribe() {
+  _channel = supabase.channel(<span class="st">'slots-$doctorId'</span>)
+    .onPostgresChanges(
+      event: PostgresChangeEvent.all, schema: <span class="st">'public'</span>, table: <span class="st">'slots'</span>,
+      filter: PostgresChangeFilter(type: PostgresChangeFilterType.eq, column: <span class="st">'doctor_id'</span>, value: doctorId),
+      callback: (_) =&gt; _repo.refreshSlots(),               <span class="cm">// signal, not payload</span>
+    )
+    .subscribe();
+}
+<span class="cm">// dispose(): _lifecycle.dispose(); _unsubscribe();   — the MB1 rule about cancelling still applies</span></pre>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Realtime doesn't replace the 409.</strong> A live slot list makes conflicts rarer, not impossible: two
+        patients can still tap 09:30 within the same second. The booking call must still handle
+        <code class="inline">Conflict</code> from Part I, and the server must still enforce the rule.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are good at the Dart side of this module and bad at everything around it: platform files, store
+        rules, the three app states and network failure. Give it the failure cases in the prompt, and ask for the
+        platform changes as a separate, reviewable list.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — the API client</span>
+        <pre class="code">Replace the http-based ClinicApiService with a single Dio client (lib/data/api_client.dart).
+- Interceptors in this order: auth (only for our baseUrl), refresh (QueuedInterceptor,
+  one refresh in flight, never for /auth/*), retry (GET only, 3 tries, backoff), dev-only logging
+  with the Authorization header redacted.
+- Tokens in flutter_secure_storage. Map DioException to the sealed ApiFailure in api_failure.dart.
+- Don't touch widgets. List every file you changed.
+Then explain how you'd test the refresh with a 30-second token on staging.</pre>
+      </div>
+      <pre class="code mt-3">Add booking reminders with firebase_messaging. Handle tap from foreground,
+background AND terminated (getInitialMessage). Ask for permission after the
+first booking, not at startup. Register and unregister the token with the API.
+List the native changes (Info.plist, AndroidManifest, capabilities, APNs key)
+separately; don't apply them, I'll review them with my mentor.</pre>
+      <pre class="code mt-3">Review lib/ for data-layer red flags: Dio() created outside api_client.dart,
+tokens in shared_preferences or logs, retries on POST without an idempotency key,
+DioException reaching a widget, missing mounted checks after await, stream or
+channel subscriptions without cancel. Give file:line and the fix.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Write the Dio client, interceptors and failure mapping from your spec</li>
+            <li>Generate freezed models from the OpenAPI spec and run build_runner</li>
+            <li>Write Drift tables, DAOs and the migration step for a new column</li>
+            <li>Draft the <code class="inline">assetlinks.json</code> and AASA files and the manifest changes</li>
+            <li>Write the adb / simctl commands to test each deep link</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Refresh with an expired token and several parallel calls, on staging</li>
+            <li>Which requests are retried, and that no write is retried without a key</li>
+            <li>The app in airplane mode: what shows, what queues, what refuses</li>
+            <li>A notification tap from a killed app, on a real iPhone and a real Android phone</li>
+            <li>Every new permission string, and the "denied" path of each</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent output:</strong> <code class="inline">Dio()</code> inside a repository method ·
+        tokens in <code class="inline">SharedPreferences</code> or printed with <code class="inline">print</code> ·
+        <code class="inline">LogInterceptor(requestHeader: true)</code> in all builds · retry on every error, including
+        POST and 4xx · <code class="inline">requestPermission()</code> in <code class="inline">main()</code> · no
+        <code class="inline">getInitialMessage()</code> · patient names or diagnoses in a push payload · the debug
+        keystore fingerprint in <code class="inline">assetlinks.json</code> · a <code class="inline">connectivity_plus</code>
+        check that blocks requests · <code class="inline">google-services.json</code> or an APNs key committed to git.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has only called APIs from a mock or a single <code class="inline">http.get</code>.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can explain interceptors, token refresh, offline-first and the push path, but accepts agent code that only works online and in the foreground.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Connects the app to the real API with a reviewed Dio client, secure tokens and typed failures. Adds a local cache and one push or deep-link flow with an agent, and tests them in all app states. Needs the mentor for native setup, conflict rules and store-facing permission wording.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Designs the offline and sync behaviour per action, sets up push and verified links end to end on both platforms, and ships device features that handle every permission state.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the app's data layer and sync strategy, writes the platform channel code when needed, and turns these rules into the team's Flutter CLAUDE.md and review checklist.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> put the phone in airplane mode and open your app: does it show
+        saved data and say it's offline? Kill the app, then tap a reminder: does the right booking open? Expire the
+        token and pull to refresh a screen with several calls: how many refresh requests did the API see?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Testing only on office Wi-Fi</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Use the network link conditioner (iOS) or emulator network throttling, and airplane mode. Timeouts and retries only show up there.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Queueing everything offline</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A booking queued offline and rejected an hour later is worse than "booking needs a connection". Decide per action.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Forgetting sign-out cleanup</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Clear tokens, the local database and the push token registration. A shared family phone must not show the previous patient's bookings.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Short token lifetime on staging</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A 30-second access token turns a once-an-hour refresh bug into one you hit every minute while developing.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Payloads carry IDs, not content</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A push with <code class="inline">{"route": "/bookings/981"}</code> leaks nothing on a lock screen, and the app loads current data when opened.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ One link-test script</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Keep the adb and simctl commands for every deep link in the repo. Run them before each release (<a href="./mb5.html" class="text-viol underline decoration-viol/40">MB5</a>).</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dio-client"> <span>Replaced ad-hoc HTTP calls with one Dio client whose interceptors I can explain, including why each request type is or isn't retried.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="token-refresh"> <span>Showed my mentor the API log for an expired token with several parallel calls: exactly one refresh, every request replayed.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="offline-cache"> <span>Made one list screen offline-first with a local database, and demonstrated it in airplane mode, including an upgrade from the previous schema.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="permission-paths"> <span>Implemented a device feature (camera or location) with handled denied and permanently-denied paths and a reviewed iOS usage string.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="reminder-deeplink"> <span class="font-semibold">Switched my week-3 app to the real API with Claude Code, then added a booking reminder push and an https deep link to <code class="inline">/bookings/:id</code>. Opened a PR with a short screen recording of the tap working from a killed app on both platforms, the adb/simctl test commands, and the airplane-mode behaviour (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://pub.dev/packages/dio" target="_blank" rel="noopener">dio on pub.dev</a> — interceptors, QueuedInterceptor, cancellation and upload progress from Parts I and IV.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/app-architecture/design-patterns/offline-first" target="_blank" rel="noopener">Flutter — Offline-first support</a> — the official pattern for local-first reads and synchronised writes.</li>
+        <li><a class="text-coral underline" href="https://drift.simonbinder.eu/" target="_blank" rel="noopener">Drift documentation</a> — tables, reactive queries and schema migrations.</li>
+        <li><a class="text-coral underline" href="https://firebase.google.com/docs/cloud-messaging/flutter/client" target="_blank" rel="noopener">Firebase — Set up FCM in Flutter</a> · <a class="text-coral underline" href="https://firebase.google.com/docs/cloud-messaging/flutter/receive" target="_blank" rel="noopener">Receive messages</a> — permissions, tokens and the three app states.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/ui/navigation/deep-linking" target="_blank" rel="noopener">Flutter — Deep linking</a> — App Links and Universal Links setup with go_router.</li>
+        <li><a class="text-coral underline" href="https://pub.dev/packages/permission_handler" target="_blank" rel="noopener">permission_handler on pub.dev</a> — permission states and the platform setup each one needs.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/platform-integration/platform-channels" target="_blank" rel="noopener">Flutter — Platform channels</a> — writing platform code and generating it with Pigeon.</li>
+      </ul>

@@ -1,0 +1,778 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">State, Navigation &amp; Forms in Flutter</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          MB1 got one screen on the phone. A real app has a dozen screens, bottom tabs, a login wall, forms that
+          talk back, a dark theme, two languages and a tablet layout someone forgot about. This module goes deep on
+          state management with Riverpod (and Bloc, for teams that use it), navigation with go_router beyond the
+          basics, production forms, and the theme, layout, localisation and accessibility work that makes an app
+          feel finished.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent writes Flutter state code that works for
+          the path it tried: log in once, open one tab, submit one valid form. The bugs live on the other paths. The
+          profile tab loses its scroll position, logout leaves you on a private screen, a slow network lets the user
+          book twice, a Vietnamese date shows up in English format, and a screen reader announces "button" with no
+          name. None of these fail <code class="inline">flutter analyze</code>. You catch them by knowing where state
+          lives and which paths to try.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · State with Riverpod</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Classify the state before you pick the tool</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The running example is the same <strong>clinic booking patient app</strong> as
+        <a href="./mb1.html" class="text-viol underline decoration-viol/40">MB1</a>, now with three bottom tabs
+        (Doctors, My bookings, Profile), a login screen, a patient-details form and Vietnamese + English text. In
+        MB1 you built one screen with a ChangeNotifier ViewModel. Before adding more, sort every piece of state
+        into one of four kinds. The kind decides where it lives, and most state bugs are a value living in the
+        wrong place.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Four kinds of state</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Kind</th><th class="px-4 py-3">Lives in</th><th class="px-4 py-3">Clinic app example</th><th class="px-4 py-3">Wrong home agents pick</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Ephemeral UI</td><td class="px-4 py-3"><code class="inline">State</code> + <code class="inline">setState</code>, or a controller</td><td class="px-4 py-3">Is the "notes" panel expanded? The text being typed</td><td class="px-4 py-3">A global provider, so every screen rebuilds on each keystroke</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Server cache</td><td class="px-4 py-3">An <code class="inline">AsyncNotifier</code> / <code class="inline">FutureProvider</code> keyed by its inputs</td><td class="px-4 py-3">Free slots for Dr. Lan on 12 May</td><td class="px-4 py-3">A plain <code class="inline">List</code> field copied into a widget, never refreshed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">App state</td><td class="px-4 py-3">A long-lived <code class="inline">Notifier</code> (<code class="inline">keepAlive</code>)</td><td class="px-4 py-3">Who is logged in, chosen language, theme mode</td><td class="px-4 py-3">A static variable or a singleton that nothing listens to</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Route</td><td class="px-4 py-3">The URL path and query (go_router)</td><td class="px-4 py-3"><code class="inline">/doctors/42/slots?date=2026-05-12</code></td><td class="px-4 py-3">An object passed through <code class="inline">extra</code>, lost on a deep link</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This is the same classification as the web version in
+        <a href="./fe1.html" class="text-viol underline decoration-viol/40">FE1</a>. The question to ask in review is
+        also the same: "<strong>who owns this value, and who needs to hear when it changes?</strong>"
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">From ChangeNotifier to Riverpod: same layers, safer wiring</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        MB1 used Provider with ChangeNotifier ViewModels because the official architecture guide does. Many Golden
+        Owl projects use <strong>Riverpod</strong> instead, and it is what this module teaches. The layering does not
+        change: widgets render, a notifier holds screen state and logic, a repository owns the data. What changes
+        is the wiring. Providers are declared once, outside the widget tree, so there is no "provider not found above
+        this context" error, dependencies are checked at compile time, and loading and error states come built in.
+        If your project uses Provider or Bloc, <strong>follow the project</strong>. Part II shows Bloc.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    W1["DoctorSlotsScreen<br/>ConsumerWidget"] -->|"ref.watch"| SP["slotPickerProvider<br/>(doctorId, day)<br/>AsyncNotifier"]
+    W2["BookingSummary"] -->|"ref.watch"| SP
+    SP -->|"ref.watch"| RP["bookingRepositoryProvider<br/>keepAlive"]
+    RP -->|"ref.watch"| AP["apiClientProvider<br/>base URL from flavor"]
+    AU["authProvider<br/>Notifier · keepAlive"] --> AP
+    W1 -.->|"onTap: ref.read(...notifier).book()"| SP
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read the arrows as "depends on". When <code class="inline">authProvider</code> changes (the user logs out),
+        everything downstream rebuilds with the new value automatically. That is the main thing Riverpod buys you:
+        <strong>state that reacts to other state without you wiring listeners by hand</strong>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">An AsyncNotifier and the three states it can be in</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most screens show server data and let the user change it. That is an <code class="inline">AsyncNotifier</code>:
+        <code class="inline">build</code> loads the data, and methods change it. With code generation
+        (<code class="inline">riverpod_generator</code> plus <code class="inline">dart run build_runner watch</code>),
+        the parameters of <code class="inline">build</code> become the provider's <strong>family</strong> arguments,
+        and the provider is <strong>auto-disposed</strong> when no widget watches it any more.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/booking/slot_picker.dart — an AsyncNotifier</span>
+        <pre class="code">@riverpod
+<span class="kw">class</span> <span class="fn">SlotPicker</span> <span class="kw">extends</span> _$SlotPicker {
+  @override
+  Future&lt;List&lt;Slot&gt;&gt; build(String doctorId, DateTime day) {   <span class="cm">// params = family key</span>
+    <span class="kw">return</span> ref.watch(bookingRepositoryProvider).slots(doctorId, day);
+  }
+
+  Future&lt;<span class="kw">void</span>&gt; book(Slot slot) <span class="kw">async</span> {
+    <span class="kw">final</span> repo = ref.read(bookingRepositoryProvider);           <span class="cm">// read: inside a method</span>
+    state = <span class="kw">const</span> AsyncLoading();                            <span class="cm">// the screen shows progress</span>
+    state = <span class="kw">await</span> AsyncValue.guard(() <span class="kw">async</span> {
+      <span class="kw">await</span> repo.book(slot.id);
+      <span class="kw">return</span> repo.slots(doctorId, day);                       <span class="cm">// re-fetch the truth</span>
+    });
+    ref.invalidate(myBookingsProvider);                         <span class="cm">// the other tab is now stale</span>
+  }
+}
+<span class="cm">// Generated: slotPickerProvider(doctorId, day), auto-disposed by default.</span>
+<span class="cm">// @Riverpod(keepAlive: true) for app state that must survive navigation.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The screen never sees a <code class="inline">bool loading</code> and a nullable <code class="inline">error</code>
+        that can contradict each other. It gets an <code class="inline">AsyncValue</code>, a sealed type with exactly
+        three cases, and Dart 3's <code class="inline">switch</code> makes you handle all of them:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/booking/doctor_slots_screen.dart — rendering an AsyncValue</span>
+        <pre class="code"><span class="kw">class</span> <span class="fn">DoctorSlotsScreen</span> <span class="kw">extends</span> ConsumerWidget {
+  <span class="kw">const</span> DoctorSlotsScreen({<span class="kw">super</span>.key, <span class="kw">required this</span>.doctorId, <span class="kw">required this</span>.day});
+  <span class="kw">final</span> String doctorId;
+  <span class="kw">final</span> DateTime day;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    <span class="kw">final</span> slots = ref.watch(slotPickerProvider(doctorId, day));
+    <span class="kw">return</span> <span class="kw">switch</span> (slots) {
+      AsyncData(:<span class="kw">final</span> value) <span class="kw">when</span> value.isEmpty =&gt; <span class="kw">const</span> EmptySlots(),
+      AsyncData(:<span class="kw">final</span> value) =&gt; SlotGrid(slots: value),
+      AsyncError(:<span class="kw">final</span> error) =&gt; ErrorRetry(error: error,
+          onRetry: () =&gt; ref.invalidate(slotPickerProvider(doctorId, day))),
+      _ =&gt; <span class="kw">const</span> SlotGridSkeleton(),                          <span class="cm">// AsyncLoading</span>
+    };
+  }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">watch, read and listen are three different questions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Mixing these up is the most common Riverpod mistake in agent code, and it produces either a screen that
+        never updates or a snackbar that shows on every rebuild.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Call</th><th class="px-4 py-3">Question it answers</th><th class="px-4 py-3">Use it in</th><th class="px-4 py-3">Bug when misused</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">ref.watch</code></td><td class="px-4 py-3">"Rebuild me when this changes"</td><td class="px-4 py-3"><code class="inline">build</code> of widgets and providers</td><td class="px-4 py-3">In a callback: subscribes at the wrong time, runtime assertion</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">ref.read</code></td><td class="px-4 py-3">"Give me the current value once"</td><td class="px-4 py-3"><code class="inline">onTap</code>, <code class="inline">onPressed</code>, notifier methods</td><td class="px-4 py-3">In <code class="inline">build</code>: the screen shows the first value forever</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">ref.listen</code></td><td class="px-4 py-3">"Do something once when this changes"</td><td class="px-4 py-3"><code class="inline">build</code>, for side effects: snackbar, dialog, navigation</td><td class="px-4 py-3">Replaced by <code class="inline">watch</code> + <code class="inline">if</code>: the snackbar fires on every rebuild</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">ref.invalidate</code> / <code class="inline">ref.refresh</code></td><td class="px-4 py-3">"Throw this cache away"</td><td class="px-4 py-3">Pull-to-refresh, retry, after a mutation</td><td class="px-4 py-3">Forgotten after a booking: "My bookings" shows the old list</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">lib/booking/doctor_slots_screen.dart — side effects with ref.listen</span>
+        <pre class="code">ref.listen(slotPickerProvider(doctorId, day), (previous, next) {
+  <span class="kw">if</span> (next <span class="kw">case</span> AsyncError(:<span class="kw">final</span> error) <span class="kw">when</span> previous <span class="kw">is</span> AsyncData) {
+    ScaffoldMessenger.of(context).showSnackBar(            <span class="cm">// runs once per change,</span>
+      SnackBar(content: Text(bookingErrorText(context, error))), <span class="cm">// not once per build</span>
+    );
+  }
+});</pre>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Riverpod 3 changes worth knowing.</strong> Failed providers are retried automatically with backoff,
+        providers whose widgets are off screen are paused, and notifiers have <code class="inline">ref.mounted</code>
+        so you can check that the provider still exists after an <code class="inline">await</code>. If the agent's
+        code was written from Riverpod 2 examples, ask it to check the migration guide before you debug further.
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Bloc, immutability and agent bugs</div>
+      <h2 class="font-display text-2xl font-bold mt-2">State goes in as events and comes out as new objects</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Whatever the library, good Flutter state code follows one rule: <strong>a state object is never edited in
+        place</strong>. You build a new one and hand it over, and the UI rebuilds because it received a different
+        object. Bloc makes that rule explicit. Riverpod expects it just as much.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Bloc and Cubit, for teams that use them</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>Cubit</strong> exposes methods and emits new states. A <strong>Bloc</strong> receives
+        <em>event</em> objects and maps them to states, which gives you a log of every event (good for complex flows
+        and debugging) at the cost of more code. Start with a Cubit. Move to a Bloc when you need event
+        transformations such as debouncing a search box, or when the team's convention says so.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/booking/slot_cubit.dart — the same screen as a Cubit</span>
+        <pre class="code"><span class="kw">sealed class</span> <span class="fn">SlotState</span> { <span class="kw">const</span> SlotState(); }
+<span class="kw">final class</span> <span class="fn">SlotLoading</span> <span class="kw">extends</span> SlotState { <span class="kw">const</span> SlotLoading(); }
+<span class="kw">final class</span> <span class="fn">SlotLoaded</span> <span class="kw">extends</span> SlotState { <span class="kw">const</span> SlotLoaded(<span class="kw">this</span>.slots); <span class="kw">final</span> List&lt;Slot&gt; slots; }
+<span class="kw">final class</span> <span class="fn">SlotFailed</span> <span class="kw">extends</span> SlotState { <span class="kw">const</span> SlotFailed(<span class="kw">this</span>.message); <span class="kw">final</span> String message; }
+
+<span class="kw">class</span> <span class="fn">SlotCubit</span> <span class="kw">extends</span> Cubit&lt;SlotState&gt; {
+  SlotCubit(<span class="kw">this</span>._repo) : <span class="kw">super</span>(<span class="kw">const</span> SlotLoading());
+  <span class="kw">final</span> BookingRepository _repo;
+
+  Future&lt;<span class="kw">void</span>&gt; load(String doctorId, DateTime day) <span class="kw">async</span> {
+    emit(<span class="kw">const</span> SlotLoading());
+    <span class="kw">try</span> {
+      <span class="kw">final</span> slots = <span class="kw">await</span> _repo.slots(doctorId, day);
+      <span class="kw">if</span> (isClosed) <span class="kw">return</span>;                          <span class="cm">// the screen left while we waited</span>
+      emit(SlotLoaded(slots));
+    } <span class="kw">on</span> ApiException <span class="kw">catch</span> (e) {
+      <span class="kw">if</span> (!isClosed) emit(SlotFailed(e.userMessage));
+    }
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        In the widget tree, <code class="inline">BlocProvider</code> creates and closes the cubit,
+        <code class="inline">BlocBuilder</code> rebuilds from states (the same job as <code class="inline">ref.watch</code>),
+        and <code class="inline">BlocListener</code> runs side effects once per state change (the same job as
+        <code class="inline">ref.listen</code>). The mapping is almost one to one:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Job</th><th class="px-4 py-3">Riverpod</th><th class="px-4 py-3">Bloc</th><th class="px-4 py-3">Provider (MB1)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Hold screen state + logic</td><td class="px-4 py-3"><code class="inline">Notifier</code> / <code class="inline">AsyncNotifier</code></td><td class="px-4 py-3"><code class="inline">Cubit</code> / <code class="inline">Bloc</code></td><td class="px-4 py-3"><code class="inline">ChangeNotifier</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rebuild on change</td><td class="px-4 py-3"><code class="inline">ref.watch</code></td><td class="px-4 py-3"><code class="inline">BlocBuilder</code> / <code class="inline">context.watch</code></td><td class="px-4 py-3"><code class="inline">context.watch</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Call an action</td><td class="px-4 py-3"><code class="inline">ref.read(p.notifier).book()</code></td><td class="px-4 py-3"><code class="inline">context.read&lt;SlotCubit&gt;().book()</code></td><td class="px-4 py-3"><code class="inline">context.read&lt;Vm&gt;().book()</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">One-off side effect</td><td class="px-4 py-3"><code class="inline">ref.listen</code></td><td class="px-4 py-3"><code class="inline">BlocListener</code></td><td class="px-4 py-3"><code class="inline">addListener</code> in <code class="inline">initState</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rebuild less</td><td class="px-4 py-3"><code class="inline">ref.watch(p.select(...))</code></td><td class="px-4 py-3"><code class="inline">buildWhen</code> / <code class="inline">BlocSelector</code></td><td class="px-4 py-3"><code class="inline">context.select</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Work finished after the screen closed</td><td class="px-4 py-3"><code class="inline">ref.mounted</code></td><td class="px-4 py-3"><code class="inline">isClosed</code></td><td class="px-4 py-3">a disposed flag</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        If you can read one column, you can review code in the other two. That matters, because you will join
+        projects that chose differently.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Immutable state classes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Riverpod and Bloc both decide whether to rebuild by comparing the old state with the new one. If the agent
+        mutates a list inside the current state and emits it again, the comparison says "same object" and
+        <strong>nothing rebuilds</strong>. The fix is immutable classes with <code class="inline">copyWith</code>,
+        written by hand for small cases or generated with <code class="inline">freezed</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/booking/booking_draft.dart — mutate vs copy</span>
+        <pre class="code"><span class="cm">// ✗ mutation: same object, Riverpod/Bloc see no change, the UI stays stale</span>
+state.value!.selectedSlotIds.add(slot.id);
+state = state;
+
+<span class="cm">// ✓ a new object with the change</span>
+@freezed
+<span class="kw">abstract class</span> <span class="fn">BookingDraft</span> <span class="kw">with</span> _$BookingDraft {
+  <span class="kw">const factory</span> BookingDraft({
+    <span class="kw">required</span> String doctorId,
+    String? slotId,
+    <span class="kw">@Default</span>(<span class="st">''</span>) String notes,
+  }) = _BookingDraft;
+}
+state = state.copyWith(slotId: slot.id);           <span class="cm">// == compares fields, so rebuilds are exact</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The six state bugs agents write most</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Like the React list in FE1, these have recognisable shapes. You can spot them in a diff without running
+        anything.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">agent-bugs.dart — spot the bug, then the fix</span>
+        <pre class="code"><span class="cm">// 1. read in build: the screen never updates</span>
+<span class="kw">final</span> user = ref.read(authProvider);                   <span class="cm">// fix: ref.watch</span>
+
+<span class="cm">// 2. setState / emit / context after the screen is gone</span>
+<span class="kw">await</span> repo.book(id); setState(() =&gt; _done = <span class="kw">true</span>); <span class="cm">// fix: if (!mounted) return; first</span>
+
+<span class="cm">// 3. controller created in build, or never disposed</span>
+TextFormField(controller: TextEditingController(text: name)) <span class="cm">// fix: State field + dispose()</span>
+
+<span class="cm">// 4. the whole screen watches a big object for one field</span>
+<span class="kw">final</span> profile = ref.watch(profileProvider);            <span class="cm">// fix: ref.watch(profileProvider</span>
+Text(profile.value?.name ?? <span class="st">''</span>)                      <span class="cm">//   .select((p) =&gt; p.value?.name))</span>
+
+<span class="cm">// 5. business rule in a widget</span>
+onTap: () { <span class="kw">if</span> (slot.start.difference(now).inHours &lt; <span class="st">2</span>) … } <span class="cm">// fix: a method on the notifier</span>
+
+<span class="cm">// 6. two libraries for one job</span>
+<span class="kw">import</span> <span class="st">'package:provider/provider.dart'</span>;             <span class="cm">// in a Riverpod project: remove</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        To <strong>verify</strong> rather than just read: turn on the rebuild counter in Flutter DevTools, type in a
+        form field, and watch which widgets rebuild. Then open a screen, start a slow request (throttle the network
+        in the emulator), and press Back before it finishes. The console must stay free of
+        "setState() called after dispose()" and "Cannot emit new states after calling close".
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>"Just make it global" is the agent's favourite fix.</strong> When a value doesn't update, an agent
+        often moves it into a <code class="inline">keepAlive</code> provider or a top-level variable. The bug seems
+        to disappear, and now the doctor's slots from yesterday's session survive logout, or one patient's draft
+        leaks into another account on a shared tablet. Ask what the value's lifetime should be, and scope it to that.
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Navigation and forms</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Routes carry IDs, and forms own their controllers</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        MB1 set up go_router with a redirect and two routes, and explained <code class="inline">go</code> versus
+        <code class="inline">push</code>. A real app needs three more things from the router: tabs that remember
+        where you were, an auth wall that reacts when the session changes, and routes that work when the app is
+        opened cold from a link.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Bottom tabs that keep their own stacks</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Users expect this: open Doctors, drill into Dr. Lan's slots, switch to My bookings, switch back, and still be
+        on Dr. Lan's slots. A plain <code class="inline">ShellRoute</code> loses that. Use
+        <code class="inline">StatefulShellRoute.indexedStack</code>, which gives every tab (a
+        <strong>branch</strong>) its own navigator and keeps them all alive.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="StatefulShellRoute with three branches, each keeping its own navigation stack">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">STATEFULSHELLROUTE · one navigator per tab</text>
+          <g class="anim-pulse"><rect x="200" y="32" width="300" height="40" rx="9" fill="#37474F"/>
+            <text x="350" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ScaffoldWithNavBar</text>
+            <text x="350" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">navigationShell.goBranch(index)</text></g>
+          <line x1="260" y1="72" x2="120" y2="100" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="350" y1="72" x2="350" y2="100" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="440" y1="72" x2="580" y2="100" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="30" y="100" width="180" height="36" rx="9" fill="#2563EB"/>
+            <text x="120" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Doctors /doctors</text></g>
+          <g class="anim-pulse d2"><rect x="30" y="144" width="180" height="36" rx="9" fill="#2563EB"/>
+            <text x="120" y="160" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Slots</text>
+            <text x="120" y="173" text-anchor="middle" fill="#ffffffbb" font-size="9">/doctors/42/slots · kept</text></g>
+          <g class="anim-pulse d1"><rect x="260" y="100" width="180" height="36" rx="9" fill="#6d5acd"/>
+            <text x="350" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">My bookings /bookings</text></g>
+          <g class="anim-pulse d2"><rect x="490" y="100" width="180" height="36" rx="9" fill="#0D9488"/>
+            <text x="580" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Profile /profile</text></g>
+          <g class="anim-pulse d3"><rect x="490" y="144" width="180" height="36" rx="9" fill="#0D9488"/>
+            <text x="580" y="160" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Edit details</text>
+            <text x="580" y="173" text-anchor="middle" fill="#ffffffbb" font-size="9">/profile/edit · half-typed form kept</text></g>
+          <text x="350" y="208" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">switching tabs changes which stack is visible; it doesn't pop anything</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">lib/router.dart — tabs as branches</span>
+        <pre class="code">StatefulShellRoute.indexedStack(
+  builder: (context, state, shell) =&gt; ScaffoldWithNavBar(navigationShell: shell),
+  branches: [
+    StatefulShellBranch(routes: [
+      GoRoute(path: <span class="st">'/doctors'</span>, builder: (_, __) =&gt; <span class="kw">const</span> DoctorListScreen(), routes: [
+        GoRoute(path: <span class="st">':doctorId/slots'</span>,                   <span class="cm">// /doctors/42/slots?date=…</span>
+          builder: (_, s) =&gt; DoctorSlotsScreen(
+            doctorId: s.pathParameters[<span class="st">'doctorId'</span>]!,
+            day: parseDay(s.uri.queryParameters[<span class="st">'date'</span>])),  <span class="cm">// bad/missing date → today</span>
+        ),
+      ]),
+    ]),
+    StatefulShellBranch(routes: [GoRoute(path: <span class="st">'/bookings'</span>, builder: …)]),
+    StatefulShellBranch(routes: [GoRoute(path: <span class="st">'/profile'</span>, builder: …)]),
+  ],
+)
+<span class="cm">// In the nav bar: shell.goBranch(i, initialLocation: i == shell.currentIndex)</span>
+<span class="cm">// → tapping the current tab again pops it back to its root, as users expect</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">An auth wall that reacts to logout</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        MB1's <code class="inline">redirect</code> runs on navigation. But when a token expires while the user sits
+        on "My bookings", nobody navigates, so the redirect never runs and the private screen stays up. Give the
+        router a <code class="inline">refreshListenable</code> that fires whenever auth changes, so it re-evaluates
+        the redirect immediately. Keep the original location, so the user lands back where they were after logging in.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/router.dart — redirect driven by auth state</span>
+        <pre class="code"><span class="kw">final</span> router = GoRouter(
+  refreshListenable: authChanges,                       <span class="cm">// a Listenable fed by authProvider</span>
+  redirect: (context, state) {
+    <span class="kw">final</span> loggedIn = container.read(authProvider).isLoggedIn;
+    <span class="kw">final</span> atLogin = state.matchedLocation == <span class="st">'/login'</span>;
+    <span class="kw">if</span> (!loggedIn &amp;&amp; !atLogin) {
+      <span class="kw">return</span> <span class="st">'/login?from=${Uri.encodeComponent(state.uri.toString())}'</span>;
+    }
+    <span class="kw">if</span> (loggedIn &amp;&amp; atLogin) {
+      <span class="kw">return</span> state.uri.queryParameters[<span class="st">'from'</span>] ?? <span class="st">'/doctors'</span>;
+    }
+    <span class="kw">return null</span>;                                        <span class="cm">// null = stay; never redirect to yourself</span>
+  },
+  routes: [ … ],
+);</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Test the three transitions by hand: open the app logged out, log out from a deep screen, and let the token
+        expire (shorten its lifetime on the mock). A redirect that returns the current location loops forever, and
+        go_router will report "too many redirects". Validate <code class="inline">from</code> so it only accepts
+        your own paths.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Pass IDs, not objects, and decide what Back does</h3>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>IDs in the path, never whole objects in <code class="inline">extra</code>.</strong> <code class="inline">extra</code> is lost when the route is opened from a deep link or a notification (<a href="./mb3.html" class="text-viol underline decoration-viol/40">MB3</a> sets those up), and the object is a stale copy. Pass <code class="inline">/bookings/981</code> and let the screen load booking 981 from its provider.</li>
+        <li><strong>Every route must build from its URL alone.</strong> Try it: <code class="inline">xcrun simctl openurl booted clinicapp://…/doctors/42/slots</code> or <code class="inline">adb shell am start -d</code>. If the screen crashes on a missing object, it's not deep-link ready.</li>
+        <li><strong>Typed routes</strong> (<code class="inline">go_router_builder</code>) turn <code class="inline">'/doctors/$id/slots'</code> strings into <code class="inline">DoctorSlotsRoute(doctorId: id).go(context)</code>, so a typo in a path is a compile error. Worth it once a project has more than a handful of routes.</li>
+        <li><strong>Guard unsaved work with <code class="inline">PopScope</code>.</strong> Set <code class="inline">canPop: !form.isDirty</code> and ask "Discard changes?" in <code class="inline">onPopInvokedWithResult</code>. It covers the app bar arrow, Android's system Back and the iOS swipe. The old <code class="inline">WillPopScope</code> is deprecated; agents still write it.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Forms: validators, controllers and focus</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Flutter's built-in <code class="inline">Form</code> is enough for most app forms. Each
+        <code class="inline">TextFormField</code> has a <code class="inline">validator</code> that returns an error
+        string or <code class="inline">null</code>, and <code class="inline">formKey.currentState!.validate()</code>
+        runs them all. The widget that owns the form is a <code class="inline">StatefulWidget</code>, because it owns
+        things with a lifecycle: the form key, the controllers and the focus nodes, which must all be disposed.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/profile/patient_details_form.dart — a phone-friendly form</span>
+        <pre class="code"><span class="kw">final</span> _formKey = GlobalKey&lt;FormState&gt;();
+<span class="kw">final</span> _name = TextEditingController();
+<span class="kw">final</span> _phone = TextEditingController();
+@override <span class="kw">void</span> dispose() { _name.dispose(); _phone.dispose(); <span class="kw">super</span>.dispose(); }
+
+Form(key: _formKey, autovalidateMode: AutovalidateMode.onUserInteraction, <span class="cm">// errors after first edit, not on open</span>
+  child: AutofillGroup(child: Column(children: [
+    TextFormField(
+      controller: _name,
+      decoration: InputDecoration(labelText: l10n.fullName),       <span class="cm">// a label, not just a hint</span>
+      textCapitalization: TextCapitalization.words,
+      autofillHints: <span class="kw">const</span> [AutofillHints.name],
+      textInputAction: TextInputAction.next,                        <span class="cm">// keyboard shows "Next"</span>
+      validator: (v) =&gt; (v == <span class="kw">null</span> || v.trim().isEmpty) ? l10n.required : <span class="kw">null</span>,
+    ),
+    TextFormField(
+      controller: _phone,
+      decoration: InputDecoration(labelText: l10n.phone),
+      keyboardType: TextInputType.phone,                           <span class="cm">// digit pad, not QWERTY</span>
+      autofillHints: <span class="kw">const</span> [AutofillHints.telephoneNumber],
+      textInputAction: TextInputAction.done,
+      onFieldSubmitted: (_) =&gt; _submit(),                         <span class="cm">// "Done" submits</span>
+      validator: validateVnPhone,
+    ),
+  ])),
+)</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Field</th><th class="px-4 py-3"><code class="inline">keyboardType</code></th><th class="px-4 py-3"><code class="inline">autofillHints</code></th><th class="px-4 py-3">Also set</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Email</td><td class="px-4 py-3"><code class="inline">emailAddress</code></td><td class="px-4 py-3"><code class="inline">email</code></td><td class="px-4 py-3"><code class="inline">autocorrect: false</code>, trim before validating</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Phone</td><td class="px-4 py-3"><code class="inline">phone</code></td><td class="px-4 py-3"><code class="inline">telephoneNumber</code></td><td class="px-4 py-3">Accept spaces and <code class="inline">+84</code>, normalise before sending</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Password</td><td class="px-4 py-3"><code class="inline">visiblePassword</code> only when shown</td><td class="px-4 py-3"><code class="inline">password</code> / <code class="inline">newPassword</code></td><td class="px-4 py-3"><code class="inline">obscureText: true</code>, a show/hide toggle</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Notes to doctor</td><td class="px-4 py-3"><code class="inline">multiline</code></td><td class="px-4 py-3">none</td><td class="px-4 py-3"><code class="inline">maxLines: null</code>, <code class="inline">maxLength</code> matching the API limit</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Date of birth</td><td class="px-4 py-3">don't type it</td><td class="px-4 py-3"><code class="inline">birthday</code></td><td class="px-4 py-3">A date picker, formatted for the locale (Part IV)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Then test with the keyboard open on a small phone: can you reach the last field and the submit button, and
+        does "Next" move focus in order? A form wrapped in a <code class="inline">SingleChildScrollView</code> (MB1)
+        plus the right <code class="inline">textInputAction</code>s handles most of it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Submit once, and show server errors on the field</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        On a slow 4G connection, users tap Save twice. Client validation also can't know that the phone number is
+        already registered or that the slot was taken a second ago. Only the server knows, and its answer belongs
+        next to the field it is about, not in a generic "Something went wrong" snackbar. The server's error format
+        is defined in <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/profile/patient_details_form.dart — submit</span>
+        <pre class="code"><span class="kw">bool</span> _submitting = <span class="kw">false</span>;
+Map&lt;String, String&gt; _serverErrors = {};
+
+Future&lt;<span class="kw">void</span>&gt; _submit() <span class="kw">async</span> {
+  <span class="kw">if</span> (_submitting) <span class="kw">return</span>;                            <span class="cm">// ✓ second tap does nothing</span>
+  setState(() =&gt; _serverErrors = {});
+  <span class="kw">if</span> (!_formKey.currentState!.validate()) <span class="kw">return</span>;
+  setState(() =&gt; _submitting = <span class="kw">true</span>);
+  <span class="kw">try</span> {
+    <span class="kw">await</span> ref.read(profileProvider.notifier).save(name: _name.text.trim(), phone: _phone.text);
+    <span class="kw">if</span> (!mounted) <span class="kw">return</span>;
+    context.pop();
+  } <span class="kw">on</span> ValidationException <span class="kw">catch</span> (e) {                <span class="cm">// 422 with per-field errors</span>
+    <span class="kw">if</span> (mounted) setState(() =&gt; _serverErrors = e.fieldErrors);
+  } <span class="kw">finally</span> {
+    <span class="kw">if</span> (mounted) setState(() =&gt; _submitting = <span class="kw">false</span>);
+  }
+}
+<span class="cm">// On the field:   forceErrorText: _serverErrors['phone'],</span>
+<span class="cm">// On the button:  onPressed: _submitting ? null : _submit,   (null = disabled)</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">ref</code> here comes from a <code class="inline">ConsumerStatefulWidget</code>, the
+        Riverpod version of a StatefulWidget. Note what stays local: the controllers, the submitting flag and the
+        server errors are ephemeral UI state, so they live in <code class="inline">State</code>. Only the saved
+        profile goes into a provider.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Theme, layout, language and access</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Theme once, adapt everywhere, speak both languages</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The last layer is the one clients notice first. It is also where agents hard-code the most: hex colours in
+        widgets, pixel widths from one simulator, English strings, and icons with no labels. Each of these is cheap
+        to do right at the start and expensive to fix across forty screens later.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">One theme, with brand tokens as an extension</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Material 3 is the default. Generate a full, accessible colour scheme from the brand colour with
+        <code class="inline">ColorScheme.fromSeed</code>, once for light and once for dark, and read colours from
+        the theme in widgets. Brand values that Material has no slot for (a "booked" status colour, the clinic's
+        accent) go in a <code class="inline">ThemeExtension</code>. What the tokens <em>are</em> is a design decision
+        (<a href="./ag4.html" class="text-viol underline decoration-viol/40">AG4</a>); this is how they reach the code.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/theme.dart — seed scheme plus a brand extension</span>
+        <pre class="code"><span class="kw">class</span> <span class="fn">BrandColors</span> <span class="kw">extends</span> ThemeExtension&lt;BrandColors&gt; {
+  <span class="kw">const</span> BrandColors({<span class="kw">required this</span>.booked, <span class="kw">required this</span>.available});
+  <span class="kw">final</span> Color booked, available;
+  @override BrandColors copyWith({Color? booked, Color? available}) =&gt;
+      BrandColors(booked: booked ?? <span class="kw">this</span>.booked, available: available ?? <span class="kw">this</span>.available);
+  @override BrandColors lerp(BrandColors? o, <span class="kw">double</span> t) =&gt; o == <span class="kw">null</span> ? <span class="kw">this</span> : BrandColors(
+      booked: Color.lerp(booked, o.booked, t)!, available: Color.lerp(available, o.available, t)!);
+}
+
+ThemeData buildTheme(Brightness b) =&gt; ThemeData(
+  colorScheme: ColorScheme.fromSeed(seedColor: <span class="kw">const</span> Color(<span class="st">0xFF0D9488</span>), brightness: b),
+  extensions: [b == Brightness.light ? brandLight : brandDark],
+);
+<span class="cm">// MaterialApp.router(theme: buildTheme(Brightness.light), darkTheme: buildTheme(Brightness.dark),</span>
+<span class="cm">//                    themeMode: ref.watch(themeModeProvider))   // system by default</span>
+<span class="cm">// In widgets: Theme.of(context).colorScheme.primary, Theme.of(context).extension&lt;BrandColors&gt;()!.booked</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Review rule: a <code class="inline">Color(0xFF…)</code> or <code class="inline">Colors.grey</code> inside a
+        screen widget is a bug waiting for dark mode. Switch the phone to dark mode before you approve any screen.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Adaptive layouts: phones, tablets and big text</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Responsive" in Flutter means choosing a layout from the <strong>space you are given</strong>, not from the
+        device type. Material 3 defines window size classes by width, and the patient app switches its navigation at
+        the first breakpoint.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Material 3 window size classes: compact uses a bottom bar, medium a navigation rail, expanded a rail with list and detail side by side">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">WINDOW SIZE CLASSES · by available width</text>
+          <g class="anim-pulse"><rect x="20" y="36" width="130" height="130" rx="9" fill="#2563EB"/>
+            <text x="85" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Compact</text>
+            <text x="85" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">&lt; 600 dp · phone</text>
+            <text x="85" y="130" text-anchor="middle" fill="#ffffffbb" font-size="9">list → push detail</text>
+            <rect x="30" y="146" width="110" height="12" rx="3" fill="#ffffff55"/>
+            <text x="85" y="155" text-anchor="middle" fill="#fff" font-size="8">NavigationBar</text></g>
+          <g class="anim-pulse d1"><rect x="185" y="36" width="200" height="130" rx="9" fill="#6d5acd"/>
+            <text x="285" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Medium</text>
+            <text x="285" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">600–839 dp · small tablet, foldable</text>
+            <rect x="195" y="90" width="18" height="66" rx="3" fill="#ffffff55"/>
+            <text x="300" y="130" text-anchor="middle" fill="#ffffffbb" font-size="9">NavigationRail + one pane</text></g>
+          <g class="anim-pulse d2"><rect x="420" y="36" width="260" height="130" rx="9" fill="#0D9488"/>
+            <text x="550" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Expanded</text>
+            <text x="550" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">≥ 840 dp · tablet landscape</text>
+            <rect x="430" y="90" width="18" height="66" rx="3" fill="#ffffff55"/>
+            <rect x="456" y="90" width="90" height="66" rx="3" fill="#ffffff33"/>
+            <rect x="552" y="90" width="118" height="66" rx="3" fill="#ffffff33"/>
+            <text x="501" y="127" text-anchor="middle" fill="#fff" font-size="8">doctors</text>
+            <text x="611" y="127" text-anchor="middle" fill="#fff" font-size="8">slots</text></g>
+          <line x1="150" y1="101" x2="185" y2="101" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="385" y1="101" x2="420" y2="101" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="350" y="190" text-anchor="middle" font-size="10" fill="#A8A49B">same routes and providers; only the layout widget changes</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">lib/shell/scaffold_with_nav_bar.dart — choose by width</span>
+        <pre class="code">Widget build(BuildContext context) {
+  <span class="kw">final</span> width = MediaQuery.sizeOf(context).width;      <span class="cm">// sizeOf: rebuilds on size only</span>
+  <span class="kw">return</span> width &lt; <span class="st">600</span>
+      ? Scaffold(body: navigationShell, bottomNavigationBar: NavigationBar(…))
+      : Scaffold(body: SafeArea(child: Row(children: [
+          NavigationRail(…, extended: width &gt;= <span class="st">840</span>),
+          Expanded(child: navigationShell),
+        ])));
+}
+<span class="cm">// Inside a pane, prefer LayoutBuilder: it gives the pane's own constraints, not the screen's.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Text size is the other half. Users with large system text are common, especially among older patients.
+        Flutter applies the setting through <code class="inline">MediaQuery.textScalerOf</code> (the old
+        <code class="inline">textScaleFactor</code> is deprecated). Test at the largest setting on a small phone, and
+        don't let an agent "fix" overflow by clamping the text scaler to 1.0: that removes the accessibility
+        feature. Wrap, scroll or ellipsise instead, using the constraints rule from MB1.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Vietnamese and English with gen-l10n</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Flutter's built-in localisation reads <strong>ARB files</strong> (JSON with ICU message syntax) and generates
+        a typed <code class="inline">AppLocalizations</code> class. Every user-facing string goes in the ARB files
+        from the first screen. Adding a second language later means finding every hard-coded string in the app.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/l10n/app_en.arb — plurals and placeholders</span>
+        <pre class="code">{
+  <span class="st">"slotsLeft"</span>: <span class="st">"{count, plural, =0{No slots left} =1{1 slot left} other{{count} slots left}}"</span>,
+  <span class="st">"@slotsLeft"</span>: { <span class="st">"placeholders"</span>: { <span class="st">"count"</span>: { <span class="st">"type"</span>: <span class="st">"int"</span> } } },
+  <span class="st">"bookedWith"</span>: <span class="st">"Booked with {doctor} on {date}"</span>,
+  <span class="st">"@bookedWith"</span>: { <span class="st">"placeholders"</span>: {
+    <span class="st">"doctor"</span>: { <span class="st">"type"</span>: <span class="st">"String"</span> },
+    <span class="st">"date"</span>: { <span class="st">"type"</span>: <span class="st">"DateTime"</span>, <span class="st">"format"</span>: <span class="st">"yMMMMEEEEd"</span> }   <span class="cm">// formatted per locale</span>
+  } }
+}
+<span class="cm">// app_vi.arb has the same keys. Then in a widget:</span>
+<span class="cm">//   final l10n = AppLocalizations.of(context)!;</span>
+<span class="cm">//   Text(l10n.slotsLeft(slots.length))</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Setup is <code class="inline">flutter_localizations</code> and <code class="inline">intl</code> in
+        <code class="inline">pubspec.yaml</code>, <code class="inline">generate: true</code>, an
+        <code class="inline">l10n.yaml</code>, and <code class="inline">localizationsDelegates</code> plus
+        <code class="inline">supportedLocales</code> on <code class="inline">MaterialApp</code>. The Flutter
+        internationalisation guide has the current file layout. Three review rules:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>No string concatenation.</strong> <code class="inline">'$count ' + 'slots'</code> can't be translated: word order and plurals differ between languages. Use one message with placeholders.</li>
+        <li><strong>Dates and money through <code class="inline">intl</code>.</strong> <code class="inline">DateFormat.yMMMd(locale)</code> and <code class="inline">NumberFormat.currency(locale: 'vi_VN', symbol: '₫', decimalDigits: 0)</code>. "12/05" means different days in different countries.</li>
+        <li><strong>Test with the longer language.</strong> Vietnamese labels are often longer than the English ones, and German-length strings break buttons. Switch the device language and look at every screen you changed.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Accessibility you can check on your own phone</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Flutter builds a <strong>semantics tree</strong> next to the widget tree, and that is what TalkBack (Android)
+        and VoiceOver (iOS) read. Standard Material widgets fill it in for you. Custom widgets built from
+        <code class="inline">GestureDetector</code> and <code class="inline">Container</code>, which agents love, give
+        the screen reader nothing.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/booking/slot_chip.dart — a custom widget with semantics</span>
+        <pre class="code">Semantics(
+  button: <span class="kw">true</span>,
+  enabled: !slot.isBooked,
+  selected: isSelected,
+  label: l10n.slotLabel(slot.start, doctor.name),   <span class="cm">// "9:30, Tuesday 12 May, Dr. Lan"</span>
+  excludeSemantics: <span class="kw">true</span>,                           <span class="cm">// don't also read the raw "09:30" text</span>
+  child: InkWell(
+    onTap: slot.isBooked ? <span class="kw">null</span> : () =&gt; onSelect(slot.id),
+    child: ConstrainedBox(
+      constraints: <span class="kw">const</span> BoxConstraints(minWidth: <span class="st">48</span>, minHeight: <span class="st">48</span>), <span class="cm">// Material minimum tap target</span>
+      child: Center(child: Text(formatTime(context, slot.start))),
+    ),
+  ),
+)
+<span class="cm">// Simpler: use a real ChoiceChip or FilledButton and you get most of this for free.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The five-minute check: turn on TalkBack or VoiceOver, close your eyes, and book a slot. Every control must be
+        announced with a name and a role, the order must make sense, and booked slots must say they are unavailable.
+        Icon-only buttons need a <code class="inline">tooltip</code> (which doubles as their label). Automating these
+        checks in widget tests is in <a href="./mb4.html" class="text-viol underline decoration-viol/40">MB4</a>.
+      </p>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents write plausible state and navigation code quickly, but they test the path they built, not the paths
+        around it. Put your conventions in <code class="inline">CLAUDE.md</code> (which state library, where state
+        lives, "all strings in ARB files", "no colours outside theme.dart") so you don't repeat them in every prompt
+        (<a href="./ag2.html" class="text-viol underline decoration-viol/40">AG2</a>), and make the agent run
+        <code class="inline">build_runner</code>, <code class="inline">flutter analyze</code> and
+        <code class="inline">flutter test</code> before it reports done.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — a tab with state, routes and strings done properly</span>
+        <pre class="code">Add the "My bookings" tab as a StatefulShellBranch at /bookings, with
+/bookings/:bookingId for details. Follow lib/booking/ conventions:
+- Riverpod with riverpod_generator: an AsyncNotifier for the list, family by ID for
+  details. Render AsyncValue with an exhaustive switch (loading, error+retry, empty, data).
+- Cancelling a booking must invalidate the list and the slot picker for that doctor.
+- Details load from the ID in the path only (no `extra`), so a deep link works cold.
+- All strings in app_en.arb and app_vi.arb; dates via intl in the current locale.
+Run build_runner, flutter analyze and flutter test; paste the summaries.</pre>
+      </div>
+      <pre class="code mt-3">Review lib/ for state bugs: ref.read in build, ref.watch in callbacks,
+side effects in build instead of ref.listen, missing mounted/ref.mounted/isClosed
+checks after await, controllers or FocusNodes not disposed, state objects mutated
+in place, hard-coded colours or strings. Give file:line and the minimal fix. No edits yet.</pre>
+      <pre class="code mt-3">Walk me through what happens, provider by provider and route by route, when the
+access token expires while the user is on /bookings/981. Then list what the user
+sees and where they land after logging in again.
+<span class="cm"># making the agent trace the flow finds redirect and invalidation bugs before you test</span></pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Scaffold notifiers, cubits, freezed state classes and run code generation</li>
+            <li>Convert a ChangeNotifier ViewModel to Riverpod or Bloc in the project's style</li>
+            <li>Build the route tree, shell branches and typed routes</li>
+            <li>Extract hard-coded strings into ARB files for both languages</li>
+            <li>Add <code class="inline">Semantics</code>, tooltips and tap-target sizes to custom widgets</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every <code class="inline">watch</code>/<code class="inline">read</code>/<code class="inline">listen</code> is in the right place</li>
+            <li>Every <code class="inline">keepAlive</code> or global: what is its real lifetime, and is it cleared on logout?</li>
+            <li>Tab switching keeps stacks; logout from a deep screen lands on login; Back works on both platforms</li>
+            <li>Double-tap Save on a throttled network sends one request</li>
+            <li>Dark mode, largest text, Vietnamese, and a screen reader, on a real small phone</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent output:</strong> <code class="inline">ref.read</code> inside
+        <code class="inline">build</code> · a snackbar or <code class="inline">context.go</code> called directly in
+        <code class="inline">build</code> · <code class="inline">extra: booking</code> to pass data between routes ·
+        <code class="inline">WillPopScope</code> · <code class="inline">TextEditingController()</code> in
+        <code class="inline">build</code> · <code class="inline">list.add(x); emit(state)</code> ·
+        <code class="inline">textScaler: TextScaler.noScaling</code> to fix an overflow · <code class="inline">Color(0xFF…)</code>
+        or an English string literal inside a screen widget · a second state management package in
+        <code class="inline">pubspec.yaml</code>.
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has only used <code class="inline">setState</code> and single-screen navigation.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can name the four kinds of state and explain watch vs read. Accepts agent state code if the screen appears to work.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Builds multi-tab flows with an agent in the project's state library, catches the six state bugs in review, ships forms that submit once and show server errors, and checks dark mode, large text, both languages and a screen reader. Asks the mentor about provider lifetimes and route structure for new features.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Designs the provider graph and route tree for a feature alone, scopes every piece of state to its real lifetime, and builds adaptive layouts for phone and tablet without being asked.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the team's state, routing, theming and l10n conventions, and turns them into CLAUDE.md rules, lints and review checklists.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> in your last Flutter PR, can you point to where each piece of
+        state lives and say when it is disposed? If you log out from the deepest screen, where do you land, and is any
+        of the previous user's data still in memory? Does the screen work in Vietnamese at the largest text size?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Everything keepAlive</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Screen data that never disposes goes stale and survives logout. Default to auto-dispose and keep alive only what is truly app-wide: auth, settings, locale.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Objects through route extras</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">They vanish on deep links and restarts and go stale immediately. Put the ID in the path and load the rest from a provider.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Translating at the end</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Extracting strings from forty finished screens takes days and misses plurals and date formats. Start with ARB files on screen one.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Invalidate, don't patch</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">After a mutation, invalidating the affected providers and re-fetching is simpler and safer than editing three cached lists by hand.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Use select for big objects</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">ref.watch(p.select(…))</code> or <code class="inline">BlocSelector</code> rebuilds a widget only when the field it shows changes. Check with the DevTools rebuild counter.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep a "worst case" device profile</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Small Android phone, largest text, dark mode, Vietnamese, TalkBack on. Five minutes on it finds more bugs than an hour on a big simulator.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="state-map"> <span>Classified every piece of state in one feature as ephemeral, server cache, app state or route, and showed my mentor where each lives and when it is disposed.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="state-review"> <span>Reviewed agent-written state code for the six bugs (read/watch/listen, mounted checks, disposal, over-watching, logic in widgets, mutation) and fixed what I found.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tabs-auth"> <span>Built bottom tabs that keep their stacks, and an auth redirect that reacts to logout and returns the user to where they were after login.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="form-submit"> <span>Shipped a form with correct keyboards, autofill and focus order that submits once on a throttled network and shows server errors on the right fields.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tabbed-app-pr"> <span class="font-semibold">Extended the MB1 patient app with Claude Code into three tabs (Doctors, My bookings, Profile) with Riverpod or the project's library, a login wall, a patient-details form, a dark theme and Vietnamese + English. Opened a PR with widget tests for each AsyncValue state and screenshots or a recording on a small phone showing tab switching, logout from a deep screen, dark mode, largest text and Vietnamese (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://riverpod.dev/docs/introduction/getting_started" target="_blank" rel="noopener">Riverpod — Getting started</a> · <a class="text-coral underline" href="https://riverpod.dev/docs/3.0_migration" target="_blank" rel="noopener">Migrating to 3.0</a> — notifiers, AsyncValue, families and what changed in v3.</li>
+        <li><a class="text-coral underline" href="https://bloclibrary.dev/" target="_blank" rel="noopener">Bloc library — Documentation</a> — Cubit vs Bloc, BlocBuilder, BlocListener and BlocSelector from Part II.</li>
+        <li><a class="text-coral underline" href="https://pub.dev/documentation/go_router/latest/topics/Configuration-topic.html" target="_blank" rel="noopener">go_router — Configuration</a> · <a class="text-coral underline" href="https://pub.dev/documentation/go_router/latest/topics/Redirection-topic.html" target="_blank" rel="noopener">Redirection</a> — shell routes, StatefulShellRoute and auth redirects.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/cookbook/forms/validation" target="_blank" rel="noopener">Flutter — Build a form with validation</a> — Form, TextFormField and validators.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/ui/adaptive-responsive" target="_blank" rel="noopener">Flutter — Adaptive and responsive design</a> — window size classes, LayoutBuilder vs MediaQuery, and large screens.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/ui/internationalization" target="_blank" rel="noopener">Flutter — Internationalizing Flutter apps</a> — gen-l10n setup, ARB files, plurals and date placeholders.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/ui/accessibility-and-internationalization/accessibility" target="_blank" rel="noopener">Flutter — Accessibility</a> — semantics, screen readers, tap targets and text scaling.</li>
+        <li><a class="text-coral underline" href="./mb3.html">MB3 — Data, Offline &amp; Device Features</a> — the real API, tokens, deep links and push notifications behind these screens.</li>
+      </ul>

@@ -1,0 +1,639 @@
+<!-- meta: days=2 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Mobile Release, Performance &amp; Production Readiness</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Getting a build into TestFlight is the start of the job. Once the app is on real phones it has to scroll
+          smoothly on a three-year-old Android, tell you when it crashes, ship through a pipeline nobody runs by hand,
+          roll out gradually, and keep working for the users who never update. This module covers Flutter performance
+          with DevTools, crash reporting and analytics, CI/CD with Fastlane or Codemagic, store release in depth, and
+          how to keep old versions alive with forced updates, kill switches and code push.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> an agent tests on a fast simulator in debug mode,
+          where nothing is ever janky and every crash shows up in the console. Your users run release builds on slow
+          phones, with obfuscated stack traces and no console at all. The agent also can't see the Play Console, the
+          phased rollout or the 20% of users still on v1.0. Those are exactly the places mobile incidents happen, and
+          a bug that escapes takes days of store review to fix, not a redeploy. You own the parts the agent can't see.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Performance</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Measure in profile mode on a cheap phone, then fix the one thing the timeline shows</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Our running example is the patient app of the clinic booking system from
+        <a href="./mb1.html" class="text-viol underline decoration-viol/40">MB1</a>. Version 1.3 added photos to the
+        doctor list, and the reviews started: "the list stutters when I scroll". On the developer's iPhone
+        simulator it is perfectly smooth. That gap is where this Part starts.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Debug mode lies about speed</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Flutter builds in three modes, and only two of them tell the truth about performance. Debug mode runs Dart
+        in a just-in-time VM with assertions and hot reload, and it is <strong>much slower</strong> than what users
+        get. Never judge speed in debug mode, and never accept "it feels fine" from an agent that only ran
+        <code class="inline">flutter run</code>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Mode</th><th class="px-4 py-3">Command</th><th class="px-4 py-3">Use it for</th><th class="px-4 py-3">Don't use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Debug</td><td class="px-4 py-3"><code class="inline">flutter run</code></td><td class="px-4 py-3">Building features, hot reload, the widget inspector</td><td class="px-4 py-3">Any statement about speed or smoothness</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Profile</td><td class="px-4 py-3"><code class="inline">flutter run --profile</code></td><td class="px-4 py-3">Measuring: close to release speed, with DevTools still attached. Real device only (not simulators)</td><td class="px-4 py-3">Shipping</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Release</td><td class="px-4 py-3"><code class="inline">flutter run --release</code></td><td class="px-4 py-3">The final smoke test: obfuscation, tree shaking, real config</td><td class="px-4 py-3">Diagnosing: no DevTools, no debugging</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Measure on the <strong>slowest phone your users realistically have</strong>, not the newest one on the team.
+        For a Vietnamese consumer app that often means a mid-range Android from a few years ago. Keep one on your
+        desk. A problem you can't reproduce on your own device, you can't verify you fixed.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Reading the frame chart: UI thread or raster thread?</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        To look smooth at 60 Hz, each frame has about <strong>16 ms</strong> (about 8 ms at 120 Hz). Flutter splits a
+        frame across two threads. The <strong>UI thread</strong> runs your Dart code: <code class="inline">build</code>,
+        layout, and anything else you do on the main isolate. The <strong>raster thread</strong> turns the resulting
+        layer tree into GPU commands. The Performance view in Flutter DevTools shows both as bars per frame, and
+        frames over budget in red. The first question is always <em>which</em> bar is red, because the fixes are
+        completely different.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="One Flutter frame: UI thread builds and lays out, raster thread paints; each has a 16 ms budget at 60 Hz">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">ONE FRAME · 16 MS BUDGET AT 60 HZ</text>
+          <text x="12" y="62" font-size="10" font-weight="700" fill="#6E6B64">UI thread</text>
+          <g class="anim-pulse"><rect x="90" y="40" width="130" height="40" rx="9" fill="#2563EB"/>
+            <text x="155" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">build()</text>
+            <text x="155" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">your widgets</text></g>
+          <g class="anim-pulse d1"><rect x="230" y="40" width="110" height="40" rx="9" fill="#6d5acd"/>
+            <text x="285" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Layout</text>
+            <text x="285" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">constraints</text></g>
+          <g class="anim-pulse d2"><rect x="350" y="40" width="110" height="40" rx="9" fill="#D97757"/>
+            <text x="405" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Paint</text>
+            <text x="405" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">layer tree</text></g>
+          <line x1="460" y1="60" x2="480" y2="120" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="12" y="142" font-size="10" font-weight="700" fill="#6E6B64">Raster thread</text>
+          <g class="anim-pulse d3"><rect x="480" y="120" width="200" height="40" rx="9" fill="#0D9488"/>
+            <text x="580" y="138" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Rasterise on GPU</text>
+            <text x="580" y="152" text-anchor="middle" fill="#ffffffbb" font-size="9">Impeller · layers · images</text></g>
+          <text x="155" y="105" text-anchor="middle" font-size="10" fill="#A8A49B">red here: too much Dart work</text>
+          <text x="155" y="119" text-anchor="middle" font-size="10" fill="#A8A49B">rebuilds, JSON parsing, sorting</text>
+          <text x="580" y="185" text-anchor="middle" font-size="10" fill="#A8A49B">red here: too expensive to draw</text>
+          <text x="580" y="199" text-anchor="middle" font-size="10" fill="#A8A49B">huge images, Opacity, clips, shadows</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Flutter's renderer, <strong>Impeller</strong>, is now the default on iOS and on modern Android devices. It
+        precompiles its shaders, so the old "first-run jank" from shader compilation is mostly gone. If an agent
+        suggests shader warm-up tricks from an old blog post, check whether they still apply to your Flutter version.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The five culprits in agent-written Flutter</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Almost every janky screen in a review comes down to one of these. Turn on rebuild tracking in DevTools and
+        scroll the doctor list: a widget whose rebuild count climbs while nothing on it changes is your first lead.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">doctor_list.dart — the janky version and the fix</span>
+        <pre class="code"><span class="cm">// ✗ 1. builds all 800 rows up front, even the ones off screen</span>
+ListView(children: doctors.map((d) =&gt; DoctorTile(d)).toList());
+<span class="cm">// ✓ builds only visible rows, recycles as you scroll</span>
+ListView.builder(itemCount: doctors.length, itemBuilder: (_, i) =&gt; DoctorTile(doctors[i]));
+
+<span class="cm">// ✗ 2. decodes a 4000×3000 photo to show it at 56×56</span>
+Image.network(d.photoUrl, width: <span class="st">56</span>, height: <span class="st">56</span>);
+<span class="cm">// ✓ decode at display size (×device pixel ratio), and cache on disk</span>
+CachedNetworkImage(imageUrl: d.photoUrl, memCacheWidth: <span class="st">168</span>, width: <span class="st">56</span>, height: <span class="st">56</span>);
+
+<span class="cm">// ✗ 3. parses 2 MB of JSON on the UI isolate: the frame freezes</span>
+<span class="kw">final</span> list = parseDoctors(body);
+<span class="cm">// ✓ move heavy CPU work to another isolate</span>
+<span class="kw">final</span> list = <span class="kw">await</span> Isolate.run(() =&gt; parseDoctors(body));
+
+<span class="cm">// ✗ 4. Opacity on a big subtree forces an offscreen layer (saveLayer) every frame</span>
+Opacity(opacity: <span class="st">0.5</span>, child: DoctorCard(d));
+<span class="cm">// ✓ fade the colour, or use FadeTransition for animations</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The fifth culprit is <strong>rebuild scope</strong>: a <code class="inline">setState</code> or a
+        <code class="inline">notifyListeners</code> high in the tree rebuilds every row when one heart icon toggles.
+        Push state down to the widget that shows it, mark widgets <code class="inline">const</code> where their inputs
+        never change, and listen to the narrowest piece of state (how to do that with your state library is in
+        <a href="./mb2.html" class="text-viol underline decoration-viol/40">MB2</a>). Fix one thing, re-measure, and
+        keep the before/after frame chart for the PR.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Startup time and app size</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Users judge an app in its first two seconds, and a download over about 100 MB on mobile data is one many of
+        them skip. Most slow starts come from doing work before the first frame: initialising five SDKs, reading
+        the whole local database, awaiting a network call in <code class="inline">main()</code>. Show the first
+        screen, then load. For size, measure before you cut:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terminal — measuring size</span>
+        <pre class="code">flutter build appbundle --analyze-size --target-platform android-arm64
+<span class="cm"># writes a size breakdown you open in DevTools → App Size: packages, assets, native libs</span>
+
+flutter build apk --split-per-abi     <span class="cm"># one APK per CPU type, for side-loading or other stores</span>
+<span class="cm"># The Play Store already splits an .aab per device, so users never download all ABIs.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The usual size wins are boring: uncompressed PNGs and bundled fonts you don't use, and a heavy package an
+        agent added for one helper function. Deferred components (loading part of the app on demand) exist for
+        Android, but they add real complexity. Reach for them only when the size report says you must.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Crashes and analytics</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A crash you can't see still happened, just to your users</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Two days after v1.4 reaches 10% of users, the Play Console shows a crash rate rising on a handful of Samsung
+        models. Nobody on the team can reproduce it. Without crash reporting you would learn about it from one-star
+        reviews. With it, you have a stack trace, the device model, the OS version, the app version and the last
+        screens the user visited, within minutes. Observability in general is covered in
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>. This Part is the mobile version.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Catch every error path, not just the ones in try/catch</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Flutter reports errors through two different channels. Errors inside the framework (build, layout, paint)
+        go to <code class="inline">FlutterError.onError</code>. Uncaught asynchronous errors go to
+        <code class="inline">PlatformDispatcher.instance.onError</code>. A setup that wires only one of them misses
+        half your crashes. The two common tools are <strong>Firebase Crashlytics</strong> and <strong>Sentry</strong>;
+        both work well with Flutter. Pick the one your team already uses for other apps.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/main.dart — Crashlytics wired to both channels</span>
+        <pre class="code"><span class="kw">Future</span>&lt;<span class="kw">void</span>&gt; <span class="fn">main</span>() <span class="kw">async</span> {
+  WidgetsFlutterBinding.ensureInitialized();
+  <span class="kw">await</span> Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  <span class="cm">// framework errors: build, layout, paint</span>
+  FlutterError.onError = FirebaseCrashlytics.instance.recordFlutterFatalError;
+  <span class="cm">// uncaught async errors that never reach the framework</span>
+  PlatformDispatcher.instance.onError = (error, stack) {
+    FirebaseCrashlytics.instance.recordError(error, stack, fatal: <span class="kw">true</span>);
+    <span class="kw">return true</span>;                                   <span class="cm">// handled: don't also crash to the OS</span>
+  };
+  <span class="cm">// don't pollute production data with your own debug sessions</span>
+  <span class="kw">await</span> FirebaseCrashlytics.instance.setCrashlyticsCollectionEnabled(!kDebugMode);
+
+  runApp(<span class="kw">const</span> PatientApp());
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Record <strong>non-fatal</strong> errors too: a booking request that fails with a 500, a JSON field that
+        was unexpectedly null. <code class="inline">recordError(e, stack, fatal: false)</code> in the repository's
+        catch block turns "some users say booking doesn't work" into a count, a stack trace and a device list. What
+        is <em>not</em> fine is the agent's favourite: <code class="inline">catch (_) {}</code>, which hides the error
+        from the user, from you and from the crash tool at the same time.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Obfuscated stack traces are useless without their symbols</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Release builds should be obfuscated: it shrinks the app and makes reverse engineering harder. But an
+        obfuscated stack trace reads like <code class="inline">a.b.c</code>. To turn it back into file names and line
+        numbers, the crash tool needs the <strong>symbol files</strong> from that exact build. Upload them from CI on
+        every release, or the one crash you urgently need to read will be unreadable.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">ci — build obfuscated, then upload symbols</span>
+        <pre class="code">flutter build appbundle --flavor production \
+  --obfuscate --split-debug-info=build/symbols      <span class="cm"># Dart symbols land here</span>
+
+<span class="cm"># Crashlytics: upload the Dart symbols for this build</span>
+firebase crashlytics:symbols:upload --app=<span class="st">$FIREBASE_ANDROID_APP_ID</span> build/symbols
+<span class="cm"># iOS also needs its dSYM files uploaded (the Crashlytics build phase or Fastlane does this)</span>
+
+<span class="cm"># Sentry: the sentry_dart_plugin uploads Dart symbols and dSYMs in one step</span>
+dart run sentry_dart_plugin</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Keep <code class="inline">build/symbols</code> out of git, and keep it out of the app bundle. It belongs
+        to the crash tool and to your CI artifacts, nowhere else.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Releases, breadcrumbs and what never goes in a crash report</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A crash report is only as useful as the context around it. The table is what to attach, and the last row is
+        what to keep out.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Context</th><th class="px-4 py-3">Why</th><th class="px-4 py-3">Clinic app example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Release / version</td><td class="px-4 py-3">"Did v1.4 cause this?" is the first question in every incident</td><td class="px-4 py-3"><code class="inline">1.4.0+27</code>, set automatically from <code class="inline">pubspec.yaml</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Environment / flavor</td><td class="px-4 py-3">Staging crashes must not wake anyone up</td><td class="px-4 py-3"><code class="inline">production</code> vs <code class="inline">staging</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Breadcrumbs</td><td class="px-4 py-3">The last screens and actions before the crash</td><td class="px-4 py-3">"/doctors → /doctors/42 → tapped Book"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Anonymous user ID</td><td class="px-4 py-3">Count affected users, find one user's crashes for support</td><td class="px-4 py-3">An internal ID, <strong>not</strong> email or phone</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Never</td><td class="px-4 py-3">Crash tools are third parties; this is personal and medical data</td><td class="px-4 py-3">Names, phone numbers, symptoms, tokens, full request bodies</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Analytics: a few events you will actually read</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Agents love to add an analytics call to every button. Nobody reads that data. Start with screen views and
+        the three or four events that describe your funnel: <code class="inline">search_doctor</code>,
+        <code class="inline">view_slots</code>, <code class="inline">booking_started</code>,
+        <code class="inline">booking_confirmed</code>. Now "where do users drop off?" has an answer.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/analytics.dart — screen views plus funnel events</span>
+        <pre class="code"><span class="kw">final</span> router = GoRouter(
+  observers: [FirebaseAnalyticsObserver(analytics: FirebaseAnalytics.instance)], <span class="cm">// screen views</span>
+  routes: appRoutes,
+);
+
+<span class="kw">Future</span>&lt;<span class="kw">void</span>&gt; <span class="fn">logBookingConfirmed</span>(Booking b) =&gt;
+    FirebaseAnalytics.instance.logEvent(name: <span class="st">'booking_confirmed'</span>, parameters: {
+      <span class="st">'clinic_id'</span>: b.clinicId,        <span class="cm">// IDs and categories: yes</span>
+      <span class="st">'lead_time_days'</span>: b.leadTimeDays,
+      <span class="cm">// 'reason': b.reason            ✗ free text from a patient: never</span>
+    });</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Respect consent. If the app asks users to opt in, collection stays off
+        (<code class="inline">setAnalyticsCollectionEnabled(false)</code>) until they do. On iOS, tracking users
+        across other companies' apps also requires the App Tracking Transparency prompt. Whatever you collect must
+        match what you declare to the stores (Part III).
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · CI/CD and the stores</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Nobody on the team should be able to release from their laptop</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <a href="./mb1.html" class="text-viol underline decoration-viol/40">MB1</a> showed the steps once: flavors,
+        signing, TestFlight and the Play Console. Doing them by hand works the first time and fails on the fifth,
+        usually at 6 pm on release day with the wrong keystore. The fix is a pipeline that builds, signs, uploads and
+        numbers every release the same way. The GitHub Actions mechanics (workflows, secrets, OIDC) are in
+        <a href="./op2.html" class="text-viol underline decoration-viol/40">OP2</a>. The quality gates that run
+        before a build (analyze, tests) are in <a href="./mb4.html" class="text-viol underline decoration-viol/40">MB4</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The pipeline: from tag to testers</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    TAG["git tag v1.4.0"] --> GATE["analyze + test<br/>(MB4 gates)"]
+    GATE --> BA["Android job<br/>build .aab · sign"]
+    GATE --> BI["iOS job (macOS runner)<br/>match certs · build .ipa"]
+    BA --> SYM["upload symbols<br/>to crash tool"]
+    BI --> SYM
+    BA --> PI["Play internal track<br/>(supply)"]
+    BI --> TF["TestFlight internal<br/>(pilot)"]
+    PI --> HUM{"QA on real devices<br/>+ release notes"}
+    TF --> HUM
+    HUM -->|"a human presses"| PROD["Store review →<br/>staged rollout"]
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two tools dominate. <strong>Codemagic</strong> is a CI service built around Flutter: it handles macOS
+        runners and iOS code signing for you, which is the hardest part to set up. <strong>GitHub Actions with
+        Fastlane</strong> keeps everything next to your code and is common when the team already uses Actions for the
+        backend. Either is fine. What matters is that production builds come only from the pipeline, and that
+        promoting to production stays a deliberate human step.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Fastlane: signing and uploading as code</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Fastlane is a Ruby tool with actions for everything the stores need. Three matter most:
+        <strong>match</strong> keeps iOS certificates and provisioning profiles encrypted in a private repo or bucket,
+        so every machine signs with the same identity; <strong>pilot</strong> (<code class="inline">upload_to_testflight</code>)
+        uploads to TestFlight; <strong>supply</strong> (<code class="inline">upload_to_play_store</code>) uploads to a Play
+        track.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">ios/fastlane/Fastfile — a beta lane</span>
+        <pre class="code">lane <span class="st">:beta</span> <span class="kw">do</span>
+  setup_ci                                          <span class="cm"># temporary keychain on the CI runner</span>
+  match(type: <span class="st">"appstore"</span>, readonly: <span class="kw">true</span>)          <span class="cm"># CI reads certs, never creates them</span>
+  build_number = latest_testflight_build_number + <span class="st">1</span>
+  sh(<span class="st">"cd ../.. &amp;&amp; flutter build ipa --flavor production --obfuscate "</span> \
+     <span class="st">"--split-debug-info=build/symbols --build-number=#{build_number} "</span> \
+     <span class="st">"--export-options-plist=ios/ExportOptions.plist"</span>)
+  upload_to_testflight(ipa: <span class="st">"../build/ios/ipa/patient_app.ipa"</span>,
+                       skip_waiting_for_build_processing: <span class="kw">true</span>)
+<span class="kw">end</span>
+<span class="cm"># Android lane: google_play_track_version_codes → flutter build appbundle → upload_to_play_store(track: "internal")</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note <code class="inline">readonly: true</code>. If an agent writes a lane that lets CI create or revoke
+        certificates, one bad run can invalidate the signing identity the whole team uses.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Secrets and build numbers in CI</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The pipeline needs the Android upload keystore, its passwords, the match passphrase, an App Store Connect
+        API key and a Play service-account key. All of them live in the CI secret store and are written to disk only
+        for the length of the job. Secrets management as a concept is in
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">.github/workflows/android-release.yml — the signing step</span>
+        <pre class="code">- name: Restore upload keystore
+  run: |
+    echo <span class="st">"${{ secrets.ANDROID_KEYSTORE_BASE64 }}"</span> | base64 -d &gt; android/app/upload.jks
+    cat &gt; android/key.properties &lt;&lt;EOF
+    storeFile=upload.jks
+    storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+    keyAlias=upload
+    keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+    EOF
+- name: Build
+  run: flutter build appbundle --flavor production --build-number=${{ github.run_number }}
+  <span class="cm"># run_number only goes up: every upload gets a fresh, larger build number</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The version name (<code class="inline">1.4.0</code>) is a product decision you make in
+        <code class="inline">pubspec.yaml</code>. The build number is a machine counter CI sets. Keeping those two jobs
+        separate ends the "build number already used" rejection for good.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Test tracks and staged rollout</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Both stores let you release to a small group first. Use every stage. A crash on 1% of users is an
+        incident; the same crash on 100% is a crisis.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Stage</th><th class="px-4 py-3">Google Play</th><th class="px-4 py-3">Apple</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Team testing</td><td class="px-4 py-3">Internal testing track: available within minutes, small tester list</td><td class="px-4 py-3">TestFlight internal testers (your App Store Connect team), no review</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Wider beta</td><td class="px-4 py-3">Closed testing (invited lists), then open testing. New personal developer accounts must run a closed test before production (check the current tester and day requirements)</td><td class="px-4 py-3">TestFlight external testers: needs a light beta review; builds expire after 90 days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Gradual production</td><td class="px-4 py-3"><strong>Staged rollout</strong>: you pick the percentage (say 5% → 20% → 50% → 100%) and can halt it</td><td class="px-4 py-3"><strong>Phased release</strong>: automatic 7-day ramp for auto-updates; you can pause it. Anyone can still update manually</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Stop a bad release</td><td class="px-4 py-3">Halt the rollout. Users who already got it keep it, so ship a fix with a higher build number</td><td class="px-4 py-3">Pause the phased release, or remove the version from sale and ship a fix</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Neither store has a rollback button. "Rolling back" means shipping the old code again as a <em>new</em>
+        build with a higher number. That is why the percentage stages, the kill switches in Part IV and the crash
+        dashboard during rollout matter so much.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Review rejections you can prevent</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A rejection costs a day or more per round trip. Most are predictable, so check them before you submit. Store
+        policies change often: treat this list as a starting point and read the current guidelines.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Permission strings.</strong> Every iOS permission needs a clear usage description that says why ("to photograph your insurance card"), not "needs camera".</li>
+        <li><strong>Privacy declarations.</strong> Apple's privacy manifest (<code class="inline">PrivacyInfo.xcprivacy</code>) and App Store privacy labels, and Google Play's Data safety form, must match what the app and every SDK in it actually collect. Adding Crashlytics or Analytics changes the answers.</li>
+        <li><strong>Account deletion.</strong> If users can create an account in the app, both stores require a way to delete it from within the app (Play also asks for a web link).</li>
+        <li><strong>Demo access.</strong> Reviewers need a working test account. A login wall with no credentials in the review notes is an instant rejection.</li>
+        <li><strong>Target SDK.</strong> Google Play requires new apps and updates to target a recent Android API level. Check the deadline each year before it blocks your release.</li>
+      </ul>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Living with old versions</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every version you ship is a version you support</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        On the web, every user gets the new version on their next page load. On mobile, v1.0 from last year is
+        still installed on phones with auto-update off, and it still calls your API. The backend team renames
+        <code class="inline">GET /slots</code> to <code class="inline">GET /v2/availability</code>, deploys, and the oldest
+        20% of patients can no longer book. Nothing crashed in the new app. The old app broke.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The API must stay backward compatible</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Old as App v1.0 (20% of users)
+    participant New as App v1.4
+    participant API as Booking API
+    New->>API: GET /v2/availability
+    API-->>New: 200 slots
+    Old->>API: GET /slots
+    alt old route kept and deprecated
+        API-->>Old: 200 slots (still works)
+    else old route removed
+        API-->>Old: 404 → "Something went wrong"
+        Note over Old: can't be fixed by a deploy:<br/>the user must update
+    end
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The rule for the backend is additive change only, with old routes kept until usage is near zero (how to
+        version and deprecate is in <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>). The
+        rule for the app is to <strong>send its version on every request</strong>, for example in an
+        <code class="inline">X-App-Version</code> header, so the backend can see who still uses the old route and
+        decide when it is safe to remove.
+      </p>
+      <div class="mt-4 callout callout-danger">
+        <strong>A breaking API change breaks apps you can't redeploy.</strong> Before any backend PR removes or renames
+        a route or a response field, check the version header data for the oldest app still calling it. If that
+        version is above your minimum supported version, the change waits, or ships behind a forced update.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Forced and soft updates</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Sometimes an old version must stop: a security fix, a legal change, an API you really can't keep. Build the
+        mechanism <strong>in v1.0</strong>, because you can't add it later to versions already installed. The app
+        reads a minimum supported version and a recommended version from remote config at startup.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">lib/update_gate.dart — min-version check at startup</span>
+        <pre class="code"><span class="kw">Future</span>&lt;UpdateStatus&gt; <span class="fn">checkForUpdate</span>() <span class="kw">async</span> {
+  <span class="kw">final</span> rc = FirebaseRemoteConfig.instance;
+  <span class="kw">await</span> rc.fetchAndActivate();                        <span class="cm">// with sensible in-app defaults set</span>
+  <span class="kw">final</span> current = Version.parse((<span class="kw">await</span> PackageInfo.fromPlatform()).version);
+  <span class="kw">final</span> minimum = Version.parse(rc.getString(<span class="st">'min_supported_version'</span>));  <span class="cm">// e.g. 1.2.0</span>
+  <span class="kw">final</span> latest  = Version.parse(rc.getString(<span class="st">'latest_version'</span>));         <span class="cm">// e.g. 1.4.0</span>
+
+  <span class="kw">if</span> (current &lt; minimum) <span class="kw">return</span> UpdateStatus.required;    <span class="cm">// blocking screen: "Update to continue"</span>
+  <span class="kw">if</span> (current &lt; latest)  <span class="kw">return</span> UpdateStatus.recommended; <span class="cm">// dismissible banner</span>
+  <span class="kw">return</span> UpdateStatus.upToDate;
+}
+<span class="cm">// If the fetch fails (offline), fall back to the defaults: never block a user because config didn't load.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On Android, the Play <strong>in-app updates</strong> API can download and install the update without leaving
+        the app. On iOS, the best you can do is open the App Store page. A forced update is a blunt tool that annoys
+        every affected user, so use it rarely and never for a feature you'd simply like people to see.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Kill switches and code push</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>kill switch</strong> is a remote flag that turns a feature off without a release. Put new, risky
+        features behind one: when the v1.4 "book for a family member" flow starts failing, you flip
+        <code class="inline">family_booking_enabled</code> to false in Remote Config and the button disappears for
+        everyone within minutes, including users on the phased rollout. Then you fix it calmly.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Code push</strong> goes one step further. <strong>Shorebird</strong> lets you ship patches to the Dart
+        code of an already released Flutter app without a store review. It is genuinely useful for urgent bug fixes,
+        with limits you must know before you rely on it:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tool</th><th class="px-4 py-3">Fixes without a store release</th><th class="px-4 py-3">Can't do</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Remote config flag</td><td class="px-4 py-3">Turn a feature off, change a limit or a text, set the minimum version</td><td class="px-4 py-3">Change any code path that wasn't built to read the flag</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shorebird patch</td><td class="px-4 py-3">Bugs in Dart code of an existing release</td><td class="px-4 py-3">Native code, new plugins or permissions. Store rules also forbid using it to change what the app does or add features that should be reviewed (check the current guidelines)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Store release</td><td class="px-4 py-3">Anything</td><td class="px-4 py-3">Be fast: review plus rollout takes days</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">A release checklist you run every time</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Put this in the repo as <code class="inline">RELEASE.md</code> and paste it into the release PR. The
+        Definition of Done idea behind it is in <a href="./qa3.html" class="text-viol underline decoration-viol/40">QA3</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">RELEASE.md — patient app</span>
+        <pre class="code">Before submitting
+[ ] Version name bumped in pubspec.yaml; build number comes from CI
+[ ] Release build smoke-tested on the slow Android phone and a real iPhone
+[ ] Profile-mode frame chart for the doctor list: no red frames while scrolling
+[ ] Crash tool receives a test non-fatal from this build, with readable symbols
+[ ] New permissions have usage strings; privacy labels / Data safety updated
+[ ] Backend: no route this app's oldest supported version uses was removed
+[ ] Risky features behind a kill switch, default OFF until rollout is healthy
+[ ] Release notes written for users, not for developers
+
+After submitting
+[ ] Staged rollout 5% → watch crash-free users for 24 h → 20% → 50% → 100%
+[ ] Halt criteria agreed in advance (e.g. crash-free users drops below 99.5%)</pre>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Crash-free users is the release metric.</strong> Both Crashlytics and Sentry show the share of users
+        who didn't crash, per version. Compare the new version with the previous one at the same rollout stage, not
+        with a number you remember. A drop is your signal to halt.
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An agent is very good at the text-heavy parts of releasing: Fastfiles, workflow YAML, release notes,
+        checklists, and reading a symbolicated stack trace. It can't feel jank, see the Play Console or judge
+        whether a rollout is healthy. Give it measurements to work from, and keep the actions that touch real users
+        (promoting a build, halting a rollout, flipping a kill switch) for yourself.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">prompt — performance from a measurement, not a guess</span>
+        <pre class="code">The doctor list janks on a Samsung A-series phone in profile mode.
+Attached: DevTools frame chart export and rebuild stats while scrolling.
+1. Tell me whether the red frames are UI-thread or raster-thread, citing the data.
+2. Find the cause in lib/doctors/ (list building, image decoding, rebuild scope,
+   work on the UI isolate, saveLayer). Give file:line.
+3. Propose the smallest fix. Don't change anything else.
+I will re-measure on the device and send you the new chart.</pre>
+      </div>
+      <pre class="code mt-3">Write a GitHub Actions workflow + Fastlane lanes that, on a v* tag, run
+flutter analyze and flutter test, build the production flavor for Android
+and iOS with --obfuscate --split-debug-info, set the build number from CI,
+upload symbols to Crashlytics, and upload to Play internal and TestFlight.
+Secrets come from repository secrets only; match must be readonly.
+Don't create, move or commit any keystore, certificate or key file.
+<span class="cm"># then review every line that touches secrets before merging</span></pre>
+      <pre class="code mt-3">Here is a symbolicated Crashlytics stack trace from v1.4.0+27 (Android 12,
+Samsung only) and the breadcrumbs. Explain the most likely cause, what
+evidence supports it, what would rule it out, and the minimal fix.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft Fastlane lanes, CI workflows and <code class="inline">RELEASE.md</code></li>
+            <li>Wire Crashlytics or Sentry to both error channels</li>
+            <li>Find jank causes from a frame chart you exported</li>
+            <li>Read symbolicated stack traces and suggest hypotheses</li>
+            <li>Write the update gate and kill-switch plumbing, with tests</li>
+            <li>Draft release notes from the merged PRs</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Performance claims against a profile-mode run on a real, slow device</li>
+            <li>Every CI line that reads a secret, and that nothing secret is echoed or committed</li>
+            <li>A readable stack trace arrives from a release build before you ship</li>
+            <li>No personal or medical data in crash reports or analytics events</li>
+            <li>Privacy declarations still match the SDKs in the app</li>
+            <li>Rollout percentages and halts: you press those buttons, not the agent</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent output:</strong> "it's smooth now" with no profile-mode measurement ·
+        <code class="inline">ListView(children: …)</code> over a list from the API · <code class="inline">catch (_) {}</code>
+        or <code class="inline">print(e)</code> instead of recording the error · only <code class="inline">FlutterError.onError</code>
+        wired, no <code class="inline">PlatformDispatcher</code> handler · <code class="inline">--obfuscate</code> without a
+        symbol upload · user email or phone passed to <code class="inline">setUserIdentifier</code> or an analytics
+        event · a keystore, <code class="inline">key.properties</code> or <code class="inline">.p8</code> key file in the
+        diff · <code class="inline">match</code> without <code class="inline">readonly</code> in CI · an API route removed
+        "because the app doesn't use it any more".
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has only run the app in debug mode on a simulator.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows profile mode exists, that crash reporting and staged rollouts are standard, and that old app versions keep calling the API.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Finds and fixes a jank cause from a profile-mode frame chart, wires crash reporting with symbols, ships a build to TestFlight and Play internal through CI, and follows the release checklist. Relies on the mentor for signing setup and rollout decisions.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Runs a release end to end: pipeline, store submission, staged rollout with halt criteria, and a hotfix when the crash rate moves. Designs update gates and kill switches into new features.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the team's release process and mobile observability, sets performance budgets, and negotiates API deprecation timelines with the backend team.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> can you show a before/after frame chart from a real device for
+        something you fixed? Does a crash from your latest release build arrive with readable file names and line
+        numbers? Could you explain to your mentor what happens to v1.0 users if the backend removes a route tomorrow?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Optimising in debug mode</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Debug builds are slow by design. Hours spent "fixing" debug jank often fix nothing users feel. Profile mode on a real device, every time.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Going straight to 100%</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">There is no rollback button in either store. A staged rollout is the only way to find a device-specific crash before it reaches everyone.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Shipping without an update gate</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The min-version check only helps in versions that already contain it. Skip it in v1.0 and you can never force those users to update.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Test the crash pipeline before you need it</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Trigger a test crash from a release build of every new version and confirm it shows up symbolicated. Finding out during an incident is too late.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Send the app version on every request</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An <code class="inline">X-App-Version</code> header lets the backend see exactly who still uses an old route, so deprecations are decided by data.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Agree halt criteria before the rollout</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">"Halt if crash-free users drops below 99.5%" written in advance beats a debate at 11 pm about whether the graph looks bad.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="jank-fix"> <span>Fixed one jank cause and showed my mentor the profile-mode frame chart from a real device, before and after.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="crash-symbols"> <span>Wired crash reporting to both error channels and saw a test crash from an obfuscated release build arrive with readable symbols.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="ci-release"> <span>Shipped a build to TestFlight and Play internal testing from CI, with the build number set by the pipeline and no secrets in git.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="update-gate"> <span>Added a min-supported-version check and one kill switch driven by remote config, with safe offline defaults.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="release-run"> <span class="font-semibold">Ran a full practice release of the patient app with Claude Code: CI pipeline to both test tracks, crash reporting with symbols, a kill switch around one feature, a filled-in RELEASE.md, and a one-page rollout plan with halt criteria and the oldest app version the API must keep supporting (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/perf/best-practices" target="_blank" rel="noopener">Flutter — Performance best practices</a> · <a class="text-coral underline" href="https://docs.flutter.dev/tools/devtools/performance" target="_blank" rel="noopener">DevTools Performance view</a> — the culprits and the frame chart from Part I.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/perf/app-size" target="_blank" rel="noopener">Flutter — Measuring your app's size</a> — <code class="inline">--analyze-size</code> and the App Size tool.</li>
+        <li><a class="text-coral underline" href="https://firebase.google.com/docs/crashlytics/get-started?platform=flutter" target="_blank" rel="noopener">Firebase — Crashlytics for Flutter</a> · <a class="text-coral underline" href="https://docs.sentry.io/platforms/dart/guides/flutter/" target="_blank" rel="noopener">Sentry for Flutter</a> — the two crash tools from Part II.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/deployment/obfuscate" target="_blank" rel="noopener">Flutter — Obfuscating Dart code</a> — <code class="inline">--obfuscate</code>, <code class="inline">--split-debug-info</code> and reading obfuscated traces.</li>
+        <li><a class="text-coral underline" href="https://docs.flutter.dev/deployment/cd" target="_blank" rel="noopener">Flutter — Continuous delivery</a> · <a class="text-coral underline" href="https://docs.fastlane.tools/" target="_blank" rel="noopener">fastlane docs</a> — the pipeline in Part III.</li>
+        <li><a class="text-coral underline" href="https://support.google.com/googleplay/android-developer/answer/6346149" target="_blank" rel="noopener">Google Play — Staged rollouts</a> · <a class="text-coral underline" href="https://developer.apple.com/help/app-store-connect/update-your-app/release-a-version-update-in-phases" target="_blank" rel="noopener">App Store Connect — Phased release</a> — gradual rollout on each store.</li>
+        <li><a class="text-coral underline" href="https://developer.apple.com/app-store/review/guidelines/" target="_blank" rel="noopener">Apple — App Review Guidelines</a> — read before every submission that adds a permission, an SDK or accounts.</li>
+        <li><a class="text-coral underline" href="https://docs.shorebird.dev/" target="_blank" rel="noopener">Shorebird docs</a> — code push for Flutter, and what it can't patch.</li>
+      </ul>
