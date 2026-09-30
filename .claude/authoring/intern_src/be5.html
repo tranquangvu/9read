@@ -1,0 +1,699 @@
+<!-- meta: days=3 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Gin (Go)</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Learn to read, review and extend a Go API built with Gin. Lay out a Go module the way the Go team
+          recommends, write handlers and middleware, bind and validate input, handle every error explicitly, and pass
+          <code class="inline">context.Context</code> all the way to the database. Choose between GORM and sqlc, migrate
+          with golang-migrate, test with <code class="inline">httptest</code>, and run background work safely with
+          goroutines or asynq.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters when AI writes the code:</strong> Go code is verbose and repetitive, so agents write a
+          lot of it quickly, and reviewers skim the repetition. The bugs hide in exactly those skimmed lines: an
+          <code class="inline">err</code> that is checked but not returned, a query that ignores the request's context, a
+          goroutine that outlives its request, a <code class="inline">gin.Context</code> used after the handler has
+          returned. Go makes every one of these visible in the code. You only have to read it.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Philosophy &amp; project map</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Explicit beats magic, and main.go wires everything</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Go's culture is the opposite of Rails': no hidden conventions, no container, no annotations. Every
+        dependency is passed in by hand, every error is a return value you must handle, and the standard library
+        does most of the work. <strong>Gin</strong> is a thin, fast HTTP layer on top: a router, middleware, JSON
+        binding with validation, and response helpers. We target Gin 1.12, which needs Go 1.25 or newer. The
+        running example is the clinic booking app from
+        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>Do you need Gin at all?</strong> Since Go 1.22 the standard library router understands methods and path
+        parameters (<code class="inline">mux.HandleFunc("POST /bookings/{id}", h)</code>), so some teams use plain
+        <code class="inline">net/http</code>. Gin still adds binding, validation and a middleware chain that many client
+        projects rely on. Follow the project you join. Everything in Parts II–IV below except the Gin API itself
+        applies either way.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">What Go gives you, and what you choose</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Need</th><th class="px-4 py-3">Where it comes from</th><th class="px-4 py-3">What to watch in agent code</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Routing, middleware, binding</td><td class="px-4 py-3">Gin</td><td class="px-4 py-3">Gin types leaking into business code</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Validation rules</td><td class="px-4 py-3"><code class="inline">binding:"…"</code> struct tags, checked by go-playground/validator</td><td class="px-4 py-3">Fields with no tag at all</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Dependency injection</td><td class="px-4 py-3">You: constructors called in <code class="inline">main.go</code></td><td class="px-4 py-3">Package-level global variables for the DB or config</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Database access</td><td class="px-4 py-3">GORM (ORM) or sqlc (generated from SQL), on pgx</td><td class="px-4 py-3">Mixing both styles in one project</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cancellation, deadlines</td><td class="px-4 py-3"><code class="inline">context.Context</code> from the standard library</td><td class="px-4 py-3"><code class="inline">context.Background()</code> inside a handler</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Background work</td><td class="px-4 py-3">Goroutines, or asynq for durable jobs</td><td class="px-4 py-3">A bare <code class="inline">go func()</code> doing work that must not be lost</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The project map</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The Go team's own guide to module layout recommends <code class="inline">cmd/&lt;name&gt;/</code> for each binary and
+        <code class="inline">internal/</code> for packages that other modules must not import (the compiler enforces this).
+        The popular "golang-standards/project-layout" repository is <em>not</em> an official standard, so don't let an
+        agent create a dozen empty folders because of it. Keep Gin inside <code class="inline">internal/http</code>: the
+        booking rules should compile without it.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 418" class="w-full min-w-[620px]" role="img" aria-label="Go and Gin project structure map">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">clinic-api/ · A GO MODULE WITH TWO BINARIES</text>
+          <g class="anim-pulse"><rect x="10" y="198" width="150" height="42" rx="9" fill="#37474F"/>
+            <text x="85" y="217" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">clinic-api/</text>
+            <text x="85" y="231" text-anchor="middle" fill="#ffffffbb" font-size="9">go.mod</text></g>
+          <line x1="160" y1="219" x2="215" y2="58" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="215" y="40" width="190" height="36" rx="9" fill="#37474F"/>
+            <text x="310" y="56" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">cmd/api/main.go</text>
+            <text x="310" y="69" text-anchor="middle" fill="#ffffffbb" font-size="9">config, DB pool, router</text></g>
+          <text x="420" y="62" font-size="10" fill="#6E6B64">wiring: the only place objects are built</text>
+          <line x1="160" y1="219" x2="215" y2="104" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="215" y="86" width="190" height="36" rx="9" fill="#D97757"/>
+            <text x="310" y="102" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">cmd/worker/main.go</text>
+            <text x="310" y="115" text-anchor="middle" fill="#ffffffbb" font-size="9">asynq server</text></g>
+          <text x="420" y="108" font-size="10" fill="#6E6B64">a second binary from the same module</text>
+          <line x1="160" y1="219" x2="215" y2="150" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d3"><rect x="215" y="132" width="190" height="36" rx="9" fill="#6d5acd"/>
+            <text x="310" y="148" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">internal/http/</text>
+            <text x="310" y="161" text-anchor="middle" fill="#ffffffbb" font-size="9">router, handlers, middleware</text></g>
+          <text x="420" y="154" font-size="10" fill="#6E6B64">Gin lives here, and only here</text>
+          <line x1="160" y1="219" x2="215" y2="196" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d4"><rect x="215" y="178" width="190" height="36" rx="9" fill="#0D9488"/>
+            <text x="310" y="194" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">internal/booking/</text>
+            <text x="310" y="207" text-anchor="middle" fill="#ffffffbb" font-size="9">service.go, errors.go</text></g>
+          <text x="420" y="200" font-size="10" fill="#6E6B64">business rules; imports no Gin</text>
+          <line x1="160" y1="219" x2="215" y2="242" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d1"><rect x="215" y="224" width="190" height="36" rx="9" fill="#2563EB"/>
+            <text x="310" y="240" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">internal/store/</text>
+            <text x="310" y="253" text-anchor="middle" fill="#ffffffbb" font-size="9">queries/*.sql + sqlc output</text></g>
+          <text x="420" y="246" font-size="10" fill="#6E6B64">data access, generated by sqlc</text>
+          <line x1="160" y1="219" x2="215" y2="288" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="215" y="270" width="190" height="36" rx="9" fill="#37474F"/>
+            <text x="310" y="286" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">internal/config/</text>
+            <text x="310" y="299" text-anchor="middle" fill="#ffffffbb" font-size="9">Config struct</text></g>
+          <text x="420" y="292" font-size="10" fill="#6E6B64">env vars, parsed once at startup</text>
+          <line x1="160" y1="219" x2="215" y2="334" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d3"><rect x="215" y="316" width="190" height="36" rx="9" fill="#DB2777"/>
+            <text x="310" y="332" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">db/migrations/</text>
+            <text x="310" y="345" text-anchor="middle" fill="#ffffffbb" font-size="9">000001_….up.sql / .down.sql</text></g>
+          <text x="420" y="338" font-size="10" fill="#6E6B64">golang-migrate files</text>
+          <line x1="160" y1="219" x2="215" y2="380" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d4"><rect x="215" y="362" width="190" height="36" rx="9" fill="#2563EB"/>
+            <text x="310" y="378" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Dockerfile</text>
+            <text x="310" y="391" text-anchor="middle" fill="#ffffffbb" font-size="9">multi-stage build</text></g>
+          <text x="420" y="384" font-size="10" fill="#6E6B64">static binary on a tiny base image</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">cmd/api/main.go — explicit wiring</span>
+        <pre class="code"><span class="kw">func</span> <span class="fn">main</span>() {
+    cfg := config.MustLoad()                              <span class="cm">// exits with a clear message if env is missing</span>
+    pool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        log.Fatalf(<span class="st">"connect db: %v"</span>, err)
+    }
+    <span class="kw">defer</span> pool.Close()
+
+    queries := store.New(pool)                            <span class="cm">// sqlc-generated</span>
+    bookings := booking.NewService(pool, queries, jobs.NewClient(cfg.RedisURL))
+    router := httpapi.NewRouter(cfg, bookings)            <span class="cm">// handlers get the service, not the pool</span>
+
+    srv := &amp;http.Server{Addr: <span class="st">":8080"</span>, Handler: router, ReadHeaderTimeout: <span class="st">5</span> * time.Second}
+    runWithGracefulShutdown(srv)                          <span class="cm">// Shutdown(ctx) on SIGTERM (Part IV)</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This is Go's dependency injection: plain constructors, called in order, in one file. It is more typing than
+        a container, and every dependency is visible. If a handler reaches for a package-level
+        <code class="inline">var DB *sql.DB</code>, the wiring has been bypassed and tests can no longer swap it.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · The request lifecycle</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every step returns an error, and every step passes the context</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Follow <code class="inline">POST /bookings</code> through the app. Two things travel with it the whole way: the
+        request's <code class="inline">context.Context</code>, which carries the deadline and is cancelled if the client
+        disconnects, and an <code class="inline">error</code> return at every step, which the caller must check.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">One request, end to end</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant MW as Middleware chain
+    participant H as BookingHandler.Create
+    participant S as booking.Service
+    participant Q as store.Queries
+    participant DB as Postgres
+    C->>MW: POST /bookings with slot_id
+    Note over MW: Recovery, Logger, RequestID<br/>Auth sets patientID or aborts 401
+    MW->>H: c.Next
+    Note over H: ShouldBindJSON validates tags<br/>failure returns 400
+    H->>S: Create with ctx, patientID, slotID
+    S->>Q: CreateBooking in a tx, same ctx
+    Q->>DB: INSERT INTO bookings
+    DB-->>Q: row, or error code 23505
+    Q-->>S: Booking, or pgconn.PgError
+    S-->>H: booking, or ErrSlotTaken
+    H-->>C: 201 JSON, or 409 via errors.Is
+        </pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Concern</th><th class="px-4 py-3">Where it lives</th><th class="px-4 py-3">Red flag in a PR</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Panics, logging, request ids</td><td class="px-4 py-3">Global middleware: <code class="inline">r.Use(…)</code></td><td class="px-4 py-3"><code class="inline">gin.New()</code> with no Recovery: one panic kills the process</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Authentication</td><td class="px-4 py-3">Middleware on a route group</td><td class="px-4 py-3">A protected route registered on <code class="inline">r</code> instead of the group</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Input shape</td><td class="px-4 py-3">A request struct with <code class="inline">binding</code> tags + <code class="inline">ShouldBindJSON</code></td><td class="px-4 py-3"><code class="inline">map[string]any</code> or binding straight into the DB model</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Business rules</td><td class="px-4 py-3"><code class="inline">internal/booking</code>, no Gin imports</td><td class="px-4 py-3">A service function that takes <code class="inline">*gin.Context</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Errors → HTTP</td><td class="px-4 py-3">The handler, with <code class="inline">errors.Is</code> on sentinel errors</td><td class="px-4 py-3">Every error mapped to 500, or <code class="inline">err.Error()</code> sent to the client</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Middleware and route groups</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A Gin middleware is a <code class="inline">gin.HandlerFunc</code> that does some work, then calls
+        <code class="inline">c.Next()</code> to continue or <code class="inline">c.Abort…()</code> to stop the chain. Attaching
+        auth to a route group means a new route added to that group is protected automatically. This is the chain
+        of responsibility pattern from <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">internal/http/router.go</span>
+        <pre class="code"><span class="kw">func</span> <span class="fn">NewRouter</span>(cfg config.Config, bookings *booking.Service) *gin.Engine {
+    r := gin.New()
+    r.Use(gin.Recovery(), gin.Logger(), RequestID())
+
+    r.GET(<span class="st">"/healthz"</span>, <span class="kw">func</span>(c *gin.Context) { c.Status(http.StatusOK) })
+
+    api := r.Group(<span class="st">"/v1"</span>, Auth(cfg.JWTSecret))          <span class="cm">// everything below requires a token</span>
+    h := &amp;BookingHandler{svc: bookings}
+    api.POST(<span class="st">"/bookings"</span>, h.Create)
+    api.GET(<span class="st">"/bookings/:id"</span>, h.Get)
+    <span class="kw">return</span> r
+}
+
+<span class="kw">func</span> <span class="fn">Auth</span>(secret string) gin.HandlerFunc {
+    <span class="kw">return func</span>(c *gin.Context) {
+        patientID, err := parseToken(c.GetHeader(<span class="st">"Authorization"</span>), secret)
+        <span class="kw">if</span> err != <span class="kw">nil</span> {
+            c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{<span class="st">"error"</span>: <span class="st">"unauthorized"</span>})
+            <span class="kw">return</span>                                        <span class="cm">// Abort alone doesn't stop this function</span>
+        }
+        c.Set(<span class="st">"patientID"</span>, patientID)
+        c.Next()
+    }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Binding, validation and explicit errors</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">ShouldBindJSON</code> decodes the body into a struct and runs the <code class="inline">binding</code>
+        tag rules. Use the <code class="inline">Should…</code> variants: they return the error so you choose the response,
+        while the <code class="inline">Bind…</code> variants write a 400 themselves. The service returns
+        <strong>sentinel errors</strong> (named values like <code class="inline">ErrSlotTaken</code>), and the handler maps
+        them to status codes with <code class="inline">errors.Is</code>. The API contract itself is designed in
+        <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">internal/http/bookings.go</span>
+        <pre class="code"><span class="kw">type</span> <span class="fn">createBookingReq</span> <span class="kw">struct</span> {
+    SlotID int64  <span class="st">`json:"slot_id" binding:"required,gt=0"`</span>
+    Note   string <span class="st">`json:"note" binding:"max=500"`</span>
+}   <span class="cm">// no PatientID field: it comes from the Auth middleware</span>
+
+<span class="kw">func</span> (h *BookingHandler) <span class="fn">Create</span>(c *gin.Context) {
+    <span class="kw">var</span> req createBookingReq
+    <span class="kw">if</span> err := c.ShouldBindJSON(&amp;req); err != <span class="kw">nil</span> {
+        c.JSON(http.StatusBadRequest, gin.H{<span class="st">"error"</span>: <span class="st">"invalid_body"</span>})
+        <span class="kw">return</span>
+    }
+    b, err := h.svc.Create(c.Request.Context(), c.GetInt64(<span class="st">"patientID"</span>), req.SlotID)
+    <span class="kw">switch</span> {
+    <span class="kw">case</span> errors.Is(err, booking.ErrSlotTaken):
+        c.JSON(http.StatusConflict, gin.H{<span class="st">"error"</span>: <span class="st">"slot_taken"</span>})
+    <span class="kw">case</span> errors.Is(err, booking.ErrSlotNotFound):
+        c.JSON(http.StatusNotFound, gin.H{<span class="st">"error"</span>: <span class="st">"not_found"</span>})
+    <span class="kw">case</span> err != <span class="kw">nil</span>:
+        slog.ErrorContext(c.Request.Context(), <span class="st">"create booking"</span>, <span class="st">"err"</span>, err)   <span class="cm">// log the detail, hide it from the client</span>
+        c.JSON(http.StatusInternalServerError, gin.H{<span class="st">"error"</span>: <span class="st">"internal"</span>})
+    <span class="kw">default</span>:
+        c.JSON(http.StatusCreated, toBookingResp(b))
+    }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two Gin details worth knowing. <code class="inline">binding:"required"</code> on a number fails for the value 0,
+        because it can't tell "missing" from "zero". That is fine for an id, and a surprise for a quantity. And
+        <code class="inline">*gin.Context</code> itself satisfies the <code class="inline">context.Context</code> interface, but by
+        default it does not forward the request's cancellation and deadline. Pass <code class="inline">c.Request.Context()</code>
+        into your services: it carries both, and the services never depend on Gin.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Data with sqlc or GORM</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Write the SQL you mean, or let GORM write it and check</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Go projects split into two camps. <strong>GORM</strong> is a full ORM with struct models, associations and
+        preloading. <strong>sqlc</strong> goes the other way: you write plain SQL queries, and it generates type-safe Go
+        functions from them. Both usually sit on the pgx driver, and both use golang-migrate (or a similar tool) for
+        schema changes, with plain SQL files. The schema decisions themselves come from
+        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">GORM vs sqlc</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3"></th><th class="px-4 py-3">GORM</th><th class="px-4 py-3">sqlc</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">You write</td><td class="px-4 py-3">Go structs and method chains</td><td class="px-4 py-3">SQL in <code class="inline">.sql</code> files, with a <code class="inline">-- name:</code> comment per query</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SQL checked</td><td class="px-4 py-3">At runtime, when the query runs</td><td class="px-4 py-3">At generate time, against your schema. A typo fails <code class="inline">sqlc generate</code>.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Relations</td><td class="px-4 py-3"><code class="inline">Preload</code>, <code class="inline">Joins</code></td><td class="px-4 py-3">You write the JOIN</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Schema changes</td><td class="px-4 py-3"><code class="inline">AutoMigrate</code> exists: fine for prototypes, not for production</td><td class="px-4 py-3">Always separate migration files</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hidden risk</td><td class="px-4 py-3">Silent zero values, and queries you didn't expect</td><td class="px-4 py-3">More SQL to write and review</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The examples below use sqlc, with GORM equivalents alongside. Agents write good SQL, and sqlc turns it into
+        code the compiler checks, which suits an AI-assisted workflow well.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Migrations with golang-migrate</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each migration is a pair of SQL files, <code class="inline">.up.sql</code> and <code class="inline">.down.sql</code>,
+        numbered in order. The tool records the current version in a <code class="inline">schema_migrations</code> table.
+        If a migration fails halfway, the database is marked <em>dirty</em> and the tool refuses to continue until a
+        human fixes the schema and runs <code class="inline">migrate force &lt;version&gt;</code>. The golang-migrate docs
+        recommend wrapping multi-statement Postgres migrations in <code class="inline">BEGIN; … COMMIT;</code> so a failure
+        leaves nothing half-applied.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">db/migrations/000003_create_bookings.up.sql</span>
+        <pre class="code"><span class="kw">BEGIN</span>;
+<span class="kw">CREATE TABLE</span> <span class="fn">bookings</span> (
+  id           bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  slot_id      bigint <span class="kw">NOT NULL REFERENCES</span> slots(id),
+  patient_id   bigint <span class="kw">NOT NULL REFERENCES</span> patients(id),
+  status       text   <span class="kw">NOT NULL DEFAULT</span> <span class="st">'booked'</span> <span class="kw">CHECK</span> (status <span class="kw">IN</span> (<span class="st">'booked'</span>, <span class="st">'cancelled'</span>)),
+  cancelled_at timestamptz,
+  created_at   timestamptz <span class="kw">NOT NULL DEFAULT</span> now()
+);
+<span class="kw">CREATE UNIQUE INDEX</span> bookings_one_active_per_slot <span class="kw">ON</span> bookings (slot_id) <span class="kw">WHERE</span> status = <span class="st">'booked'</span>;
+<span class="kw">CREATE INDEX</span> bookings_patient_created_idx <span class="kw">ON</span> bookings (patient_id, created_at <span class="kw">DESC</span>);
+<span class="kw">COMMIT</span>;
+
+<span class="cm">-- 000003_create_bookings.down.sql:  DROP TABLE bookings;</span>
+<span class="cm">-- terminal:  migrate create -ext sql -dir db/migrations -seq create_bookings</span>
+<span class="cm">--            migrate -path db/migrations -database "$DATABASE_URL" up   (then: down 1, then up)</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">N+1 and its fix</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In Go the N+1 is never hidden: it is a query call inside a <code class="inline">for</code> loop. Agents write it
+        when they build a response one row at a time. With sqlc the fix is one query with a JOIN. With GORM it is
+        <code class="inline">Preload</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">internal/store/queries/bookings.sql</span>
+        <pre class="code"><span class="cm">-- name: CreateBooking :one</span>
+<span class="kw">INSERT INTO</span> bookings (slot_id, patient_id) <span class="kw">VALUES</span> ($1, $2) <span class="kw">RETURNING</span> *;
+
+<span class="cm">-- name: ListBookingsForPatient :many</span>
+<span class="kw">SELECT</span> b.id, b.status, s.starts_at, d.name <span class="kw">AS</span> doctor_name       <span class="cm">-- one query, not 1 + 2N</span>
+<span class="kw">FROM</span> bookings b
+<span class="kw">JOIN</span> slots s   <span class="kw">ON</span> s.id = b.slot_id
+<span class="kw">JOIN</span> doctors d <span class="kw">ON</span> d.id = s.doctor_id
+<span class="kw">WHERE</span> b.patient_id = $1
+<span class="kw">ORDER BY</span> b.created_at <span class="kw">DESC LIMIT</span> 50;</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">the same list in GORM — before and after</span>
+        <pre class="code"><span class="cm">// ✗ N+1: one query per booking for its slot (and another for the doctor)</span>
+db.WithContext(ctx).Where(<span class="st">"patient_id = ?"</span>, pid).Limit(<span class="st">50</span>).Find(&amp;bookings)
+<span class="kw">for</span> i := <span class="kw">range</span> bookings {
+    db.WithContext(ctx).Preload(<span class="st">"Doctor"</span>).First(&amp;bookings[i].Slot, bookings[i].SlotID)
+}
+
+<span class="cm">// ✓ 3 queries in total, however many bookings there are</span>
+db.WithContext(ctx).Preload(<span class="st">"Slot.Doctor"</span>).
+    Where(<span class="st">"patient_id = ?"</span>, pid).Order(<span class="st">"created_at DESC"</span>).Limit(<span class="st">50</span>).Find(&amp;bookings)</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Transactions, context and the double-booking race</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        With pgx and sqlc you begin a transaction, get a transaction-bound copy of the queries with
+        <code class="inline">WithTx</code>, and commit. A deferred <code class="inline">Rollback</code> undoes everything if the
+        function returns early, and does nothing after a successful commit. The partial unique index from SD1
+        stops the double booking. The service recognises Postgres error code <code class="inline">23505</code> and returns
+        a sentinel error. Every call takes the request's <code class="inline">ctx</code>, so a client that gives up
+        cancels the query too.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">internal/booking/service.go</span>
+        <pre class="code"><span class="kw">var</span> ErrSlotTaken = errors.New(<span class="st">"slot already booked"</span>)
+
+<span class="kw">func</span> (s *Service) <span class="fn">Create</span>(ctx context.Context, patientID, slotID int64) (store.Booking, error) {
+    tx, err := s.pool.Begin(ctx)
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        <span class="kw">return</span> store.Booking{}, fmt.Errorf(<span class="st">"begin: %w"</span>, err)      <span class="cm">// wrap with %w: errors.Is still works</span>
+    }
+    <span class="kw">defer</span> tx.Rollback(ctx)                                        <span class="cm">// no-op after Commit</span>
+
+    q := s.queries.WithTx(tx)
+    b, err := q.CreateBooking(ctx, store.CreateBookingParams{SlotID: slotID, PatientID: patientID})
+    <span class="kw">var</span> pgErr *pgconn.PgError
+    <span class="kw">if</span> errors.As(err, &amp;pgErr) &amp;&amp; pgErr.Code == <span class="st">"23505"</span> {       <span class="cm">// unique_violation</span>
+        <span class="kw">return</span> store.Booking{}, ErrSlotTaken
+    }
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        <span class="kw">return</span> store.Booking{}, fmt.Errorf(<span class="st">"create booking: %w"</span>, err)
+    }
+    <span class="kw">if</span> err := q.InsertAuditLog(ctx, store.InsertAuditLogParams{Action: <span class="st">"booking.created"</span>, BookingID: b.ID}); err != <span class="kw">nil</span> {
+        <span class="kw">return</span> store.Booking{}, fmt.Errorf(<span class="st">"audit log: %w"</span>, err)
+    }
+    <span class="kw">return</span> b, tx.Commit(ctx)
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        In GORM the same shape is <code class="inline">db.WithContext(ctx).Transaction(func(tx *gorm.DB) error { … })</code>,
+        which commits if the function returns <code class="inline">nil</code>. Use <code class="inline">tx</code>, not
+        <code class="inline">db</code>, inside it. With <code class="inline">TranslateError: true</code> in the GORM config, a
+        unique violation comes back as <code class="inline">gorm.ErrDuplicatedKey</code>.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>The three silent Go database bugs.</strong> An error that is checked and logged but not returned, so
+        the handler answers 201 for a booking that failed. A query run with <code class="inline">context.Background()</code>
+        instead of the request context, so it keeps running after the client has gone. And a call on
+        <code class="inline">s.queries</code> or <code class="inline">db</code> instead of the transaction handle, which escapes
+        the transaction. All three compile, and all three pass a happy-path test.
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Tests, config, jobs &amp; deploy</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The standard library does most of the production work</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Go needs very little extra to test, configure and ship a service. <code class="inline">net/http/httptest</code>
+        tests handlers without a network, a struct holds the config, goroutines handle small concurrent work, and
+        the whole app compiles to one static binary that fits in a tiny image.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Testing handlers with httptest</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Build the router with a fake or a real service, send it a request through
+        <code class="inline">httptest.NewRecorder</code>, and check the response. Go tests are usually
+        <strong>table-driven</strong>: one slice of cases, one loop, one subtest each, which makes it obvious which cases
+        are missing. For service tests that touch SQL, run against a real Postgres (a Docker container in CI), not a
+        mock: the unique index is part of what you are testing. What to test and how much is covered in
+        <a href="./qa1.html" class="text-viol underline decoration-viol/40">QA1</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">internal/http/bookings_test.go</span>
+        <pre class="code"><span class="kw">func</span> <span class="fn">TestCreateBooking</span>(t *testing.T) {
+    gin.SetMode(gin.TestMode)
+    cases := []<span class="kw">struct</span> {
+        name   string
+        body   string
+        svcErr error
+        want   int
+    }{
+        {<span class="st">"created"</span>, <span class="st">`{"slot_id": 42}`</span>, <span class="kw">nil</span>, <span class="st">201</span>},
+        {<span class="st">"slot taken"</span>, <span class="st">`{"slot_id": 42}`</span>, booking.ErrSlotTaken, <span class="st">409</span>},
+        {<span class="st">"missing slot"</span>, <span class="st">`{}`</span>, <span class="kw">nil</span>, <span class="st">400</span>},
+        {<span class="st">"db down"</span>, <span class="st">`{"slot_id": 42}`</span>, errors.New(<span class="st">"conn refused"</span>), <span class="st">500</span>},
+    }
+    <span class="kw">for</span> _, tc := <span class="kw">range</span> cases {
+        t.Run(tc.name, <span class="kw">func</span>(t *testing.T) {
+            r := newTestRouter(fakeBookings{err: tc.svcErr})      <span class="cm">// fake satisfies an interface</span>
+            w := httptest.NewRecorder()
+            req := httptest.NewRequest(http.MethodPost, <span class="st">"/v1/bookings"</span>, strings.NewReader(tc.body))
+            req.Header.Set(<span class="st">"Authorization"</span>, testToken(t, <span class="st">7</span>))
+            r.ServeHTTP(w, req)
+            <span class="kw">if</span> w.Code != tc.want {
+                t.Fatalf(<span class="st">"got %d, want %d: %s"</span>, w.Code, tc.want, w.Body)
+            }
+        })
+    }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        To fake the service, the handler must depend on a small interface (<code class="inline">Create(ctx, …)</code>) rather
+        than the concrete type. Go's convention is to declare that interface where it is used, in the handler
+        package. Always run tests with <code class="inline">go test -race ./...</code>: the race detector finds the
+        goroutine bugs described next.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Config: one struct, loaded once</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Read environment variables once in <code class="inline">main</code>, into a typed struct, and fail at startup if a
+        required one is missing. Pass the struct (or just the fields each part needs) down through constructors.
+        Some teams use a small library to parse env into the struct. The rule is the same either way.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">internal/config/config.go</span>
+        <pre class="code"><span class="kw">type</span> <span class="fn">Config</span> <span class="kw">struct</span> {
+    DatabaseURL string
+    RedisURL    string
+    JWTSecret   string
+}
+
+<span class="kw">func</span> <span class="fn">MustLoad</span>() Config {
+    c := Config{DatabaseURL: os.Getenv(<span class="st">"DATABASE_URL"</span>), RedisURL: os.Getenv(<span class="st">"REDIS_URL"</span>), JWTSecret: os.Getenv(<span class="st">"JWT_SECRET"</span>)}
+    <span class="kw">if</span> c.DatabaseURL == <span class="st">""</span> || c.RedisURL == <span class="st">""</span> || len(c.JWTSecret) &lt; <span class="st">32</span> {
+        log.Fatal(<span class="st">"config: DATABASE_URL, REDIS_URL and a 32+ char JWT_SECRET are required"</span>)
+    }
+    <span class="kw">return</span> c                                   <span class="cm">// no os.Getenv anywhere else in the codebase</span>
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Background work: goroutines, then asynq</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">go func() { … }()</code> is the cheapest background work there is, and the easiest to get
+        wrong. It dies with the process, has no retries, and inherits two traps from the request. First, the
+        request context is cancelled when the handler returns, so work that uses it fails. Second, Gin reuses
+        <code class="inline">gin.Context</code> objects across requests, so a goroutine must never touch
+        <code class="inline">c</code> after the handler returns. Gin's docs say to use <code class="inline">c.Copy()</code> if
+        you must. For work that must happen, such as the confirmation SMS, use a durable queue. <strong>asynq</strong> is
+        the common Redis-backed choice in Go. It is still pre-1.0 (v0.x), so pin the version. Retry policy and
+        idempotent consumers are covered in <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">internal/jobs/confirmation.go</span>
+        <pre class="code"><span class="cm">// ✗ in a handler: lost on restart, uses a cancelled ctx, may race on c</span>
+<span class="kw">go</span> sms.SendConfirmation(c.Request.Context(), b.ID)
+
+<span class="cm">// ✓ enqueue a durable task after the transaction commits</span>
+payload, _ := json.Marshal(ConfirmationPayload{BookingID: b.ID})
+_, err = client.EnqueueContext(ctx, asynq.NewTask(TypeConfirmation, payload),
+    asynq.MaxRetry(<span class="st">5</span>), asynq.TaskID(fmt.Sprintf(<span class="st">"confirm-%d"</span>, b.ID)))  <span class="cm">// same id twice → rejected</span>
+
+<span class="cm">// worker side (cmd/worker): mux.HandleFunc(TypeConfirmation, HandleConfirmation)</span>
+<span class="kw">func</span> <span class="fn">HandleConfirmation</span>(ctx context.Context, t *asynq.Task) error {
+    <span class="kw">var</span> p ConfirmationPayload
+    <span class="kw">if</span> err := json.Unmarshal(t.Payload(), &amp;p); err != <span class="kw">nil</span> {
+        <span class="kw">return</span> fmt.Errorf(<span class="st">"bad payload: %v: %w"</span>, err, asynq.SkipRetry)
+    }
+    <span class="kw">return</span> sendIfNotSent(ctx, p.BookingID)      <span class="cm">// idempotent: checks confirmation_sent_at first</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Goroutines are still the right tool <em>inside</em> one request, for example fetching three things in parallel
+        with <code class="inline">errgroup</code>, where the request waits for all of them. The question to ask of any
+        <code class="inline">go</code> statement in a review is: who waits for this, and what happens if it fails?
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Deploying: a static binary and a graceful shutdown</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A multi-stage Dockerfile compiles with <code class="inline">CGO_ENABLED=0</code> into one static binary and copies it
+        onto a minimal base image. The same image carries both binaries. Handle SIGTERM with
+        <code class="inline">http.Server.Shutdown</code>, so in-flight requests finish during a deploy instead of being cut
+        off. Migrations run once as a release step. Docker and CI are covered in
+        <a href="./op2.html" class="text-viol underline decoration-viol/40">OP2</a>.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    CI["CI pipeline"] -->|release step| MIG["migrate up"]
+    MIG --> DB[("Postgres")]
+    U["Mobile app / SPA"] --> API["api container<br/>/app/api"]
+    API --> DB
+    API -->|enqueue| R[("Redis<br/>asynq queues")]
+    W["worker container<br/>/app/worker"] -->|dequeue| R
+    W --> DB
+    W --> SMS["SMS provider"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">Dockerfile</span>
+        <pre class="code"><span class="kw">FROM</span> golang:1.25 <span class="kw">AS</span> build
+<span class="kw">WORKDIR</span> /src
+<span class="kw">COPY</span> go.mod go.sum ./
+<span class="kw">RUN</span> go mod download                          <span class="cm"># cached until dependencies change</span>
+<span class="kw">COPY</span> . .
+<span class="kw">RUN</span> CGO_ENABLED=0 go build -o /out/api ./cmd/api &amp;&amp; CGO_ENABLED=0 go build -o /out/worker ./cmd/worker
+
+<span class="kw">FROM</span> gcr.io/distroless/static-debian12:nonroot   <span class="cm"># no shell, no package manager, not root</span>
+<span class="kw">COPY</span> --from=build /out/ /app/
+<span class="kw">EXPOSE</span> 8080
+<span class="kw">ENTRYPOINT</span> ["/app/api"]                       <span class="cm"># worker: override with /app/worker</span></pre>
+      </div>
+
+      <!-- ═══════════════ Claude Code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Go's tooling gives the agent a fast, strict feedback loop: <code class="inline">go build</code>,
+        <code class="inline">go vet</code>, <code class="inline">go test -race</code> and <code class="inline">sqlc generate</code>
+        all fail loudly. Tell the agent to run them after every change, and put the layout and error rules in
+        <code class="inline">CLAUDE.md</code> (<a href="./ag2.html" class="text-viol underline decoration-viol/40">AG2</a>). A
+        post-edit hook running <code class="inline">gofmt</code> and <code class="inline">go vet</code>
+        (<a href="./ag4.html" class="text-viol underline decoration-viol/40">AG4</a>) keeps every diff clean.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">CLAUDE.md — Go section</span>
+        <pre class="code">## Go conventions (clinic-api)
+- Go 1.25, Gin 1.12, pgx v5, sqlc, golang-migrate, asynq. Layout: cmd/ + internal/ (see go.dev/doc/modules/layout).
+- Gin only in internal/http. Services take context.Context first and never import gin.
+- Every error is returned or handled, never only logged. Wrap with fmt.Errorf("doing x: %w", err).
+- Domain errors are sentinel vars in the service package. Handlers map them with errors.Is.
+- Always pass the request ctx (c.Request.Context()) down. No context.Background() outside main and tests.
+- SQL lives in internal/store/queries/*.sql. After editing: sqlc generate. No string-built SQL.
+- New migration: migrate create -ext sql -dir db/migrations -seq &lt;name&gt;. Write up AND down. Wrap in BEGIN/COMMIT.
+- No bare go func() for work that must happen: enqueue an asynq task with a TaskID.
+- Before saying done: go build ./... &amp;&amp; go vet ./... &amp;&amp; go test -race ./... and migrate up, down 1, up. Paste output.</pre>
+      </div>
+      <pre class="code mt-3">Add POST /v1/bookings/:id/cancel. Plan first: the SQL query for sqlc, the service
+method and its sentinel errors, the handler's error mapping, and table-driven tests.
+A patient may cancel only their own booking, more than 24h before the slot.</pre>
+      <pre class="code mt-3">Audit internal/ for: errors that are logged but not returned, context.Background()
+outside main, calls on s.queries inside a transaction, and go statements. List
+file:line and a one-line fix for each. Don't change code yet.</pre>
+      <pre class="code mt-3">Replace the GORM loop in ListMyBookings with one sqlc query using JOINs.
+Show the query count before and after with pgx query logging, and keep the JSON identical.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Write SQL queries and regenerate sqlc code</li>
+            <li>Write up and down migrations and run them both ways</li>
+            <li>Write handlers, request structs and table-driven tests</li>
+            <li>Run <code class="inline">go vet</code> and <code class="inline">go test -race</code> and fix what they find</li>
+            <li>Build the multi-stage Dockerfile and graceful shutdown</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every <code class="inline">if err != nil</code> block ends in a return or a deliberate handling</li>
+            <li>The request <code class="inline">ctx</code> reaches every DB and network call</li>
+            <li>Every <code class="inline">go</code> statement: who waits, and what if it fails</li>
+            <li>Protected routes are on the authenticated group</li>
+            <li>Every call inside a transaction uses the transaction handle</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>Red flags in agent-written Go:</strong> <code class="inline">_ = err</code> or an <code class="inline">err</code> that is logged and then ignored · <code class="inline">context.Background()</code> or <code class="inline">context.TODO()</code> in a handler or service · <code class="inline">go func()</code> that captures <code class="inline">c *gin.Context</code> · <code class="inline">panic</code> used for ordinary errors · a package-level <code class="inline">var DB</code> · SQL built with <code class="inline">fmt.Sprintf</code> · <code class="inline">AutoMigrate</code> in production start-up · <code class="inline">err.Error()</code> returned in a JSON response · <code class="inline">gin.New()</code> without Recovery · a big <code class="inline">utils</code> package.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Cross-stack concept map</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The same ideas exist in every backend framework under different names. If you move to a Rails, NestJS
+        or FastAPI project (<a href="./be2.html" class="text-viol underline decoration-viol/40">BE2</a>,
+        <a href="./be3.html" class="text-viol underline decoration-viol/40">BE3</a>,
+        <a href="./be4.html" class="text-viol underline decoration-viol/40">BE4</a>), this table is your translation key.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Concept</th><th class="px-4 py-3">Rails</th><th class="px-4 py-3">NestJS</th><th class="px-4 py-3">FastAPI</th><th class="px-4 py-3">Gin (Go)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Start a project</td><td class="px-4 py-3"><code class="inline">rails new --api</code></td><td class="px-4 py-3"><code class="inline">nest new</code></td><td class="px-4 py-3"><code class="inline">pip install "fastapi[standard]"</code></td><td class="px-4 py-3"><code class="inline">go mod init</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Generate code</td><td class="px-4 py-3"><code class="inline">bin/rails g model|job</code></td><td class="px-4 py-3"><code class="inline">nest g resource</code></td><td class="px-4 py-3">none built in</td><td class="px-4 py-3">none built in (sqlc generates query code)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Routing</td><td class="px-4 py-3"><code class="inline">config/routes.rb</code></td><td class="px-4 py-3"><code class="inline">@Controller()</code> + <code class="inline">@Post()</code></td><td class="px-4 py-3"><code class="inline">APIRouter</code> + <code class="inline">@router.post</code></td><td class="px-4 py-3"><code class="inline">r.Group()</code> + <code class="inline">g.POST()</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cross-cutting request logic</td><td class="px-4 py-3">Rack middleware, <code class="inline">before_action</code></td><td class="px-4 py-3">Middleware, guards, interceptors</td><td class="px-4 py-3">Middleware, dependencies</td><td class="px-4 py-3"><code class="inline">r.Use()</code> middleware</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Input validation</td><td class="px-4 py-3"><code class="inline">params.expect</code> + model validations</td><td class="px-4 py-3">DTO + class-validator + <code class="inline">ValidationPipe</code></td><td class="px-4 py-3">Pydantic model in the signature</td><td class="px-4 py-3"><code class="inline">binding:</code> tags + <code class="inline">ShouldBindJSON</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Dependency injection</td><td class="px-4 py-3">None built in: plain objects</td><td class="px-4 py-3">IoC container, <code class="inline">@Injectable()</code></td><td class="px-4 py-3"><code class="inline">Depends()</code></td><td class="px-4 py-3">Explicit constructors in <code class="inline">main.go</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Errors to HTTP</td><td class="px-4 py-3"><code class="inline">rescue_from</code></td><td class="px-4 py-3">Exception filters</td><td class="px-4 py-3"><code class="inline">HTTPException</code> + exception handlers</td><td class="px-4 py-3">Returned <code class="inline">error</code>, mapped in the handler</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ORM / query layer</td><td class="px-4 py-3">Active Record</td><td class="px-4 py-3">Prisma or TypeORM</td><td class="px-4 py-3">SQLAlchemy 2</td><td class="px-4 py-3">GORM or sqlc</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Migrations</td><td class="px-4 py-3"><code class="inline">bin/rails db:migrate</code></td><td class="px-4 py-3"><code class="inline">prisma migrate</code> / TypeORM migrations</td><td class="px-4 py-3">Alembic</td><td class="px-4 py-3">golang-migrate</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Fix an N+1</td><td class="px-4 py-3"><code class="inline">includes</code></td><td class="px-4 py-3">Prisma <code class="inline">include</code> / TypeORM <code class="inline">relations</code></td><td class="px-4 py-3"><code class="inline">selectinload</code></td><td class="px-4 py-3">GORM <code class="inline">Preload</code> / a JOIN in sqlc</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Transaction</td><td class="px-4 py-3"><code class="inline">transaction do … end</code></td><td class="px-4 py-3"><code class="inline">prisma.$transaction</code></td><td class="px-4 py-3"><code class="inline">session.commit()</code> / <code class="inline">session.begin()</code></td><td class="px-4 py-3"><code class="inline">db.Transaction(func…)</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">HTTP-level tests</td><td class="px-4 py-3">Integration / request tests</td><td class="px-4 py-3">Vitest or Jest + supertest</td><td class="px-4 py-3">pytest + <code class="inline">TestClient</code> / httpx</td><td class="px-4 py-3"><code class="inline">httptest</code> + <code class="inline">ServeHTTP</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Background jobs</td><td class="px-4 py-3">Active Job + Solid Queue or Sidekiq</td><td class="px-4 py-3">BullMQ (Redis)</td><td class="px-4 py-3"><code class="inline">BackgroundTasks</code>, then Celery</td><td class="px-4 py-3">Goroutine, then asynq (Redis)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Config &amp; secrets</td><td class="px-4 py-3">Credentials + ENV</td><td class="px-4 py-3"><code class="inline">ConfigModule</code></td><td class="px-4 py-3">pydantic-settings</td><td class="px-4 py-3">Env vars into a config struct</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has not written Go. <code class="inline">if err != nil</code> looks like noise.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can read a Gin handler and a sqlc query, run the service and its tests. Skims error handling and context passing in agent code.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support (target).</strong> Ships an endpoint with Claude Code: request struct with binding tags, a service with sentinel errors and a pgx transaction, a reversible migration, table-driven httptest tests and a race-clean test run. Needs review to catch lost errors, dropped contexts or unsafe goroutines.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently.</strong> Designs package boundaries, chooses GORM or sqlc for a reason, propagates context and deadlines deliberately, and ships API and worker binaries with graceful shutdown.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the project's Go conventions, linters and CLAUDE.md, and teaches the team to review concurrency and error paths.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip">
+        <strong>Self-check before claiming 2:</strong> for the endpoint you shipped, can you point to where each error
+        is returned and mapped to a status code, trace the request <code class="inline">ctx</code> from the handler to the
+        query, and say why no goroutine in the path can outlive the request unsafely?
+      </div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Log and continue</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An error that is logged but not returned turns a failure into a success response. Handle it or return it, never both and never neither.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Fire-and-forget goroutines</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Lost on every deploy, invisible when they fail, and racy if they touch <code class="inline">gin.Context</code>. Durable work goes on a queue.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Binding into DB models</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Binding JSON straight into a GORM struct lets clients set <code class="inline">status</code> or <code class="inline">patient_id</code>. Use a request struct with only the allowed fields.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Always -race</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">go test -race ./...</code> in CI finds data races in agent-written concurrency before users do.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Sentinel errors at the boundary</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A short list of named domain errors, mapped in one place, keeps status codes consistent and the service free of HTTP.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Let sqlc check the SQL</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Agents write fluent SQL. sqlc turns a typo or a missing column into a generate-time error instead of a production 500.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="layout"> <span>Explained my service's <code class="inline">cmd/</code> and <code class="inline">internal/</code> layout and the wiring in <code class="inline">main.go</code> to my mentor.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="errors"> <span>Wrote a handler that maps sentinel errors to status codes with <code class="inline">errors.Is</code>, with a table-driven test for each case.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="n-plus-one"> <span>Replaced a query-in-a-loop with one JOIN (sqlc) or <code class="inline">Preload</code> (GORM), and showed the query count before and after.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="race"> <span>Ran <code class="inline">go test -race</code> on code with a goroutine, fixed what it found, and moved one fire-and-forget goroutine to an asynq task.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="gin-pr"> <span class="font-semibold">Opened a PR that adds "cancel booking" to a Gin clinic API with Claude Code: request struct with binding tags, sqlc query in a pgx transaction, context passed end to end, 409/404 via sentinel errors, reversible migrations, <code class="inline">go test -race</code> output, and a distroless image that shuts down gracefully (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://gin-gonic.com/en/docs/" target="_blank" rel="noopener">Gin — Documentation</a> — routing, middleware, binding and the goroutine rule.</li>
+        <li><a class="text-coral underline" href="https://go.dev/doc/modules/layout" target="_blank" rel="noopener">Go — Organizing a Go module</a> — the official guidance behind <code class="inline">cmd/</code> and <code class="inline">internal/</code>.</li>
+        <li><a class="text-coral underline" href="https://go.dev/blog/go1.13-errors" target="_blank" rel="noopener">Go blog — Working with errors</a> · <a class="text-coral underline" href="https://pkg.go.dev/context" target="_blank" rel="noopener">package context</a> — wrapping, <code class="inline">errors.Is</code>/<code class="inline">As</code>, and cancellation.</li>
+        <li><a class="text-coral underline" href="https://docs.sqlc.dev/en/latest/" target="_blank" rel="noopener">sqlc — Documentation</a> · <a class="text-coral underline" href="https://gorm.io/docs/preload.html" target="_blank" rel="noopener">GORM — Preloading</a> — the two data-access styles from Part III.</li>
+        <li><a class="text-coral underline" href="https://github.com/golang-migrate/migrate" target="_blank" rel="noopener">golang-migrate</a> — CLI, file naming, dirty state and <code class="inline">force</code>.</li>
+        <li><a class="text-coral underline" href="https://pkg.go.dev/net/http/httptest" target="_blank" rel="noopener">Go — package httptest</a> · <a class="text-coral underline" href="https://go.dev/doc/articles/race_detector" target="_blank" rel="noopener">Data race detector</a> — handler tests and <code class="inline">-race</code>.</li>
+        <li><a class="text-coral underline" href="https://github.com/hibiken/asynq" target="_blank" rel="noopener">asynq</a> — Redis-backed task queue for Go: tasks, retries and the worker server.</li>
+      </ul>
