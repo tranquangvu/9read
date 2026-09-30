@@ -1,789 +1,779 @@
 <!-- meta: days=2 -->
-        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Caching Strategies</h1>
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Queues, Background Jobs &amp; Async Processing</h1>
         <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
-          Decide what is worth caching and where: the browser, the CDN, the application's Redis, or the database
-          itself. Pick a read and write pattern, choose TTLs on purpose, and invalidate without serving yesterday's
-          prices. Recognise the failure modes: stampedes, stale reads, and one patient's data served to another.
-          Then prove the cache is earning its keep with a hit-rate number.
+          Move slow, spiky and failure-prone work out of the request. Tell a job queue from a message broker and pick
+          one for your stack. Understand what "at-least-once" really promises, and make every job safe to run twice.
+          Design retries, dead-letter queues, scheduled reminders and fan-out, and know which numbers tell you the
+          queue is healthy. The AWS implementation (SQS, SNS, EventBridge Scheduler) is in <a href="./op5.html" class="text-viol underline decoration-viol/40">OP5</a>.
         </p>
         <div class="mt-6 callout callout-why">
-          <strong>Why it matters when AI writes the code:</strong> ask an agent to "make this endpoint faster" and it
-          will often wrap it in a cache. The diff is five lines and the benchmark improves, so it looks like a win. The
-          costs arrive later: a key that forgets the user ID, a TTL nobody chose, and a write path that never
-          invalidates. Caching bugs don't fail tests. They show up as "I saw someone else's booking" or "the price
-          was wrong for an hour". You are the one who has to ask what the key is, how long the copy lives, and who
-          clears it.
+          <strong>Why it matters when AI writes the code:</strong> ask an agent to "send a confirmation email when a
+          booking is made" and you'll usually get an SMTP call inside the request handler, or a job that sends the email
+          again every time it is retried. Both work in the demo. In production, the first makes bookings fail when the
+          email provider is slow, and the second sends a patient five identical reminders. Queues turn "it ran once
+          on my laptop" into "it may run zero, one or three times, at any moment, in any order", and you are the
+          one who must check the code is ready for that.
         </div>
 <!-- @@BODY@@ -->
 
       <!-- ═══════════════ PART I ═══════════════ -->
-      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Why cache, and what it costs</div>
-      <h2 class="font-display text-2xl font-bold mt-2">A cache is a copy you have agreed to let go stale</h2>
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Why async</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Answer the user now, and do the slow work later</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        A cache stores the result of some expensive work (a query, a render, an API call) somewhere faster, so the
-        next request can skip the work. That is the whole idea. The price is also the whole idea: from the moment you
-        copy the data, there are two versions of it, and they can disagree. Every caching decision is a trade
-        between <strong>speed</strong> and <strong>freshness</strong>, and you should be able to say out loud how
-        stale each cached thing is allowed to be.
+        A web request should do the minimum needed to give the user a correct answer, then return. Anything that can
+        happen a few seconds later, and doesn't change that answer, is a candidate for a <strong>background
+        job</strong>: a unit of work that is saved somewhere durable and run by a separate worker process.
       </p>
 
-      <h3 class="font-semibold text-lg mt-7">The latency numbers that justify it</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        You don't need exact figures, but you need the orders of magnitude. The rows run roughly from fastest to
-        slowest, and the gap between the top and the bottom is about a million times. Caching moves a request up
-        this table.
-      </p>
+      <h3 class="font-semibold text-lg mt-7">Three reasons to go async</h3>
+      <ul class="mt-2 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Slow work.</strong> Sending an email takes 300 ms to several seconds. Generating a PDF invoice takes
+          two seconds. Resizing an uploaded photo takes more. The user shouldn't wait for any of it, and HTTP requests
+          have timeouts that long work will hit.</li>
+        <li><strong>Spikes.</strong> A clinic opens bookings for flu vaccines at 8:00 and 5,000 people book in ten
+          minutes. The bookings must be accepted instantly, but the 5,000 confirmation SMS messages can drain through a
+          queue at the rate the SMS provider allows. The queue is a <em>buffer</em> that absorbs the spike.</li>
+        <li><strong>Retries.</strong> Third-party APIs fail. A payment webhook to your accounting system returns 503.
+          Inside a request you can't wait an hour and try again. A job can retry with backoff for a day, and nobody is
+          stuck waiting.</li>
+      </ul>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Where the data comes from</th><th class="px-4 py-3">Rough time</th><th class="px-4 py-3">Clinic-app example</th></tr></thead>
+            <th class="px-4 py-3">Task in the clinic app</th><th class="px-4 py-3">In the request, or a job?</th><th class="px-4 py-3">Why</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Browser cache (no network at all)</td><td class="px-4 py-3">~0 ms</td><td class="px-4 py-3">The clinic logo and JS bundle on a repeat visit</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">In-process memory (a map in your app)</td><td class="px-4 py-3">well under 1 µs</td><td class="px-4 py-3">The list of specialties, loaded once at boot</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Redis in the same data centre</td><td class="px-4 py-3">~0.2–1 ms per round trip</td><td class="px-4 py-3">A doctor's public profile</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Indexed Postgres query</td><td class="px-4 py-3">~1–10 ms</td><td class="px-4 py-3">One booking by ID (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a> indexes)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">CDN edge near the user</td><td class="px-4 py-3">~10–40 ms, measured from the user</td><td class="px-4 py-3">The public clinic page for a user in Hanoi, served from a nearby edge</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Heavy aggregate query</td><td class="px-4 py-3">100 ms – seconds</td><td class="px-4 py-3">"Free slots per clinic for the next 14 days"</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Origin server on another continent</td><td class="px-4 py-3">~150–300 ms per round trip</td><td class="px-4 py-3">A user in Vietnam hitting a server in us-east-1</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Third-party API</td><td class="px-4 py-3">100 ms – several seconds, and rate-limited</td><td class="px-4 py-3">Insurance eligibility check, geocoding an address</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Insert the booking row</td><td class="px-4 py-3">Request</td><td class="px-4 py-3">The answer ("you're booked" or "slot taken") depends on it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Send the confirmation email</td><td class="px-4 py-3">Job</td><td class="px-4 py-3">Slow, can fail, and the user doesn't need it before the page loads</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SMS reminder 24 hours before</td><td class="px-4 py-3">Scheduled job</td><td class="px-4 py-3">It happens at a time, not in response to a request</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sync to the doctor's Google Calendar</td><td class="px-4 py-3">Job</td><td class="px-4 py-3">External API with rate limits and outages</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Charge the deposit</td><td class="px-4 py-3">Usually the request</td><td class="px-4 py-3">The booking is only valid if the charge succeeds. Payment <em>webhooks</em> from the provider are handled as jobs.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Nightly no-show report</td><td class="px-4 py-3">Cron job</td><td class="px-4 py-3">Batch work on a schedule</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Refresh the search materialized view</td><td class="px-4 py-3">Cron job, every minute</td><td class="px-4 py-3">Covered in <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a></td></tr>
           </tbody>
         </table>
       </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Notice that an indexed query is already fast. Caching a 3 ms query in Redis saves about 2 ms and adds a
-        whole invalidation problem. Caching a 900 ms aggregate or a rate-limited third-party call is where the
-        payoff is. <strong>Measure first</strong>: find the slow or expensive thing with real timings before you
-        cache anything.
-      </p>
 
-      <h3 class="font-semibold text-lg mt-8">Where caches live</h3>
+      <h3 class="font-semibold text-lg mt-8">The moving parts</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        A request passes through several layers, and each one can answer from a copy instead of passing the request
-        on. The closer to the user a layer is, the faster it is, and the less it knows about who is asking.
+        Every queue-based system has the same three roles. The <strong>producer</strong> (your API) writes a small
+        message describing the work. The <strong>queue</strong> stores it durably. A <strong>worker</strong> (a
+        separate process, often the same codebase started with a different command) takes messages, does the work,
+        and <strong>acknowledges</strong> each one when it is finished. Only an acknowledged message is removed.
       </p>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
-        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Cache layers from browser to database">
-          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">A REQUEST FOR /clinics/7 — EACH LAYER MAY ANSWER FROM A COPY</text>
-          <g class="anim-pulse"><rect x="10" y="44" width="120" height="58" rx="9" fill="#2563EB"/>
-            <text x="70" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Browser</text>
-            <text x="70" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">Cache-Control, ETag</text></g>
-          <g class="anim-pulse d1"><rect x="150" y="44" width="120" height="58" rx="9" fill="#6d5acd"/>
-            <text x="210" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">CDN edge</text>
-            <text x="210" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">shared, public only</text></g>
-          <g class="anim-pulse d2"><rect x="290" y="44" width="120" height="58" rx="9" fill="#0D9488"/>
-            <text x="350" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">App server</text>
-            <text x="350" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">in-process memory</text></g>
-          <g class="anim-pulse d3"><rect x="430" y="44" width="120" height="58" rx="9" fill="#D97757"/>
-            <text x="490" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Redis</text>
-            <text x="490" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">shared by all servers</text></g>
-          <g class="anim-pulse d4"><rect x="570" y="44" width="120" height="58" rx="9" fill="#37474F"/>
-            <text x="630" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Postgres</text>
-            <text x="630" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">buffers, mat. views</text></g>
-          <line x1="130" y1="73" x2="150" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="270" y1="73" x2="290" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="410" y1="73" x2="430" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="550" y1="73" x2="570" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <text x="70" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">one user</text>
-          <text x="210" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">everyone in a region</text>
-          <text x="350" y="128" text-anchor="middle" fill="#6E6B64" font-size="9">one server process</text>
-          <text x="490" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">every server</text>
-          <text x="630" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">the source of truth</text>
-          <text x="12" y="162" font-size="10" fill="#A8A49B">← faster, cheaper, knows less about the user</text>
-          <text x="688" y="162" text-anchor="end" font-size="10" fill="#A8A49B">slower, authoritative, knows everything →</text>
-          <text x="350" y="188" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">a hit at any layer means every layer to its right does no work</text>
+        <svg viewBox="0 0 700 210" class="w-full min-w-[620px]" role="img" aria-label="Producer, queue, workers, and dead-letter queue">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">POST /bookings — RESPONDS IN 80 MS, THE EMAIL GOES OUT A SECOND LATER</text>
+          <g class="anim-pulse"><rect x="10" y="50" width="140" height="60" rx="9" fill="#2563EB"/>
+            <text x="80" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">API (producer)</text>
+            <text x="80" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">insert booking</text>
+            <text x="80" y="101" text-anchor="middle" fill="#ffffffbb" font-size="9">enqueue {bookingId: 91}</text></g>
+          <g class="anim-pulse d1"><rect x="200" y="50" width="160" height="60" rx="9" fill="#6d5acd"/>
+            <text x="280" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Queue</text>
+            <text x="280" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">Redis · SQS · RabbitMQ</text>
+            <text x="280" y="101" text-anchor="middle" fill="#ffffffbb" font-size="9">durable, ordered-ish</text></g>
+          <g class="anim-pulse d2"><rect x="410" y="36" width="130" height="40" rx="9" fill="#0D9488"/>
+            <text x="475" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Worker 1</text>
+            <text x="475" y="67" text-anchor="middle" fill="#ffffffbb" font-size="9">send email → ack</text></g>
+          <g class="anim-pulse d3"><rect x="410" y="86" width="130" height="40" rx="9" fill="#0D9488"/>
+            <text x="475" y="104" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Worker 2</text>
+            <text x="475" y="117" text-anchor="middle" fill="#ffffffbb" font-size="9">fails → retry later</text></g>
+          <g class="anim-pulse d4"><rect x="580" y="86" width="110" height="40" rx="9" fill="#DB2777"/>
+            <text x="635" y="104" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Dead-letter</text>
+            <text x="635" y="117" text-anchor="middle" fill="#ffffffbb" font-size="9">after N attempts</text></g>
+          <g class="anim-pulse d1"><rect x="580" y="36" width="110" height="40" rx="9" fill="#37474F"/>
+            <text x="635" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Email API</text>
+            <text x="635" y="67" text-anchor="middle" fill="#ffffffbb" font-size="9">SES · Postmark</text></g>
+          <line x1="150" y1="80" x2="200" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="72" x2="410" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="88" x2="410" y2="106" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="540" y1="56" x2="580" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="540" y1="106" x2="580" y2="106" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="80" y="140" text-anchor="middle" font-size="9" fill="#6E6B64">returns 201 immediately</text>
+          <text x="280" y="140" text-anchor="middle" font-size="9" fill="#6E6B64">absorbs spikes</text>
+          <text x="475" y="150" text-anchor="middle" font-size="9" fill="#6E6B64">scale by adding workers</text>
+          <text x="635" y="150" text-anchor="middle" font-size="9" fill="#6E6B64">a human looks at these</text>
+          <text x="350" y="190" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">the message says WHAT to do (bookingId), not the data itself</text>
         </svg>
       </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note the last line of the diagram. A good message carries <strong>IDs, not snapshots</strong>:
+        <code class="inline">{"bookingId": 91}</code>, not the whole booking. The worker loads current data when it runs,
+        so a booking cancelled in the meantime isn't confirmed by email anyway, and the queue doesn't hold copies of
+        personal data.
+      </p>
 
-      <h3 class="font-semibold text-lg mt-8">What is worth caching</h3>
+      <h3 class="font-semibold text-lg mt-8">Before and after: the confirmation email</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Good candidates share three properties: they are <strong>read far more often than written</strong>, they
-        are <strong>expensive</strong> to produce, and a <strong>little staleness is acceptable</strong>. Go through
-        the data in your app and sort it. For the clinic booking app:
+        This is the most common version you'll see from an agent, followed by the fix:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">bookings/controller.ts — before: email inside the request</span>
+        <pre class="code"><span class="kw">const</span> booking = <span class="kw">await</span> bookings.create(slotId, patientId);
+<span class="kw">await</span> mailer.send(confirmationEmail(booking));  <span class="cm">// 2 s when the provider is slow,</span>
+<span class="kw">return</span> res.status(<span class="st">201</span>).json(booking);           <span class="cm">// and a 500 if it's down — but the booking exists!</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">bookings/controller.ts — after: enqueue with BullMQ</span>
+        <pre class="code"><span class="kw">const</span> booking = <span class="kw">await</span> bookings.create(slotId, patientId);
+<span class="kw">await</span> emailQueue.add(<span class="st">"booking-confirmation"</span>, { bookingId: booking.id }, {
+  jobId: <span class="st">`confirm-${booking.id}`</span>,                   <span class="cm">// same booking → same job (no ":" allowed)</span>
+  attempts: <span class="st">8</span>,
+  backoff: { type: <span class="st">"exponential"</span>, delay: <span class="st">2000</span> },  <span class="cm">// 2 s, 4 s, 8 s … (Part III)</span>
+});
+<span class="kw">return</span> res.status(<span class="st">201</span>).json(booking);           <span class="cm">// ~80 ms, whatever the email provider does</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        One gap remains. The booking is committed to Postgres and the job is written to Redis, which are two separate
+        systems. If the process crashes between the two lines, you have a booking with no email. For most emails that
+        is acceptable (the patient still sees the booking in the app). When it isn't, for example "every paid order
+        must reach the warehouse", use the <strong>transactional outbox</strong>: write the message into a table in
+        the same database transaction as the booking, and have a relay publish it. That pattern belongs to
+        <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Enqueue after the commit, not inside the transaction</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A subtle bug appears when the booking is created inside a database transaction and the job is enqueued
+        <em>inside</em> that same transaction. The worker is fast: it picks up the job within milliseconds, looks for
+        booking 91, and finds nothing, because the transaction hasn't committed yet. Or the transaction rolls back,
+        and the patient gets a confirmation for a booking that doesn't exist. Every mainstream framework has an
+        "after commit" hook for exactly this:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">after-commit enqueue — Django · Rails</span>
+        <pre class="code"><span class="cm"># Django: runs only if and when the surrounding transaction commits</span>
+<span class="kw">with</span> transaction.atomic():
+    booking = Booking.objects.create(slot=slot, patient=patient)
+    transaction.on_commit(<span class="kw">lambda</span>: send_confirmation.delay(booking.id))
+
+<span class="cm"># Rails: model callback that fires after COMMIT, never after a rollback</span>
+<span class="kw">class</span> <span class="fn">Booking</span> &lt; ApplicationRecord
+  after_create_commit { BookingConfirmationJob.perform_async(id) }
+<span class="kw">end</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        After-commit hooks fix the "job runs too early" and "job for a rolled-back row" bugs. They don't fix a crash
+        between the commit and the enqueue. That last gap is what the outbox closes.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Where the workers run</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A worker is a long-running process, so where you deploy decides which queue designs are even possible.
+        Check this before you pick a library, because a Sidekiq or BullMQ worker needs a place to run all day.
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Data</th><th class="px-4 py-3">Read / write ratio</th><th class="px-4 py-3">Staleness allowed</th><th class="px-4 py-3">Verdict</th></tr></thead>
+            <th class="px-4 py-3">Hosting</th><th class="px-4 py-3">How background work usually runs</th><th class="px-4 py-3">Watch out for</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Clinic profile, opening hours, photos</td><td class="px-4 py-3">Thousands : 1</td><td class="px-4 py-3">Minutes</td><td class="px-4 py-3">Cache at the CDN and in Redis</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">List of specialties</td><td class="px-4 py-3">Huge : almost never</td><td class="px-4 py-3">Hours</td><td class="px-4 py-3">In-process memory, or even a constant</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Free-slot counts on the search page</td><td class="px-4 py-3">High : medium</td><td class="px-4 py-3">Seconds (it's a hint)</td><td class="px-4 py-3">Cache with a short TTL, and <strong>re-check at booking time</strong></td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Whether slot 42 is free, at the moment of booking</td><td class="px-4 py-3">—</td><td class="px-4 py-3">None</td><td class="px-4 py-3">Never cache. The database constraint decides (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>).</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">A patient's own bookings</td><td class="px-4 py-3">Low : low</td><td class="px-4 py-3">None (they just made one)</td><td class="px-4 py-3">Usually don't cache. The indexed query is fast enough.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Insurance API response</td><td class="px-4 py-3">Medium, and each call costs money</td><td class="px-4 py-3">A day</td><td class="px-4 py-3">Cache per patient in Redis, never at the CDN</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Containers or VMs (ECS, Fly, a VPS)</td><td class="px-4 py-3">A second process type from the same image: <code class="inline">web</code> and <code class="inline">worker</code>, scaled separately (<a href="./op2.html" class="text-viol underline decoration-viol/40">OP2</a>)</td><td class="px-4 py-3">Forgetting to deploy the worker, so jobs pile up silently</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AWS Lambda</td><td class="px-4 py-3">SQS triggers a function for each batch of messages. EventBridge schedules run cron-style work (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>).</td><td class="px-4 py-3">The function timeout, and a batch that partly fails</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Vercel and other serverless web hosts</td><td class="px-4 py-3">No always-on worker. Use the platform's cron and queue features, or a managed queue service that calls your function (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>).</td><td class="px-4 py-3">"Fire and forget" promises after the response is sent may be cut off when the function ends</td></tr>
           </tbody>
         </table>
       </div>
-      <div class="mt-4 callout callout-info">
-        <strong>A cache can show, but must never decide.</strong> It is fine for the search page to say "3 slots
-        left" from a 10-second-old cache. It is not fine for the booking endpoint to trust that number. Any decision
-        that moves money or reserves something reads from the source of truth, inside a transaction.
-      </div>
 
-      <h3 class="font-semibold text-lg mt-8">The cost you sign up for</h3>
+      <h3 class="font-semibold text-lg mt-8">What must stay synchronous</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Every cache adds four things to your system: <strong>a staleness window</strong> (how long users can see old
-        data), <strong>an invalidation path</strong> (code that must run on every write), <strong>a new failure
-        mode</strong> (what happens when Redis is down or empty), and <strong>a memory budget</strong>. If you can't
-        name all four for a cache in your code, you don't yet understand that cache. A good first step is to
-        write them as a comment right next to it.
+        Going async is not free. The user no longer gets an error when the work fails, so failures need a different
+        path: a retry, an alert, or a status the UI can show ("Calendar sync pending"). Debugging gets harder because
+        cause and effect are seconds apart and in different processes.
       </p>
-      <div class="mt-4">
-        <span class="code-label">clinics/cache.ts — document every cache like this</span>
-        <pre class="code"><span class="cm">/**
- * CACHE: clinic public profile
- * key:          clinic:v3:{clinicId}:profile     (no user data inside)
- * staleness:    up to 5 min, or until invalidated on update
- * invalidation: ClinicService.update() deletes the key after COMMIT
- * on failure:   Redis down → read from Postgres, log a warning, don't crash
- */</span>
-<span class="kw">export const</span> <span class="fn">CLINIC_PROFILE_TTL_S</span> = <span class="st">300</span>;</pre>
+      <div class="mt-4 callout callout-info">
+        <strong>Rule of thumb:</strong> if the user's next screen depends on the result, or the operation can be
+        rejected (slot taken, card declined, validation failed), do it in the request. If the user only needs to
+        know that it <em>will</em> happen, queue it. Choosing between synchronous calls and events <em>between
+        services</em> is a wider question, covered in <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>.
       </div>
 
       <!-- ═══════════════ PART II ═══════════════ -->
-      <div class="kicker text-viol mt-14">Part II · The cache layers</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Cache as close to the user as the data's privacy allows</h2>
+      <div class="kicker text-viol mt-14">Part II · Job queues vs message brokers</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A job queue runs your code, a broker moves your messages</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Each layer from the diagram above has its own controls and its own risks. The browser and the CDN are
-        driven by <strong>HTTP headers</strong> that your server sends. Redis and in-process caches are driven by
-        <strong>your code</strong>. The database has a few tricks of its own. Start at the outside and move in.
+        The tools blur together in blog posts, but they fall into two families. A <strong>job queue</strong> is a
+        library in your language: you call a function "later", and it gives you workers, retries, scheduling and a
+        dashboard. A <strong>message broker</strong> is infrastructure: it stores and routes messages between
+        producers and consumers that may be written in different languages, and leaves "what to do with a message"
+        to you.
       </p>
 
-      <h3 class="font-semibold text-lg mt-7">HTTP caching: Cache-Control and ETag</h3>
+      <h3 class="font-semibold text-lg mt-7">Job queues, one per stack</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Every HTTP response can tell browsers and CDNs whether they may keep a copy, who may share it, and for how
-        long. This is the cheapest cache you will ever build, because you write no cache code at all: you set a
-        header. It is also the easiest to get dangerously wrong, because a wrong header on a personal page lets a
-        shared cache hand that page to the next person. (<a href="./co4.html" class="text-viol underline decoration-viol/40">CO4</a>
-        covers HTTP basics.)
+        For a single application that needs background work, use the job library your stack already favours. They
+        all look similar: define a job, enqueue it with arguments, and run workers.
+      </p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Library</th><th class="px-4 py-3">Stack</th><th class="px-4 py-3">Backed by</th><th class="px-4 py-3">Worth knowing</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Sidekiq</td><td class="px-4 py-3">Ruby / Rails (<a href="./be2.html" class="text-viol underline decoration-viol/40">BE2</a>)</td><td class="px-4 py-3">Redis</td><td class="px-4 py-3">By default retries a failed job 25 times over about 20 days with exponential backoff, then moves it to the Dead set. Rails' Active Job can sit on top.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">BullMQ</td><td class="px-4 py-3">Node / NestJS (<a href="./be3.html" class="text-viol underline decoration-viol/40">BE3</a>)</td><td class="px-4 py-3">Redis</td><td class="px-4 py-3">Per-job <code class="inline">attempts</code> and <code class="inline">backoff</code>, delayed jobs, job schedulers for repeating work, custom job IDs for de-duplication</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Celery</td><td class="px-4 py-3">Python (Django, Flask)</td><td class="px-4 py-3">RabbitMQ or Redis</td><td class="px-4 py-3">Mature and feature-rich, with many settings. Celery beat runs periodic tasks.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ARQ</td><td class="px-4 py-3">Python asyncio / FastAPI (<a href="./be4.html" class="text-viol underline decoration-viol/40">BE4</a>)</td><td class="px-4 py-3">Redis</td><td class="px-4 py-3">Small and async-native. Deferred jobs, job IDs, and cron functions.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">asynq</td><td class="px-4 py-3">Go / Gin (<a href="./be5.html" class="text-viol underline decoration-viol/40">BE5</a>)</td><td class="px-4 py-3">Redis</td><td class="px-4 py-3">Retries, scheduled tasks, unique tasks, and a periodic task scheduler</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">the same job in three stacks — Sidekiq · Celery · asynq</span>
+        <pre class="code"><span class="cm"># Ruby / Sidekiq</span>
+<span class="kw">class</span> <span class="fn">BookingConfirmationJob</span>
+  <span class="kw">include</span> Sidekiq::Job
+  sidekiq_options retry: <span class="st">8</span>
+  <span class="kw">def</span> <span class="fn">perform</span>(booking_id) = BookingMailer.confirm(booking_id)
+<span class="kw">end</span>
+BookingConfirmationJob.perform_async(booking.id)          <span class="cm"># args must be simple JSON types</span>
+
+<span class="cm"># Python / Celery</span>
+<span class="kw">@app.task</span>(bind=<span class="kw">True</span>, autoretry_for=(ProviderError,), retry_backoff=<span class="kw">True</span>, max_retries=<span class="st">8</span>)
+<span class="kw">def</span> <span class="fn">send_confirmation</span>(self, booking_id): ...
+send_confirmation.delay(booking.id)
+
+<span class="cm">// Go / asynq</span>
+task := asynq.NewTask(<span class="st">"booking:confirm"</span>, payload)       <span class="cm">// payload = JSON {"booking_id": 91}</span>
+client.Enqueue(task, asynq.MaxRetry(<span class="st">8</span>), asynq.TaskID(<span class="st">"confirm-91"</span>))</pre>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Whatever the library, review the <strong>payload</strong> the agent chose. It is stored in Redis or the broker,
+        often in plain text, sometimes for days, and it is shown in dashboards:
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Directive</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">Use it for</th></tr></thead>
+            <th class="px-4 py-3">Payload</th><th class="px-4 py-3">Problem</th><th class="px-4 py-3">Better</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">public</code></td><td class="px-4 py-3">Shared caches (CDN, proxies) may store it</td><td class="px-4 py-3">The public clinic page, images</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">private</code></td><td class="px-4 py-3">Only the user's own browser may store it</td><td class="px-4 py-3">"My bookings" JSON, if you cache it at all</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">no-store</code></td><td class="px-4 py-3">Nobody stores it, anywhere</td><td class="px-4 py-3">Medical records, payment pages, anything after login that is sensitive</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">no-cache</code></td><td class="px-4 py-3">You may store it, but must revalidate with the server before each use. It does <em>not</em> mean "don't cache".</td><td class="px-4 py-3">HTML pages that change often, combined with an ETag</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">max-age=N</code></td><td class="px-4 py-3">Fresh for N seconds in any cache</td><td class="px-4 py-3">Everything cacheable</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">s-maxage=N</code></td><td class="px-4 py-3">Overrides <code class="inline">max-age</code> for shared caches only</td><td class="px-4 py-3">Short in the browser, longer at the CDN, where you can purge</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">stale-while-revalidate=N</code></td><td class="px-4 py-3">After expiry, serve the stale copy for up to N more seconds while fetching a fresh one in the background</td><td class="px-4 py-3">Pages where "a few seconds old" beats "slow"</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">immutable</code></td><td class="px-4 py-3">It will never change at this URL, so don't even revalidate</td><td class="px-4 py-3">Build assets with a content hash in the filename, such as <code class="inline">app.3f9a1c.js</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">The whole booking object</td><td class="px-4 py-3">Stale by the time the job runs, and a copy of personal data in Redis</td><td class="px-4 py-3"><code class="inline">{"bookingId": 91}</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">An ORM model instance</td><td class="px-4 py-3">Won't serialise, or serialises into something fragile</td><td class="px-4 py-3">IDs and simple JSON types only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">The patient's phone number and diagnosis</td><td class="px-4 py-3">Health data sitting in a queue and a job dashboard</td><td class="px-4 py-3">Load it inside the worker, from the database</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">An API token for the job to use</td><td class="px-4 py-3">A secret stored in plain text in the queue</td><td class="px-4 py-3">The worker reads secrets from its environment (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">No version field, for a long-lived queue</td><td class="px-4 py-3">A deploy changes the job's arguments while old jobs are still waiting</td><td class="px-4 py-3">Keep old arguments working for one release, or add a <code class="inline">v</code> field</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mt-4 callout callout-info">
+        <strong>Redis-backed queues are only as durable as your Redis.</strong> Sidekiq, BullMQ, ARQ and asynq keep jobs
+        in Redis, so its persistence settings matter. A managed Redis with persistence switched off, or an eviction
+        policy that is allowed to evict keys under memory pressure, can silently lose queued jobs. Use a separate
+        Redis (or database) for the queue and for the cache in <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>,
+        configured with persistence on and <code class="inline">noeviction</code>.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Message brokers</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You reach for a broker when messages cross service or language boundaries, when several consumers need the
+        same event, or when you want a managed service with no Redis to run. The four you'll meet most:
+      </p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Broker</th><th class="px-4 py-3">Model</th><th class="px-4 py-3">Ordering</th><th class="px-4 py-3">After it's consumed</th><th class="px-4 py-3">Right when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Amazon SQS</td><td class="px-4 py-3">Managed queue. Consumers poll, and messages are hidden while being processed (visibility timeout).</td><td class="px-4 py-3">Standard: best-effort. FIFO: ordered per message group.</td><td class="px-4 py-3">Deleted when the consumer deletes it</td><td class="px-4 py-3">You're on AWS and want zero servers to run (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">RabbitMQ</td><td class="px-4 py-3">Broker with exchanges that route messages into queues by rules</td><td class="px-4 py-3">Per queue, with caveats on redelivery</td><td class="px-4 py-3">Removed on ack</td><td class="px-4 py-3">Flexible routing, many consumers, self-hosted or managed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Apache Kafka</td><td class="px-4 py-3">Distributed, partitioned <em>log</em>. Consumers track their own position (offset).</td><td class="px-4 py-3">Strict within a partition</td><td class="px-4 py-3"><strong>Kept</strong> for the retention period. New consumers can replay history.</td><td class="px-4 py-3">High-volume event streams, several teams consuming the same events, replay</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Redis Streams</td><td class="px-4 py-3">An append-only log inside Redis, with consumer groups and acks</td><td class="px-4 py-3">Within a stream</td><td class="px-4 py-3">Kept until trimmed</td><td class="px-4 py-3">You already run Redis and want a lightweight event log</td></tr>
           </tbody>
         </table>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        An <strong>ETag</strong> is a fingerprint of a response, such as a hash of the body or a version number.
-        The browser sends it back in <code class="inline">If-None-Match</code>. If nothing changed, the server replies
-        <code class="inline">304 Not Modified</code> with no body. The server still does some work, but the payload
-        doesn't travel again:
+        The key conceptual difference is <strong>queue vs log</strong>. In a queue, a message is work: one consumer
+        takes it and it is gone. In a log (Kafka, Redis Streams), a message is a fact that stays. Each consumer
+        group reads at its own pace, and a new group can start from the beginning.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Choosing, for a typical client project</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most Golden Owl-sized projects need a job queue and nothing more. Don't let an agent add Kafka to a
+        booking app with 2,000 users a day. Walk this decision from the top:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    A["Need work done outside the request?"] -->|"one app, one language"| B["Job queue for your stack<br/>Sidekiq, BullMQ, Celery, ARQ, asynq"]
+    A -->|"several services consume it"| C{"Must consumers replay<br/>history, or is volume huge?"}
+    C -->|"no"| D{"On AWS?"}
+    D -->|"yes"| E["SNS topic + SQS queue per consumer"]
+    D -->|"no"| F["RabbitMQ, or Redis Streams"]
+    C -->|"yes"| G["Kafka or a managed equivalent"]
+    B --> H["Already have Redis? Use it.<br/>No Redis? Consider SQS or a DB-backed queue"]
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A <strong>database-backed queue</strong> (a <code class="inline">jobs</code> table polled with
+        <code class="inline">SELECT … FOR UPDATE SKIP LOCKED</code>) is a legitimate choice too. Rails' Solid Queue works
+        this way. Its big advantage is that the job is inserted in the <em>same transaction</em> as the booking, so the
+        gap described in Part I disappears.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Anatomy of a good worker</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Whatever the tool, a worker you can trust in production has the same shape. It loads fresh state by ID, checks
+        whether the work is still needed, does the side effect once, and records that it did:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">workers/email.worker.ts — BullMQ worker</span>
+        <pre class="code"><span class="kw">new</span> <span class="fn">Worker</span>(<span class="st">"email"</span>, <span class="kw">async</span> (job) =&gt; {
+  <span class="kw">const</span> booking = <span class="kw">await</span> db.booking.find(job.data.bookingId);  <span class="cm">// 1. fresh state, by ID</span>
+  <span class="kw">if</span> (!booking || booking.status !== <span class="st">"booked"</span>) <span class="kw">return</span>;         <span class="cm">// 2. still needed? if not, succeed quietly</span>
+  <span class="cm">// 3. atomic claim: UPDATE … SET confirm_claimed_at = now()</span>
+  <span class="cm">//    WHERE id = $1 AND confirm_claimed_at IS NULL  → 0 rows = done already</span>
+  <span class="kw">if</span> (!(<span class="kw">await</span> db.booking.claimConfirmation(booking.id))) <span class="kw">return</span>;
+  <span class="kw">await</span> mailer.send(confirmationEmail(booking), {
+    idempotencyKey: <span class="st">`confirm-${booking.id}`</span>,                  <span class="cm">// 4. provider de-dupes too, if supported</span>
+  });
+  <span class="kw">await</span> db.booking.markConfirmationSent(booking.id);            <span class="cm">// 5. record it</span>
+}, { connection, concurrency: <span class="st">10</span> });</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Each numbered comment answers a question that Part III will ask: what if the booking changed, what if this
+        is the second attempt, and what if the process dies between sending and recording. Note that step 3 is a
+        single conditional <code class="inline">UPDATE</code>, not "read the flag, then check it in code". Two workers
+        running at the same moment would both pass a read-then-check, which is the same race as double booking in
+        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Test the job body as a plain function, without the queue in between. Export the processor, call it directly
+        with a fake provider, and call it <em>twice</em>. One integration test with a real Redis in CI
+        (<a href="./qa1.html" class="text-viol underline decoration-viol/40">QA1</a>) then proves the wiring.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">email.worker.test.ts — the duplicate-run test</span>
+        <pre class="code">it(<span class="st">"sends the confirmation once, even if the job runs twice"</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> booking = <span class="kw">await</span> factory.booking({ status: <span class="st">"booked"</span> });
+  <span class="kw">const</span> job = { data: { bookingId: booking.id } } <span class="kw">as</span> Job;
+
+  <span class="kw">await</span> Promise.all([processConfirmation(job), processConfirmation(job)]); <span class="cm">// concurrent retry</span>
+
+  expect(fakeMailer.sent).toHaveLength(<span class="st">1</span>);                               <span class="cm">// the assertion that matters</span>
+});</pre>
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Delivery, idempotency &amp; failure</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Assume every job runs twice, and some never succeed</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        This Part is the heart of the module. Queues make promises about delivery, and the promise you actually get
+        is weaker than most people assume. Your job code has to be correct under that weaker promise.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Delivery semantics</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Semantics</th><th class="px-4 py-3">How it works</th><th class="px-4 py-3">What can go wrong</th><th class="px-4 py-3">Use for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">At-most-once</td><td class="px-4 py-3">Ack (remove) the message <em>before</em> processing</td><td class="px-4 py-3">A crash mid-job loses it for ever</td><td class="px-4 py-3">Metrics, "user is typing" signals: anything cheap to lose</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">At-least-once</td><td class="px-4 py-3">Ack <em>after</em> processing. No ack in time means redelivery.</td><td class="px-4 py-3"><strong>Duplicates</strong>: the job ran, but the ack was lost or late</td><td class="px-4 py-3">Almost everything. It is the default of SQS, Sidekiq, BullMQ and most brokers.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Exactly-once"</td><td class="px-4 py-3">At-least-once delivery <em>plus</em> de-duplication or transactions</td><td class="px-4 py-3">The guarantee usually stops at the broker's edge. Your email, payment or HTTP call can still happen twice.</td><td class="px-4 py-3">A marketing term. Achieve the <em>effect</em> with idempotent consumers.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Kafka transactions and SQS FIFO de-duplication are real features, but read the fine print: they prevent
+        duplicates <em>inside</em> the messaging system (or, for SQS FIFO, within a de-duplication window). They cannot
+        un-send an SMS. Here is how a duplicate happens with a perfectly healthy queue:
       </p>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
 sequenceDiagram
     autonumber
-    participant B as Browser
-    participant S as API server
-    B->>S: GET /clinics/7
-    S-->>B: 200 OK, body 48 KB<br/>ETag "v42", Cache-Control no-cache
-    Note over B: stores body and ETag
-    B->>S: GET /clinics/7<br/>If-None-Match "v42"
-    Note over S: clinic.version is still 42
-    S-->>B: 304 Not Modified, no body
-    Note over B: reuses the stored 48 KB
+    participant Q as Queue (SQS)
+    participant W1 as Worker 1
+    participant P as SMS provider
+    participant W2 as Worker 2
+    Q->>W1: reminder for booking 91<br/>hidden for 30 s
+    W1->>P: send SMS
+    Note over W1: GC pause / slow network<br/>35 s pass, no delete yet
+    Note over Q: visibility timeout expires,<br/>message visible again
+    Q->>W2: reminder for booking 91
+    W2->>P: send SMS again ❌
+    W1->>Q: delete (too late)
         </pre>
       </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Nothing is broken here. A worker got slow, and the queue did exactly what it promises. The only defence is a
+        job that notices it has already done the work.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Idempotent jobs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A job is <strong>idempotent</strong> if running it twice has the same effect as running it once. Some work is
+        naturally idempotent: "set booking 91's status to confirmed" or "recompute clinic 7's rating". Work with side
+        effects ("send", "charge", "increment", "append") is not, and you have to make it so. The robust technique is a
+        <strong>record of what was done, protected by a unique constraint</strong>, so the database refuses the second
+        attempt even if two workers race:
+      </p>
       <div class="mt-4">
-        <span class="code-label">HTTP responses — three typical header sets</span>
-        <pre class="code"><span class="cm"># Hashed static asset: cache for a year, never revalidate</span>
-Cache-Control: public, max-age=31536000, immutable
+        <span class="code-label">reminders.py — idempotent reminder with ARQ and a unique constraint</span>
+        <pre class="code"><span class="cm"># migration:  CREATE TABLE sent_notifications (
+#   booking_id bigint, kind text, sent_at timestamptz DEFAULT now(),
+#   PRIMARY KEY (booking_id, kind));        -- the de-dup record</span>
 
-<span class="cm"># Public clinic page: 1 min in browsers, 10 min at the CDN, serve stale while refreshing</span>
-Cache-Control: public, max-age=60, s-maxage=600, stale-while-revalidate=60
-ETag: <span class="st">"clinic-7-v42"</span>
-
-<span class="cm"># Anything personal or sensitive: no copies anywhere</span>
-Cache-Control: <span class="kw">no-store</span></pre>
+<span class="kw">async def</span> <span class="fn">send_reminder</span>(ctx, booking_id: int):
+    <span class="kw">async with</span> db.transaction():
+        booking = <span class="kw">await</span> repo.get_booking(booking_id)
+        <span class="kw">if</span> booking <span class="kw">is None or</span> booking.status != <span class="st">"booked"</span>:
+            <span class="kw">return</span>                                    <span class="cm"># cancelled since → nothing to do</span>
+        claimed = <span class="kw">await</span> db.execute(
+            <span class="st">"INSERT INTO sent_notifications (booking_id, kind) VALUES ($1, 'reminder_24h') "</span>
+            <span class="st">"ON CONFLICT DO NOTHING"</span>, booking_id)
+        <span class="kw">if</span> claimed.rowcount == <span class="st">0</span>:
+            <span class="kw">return</span>                                    <span class="cm"># another attempt already claimed it</span>
+    <span class="kw">await</span> sms.send(booking.patient_phone, reminder_text(booking),
+                   idempotency_key=<span class="st">f"reminder-24h-{booking_id}"</span>)</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Look at the order: claim first, then send. If the SMS call fails after the claim, this version won't resend,
+        so you trade a possible duplicate for a possible miss. For reminders that is usually the right trade. For
+        must-happen work, record the claim with a status, send, then mark it done, and have a sweeper retry
+        claims stuck in "pending". Either way, <strong>decide which failure you prefer and write it down</strong>.
+        When the provider accepts an idempotency key (many payment and messaging APIs do), pass one as well. Your
+        stack's HTTP API idempotency keys are covered in <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
+      </p>
+      <div class="mt-4 callout callout-warn">
+        <strong>Queue-level de-duplication is a helper, not a guarantee.</strong> A BullMQ custom
+        <code class="inline">jobId</code> or an asynq <code class="inline">TaskID</code> stops the same job being
+        <em>enqueued</em> twice while the first one is still stored. It does nothing about one job being
+        <em>executed</em> twice after a lost ack, and the ID is free again once the old job is removed. Idempotency
+        belongs in the job's own logic and the database.
       </div>
 
-      <h3 class="font-semibold text-lg mt-8">The CDN: a shared cache at the edge</h3>
+      <h3 class="font-semibold text-lg mt-8">Retries with backoff and jitter</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        A CDN such as Cloudflare or CloudFront keeps copies of your responses in data centres close to users. It
-        makes public pages and assets fast for everyone, and it absorbs traffic spikes before they reach your
-        servers. Setup, cache rules and purging are covered in
-        <a href="./op5.html" class="text-viol underline decoration-viol/40">OP5 Cloudflare Essentials</a>. For design
-        purposes, three ideas matter:
+        Retry transient failures, and don't retry permanent ones. Space retries out <strong>exponentially</strong>
+        (1 s, 2 s, 4 s, 8 s …) so a struggling provider gets room to recover, and add <strong>jitter</strong> so that a
+        thousand jobs that failed together don't all retry in the same second. Cap the attempts, and the total time,
+        at what the business can accept: a reminder that arrives after the appointment is worse than none.
       </p>
-      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>The cache key.</strong> By default a CDN stores one copy per URL (plus a few details). If the
-          response varies by something that isn't in the URL, such as a cookie, a language header or the logged-in
-          user, then either that thing must be part of the key (the <code class="inline">Vary</code> header, or a CDN
-          rule) or the response must not be shared at all.</li>
-        <li><strong>Purging.</strong> CDNs let you purge by URL, and some also by tag or prefix. A long
-          <code class="inline">s-maxage</code> plus a purge on update gives you fast pages and fresh data at the same
-          time.</li>
-        <li><strong>Only public content.</strong> Treat any response that depends on who is logged in as
-          uncacheable at the CDN, unless you have a very specific, reviewed setup. This is the layer where a leak
-          reaches the most people.</li>
-      </ul>
-
-      <h3 class="font-semibold text-lg mt-8">Application caches: in-process vs Redis</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Inside your backend you choose between a cache in the process's own memory and a shared cache server,
-        usually Redis (or a compatible server such as Valkey). Most production apps with more than one server
-        instance use Redis for anything that changes, and in-process memory only for small, near-constant data.
-      </p>
-      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Property</th><th class="px-4 py-3">In-process (a map or LRU in the app)</th><th class="px-4 py-3">Redis (shared)</th></tr></thead>
+            <th class="px-4 py-3">Error</th><th class="px-4 py-3">Retry?</th><th class="px-4 py-3">Instead</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Speed</td><td class="px-4 py-3">Fastest: no network</td><td class="px-4 py-3">One network round trip, well under a millisecond nearby</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Shared across servers</td><td class="px-4 py-3">No. Each of 4 instances has its own copy, and they drift apart.</td><td class="px-4 py-3">Yes. One copy, one place to invalidate.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Survives a deploy</td><td class="px-4 py-3">No, every restart starts cold</td><td class="px-4 py-3">Yes</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Invalidation</td><td class="px-4 py-3">Hard: you must reach every process</td><td class="px-4 py-3">One <code class="inline">DEL</code></td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Memory</td><td class="px-4 py-3">Competes with your app, so it can cause out-of-memory crashes</td><td class="px-4 py-3">Its own budget, with an eviction policy</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Good for</td><td class="px-4 py-3">Config, feature lists, specialties, compiled templates</td><td class="px-4 py-3">Profiles, computed pages, API responses, sessions, rate-limit counters</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Timeout, connection reset, 502/503/504</td><td class="px-4 py-3">Yes, with backoff</td><td class="px-4 py-3">—</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">429 Too Many Requests</td><td class="px-4 py-3">Yes, after the <code class="inline">Retry-After</code> the provider gives</td><td class="px-4 py-3">Also lower worker concurrency for that queue</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">400 / 422: invalid phone number</td><td class="px-4 py-3">No: it will fail identically for ever</td><td class="px-4 py-3">Mark the notification failed, record the reason, and let the job succeed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">401 / 403 from the provider</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Alert a human: the API key is wrong or expired</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Booking not found</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Succeed quietly and log it. It was deleted or never committed.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A bug in your code (TypeError)</td><td class="px-4 py-3">Retries won't fix it</td><td class="px-4 py-3">Let it reach the DLQ, fix and deploy, then replay</td></tr>
           </tbody>
         </table>
       </div>
-      <div class="mt-4 callout callout-warn">
-        <strong>In-process caches and serverless don't mix well.</strong> On Vercel, Lambda or any autoscaled platform,
-        you may have dozens of short-lived instances. Each one starts empty, and a <code class="inline">new Map()</code>
-        at module level gives you dozens of caches that disagree with each other. If an agent adds a module-level map
-        "as a cache" in serverless code, ask what happens on the other instances.
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Database-level caching</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Postgres already keeps recently used data pages in memory (its <em>shared buffers</em>, plus the operating
-        system's file cache), which is why a query often runs faster the second time. But it has <strong>no result
-        cache</strong>: it doesn't store the answer to a query and hand it back. (MySQL had a query cache and removed
-        it in 8.0, because invalidating it hurt more than it helped.) The database-side tool you will actually use
-        is the <strong>materialized view</strong>: a query whose result is saved as a table and refreshed when you
-        choose.
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Timeouts, backoff formulas and circuit breakers for calls in general are owned by
+        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>. The queue-specific point is that
+        your job library already implements backoff (Part II), so configure it rather than writing
+        <code class="inline">sleep()</code> loops inside a job, which hold a worker slot hostage.
       </p>
+
       <div class="mt-4">
-        <span class="code-label">migration — a materialized view for the search page</span>
-        <pre class="code"><span class="kw">CREATE MATERIALIZED VIEW</span> <span class="fn">clinic_free_slots_14d</span> <span class="kw">AS</span>
-<span class="kw">SELECT</span> d.clinic_id, date(s.starts_at) <span class="kw">AS</span> day, count(*) <span class="kw">AS</span> free_slots
-<span class="kw">FROM</span> slots s <span class="kw">JOIN</span> doctors d <span class="kw">ON</span> d.id = s.doctor_id
-<span class="kw">WHERE</span> s.starts_at <span class="kw">BETWEEN</span> now() <span class="kw">AND</span> now() + interval <span class="st">'14 days'</span>
-  <span class="kw">AND NOT EXISTS</span> (<span class="kw">SELECT</span> 1 <span class="kw">FROM</span> bookings b <span class="kw">WHERE</span> b.slot_id = s.id <span class="kw">AND</span> b.status = <span class="st">'booked'</span>)
-<span class="kw">GROUP BY</span> 1, 2;
-
-<span class="kw">CREATE UNIQUE INDEX ON</span> clinic_free_slots_14d (clinic_id, day);  <span class="cm">-- required for CONCURRENTLY</span>
-
-<span class="cm">-- run every minute from a scheduled job (SD9); readers are not blocked</span>
-<span class="kw">REFRESH MATERIALIZED VIEW CONCURRENTLY</span> clinic_free_slots_14d;</pre>
+        <span class="code-label">backoff.py — exponential backoff with full jitter</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">retry_delay</span>(attempt: int, base: float = <span class="st">2.0</span>, cap: float = <span class="st">3600</span>) -&gt; float:
+    <span class="cm"># attempt 1 → up to 2 s, 2 → up to 4 s, 3 → up to 8 s … never more than an hour</span>
+    <span class="kw">return</span> random.uniform(<span class="st">0</span>, min(cap, base * <span class="st">2</span> ** attempt))
+<span class="cm"># "full jitter": a random delay in [0, limit] spreads a burst of failures evenly.
+# Your job library has this built in; read its docs before writing your own.</span></pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        The view is exactly as stale as your refresh interval, which suits a search page and does not suit the
-        booking decision. Refreshing is scheduled work, so it belongs in a background job
-        (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>). Adding a read replica is a
-        different tool, for a different problem, covered in <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>.
+        Put together, a job moves through a small state machine. Most job dashboards show exactly these states, so
+        learn to read them:
       </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> Waiting: enqueued
+    Waiting --> Active: worker takes it
+    Active --> Completed: success, ack
+    Active --> Retrying: transient error
+    Retrying --> Waiting: after backoff delay
+    Active --> Dead: attempts exhausted<br/>or permanent error
+    Dead --> Waiting: replay after fix
+    Completed --> [*]
+        </pre>
+      </div>
 
-      <h3 class="font-semibold text-lg mt-8">Framework caches</h3>
+      <h3 class="font-semibold text-lg mt-8">Dead-letter queues and poison messages</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Most frameworks wrap these layers in their own API. The concepts in this module still apply, but the names
-        change. Know which one your stack uses, and read its docs before you trust its defaults:
+        A <strong>poison message</strong> is one that fails every time: malformed data, a missing record, or a bug
+        that crashes on this input. Without a limit, it is retried for ever, blocks ordered queues, and fills the logs.
+        A <strong>dead-letter queue (DLQ)</strong> is where messages go after too many failed attempts. On SQS you set
+        a <em>redrive policy</em> with <code class="inline">maxReceiveCount</code>, Sidekiq has its Dead set,
+        RabbitMQ has dead-letter exchanges, and BullMQ keeps failed jobs in a failed list.
       </p>
       <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>Next.js</strong>: with Cache Components enabled, the <code class="inline">'use cache'</code>
-          directive caches a function or component, <code class="inline">cacheLife</code> sets how long,
-          <code class="inline">cacheTag</code> labels entries, and <code class="inline">updateTag</code> /
-          <code class="inline">revalidateTag</code> invalidate them after a mutation. See
-          <a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a> and the
-          <a class="text-coral underline" href="https://nextjs.org/docs/app/api-reference/directives/use-cache" target="_blank" rel="noopener">use cache docs</a>.</li>
-        <li><strong>Rails</strong>: <code class="inline">Rails.cache.fetch(key, expires_in:)</code> is cache-aside in one
-          call, and fragment caching with key-based expiry is the Rails idiom for versioned keys
-          (<a href="./be2.html" class="text-viol underline decoration-viol/40">BE2</a>).</li>
-        <li><strong>NestJS</strong>: the cache manager module and an interceptor that caches GET responses
-          (<a href="./be3.html" class="text-viol underline decoration-viol/40">BE3</a>). Check what the key is before you
-          put it on an authenticated route.</li>
-        <li><strong>FastAPI and Gin</strong>: no built-in cache, so you call Redis directly with redis-py or go-redis
-          (<a href="./be4.html" class="text-viol underline decoration-viol/40">BE4</a>,
-          <a href="./be5.html" class="text-viol underline decoration-viol/40">BE5</a>).</li>
+        <li><strong>Alert on DLQ size above zero.</strong> A DLQ nobody watches is just a slower way of losing data.</li>
+        <li><strong>Keep enough context to debug:</strong> the payload, the error, the attempt count and a trace ID.</li>
+        <li><strong>Have a replay path.</strong> After the fix is deployed, move messages back to the main queue. SQS has a
+          built-in redrive for this, and most job dashboards have a "retry" button. Replay only works safely because
+          your jobs are idempotent.</li>
+        <li><strong>Set the visibility timeout above the job's worst-case duration</strong> on SQS, or a slow job gets
+          redelivered while it is still running (the diagram above).</li>
       </ul>
 
-      <!-- ═══════════════ PART III ═══════════════ -->
-      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Patterns, TTLs &amp; invalidation</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Decide the write path first, and the read path follows</h2>
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Scheduling, fan-out, ordering &amp; monitoring</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Time, fan-out and order are where queues surprise you</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Almost every caching bug is a write bug: the data changed and the cache didn't hear about it. So when you
-        review a cache, don't start at the <code class="inline">get</code>. Start by finding every place that
-        <em>writes</em> the underlying data and checking what each one does to the cache.
+        Once basic jobs work, the next requirements are "do it at a certain time", "several things should react to
+        this event", and "these must happen in order". Each one has a simple-looking implementation that breaks in
+        production, and a boring one that doesn't.
       </p>
 
-      <h3 class="font-semibold text-lg mt-7">Cache-aside: the default you'll see 90% of the time</h3>
+      <h3 class="font-semibold text-lg mt-7">The booking reminder: delayed job vs periodic scan</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        In <strong>cache-aside</strong> (also called lazy loading), the application manages the cache itself. On a
-        read it tries the cache, and on a miss it loads from the database and stores the result. On a write it
-        updates the database and then <strong>deletes</strong> the cache key, so the next read loads fresh data.
+        "Send an SMS 24 hours before the appointment" has two designs. A <strong>delayed job</strong> is enqueued at
+        booking time with a run-at timestamp. A <strong>periodic scan</strong> is a cron job that runs every few minutes,
+        finds bookings due for a reminder, and enqueues one job each.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Question</th><th class="px-4 py-3">Delayed job at booking time</th><th class="px-4 py-3">Periodic scan (every 5 min)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Booking is rescheduled</td><td class="px-4 py-3">The old job fires at the wrong time unless you find and cancel it</td><td class="px-4 py-3">The scan reads the current time. Nothing to cancel.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Booking is cancelled</td><td class="px-4 py-3">The job must re-check status when it runs</td><td class="px-4 py-3">Cancelled bookings aren't selected</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Redis is flushed or migrated</td><td class="px-4 py-3">Months of scheduled reminders are lost</td><td class="px-4 py-3">The truth is in Postgres, so the next scan recovers</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Booking made 3 hours before</td><td class="px-4 py-3">Needs a special case</td><td class="px-4 py-3">The scan's window logic decides</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Precision</td><td class="px-4 py-3">To the second</td><td class="px-4 py-3">Within the scan interval</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Verdict</td><td class="px-4 py-3">Fine for short, fixed delays ("retry in 10 minutes", "send survey 1 hour after the visit")</td><td class="px-4 py-3"><strong>Prefer for anything days away</strong> or tied to data that can change</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">jobs/reminder_scan.rb — cron every 5 minutes (Sidekiq)</span>
+        <pre class="code"><span class="kw">class</span> <span class="fn">ReminderScanJob</span>
+  <span class="kw">include</span> Sidekiq::Job
+  <span class="kw">def</span> <span class="fn">perform</span>
+    Booking.booked
+           .where(starts_at: Time.current..<span class="st">24</span>.hours.from_now)    <span class="cm"># due within 24 h</span>
+           .where.missing(:reminder_24h)                          <span class="cm"># no sent_notifications row yet</span>
+           .find_each { |b| SendReminderJob.perform_async(b.id) }
+  <span class="kw">end</span>
+<span class="kw">end</span>
+<span class="cm"># Overlapping scans or a double enqueue are harmless: SendReminderJob is idempotent (Part III).
+# Scheduled with the cron feature of your job library (Sidekiq Enterprise, sidekiq-cron,
+# Celery beat, BullMQ job schedulers, ARQ cron, asynq Scheduler), not the server's crontab.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two cron traps are worth naming. First, if you run three app servers and each one has the same crontab
+        entry, the job runs three times: use a scheduler that elects a single runner, or make the job idempotent (you
+        did). Second, cron times are in some time zone. A reminder for a clinic in Ho Chi Minh City scheduled
+        "at 9:00" on a UTC server goes out at 16:00 local time. Store times as <code class="inline">timestamptz</code>
+        (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>) and convert deliberately.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Fan-out and pub/sub</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When a booking is created, four things should happen: confirmation email, calendar sync, analytics, and a
+        notification to the clinic's dashboard. Enqueuing four jobs from the booking handler couples it to every
+        consumer. <strong>Publish/subscribe</strong> inverts that. The handler publishes one event,
+        <code class="inline">booking.created</code>, and each consumer subscribes with its own queue. On AWS the
+        standard shape is an SNS topic with one SQS queue per consumer:
       </p>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
 flowchart LR
-    R["GET clinic 7"] --> C{"key in Redis?"}
-    C -- "hit" --> H["return cached JSON"]
-    C -- "miss" --> D["SELECT from Postgres"]
-    D --> S["SET key with TTL"]
-    S --> H2["return fresh JSON"]
-    W["UPDATE clinic 7"] --> DB["write Postgres, COMMIT"]
-    DB --> X["DEL key"]
-        </pre>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">clinics/profile.ts — cache-aside with ioredis</span>
-        <pre class="code"><span class="kw">export async function</span> <span class="fn">getClinicProfile</span>(id: <span class="kw">number</span>) {
-  <span class="kw">const</span> key = <span class="st">`clinic:v3:${id}:profile`</span>;
-  <span class="kw">try</span> {
-    <span class="kw">const</span> hit = <span class="kw">await</span> redis.get(key);
-    <span class="kw">if</span> (hit) <span class="kw">return</span> JSON.parse(hit);
-  } <span class="kw">catch</span> (err) {
-    log.warn({ err }, <span class="st">"redis read failed, falling back to db"</span>); <span class="cm">// cache down ≠ site down</span>
-  }
-  <span class="kw">const</span> profile = <span class="kw">await</span> db.clinic.findPublicProfile(id);
-  <span class="kw">if</span> (profile) {
-    <span class="kw">const</span> ttl = <span class="st">300</span> + Math.floor(Math.random() * <span class="st">60</span>);           <span class="cm">// TTL + jitter (Part IV)</span>
-    <span class="kw">await</span> redis.set(key, JSON.stringify(profile), <span class="st">"EX"</span>, ttl).catch(() =&gt; {});
-  }
-  <span class="kw">return</span> profile;
-}
-
-<span class="kw">export async function</span> <span class="fn">updateClinic</span>(id: <span class="kw">number</span>, input: ClinicUpdate) {
-  <span class="kw">await</span> db.clinic.update(id, input);                <span class="cm">// commits first…</span>
-  <span class="kw">await</span> redis.del(<span class="st">`clinic:v3:${id}:profile`</span>);      <span class="cm">// …then invalidates. Delete, don't set.</span>
-}</pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Two details separate a good version from a bad one. The good version <strong>deletes</strong> the key on
-        write instead of writing the new value into it: setting it risks racing with a concurrent reader, and it
-        caches a shape that the read path may build differently. It also <strong>survives Redis being down</strong>
-        by falling back to the database. The same pattern in Python and Ruby:
-      </p>
-      <div class="mt-4">
-        <span class="code-label">clinics/profile.py (redis-py) · clinic.rb (Rails)</span>
-        <pre class="code"><span class="kw">def</span> <span class="fn">get_clinic_profile</span>(clinic_id: int) -&gt; dict | None:
-    key = <span class="st">f"clinic:v3:{clinic_id}:profile"</span>
-    <span class="kw">if</span> (hit := r.get(key)) <span class="kw">is not None</span>:
-        <span class="kw">return</span> json.loads(hit)
-    profile = repo.find_public_profile(clinic_id)
-    <span class="kw">if</span> profile:
-        r.set(key, json.dumps(profile), ex=<span class="st">300</span>)
-    <span class="kw">return</span> profile
-
-<span class="cm"># Rails: cache-aside in one call; the block runs only on a miss</span>
-Rails.cache.fetch(<span class="st">"clinic:v3:#{id}:profile"</span>, expires_in: <span class="st">5</span>.minutes) <span class="kw">do</span>
-  Clinic.find(id).public_profile
-<span class="kw">end</span></pre>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Read-through, write-through and write-behind</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        The other named patterns move responsibility around. In <strong>read-through</strong>, a cache library or
-        service loads from the database on a miss, so your code only ever talks to the cache. Rails'
-        <code class="inline">fetch</code> above is close to this. In <strong>write-through</strong>, every write goes
-        to the cache and the database together, so the cache is never stale, but you pay on every write. In
-        <strong>write-behind</strong> (write-back), writes go to the cache and are flushed to the database later,
-        which is fast and risky.
-      </p>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Pattern</th><th class="px-4 py-3">Read path</th><th class="px-4 py-3">Write path</th><th class="px-4 py-3">Staleness</th><th class="px-4 py-3">Right when</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Cache-aside</td><td class="px-4 py-3">App checks cache, loads DB on miss</td><td class="px-4 py-3">App writes DB, deletes key</td><td class="px-4 py-3">Up to TTL if an invalidation is missed</td><td class="px-4 py-3">The default for web apps. Simple, and it survives cache outages.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Read-through</td><td class="px-4 py-3">Cache layer loads DB on miss</td><td class="px-4 py-3">Usually paired with delete or write-through</td><td class="px-4 py-3">Same as cache-aside</td><td class="px-4 py-3">A framework or library already provides it</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Write-through</td><td class="px-4 py-3">Always from cache</td><td class="px-4 py-3">Write DB and cache in the same operation</td><td class="px-4 py-3">Low, but a failed half-write leaves them different</td><td class="px-4 py-3">Data read immediately after writing, such as a user's settings</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Write-behind</td><td class="px-4 py-3">Always from cache</td><td class="px-4 py-3">Write cache, flush to DB later in batches</td><td class="px-4 py-3">DB lags behind, and a crash can <strong>lose writes</strong></td><td class="px-4 py-3">High-volume counters where losing a few is acceptable: view counts, "last seen"</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="mt-4 callout callout-danger">
-        <strong>Never use write-behind for anything that matters.</strong> A booking, a payment or an order written
-        only to Redis and "flushed later" is lost if Redis restarts before the flush. If an agent proposes buffering
-        business writes in the cache for speed, the answer is no. Use a queue with durable storage
-        (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>) instead.
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Choosing a TTL on purpose</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        The TTL (time to live) is your safety net. Even if every invalidation works, a TTL puts an upper bound on how
-        wrong the cache can be when one doesn't. Every key gets one. Pick it from the business question "how stale
-        can this be before a user is harmed or confused?", not from habit:
-      </p>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Data</th><th class="px-4 py-3">TTL</th><th class="px-4 py-3">Also invalidated on write?</th><th class="px-4 py-3">Reasoning</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Specialties list</td><td class="px-4 py-3">1 day</td><td class="px-4 py-3">Yes, on admin edit</td><td class="px-4 py-3">Changes a few times a year</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Clinic profile</td><td class="px-4 py-3">5–15 min</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">The TTL only catches a missed invalidation</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Free-slot counts</td><td class="px-4 py-3">10–30 s</td><td class="px-4 py-3">No, too many writers</td><td class="px-4 py-3">A hint only. The booking re-checks.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Exchange rates from an API</td><td class="px-4 py-3">1 hour</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Matches the provider's update rate</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Session data</td><td class="px-4 py-3">The session length, such as 7 days sliding</td><td class="px-4 py-3">Deleted on logout</td><td class="px-4 py-3">The TTL is the security property (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>)</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        A key with no TTL at all is a bug waiting for a missed invalidation, and it also slowly fills memory with keys
-        for records nobody reads any more. In review, <code class="inline">redis.set(key, value)</code> with no
-        expiry should always prompt the question "why not?".
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Four invalidation strategies</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        "There are only two hard things in computer science: cache invalidation and naming things." Invalidation
-        is hard because the code that writes data is often far away from the code that caches it. Pick a strategy
-        per cache, deliberately:
-      </p>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Strategy</th><th class="px-4 py-3">How</th><th class="px-4 py-3">Strength</th><th class="px-4 py-3">Weakness</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">TTL only</td><td class="px-4 py-3">Let entries expire</td><td class="px-4 py-3">No write-path code at all</td><td class="px-4 py-3">Always stale for up to the TTL</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Delete on write</td><td class="px-4 py-3">The service that writes deletes the key after commit</td><td class="px-4 py-3">Simple and immediate</td><td class="px-4 py-3">Every writer must remember, including admin scripts and jobs</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Event-based</td><td class="px-4 py-3">Writes publish <code class="inline">clinic.updated</code>, and a consumer deletes the keys</td><td class="px-4 py-3">Writers don't need to know about caches</td><td class="px-4 py-3">Needs reliable events: the outbox from <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a> and consumers from <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a></td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Versioned keys</td><td class="px-4 py-3">Put a version in the key. A write bumps the version, so old keys are never read again and expire on their own.</td><td class="px-4 py-3">No delete race, and invalidating many keys is one increment</td><td class="px-4 py-3">Old entries occupy memory until their TTL</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Tag-based</td><td class="px-4 py-3">Label entries with tags (<code class="inline">clinic:7</code>) and invalidate by tag</td><td class="px-4 py-3">"Everything about clinic 7" in one call</td><td class="px-4 py-3">Needs framework or CDN support, such as Next.js <code class="inline">cacheTag</code> or CDN purge-by-tag</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">clinics/cache.go — versioned keys with go-redis</span>
-        <pre class="code"><span class="cm">// One counter per clinic. Every cached thing about the clinic embeds it.</span>
-<span class="kw">func</span> <span class="fn">clinicKey</span>(ctx context.Context, id <span class="kw">int64</span>, part <span class="kw">string</span>) <span class="kw">string</span> {
-    ver, _ := rdb.Get(ctx, fmt.Sprintf(<span class="st">"clinic:%d:ver"</span>, id)).Int64() <span class="cm">// missing → 0</span>
-    <span class="kw">return</span> fmt.Sprintf(<span class="st">"clinic:%d:v%d:%s"</span>, id, ver, part)
-}
-
-<span class="cm">// After the DB transaction commits: one INCR invalidates profile, doctors, reviews…</span>
-<span class="kw">func</span> <span class="fn">invalidateClinic</span>(ctx context.Context, id <span class="kw">int64</span>) <span class="kw">error</span> {
-    <span class="kw">return</span> rdb.Incr(ctx, fmt.Sprintf(<span class="st">"clinic:%d:ver"</span>, id)).Err()
-}</pre>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">The stale-set race, and why "after commit" matters</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Cache-aside has one well-known race. A slow reader loads old data, a writer updates the database and deletes
-        the key, and then the slow reader puts the old data back. The cache is now wrong until the TTL expires:
-      </p>
-      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
-        <pre class="mermaid">
-sequenceDiagram
-    participant R as Reader (slow)
-    participant C as Redis
-    participant DB as Postgres
-    participant W as Writer
-    R->>C: GET clinic:7 → miss
-    R->>DB: SELECT clinic 7 → old hours
-    W->>DB: UPDATE clinic 7, COMMIT
-    W->>C: DEL clinic:7
-    R->>C: SET clinic:7 = old hours
-    Note over C: stale until TTL expires ❌<br/>the TTL is what saves you
+    API["Booking service<br/>(via outbox, SD6)"] --> T(["SNS topic<br/>booking-events"])
+    T --> Q1["SQS email-queue"] --> W1["Email worker"]
+    T --> Q2["SQS calendar-queue"] --> W2["Calendar sync"]
+    T --> Q3["SQS analytics-queue"] --> W3["Analytics loader"]
+    Q2 -.->|"after 5 failed receives"| D2["calendar-dlq"]
         </pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        The race is rare and the TTL bounds it, which is why cache-aside is still the default. A related bug is
-        worse and common in agent code: deleting the key <strong>inside</strong> the database transaction, before
-        it commits. A reader can then refill the cache from the not-yet-updated row. Always invalidate
-        <strong>after commit</strong> (ORMs offer after-commit hooks, such as Rails' <code class="inline">after_commit</code>).
-        If the data really can't tolerate the window, use versioned keys, a shorter TTL, or no cache.
+        Each consumer gets its own copy, its own retry policy, its own DLQ and its own pace. A Google Calendar outage
+        fills <code class="inline">calendar-queue</code> and leaves email untouched. The same shape is a fanout
+        exchange in RabbitMQ, or several consumer groups on one Kafka topic or Redis stream. The architecture-level
+        question of when to use events between services at all is in
+        <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>, and getting the event out reliably
+        is the outbox in <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>.
       </p>
 
-      <!-- ═══════════════ PART IV ═══════════════ -->
-      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Failure modes, keys &amp; measurement</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Caches fail in crowds and leak in silence</h2>
-      <p class="mt-4 text-[15px] leading-relaxed">
-        A cache that works on your laptop can still take production down in two ways: everyone misses at once, or the
-        wrong person hits. Neither shows up in a unit test. This Part covers how to recognise both, how to design keys
-        that prevent the second, and how to prove the cache helps at all.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-7">Cache stampede (thundering herd)</h3>
+      <h3 class="font-semibold text-lg mt-8">Ordering: rarely global, sometimes per key</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        A popular key expires. In the next 50 ms, 500 requests miss at the same time, and all 500 run the same
-        expensive query against the database. The database slows down, so the queries take longer, so even more
-        requests pile up behind them. The same thing happens after a deploy that flushes the cache, or when Redis
-        restarts empty. The cache was hiding how much load the database could really take.
+        With several workers and retries, messages finish out of order. A retry of "booking 91 created" can land after
+        "booking 91 cancelled". Global ordering is expensive, because it means one worker at a time, and it is almost
+        never what you need. What you usually need is <strong>order per entity</strong>: all messages for booking 91 in
+        sequence, while different bookings run in parallel.
       </p>
-      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
-        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="Cache stampede without and with single-flight">
-          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">KEY "search:hanoi:cardio" EXPIRES AT 09:00:00 — 500 REQUESTS ARRIVE IN THE SAME SECOND</text>
-          <text x="12" y="46" font-size="10" font-weight="700" fill="#DB2777">WITHOUT PROTECTION</text>
-          <g class="anim-pulse"><rect x="10" y="56" width="130" height="50" rx="9" fill="#2563EB"/>
-            <text x="75" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">500 requests</text>
-            <text x="75" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">all miss</text></g>
-          <g class="anim-pulse d1"><rect x="250" y="56" width="170" height="50" rx="9" fill="#DB2777"/>
-            <text x="335" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">500 × heavy query</text>
-            <text x="335" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">each 900 ms, then slower</text></g>
-          <g class="anim-pulse d2"><rect x="530" y="56" width="160" height="50" rx="9" fill="#37474F"/>
-            <text x="610" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Postgres at 100% CPU</text>
-            <text x="610" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">every page slows down</text></g>
-          <line x1="140" y1="81" x2="250" y2="81" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="420" y1="81" x2="530" y2="81" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <text x="12" y="138" font-size="10" font-weight="700" fill="#0D9488">WITH SINGLE-FLIGHT + STALE-WHILE-REVALIDATE</text>
-          <g class="anim-pulse d1"><rect x="10" y="148" width="130" height="50" rx="9" fill="#2563EB"/>
-            <text x="75" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">500 requests</text>
-            <text x="75" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">1 wins the lock</text></g>
-          <g class="anim-pulse d2"><rect x="250" y="148" width="170" height="50" rx="9" fill="#0D9488"/>
-            <text x="335" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1 × heavy query</text>
-            <text x="335" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">499 get the stale copy</text></g>
-          <g class="anim-pulse d3"><rect x="530" y="148" width="160" height="50" rx="9" fill="#6d5acd"/>
-            <text x="610" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Cache refilled</text>
-            <text x="610" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">DB barely notices</text></g>
-          <line x1="140" y1="173" x2="250" y2="173" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="420" y1="173" x2="530" y2="173" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-        </svg>
-      </div>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Defence</th><th class="px-4 py-3">What it does</th><th class="px-4 py-3">Cost</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">TTL jitter</td><td class="px-4 py-3">Add a random few percent to each TTL, so keys written together don't expire together</td><td class="px-4 py-3">One line. Always do it.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Single-flight (request coalescing)</td><td class="px-4 py-3">Only one caller recomputes a missing key. The rest wait for its result.</td><td class="px-4 py-3">In-process is easy. Across servers you need a short Redis lock.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Serve stale while refreshing</td><td class="px-4 py-3">Keep a "soft" expiry inside the value. After it passes, serve the old value and refresh in the background.</td><td class="px-4 py-3">Users see slightly old data during the refresh</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Early refresh / pre-warming</td><td class="px-4 py-3">Refresh hot keys shortly before they expire, or fill them from a job after a deploy</td><td class="px-4 py-3">Needs to know which keys are hot</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">search/cache.go — single-flight inside one process</span>
-        <pre class="code"><span class="kw">import</span> <span class="st">"golang.org/x/sync/singleflight"</span>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>SQS FIFO</strong>: set <code class="inline">MessageGroupId</code> to the booking ID. Messages in one
+          group are delivered in order, one at a time. Different groups proceed in parallel.</li>
+        <li><strong>Kafka</strong>: use the booking ID as the message key. The same key always goes to the same
+          partition, and a partition is consumed in order.</li>
+        <li><strong>Or don't depend on order at all</strong>: include a version or <code class="inline">updated_at</code>
+          in the message, and have the consumer ignore anything older than what it has already applied. This is often
+          the simplest and most robust fix.</li>
+      </ul>
 
-<span class="kw">var</span> group singleflight.Group
-
-<span class="kw">func</span> <span class="fn">FreeSlots</span>(ctx context.Context, city, spec <span class="kw">string</span>) ([]Slot, <span class="kw">error</span>) {
-    key := <span class="st">"search:"</span> + city + <span class="st">":"</span> + spec
-    <span class="kw">if</span> s, ok := cacheGet(ctx, key); ok {
-        <span class="kw">return</span> s, <span class="kw">nil</span>
-    }
-    <span class="cm">// 500 concurrent misses for the same key → one DB query, 500 shared results</span>
-    v, err, _ := group.Do(key, <span class="kw">func</span>() (any, <span class="kw">error</span>) {
-        s, err := db.FreeSlots(ctx, city, spec)
-        <span class="kw">if</span> err == <span class="kw">nil</span> { cacheSet(ctx, key, s, jitter(<span class="st">30</span>*time.Second)) }
-        <span class="kw">return</span> s, err
-    })
-    <span class="kw">if</span> err != <span class="kw">nil</span> { <span class="kw">return nil</span>, err }
-    <span class="kw">return</span> v.([]Slot), <span class="kw">nil</span>
-}</pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Across several servers, the same idea uses a short lock in Redis: <code class="inline">SET lock:KEY token NX PX 5000</code>
-        succeeds for exactly one caller, which recomputes. The others briefly wait and retry the cache, or serve the
-        stale copy. Always give the lock an expiry, so a crashed holder can't block the key forever.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">What never to cache, and how keys leak data</h3>
+      <h3 class="font-semibold text-lg mt-8">Throughput: concurrency, rate limits and big batches</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        The most serious caching bug is not staleness. It is <strong>serving one user's data to another</strong>. It
-        happens when a response depends on who is asking, but the cache key doesn't include who is asking. The agent
-        wraps <code class="inline">GET /me/bookings</code> in a cache keyed by the URL, the first patient's bookings
-        get cached, and every other patient now sees them.
-      </p>
-      <div class="mt-4 callout callout-danger">
-        <strong>The per-user leak, three ways it ships:</strong> a cache key built from the path only
-        (<code class="inline">cache:/api/me/bookings</code>) · a CDN or proxy caching an authenticated response because
-        it had <code class="inline">Cache-Control: public</code> or no header at all · a framework "cache this page"
-        helper put on a page that reads cookies. The rule: if the response depends on the user, the tenant or the
-        permissions, either that identity is <em>in the key</em>, or the response is <code class="inline">no-store</code>
-        and never shared. For health data, prefer no-store.
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Also keep out of any cache: secrets and tokens (they belong in a secrets manager or a session store with a
-        TTL), full payment details, and anything whose correctness decides money or capacity, such as stock levels or
-        slot availability at the moment of purchase.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Key design</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        A good key is <strong>namespaced</strong>, <strong>versioned</strong>, and contains <strong>every input that
-        changes the output</strong>, and nothing else. Use a fixed shape such as
-        <code class="inline">app:entity:version:id:variant</code>, separated by colons, which is the Redis convention.
-      </p>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Bad key</th><th class="px-4 py-3">Problem</th><th class="px-4 py-3">Better key</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">bookings</code></td><td class="px-4 py-3">Same for every user: a data leak</td><td class="px-4 py-3"><code class="inline">clinic:bookings:v1:patient:812</code>, or don't cache it</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">clinic_7</code></td><td class="px-4 py-3">No namespace or version. A changed JSON shape after a deploy breaks the readers.</td><td class="px-4 py-3"><code class="inline">clinic:v3:7:profile</code>. Bump <code class="inline">v3</code> when the shape changes.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">search:hanoi</code></td><td class="px-4 py-3">Forgets the specialty, date and language inputs</td><td class="px-4 py-3"><code class="inline">search:v1:hanoi:cardio:2026-10-01:vi</code></td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">search:{JSON of all params}</code></td><td class="px-4 py-3">Params in a different order give a different key, which kills the hit rate</td><td class="px-4 py-3">Normalise: sort params, lowercase, and hash if long</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">report:tenant</code></td><td class="px-4 py-3">Multi-tenant app with no tenant ID in the key</td><td class="px-4 py-3"><code class="inline">t:42:report:v2:monthly:2026-09</code></td></tr>
-          </tbody>
-        </table>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Measure the hit rate, or it's a guess</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>Hit rate</strong> = hits ÷ (hits + misses). A cache with a 20% hit rate adds a network hop to 80% of
-        requests and saves little. Hot, well-keyed data usually shows 90% or more. Watch three numbers: hit rate
-        <em>per cache</em> (a global number hides a useless cache), <strong>evictions</strong> (Redis is out of memory
-        and throwing keys away), and the latency of the uncached path.
+        The queue lets you choose how fast work drains, and that speed must match the slowest thing downstream.
+        Your SMS provider may allow 10 messages per second. Twenty workers with a concurrency of 10 each can
+        attempt 200, and 190 of those come back as 429s. Limit the <em>consumer</em>, not the producer:
       </p>
       <div class="mt-4">
-        <span class="code-label">redis-cli — global counters, and a per-cache metric in code</span>
-        <pre class="code">$ redis-cli INFO stats | grep -E <span class="st">"keyspace_(hits|misses)|evicted_keys"</span>
-<span class="out">keyspace_hits:1843021
-keyspace_misses:96112          # ≈ 95% global hit rate
-evicted_keys:0                 # &gt; 0 and rising → memory too small</span>
-
-$ redis-cli CONFIG GET maxmemory-policy
-<span class="out">allkeys-lru</span>                    <span class="cm"># for a pure cache: evict least-recently-used keys</span>
-
-<span class="cm">// per-cache counters: emit one metric per hit and miss, labelled with the cache name</span>
-metrics.increment(<span class="st">"cache.lookup"</span>, { cache: <span class="st">"clinic_profile"</span>, result: hit ? <span class="st">"hit"</span> : <span class="st">"miss"</span> });</pre>
+        <span class="code-label">workers/sms.worker.ts — match the provider's limit</span>
+        <pre class="code"><span class="kw">new</span> <span class="fn">Worker</span>(<span class="st">"sms"</span>, sendSms, {
+  connection,
+  concurrency: <span class="st">5</span>,
+  limiter: { max: <span class="st">10</span>, duration: <span class="st">1000</span> },   <span class="cm">// at most 10 jobs per second for this queue</span>
+});</pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Dashboards and alerts are covered in <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>.
-        For a PR, the minimum is before-and-after latency for the endpoint under realistic load, plus the hit rate
-        after a warm-up.
+        For bulk work, such as "send the new-clinic announcement to 40,000 patients", don't write one job that loops
+        over 40,000 rows. It runs for an hour, can't be retried halfway, and blocks a worker. Use one small
+        <strong>coordinator</strong> job that pages through the IDs and enqueues one job per patient (or per batch of
+        100). Each child job is small, retried on its own, and idempotent.
       </p>
 
-      <h3 class="font-semibold text-lg mt-8">Redis data structures, briefly</h3>
+      <h3 class="font-semibold text-lg mt-8">Monitoring: depth, age, failures</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Redis is not just a key-to-string store. Picking the right structure often removes a whole round of
-        serialising and reloading:
+        A queue fails quietly. Nothing errors in the API, and customers simply stop getting emails. Put these on a
+        dashboard for every queue, with alerts (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>
+        covers observability tooling):
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Type</th><th class="px-4 py-3">Commands</th><th class="px-4 py-3">Use in the clinic app</th></tr></thead>
+            <th class="px-4 py-3">Metric</th><th class="px-4 py-3">What it tells you</th><th class="px-4 py-3">Example alert</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">String</td><td class="px-4 py-3"><code class="inline">GET SET INCR EXPIRE</code></td><td class="px-4 py-3">Cached JSON, version counters, simple rate-limit counters</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Hash</td><td class="px-4 py-3"><code class="inline">HGET HSET HGETALL</code></td><td class="px-4 py-3">A clinic's fields, when you update one field at a time</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">List</td><td class="px-4 py-3"><code class="inline">LPUSH LRANGE LTRIM</code></td><td class="px-4 py-3">"Recently viewed clinics", capped at 10</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Set</td><td class="px-4 py-3"><code class="inline">SADD SISMEMBER</code></td><td class="px-4 py-3">Tags: which keys belong to clinic 7, for tag-based invalidation</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Sorted set</td><td class="px-4 py-3"><code class="inline">ZADD ZRANGE</code></td><td class="px-4 py-3">Top-rated doctors leaderboard, sliding-window rate limits</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Stream</td><td class="px-4 py-3"><code class="inline">XADD XREADGROUP</code></td><td class="px-4 py-3">A lightweight event log with consumer groups, covered in <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Queue depth (waiting jobs)</td><td class="px-4 py-3">Arrivals vs throughput. Rising steadily means workers can't keep up.</td><td class="px-4 py-3">Depth still growing after 15 min</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Age of the oldest message</td><td class="px-4 py-3">The user-facing delay. It catches stuck workers even when depth is small. SQS exposes it as <code class="inline">ApproximateAgeOfOldestMessage</code>.</td><td class="px-4 py-3">Email queue oldest &gt; 5 min</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Failure and retry rate</td><td class="px-4 py-3">A provider outage or a bad deploy</td><td class="px-4 py-3">&gt; 5% of jobs failing over 10 min</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">DLQ size</td><td class="px-4 py-3">Work that will never happen without a human</td><td class="px-4 py-3">Any message in any DLQ</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Job duration (p95)</td><td class="px-4 py-3">Slow dependencies, and whether the visibility timeout is still safe</td><td class="px-4 py-3">p95 above half the timeout</td></tr>
           </tbody>
         </table>
       </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Finally, workers need <strong>graceful shutdown</strong>. On deploy, a worker should stop taking new jobs and
+        finish (or give back) the ones in progress before it exits. Every library here supports it, but a container
+        that is killed too quickly skips it. Check that your platform's stop timeout is longer than your longest job,
+        or keep jobs short enough that it doesn't matter.
+      </p>
 
       <!-- ═══════════════ Claude Code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Agents are good at writing the cache plumbing, the load test and the metrics. They are weak at the questions
-        that make caching safe: what the key must contain, how stale is acceptable, and which writers must
-        invalidate. Give the agent those answers, or ask it to find them, before it writes a line.
+        Agents write workers, enqueue calls and retry configuration fluently. What they skip is the hostile
+        environment: duplicates, crashes between two lines, cancellations while a job waits, and poison messages.
+        Make the agent reason about those explicitly, and make it prove the job is idempotent with a test.
       </p>
       <div class="mt-4">
-        <span class="code-label">prompt — caching plan before code</span>
-        <pre class="code">GET /clinics/:id/search-summary is slow (p95 1.2 s, see the trace below).
-Before writing any code, produce a caching plan:
-1. Measure: where the time goes (queries, external calls). Paste EXPLAIN for the top query.
-2. Proposal: which layer (HTTP / CDN / Redis / materialized view) and why.
-3. For each cache: exact key format, TTL + jitter, max staleness in business terms.
-4. List EVERY code path that writes the underlying tables (grep for it) and how
-   each one invalidates. Include jobs, admin actions and seeds.
-5. Does the response vary by user, tenant, role or locale? If yes, say how the key covers it.
-Stop after the plan.</pre>
+        <span class="code-label">prompt — design the job before writing it</span>
+        <pre class="code">We need a 24h SMS reminder for bookings (clinic app, BullMQ + Postgres).
+Before coding, answer in a short design note:
+1. Delayed job or periodic scan? Justify against reschedule, cancel and Redis loss.
+2. What is the message payload? (IDs only.)
+3. How is the job idempotent? Name the unique constraint or de-dup record.
+4. Which errors retry, which don't, max attempts, backoff. Where do failures go?
+5. What happens if the worker crashes between sending the SMS and recording it?
+6. Which metrics and alerts will tell us reminders stopped?
+Stop after the note. Don't write code yet.</pre>
       </div>
-      <pre class="code mt-3">Review this diff only for caching risks: keys missing user/tenant/locale, SET without TTL,
-invalidation inside a transaction instead of after commit, Cache-Control on authenticated
-routes, and what happens when Redis is unreachable. Cite file:line for each finding.</pre>
-      <pre class="code mt-3">Write a load test (k6 or autocannon) that hits the endpoint with 200 concurrent users
-right after a cache flush. Report DB query count and p95 with and without the
-single-flight lock. Paste the raw numbers.</pre>
+      <pre class="code mt-3">Write a test that runs SendReminderJob twice concurrently for the same booking
+and asserts the SMS client was called exactly once. Then a test where the booking
+is cancelled after enqueue and asserts it was called zero times. Paste the output.</pre>
+      <pre class="code mt-3">Audit every enqueue call in this repo: list job name, payload fields, retry config,
+and whether the payload contains personal data or whole records instead of IDs.
+Output a table; don't change code.</pre>
       <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>Profile the endpoint and find where the time goes</li>
-            <li>Write the cache-aside wrapper, invalidation hooks and key helpers</li>
-            <li>Grep for every writer of a table</li>
-            <li>Add hit and miss metrics, and write the load test</li>
-            <li>Write a test that user A never receives user B's cached response</li>
+            <li>Wire the queue library, workers and scheduler config</li>
+            <li>Write the de-dup migration and the idempotent job body</li>
+            <li>Write duplicate-run and cancel-in-between tests</li>
+            <li>Classify provider errors into retry and don't-retry</li>
+            <li>Add queue-depth, age and DLQ metrics to the dashboard</li>
           </ul>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-coral">You must check</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>That caching is needed at all: the numbers before and after</li>
-            <li>Every input that changes the output is in the key</li>
-            <li>The TTL matches a staleness the business accepts</li>
-            <li>Every write path invalidates, after commit</li>
-            <li>The <code class="inline">Cache-Control</code> header on every authenticated route</li>
+            <li>That the work really should be async, and what the user sees if it fails</li>
+            <li>Idempotency that relies on the database, not on luck or the job ID alone</li>
+            <li>Max attempts and total retry time against the business deadline</li>
+            <li>That the DLQ exists, alerts, and has a replay path</li>
+            <li>Payloads: IDs only, with no secrets or health data</li>
           </ul>
         </div>
       </div>
       <div class="mt-4 callout callout-warn">
-        <strong>Red flags in agent-written caching:</strong> a cache added with no measurement ("this should be faster")
-        · <code class="inline">set(key, value)</code> with no TTL · a key built from the URL path on an authenticated
-        route · <code class="inline">Cache-Control: public</code> on anything under <code class="inline">/me</code>,
-        <code class="inline">/account</code> or <code class="inline">/admin</code> · a module-level
-        <code class="inline">Map</code> as a cache in serverless code · invalidation only in the API handler, while
-        jobs and admin tools write the same table · caching the result that a booking or payment decision reads ·
-        Redis errors that crash the request instead of falling back.
+        <strong>Red flags in agent-written async code:</strong> an email, SMS or HTTP call to a third party inside the
+        request handler · a job that sends, charges or increments with no de-dup check · <code class="inline">retry: true</code>
+        with no limit, or retries on 4xx errors · <code class="inline">sleep()</code> inside a job to "wait and retry" ·
+        whole objects or personal data in the payload · a reminder scheduled months ahead as a delayed job with no
+        cancel path · a cron entry on every app server · no DLQ, or a DLQ with no alert · "exactly-once" in a comment
+        as the reason no idempotency is needed.
       </div>
 
       <!-- ═══════════════ skill ladder ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Thinks of caching as "put it in Redis and it gets faster". Accepts any cache an agent adds.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows cache-aside and TTLs, and can read <code class="inline">Cache-Control</code>. Doesn't yet ask who invalidates, or what the key is missing.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Implements cache-aside with a TTL for a clear case. Needs review to catch a missed writer, a key without the user, or a stampede risk.</div></div>
-        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Measures before caching. Chooses the layer and pattern with a reason. Designs keys that include every input, sets TTLs from business staleness, invalidates on every write path after commit, handles Redis being down, and reports the hit rate.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the team's key conventions and caching checklist. Designs stampede protection and CDN strategy for high-traffic launches. Spots per-user leaks in other people's reviews.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Does everything inside the request, and has never run a worker process.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can enqueue a job with the stack's library. Assumes each job runs exactly once.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Moves slow work to jobs with retries configured. Needs review to catch non-idempotent side effects, retries on permanent errors, or a missing DLQ.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses a job queue or broker with reasons. Writes idempotent jobs backed by a unique constraint, with tests for duplicates and cancellation. Classifies errors, configures backoff and a DLQ with an alert, prefers a periodic scan for far-future work, and monitors depth and age.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Designs fan-out and ordering for multi-service flows, runs DLQ replays during incidents, and sets the team's conventions for job design and queue alerts.</div></div>
       </div>
       <div class="mt-4 callout callout-tip">
-        <strong>Self-check before claiming 3:</strong> for one cache in your project, can you state from memory its key
-        format, its TTL and why, every code path that invalidates it, and what happens when Redis is down? Could you
-        show a test proving two different users never share a cached response?
+        <strong>Self-check before claiming 3:</strong> for one job you wrote, explain what happens if it runs twice at
+        the same moment, if the worker is killed halfway through, and if the provider returns 400. Can you show where
+        its failures end up and who gets alerted?
       </div>
 
       <!-- ═══════════════ pitfalls ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
       <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Caching to hide a missing index</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The query is slow because of a Seq Scan. A cache hides it until the first miss after a deploy. Fix the query first (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>), then cache only if it's still needed.</p>
+          <div class="font-semibold text-rose-500">✗ Enqueuing before the commit</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The worker picks up the job in 5 ms, looks for booking 91, and doesn't find it because the transaction hasn't committed. Enqueue after commit, or use the outbox (<a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>).</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Trusting the cache for decisions</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A cached "slot is free" or "5 in stock" used to accept a booking or an order. Show from the cache, decide from the database.</p>
+          <div class="font-semibold text-rose-500">✗ One queue for everything</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A 10,000-row CSV import sits in front of password-reset emails. Separate queues (or priorities) for user-facing and bulk work.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Flushing everything on deploy</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">FLUSHALL</code> in a deploy script causes a stampede at the busiest moment. Bump a key version for the caches whose shape changed instead.</p>
+          <div class="font-semibold text-rose-500">✗ Unbounded retries</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A poison message retried for ever burns worker time and hides real failures in noise. Cap the attempts, and send the rest to a DLQ.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write the four facts next to every cache</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Key, staleness, invalidation and failure behaviour, as a comment. Reviewers and future agents can check the code against it.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Store notification state in the database</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A <code class="inline">sent_notifications</code> table gives you idempotency, an audit trail, and an answer when a patient says "I never got the SMS".</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Add a cross-user test</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Log in as patient A, fetch, log in as patient B, fetch, and assert that the responses differ. It takes ten minutes and catches the worst caching bug there is.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Run workers locally from day one</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Put the worker in your <code class="inline">docker compose</code> or Procfile next to the API, so async bugs appear on your laptop and not first in staging.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Start with HTTP headers</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">For public pages, a correct <code class="inline">Cache-Control</code> plus the CDN often beats any Redis code, with nothing to invalidate by hand except a purge.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Kill a worker on purpose</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Stop the worker mid-job and watch what happens to the message. Ten minutes of this teaches more about delivery semantics than any article.</p>
         </div>
       </div>
 
       <!-- ═══════════════ evidence & resources ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="measure"> <span>Measured an endpoint's latency and found where the time goes before proposing any cache.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="headers"> <span>Set correct <code class="inline">Cache-Control</code> and ETag headers for a public route and <code class="inline">no-store</code> for a personal one, and verified them with <code class="inline">curl -I</code>.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="invalidate"> <span>Listed every writer of a cached table and showed each one invalidates after commit.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="leak-test"> <span>Wrote a test proving two users never receive each other's cached data.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cache-pr"> <span class="font-semibold">Opened a PR that adds a Redis cache-aside layer to one slow, read-heavy endpoint (for example the clinic search summary), with the four facts documented, TTL jitter, a Redis-down fallback, a cross-user test, a hit-rate metric, and before-and-after p95 numbers from a load test (mentor evidence ✓).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="move-async"> <span>Moved a slow third-party call out of a request into a job, and showed the endpoint's latency before and after.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="idempotent"> <span>Made a side-effecting job idempotent with a unique constraint, and a test proves two concurrent runs cause one side effect.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="retry-dlq"> <span>Configured bounded retries with backoff, skipped retries for permanent errors, and watched a poison message land in the DLQ.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="queue-metrics"> <span>Can show queue depth, oldest-message age and DLQ size for my project's queues, with at least one alert.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="reminder-pr"> <span class="font-semibold">Opened a PR that adds booking confirmation emails and 24-hour SMS reminders (a fake SMS provider is fine) using your stack's job library: periodic scan, <code class="inline">sent_notifications</code> de-dup table, error classification, a DLQ, tests for duplicates and cancellation, and a short design note answering the six questions from the prompt above (mentor evidence ✓).</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
       <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
-        <li><a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching" target="_blank" rel="noopener">MDN — HTTP caching</a> — freshness, validation, and how browsers and shared caches treat each header.</li>
-        <li><a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control" target="_blank" rel="noopener">MDN — Cache-Control</a> — the exact meaning of every directive in Part II.</li>
-        <li><a class="text-coral underline" href="https://redis.io/docs/latest/develop/data-types/" target="_blank" rel="noopener">Redis — Data types</a> — strings, hashes, sets, sorted sets and streams, with command references.</li>
-        <li><a class="text-coral underline" href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" rel="noopener">Redis — Key eviction</a> — <code class="inline">maxmemory</code> and choosing an eviction policy for a cache.</li>
-        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/rules-materializedviews.html" target="_blank" rel="noopener">PostgreSQL — Materialized views</a> — creating and refreshing them, including <code class="inline">CONCURRENTLY</code>.</li>
-        <li><a class="text-coral underline" href="https://nextjs.org/docs/app/getting-started/caching" target="_blank" rel="noopener">Next.js — Caching</a> · <a class="text-coral underline" href="https://nextjs.org/docs/app/api-reference/functions/cacheTag" target="_blank" rel="noopener">cacheTag</a> — framework-level caching and tag invalidation (<a class="text-coral underline" href="./fe2.html">FE2</a>).</li>
-        <li><a class="text-coral underline" href="https://developers.cloudflare.com/cache/" target="_blank" rel="noopener">Cloudflare — Cache</a> — CDN cache rules, cache keys and purging (<a class="text-coral underline" href="./op5.html">OP5</a>).</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html" target="_blank" rel="noopener">AWS — SQS visibility timeout</a> — why at-least-once delivery produces duplicates, and how to size the timeout.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html" target="_blank" rel="noopener">AWS — SQS dead-letter queues</a> — redrive policies, <code class="inline">maxReceiveCount</code> and redriving back to the source queue.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/sns/latest/dg/sns-sqs-as-subscriber.html" target="_blank" rel="noopener">AWS — Fanout to SQS queues with SNS</a> — the pub/sub shape from Part IV.</li>
+        <li><a class="text-coral underline" href="https://github.com/sidekiq/sidekiq/wiki/Error-Handling" target="_blank" rel="noopener">Sidekiq — Error handling</a> — retry schedule, the Dead set, and the advice that jobs must be idempotent.</li>
+        <li><a class="text-coral underline" href="https://docs.bullmq.io/guide/retrying-failing-jobs" target="_blank" rel="noopener">BullMQ — Retrying failing jobs</a> · <a class="text-coral underline" href="https://docs.bullmq.io/guide/jobs/job-ids" target="_blank" rel="noopener">Job IDs</a> — attempts, backoff and de-duplication by ID.</li>
+        <li><a class="text-coral underline" href="https://docs.celeryq.dev/en/stable/userguide/tasks.html" target="_blank" rel="noopener">Celery — Tasks</a> · <a class="text-coral underline" href="https://arq-docs.helpmanual.io/" target="_blank" rel="noopener">ARQ</a> — retries, acks and idempotency advice for Python.</li>
+        <li><a class="text-coral underline" href="https://github.com/hibiken/asynq/wiki" target="_blank" rel="noopener">asynq — Wiki</a> — retries, unique tasks and the periodic task scheduler in Go.</li>
+        <li><a class="text-coral underline" href="https://kafka.apache.org/documentation/#semantics" target="_blank" rel="noopener">Apache Kafka — Message delivery semantics</a> — what "exactly-once" means inside Kafka, and where it stops.</li>
       </ul>

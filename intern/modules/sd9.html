@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SD9 · Queues, Background Jobs &amp; Async Processing — AI-Native Developer Internship</title>
+<title>SD9 · Authentication, Authorization &amp; Security Design — AI-Native Developer Internship</title>
 <script>(function(){if(localStorage.getItem('fde-theme')==='dark')document.documentElement.classList.add('dark');if(localStorage.getItem('fde-nav')==='collapsed')document.documentElement.classList.add('nav-collapsed');})();</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -40,7 +40,7 @@ tailwind.config = {
     <div class="px-5 py-5 border-b border-line dark:border-linedark">
       <a href="../index.html" class="block">
         <div class="font-display text-lg font-bold leading-tight">AI-Native Developer</div>
-        <div class="text-xs text-mute dark:text-mutedark mt-0.5">12-week Internship Program</div>
+        <div class="text-xs text-mute dark:text-mutedark mt-0.5">9-week Internship Program</div>
       </a>
     </div>
     <nav id="module-nav" class="flex-1 overflow-y-auto px-2 py-3"></nav>
@@ -61,792 +61,789 @@ tailwind.config = {
           <span class="badge badge-neutral">Target score: 3 / 4</span>
           <span class="badge badge-accent">~2 days · guided practice</span>
         </div>
-        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Queues, Background Jobs &amp; Async Processing</h1>
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Authentication, Authorization &amp; Security Design</h1>
         <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
-          Move slow, spiky and failure-prone work out of the request. Tell a job queue from a message broker and pick
-          one for your stack. Understand what "at-least-once" really promises, and make every job safe to run twice.
-          Design retries, dead-letter queues, scheduled reminders and fan-out, and know which numbers tell you the
-          queue is healthy.
+          Know who the user is (authentication) and what they may do (authorization), and keep those two ideas
+          separate in your head and in your code. Store passwords correctly, choose between sessions and JWTs with
+          reasons, and use OAuth and OIDC or a managed provider instead of inventing login. Then read agent code the
+          way an attacker does: IDOR, injection, SSRF, XSS, CSRF, mass assignment and leaked secrets.
         </p>
         <div class="mt-6 callout callout-why">
-          <strong>Why it matters when AI writes the code:</strong> ask an agent to "send a confirmation email when a
-          booking is made" and you'll usually get an SMTP call inside the request handler, or a job that sends the email
-          again every time it is retried. Both work in the demo. In production, the first makes bookings fail when the
-          email provider is slow, and the second sends a patient five identical reminders. Queues turn "it ran once
-          on my laptop" into "it may run zero, one or three times, at any moment, in any order", and you are the
-          one who must check the code is ready for that.
+          <strong>Why it matters when AI writes the code:</strong> agents produce code that works for the user in the
+          demo, and security bugs are, by definition, code that also "works" for someone it shouldn't.
+          <code class="inline">GET /bookings/:id</code> that returns any booking to any logged-in user passes every
+          happy-path test. So does a JWT that is decoded but never verified. The agent won't notice, because nothing
+          fails. Security review is the one part of the job you cannot hand back to the tool that wrote the code: you
+          have to ask "what if the caller is someone else?" on every endpoint.
         </div>
       </article>
     </div>
 
     <article class="max-w-[52rem] mx-auto px-6 pb-12 prose-fde">
       <!-- ═══════════════ PART I ═══════════════ -->
-      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Why async</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Answer the user now, and do the slow work later</h2>
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Authentication</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Prove who someone is, then remember it without leaking it</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        A web request should do the minimum needed to give the user a correct answer, then return. Anything that can
-        happen a few seconds later, and doesn't change that answer, is a candidate for a <strong>background
-        job</strong>: a unit of work that is saved somewhere durable and run by a separate worker process.
+        Two different questions get asked on every request, and bugs happen when code answers one and assumes the
+        other. <strong>Authentication (AuthN)</strong> asks "who are you?" and is answered by a password, a social
+        login or a token. <strong>Authorization (AuthZ)</strong> asks "are you allowed to do <em>this</em>, to
+        <em>this</em> record?" and is answered by your business rules.
       </p>
 
-      <h3 class="font-semibold text-lg mt-7">Three reasons to go async</h3>
-      <ul class="mt-2 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>Slow work.</strong> Sending an email takes 300 ms to several seconds. Generating a PDF invoice takes
-          two seconds. Resizing an uploaded photo takes more. The user shouldn't wait for any of it, and HTTP requests
-          have timeouts that long work will hit.</li>
-        <li><strong>Spikes.</strong> A clinic opens bookings for flu vaccines at 8:00 and 5,000 people book in ten
-          minutes. The bookings must be accepted instantly, but the 5,000 confirmation SMS messages can drain through a
-          queue at the rate the SMS provider allows. The queue is a <em>buffer</em> that absorbs the spike.</li>
-        <li><strong>Retries.</strong> Third-party APIs fail. A payment webhook to your accounting system returns 503.
-          Inside a request you can't wait an hour and try again. A job can retry with backoff for a day, and nobody is
-          stuck waiting.</li>
-      </ul>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Task in the clinic app</th><th class="px-4 py-3">In the request, or a job?</th><th class="px-4 py-3">Why</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Insert the booking row</td><td class="px-4 py-3">Request</td><td class="px-4 py-3">The answer ("you're booked" or "slot taken") depends on it</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Send the confirmation email</td><td class="px-4 py-3">Job</td><td class="px-4 py-3">Slow, can fail, and the user doesn't need it before the page loads</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">SMS reminder 24 hours before</td><td class="px-4 py-3">Scheduled job</td><td class="px-4 py-3">It happens at a time, not in response to a request</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Sync to the doctor's Google Calendar</td><td class="px-4 py-3">Job</td><td class="px-4 py-3">External API with rate limits and outages</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Charge the deposit</td><td class="px-4 py-3">Usually the request</td><td class="px-4 py-3">The booking is only valid if the charge succeeds. Payment <em>webhooks</em> from the provider are handled as jobs.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Nightly no-show report</td><td class="px-4 py-3">Cron job</td><td class="px-4 py-3">Batch work on a schedule</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Refresh the search materialized view</td><td class="px-4 py-3">Cron job, every minute</td><td class="px-4 py-3">Covered in <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a></td></tr>
-          </tbody>
-        </table>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">The moving parts</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Every queue-based system has the same three roles. The <strong>producer</strong> (your API) writes a small
-        message describing the work. The <strong>queue</strong> stores it durably. A <strong>worker</strong> (a
-        separate process, often the same codebase started with a different command) takes messages, does the work,
-        and <strong>acknowledges</strong> each one when it is finished. Only an acknowledged message is removed.
-      </p>
-      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
-        <svg viewBox="0 0 700 210" class="w-full min-w-[620px]" role="img" aria-label="Producer, queue, workers, and dead-letter queue">
-          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">POST /bookings — RESPONDS IN 80 MS, THE EMAIL GOES OUT A SECOND LATER</text>
-          <g class="anim-pulse"><rect x="10" y="50" width="140" height="60" rx="9" fill="#2563EB"/>
-            <text x="80" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">API (producer)</text>
-            <text x="80" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">insert booking</text>
-            <text x="80" y="101" text-anchor="middle" fill="#ffffffbb" font-size="9">enqueue {bookingId: 91}</text></g>
-          <g class="anim-pulse d1"><rect x="200" y="50" width="160" height="60" rx="9" fill="#6d5acd"/>
-            <text x="280" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Queue</text>
-            <text x="280" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">Redis · SQS · RabbitMQ</text>
-            <text x="280" y="101" text-anchor="middle" fill="#ffffffbb" font-size="9">durable, ordered-ish</text></g>
-          <g class="anim-pulse d2"><rect x="410" y="36" width="130" height="40" rx="9" fill="#0D9488"/>
-            <text x="475" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Worker 1</text>
-            <text x="475" y="67" text-anchor="middle" fill="#ffffffbb" font-size="9">send email → ack</text></g>
-          <g class="anim-pulse d3"><rect x="410" y="86" width="130" height="40" rx="9" fill="#0D9488"/>
-            <text x="475" y="104" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Worker 2</text>
-            <text x="475" y="117" text-anchor="middle" fill="#ffffffbb" font-size="9">fails → retry later</text></g>
-          <g class="anim-pulse d4"><rect x="580" y="86" width="110" height="40" rx="9" fill="#DB2777"/>
-            <text x="635" y="104" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Dead-letter</text>
-            <text x="635" y="117" text-anchor="middle" fill="#ffffffbb" font-size="9">after N attempts</text></g>
-          <g class="anim-pulse d1"><rect x="580" y="36" width="110" height="40" rx="9" fill="#37474F"/>
-            <text x="635" y="54" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Email API</text>
-            <text x="635" y="67" text-anchor="middle" fill="#ffffffbb" font-size="9">SES · Postmark</text></g>
-          <line x1="150" y1="80" x2="200" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="360" y1="72" x2="410" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="360" y1="88" x2="410" y2="106" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="540" y1="56" x2="580" y2="56" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="540" y1="106" x2="580" y2="106" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <text x="80" y="140" text-anchor="middle" font-size="9" fill="#6E6B64">returns 201 immediately</text>
-          <text x="280" y="140" text-anchor="middle" font-size="9" fill="#6E6B64">absorbs spikes</text>
-          <text x="475" y="150" text-anchor="middle" font-size="9" fill="#6E6B64">scale by adding workers</text>
-          <text x="635" y="150" text-anchor="middle" font-size="9" fill="#6E6B64">a human looks at these</text>
-          <text x="350" y="190" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">the message says WHAT to do (bookingId), not the data itself</text>
+      <h3 class="font-semibold text-lg mt-7">AuthN vs AuthZ, on every request</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Request passes authentication, then authorization, then the handler">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">GET /bookings/91 — TWO GATES BEFORE ANY DATA IS RETURNED</text>
+          <g class="anim-pulse"><rect x="10" y="44" width="130" height="58" rx="9" fill="#2563EB"/>
+            <text x="75" y="67" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Request</text>
+            <text x="75" y="83" text-anchor="middle" fill="#ffffffbb" font-size="9">cookie or Bearer token</text></g>
+          <g class="anim-pulse d1"><rect x="180" y="44" width="150" height="58" rx="9" fill="#6d5acd"/>
+            <text x="255" y="67" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">AuthN: who?</text>
+            <text x="255" y="83" text-anchor="middle" fill="#ffffffbb" font-size="9">valid session → user 812</text></g>
+          <g class="anim-pulse d2"><rect x="370" y="44" width="150" height="58" rx="9" fill="#0D9488"/>
+            <text x="445" y="67" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">AuthZ: allowed?</text>
+            <text x="445" y="83" text-anchor="middle" fill="#ffffffbb" font-size="9">is booking 91 theirs?</text></g>
+          <g class="anim-pulse d3"><rect x="560" y="44" width="130" height="58" rx="9" fill="#D97757"/>
+            <text x="625" y="67" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Handler</text>
+            <text x="625" y="83" text-anchor="middle" fill="#ffffffbb" font-size="9">returns the booking</text></g>
+          <line x1="140" y1="73" x2="180" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="330" y1="73" x2="370" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="520" y1="73" x2="560" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="180" y="128" width="150" height="40" rx="9" fill="#DB2777"/>
+            <text x="255" y="146" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">401 Unauthorized</text>
+            <text x="255" y="160" text-anchor="middle" fill="#ffffffbb" font-size="9">we don't know who you are</text></g>
+          <g class="anim-pulse d3"><rect x="370" y="128" width="150" height="40" rx="9" fill="#DB2777"/>
+            <text x="445" y="146" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">403 or 404</text>
+            <text x="445" y="160" text-anchor="middle" fill="#ffffffbb" font-size="9">we know, and the answer is no</text></g>
+          <line x1="255" y1="102" x2="255" y2="128" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="445" y1="102" x2="445" y2="128" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="625" y="150" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">most agent bugs skip gate 2</text>
         </svg>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Note the last line of the diagram. A good message carries <strong>IDs, not snapshots</strong>:
-        <code class="inline">{"bookingId": 91}</code>, not the whole booking. The worker loads current data when it runs,
-        so a booking cancelled in the meantime isn't confirmed by email anyway, and the queue doesn't hold copies of
-        personal data.
+        The naming is confusing: HTTP <code class="inline">401 Unauthorized</code> actually means "unauthenticated", and
+        <code class="inline">403 Forbidden</code> means "authenticated but not authorized". For records the user must not
+        even know exist, such as another patient's booking, returning <code class="inline">404</code> is common, so an
+        attacker can't probe which IDs are real.
       </p>
 
-      <h3 class="font-semibold text-lg mt-8">Before and after: the confirmation email</h3>
+      <h3 class="font-semibold text-lg mt-8">Password storage: slow hashes, never encryption</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        This is the most common version you'll see from an agent, followed by the fix:
-      </p>
-      <div class="mt-4">
-        <span class="code-label">bookings/controller.ts — before: email inside the request</span>
-        <pre class="code"><span class="kw">const</span> booking = <span class="kw">await</span> bookings.create(slotId, patientId);
-<span class="kw">await</span> mailer.send(confirmationEmail(booking));  <span class="cm">// 2 s when the provider is slow,</span>
-<span class="kw">return</span> res.status(<span class="st">201</span>).json(booking);           <span class="cm">// and a 500 if it's down — but the booking exists!</span></pre>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">bookings/controller.ts — after: enqueue with BullMQ</span>
-        <pre class="code"><span class="kw">const</span> booking = <span class="kw">await</span> bookings.create(slotId, patientId);
-<span class="kw">await</span> emailQueue.add(<span class="st">"booking-confirmation"</span>, { bookingId: booking.id }, {
-  jobId: <span class="st">`confirm-${booking.id}`</span>,                   <span class="cm">// same booking → same job (no ":" allowed)</span>
-  attempts: <span class="st">8</span>,
-  backoff: { type: <span class="st">"exponential"</span>, delay: <span class="st">2000</span> },  <span class="cm">// 2 s, 4 s, 8 s … (Part III)</span>
-});
-<span class="kw">return</span> res.status(<span class="st">201</span>).json(booking);           <span class="cm">// ~80 ms, whatever the email provider does</span></pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        One gap remains. The booking is committed to Postgres and the job is written to Redis, which are two separate
-        systems. If the process crashes between the two lines, you have a booking with no email. For most emails that
-        is acceptable (the patient still sees the booking in the app). When it isn't, for example "every paid order
-        must reach the warehouse", use the <strong>transactional outbox</strong>: write the message into a table in
-        the same database transaction as the booking, and have a relay publish it. That pattern belongs to
-        <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Enqueue after the commit, not inside the transaction</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        A subtle bug appears when the booking is created inside a database transaction and the job is enqueued
-        <em>inside</em> that same transaction. The worker is fast: it picks up the job within milliseconds, looks for
-        booking 91, and finds nothing, because the transaction hasn't committed yet. Or the transaction rolls back,
-        and the patient gets a confirmation for a booking that doesn't exist. Every mainstream framework has an
-        "after commit" hook for exactly this:
-      </p>
-      <div class="mt-4">
-        <span class="code-label">after-commit enqueue — Django · Rails</span>
-        <pre class="code"><span class="cm"># Django: runs only if and when the surrounding transaction commits</span>
-<span class="kw">with</span> transaction.atomic():
-    booking = Booking.objects.create(slot=slot, patient=patient)
-    transaction.on_commit(<span class="kw">lambda</span>: send_confirmation.delay(booking.id))
-
-<span class="cm"># Rails: model callback that fires after COMMIT, never after a rollback</span>
-<span class="kw">class</span> <span class="fn">Booking</span> &lt; ApplicationRecord
-  after_create_commit { BookingConfirmationJob.perform_async(id) }
-<span class="kw">end</span></pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        After-commit hooks fix the "job runs too early" and "job for a rolled-back row" bugs. They don't fix a crash
-        between the commit and the enqueue. That last gap is what the outbox closes.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Where the workers run</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        A worker is a long-running process, so where you deploy decides which queue designs are even possible.
-        Check this before you pick a library, because a Sidekiq or BullMQ worker needs a place to run all day.
+        If you store passwords yourself, store only a <strong>password hash</strong> made with an algorithm that is
+        deliberately <em>slow</em> and <em>salted</em>. When your database leaks (plan for it), a slow hash turns
+        "crack every password in an hour" into "crack a few weak ones in a month". Fast hashes like SHA-256 are designed
+        for speed, which is exactly wrong here. Encryption is also wrong, because anything that can be decrypted
+        will be, by whoever steals the key.
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Hosting</th><th class="px-4 py-3">How background work usually runs</th><th class="px-4 py-3">Watch out for</th></tr></thead>
+            <th class="px-4 py-3">Algorithm</th><th class="px-4 py-3">Verdict</th><th class="px-4 py-3">Notes (OWASP Password Storage Cheat Sheet)</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Containers or VMs (ECS, Fly, a VPS)</td><td class="px-4 py-3">A second process type from the same image: <code class="inline">web</code> and <code class="inline">worker</code>, scaled separately (<a href="./op2.html" class="text-viol underline decoration-viol/40">OP2</a>)</td><td class="px-4 py-3">Forgetting to deploy the worker, so jobs pile up silently</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">AWS Lambda</td><td class="px-4 py-3">SQS triggers a function for each batch of messages. EventBridge schedules run cron-style work (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>).</td><td class="px-4 py-3">The function timeout, and a batch that partly fails</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Vercel and other serverless web hosts</td><td class="px-4 py-3">No always-on worker. Use the platform's cron and queue features, or a managed queue service that calls your function (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>).</td><td class="px-4 py-3">"Fire and forget" promises after the response is sent may be cut off when the function ends</td></tr>
-          </tbody>
-        </table>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">What must stay synchronous</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Going async is not free. The user no longer gets an error when the work fails, so failures need a different
-        path: a retry, an alert, or a status the UI can show ("Calendar sync pending"). Debugging gets harder because
-        cause and effect are seconds apart and in different processes.
-      </p>
-      <div class="mt-4 callout callout-info">
-        <strong>Rule of thumb:</strong> if the user's next screen depends on the result, or the operation can be
-        rejected (slot taken, card declined, validation failed), do it in the request. If the user only needs to
-        know that it <em>will</em> happen, queue it. Choosing between synchronous calls and events <em>between
-        services</em> is a wider question, covered in <a href="./sd4.html" class="text-viol underline decoration-viol/40">SD4</a>.
-      </div>
-
-      <!-- ═══════════════ PART II ═══════════════ -->
-      <div class="kicker text-viol mt-14">Part II · Job queues vs message brokers</div>
-      <h2 class="font-display text-2xl font-bold mt-2">A job queue runs your code, a broker moves your messages</h2>
-      <p class="mt-4 text-[15px] leading-relaxed">
-        The tools blur together in blog posts, but they fall into two families. A <strong>job queue</strong> is a
-        library in your language: you call a function "later", and it gives you workers, retries, scheduling and a
-        dashboard. A <strong>message broker</strong> is infrastructure: it stores and routes messages between
-        producers and consumers that may be written in different languages, and leaves "what to do with a message"
-        to you.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-7">Job queues, one per stack</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        For a single application that needs background work, use the job library your stack already favours. They
-        all look similar: define a job, enqueue it with arguments, and run workers.
-      </p>
-      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Library</th><th class="px-4 py-3">Stack</th><th class="px-4 py-3">Backed by</th><th class="px-4 py-3">Worth knowing</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Sidekiq</td><td class="px-4 py-3">Ruby / Rails (<a href="./be2.html" class="text-viol underline decoration-viol/40">BE2</a>)</td><td class="px-4 py-3">Redis</td><td class="px-4 py-3">By default retries a failed job 25 times over about 20 days with exponential backoff, then moves it to the Dead set. Rails' Active Job can sit on top.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">BullMQ</td><td class="px-4 py-3">Node / NestJS (<a href="./be3.html" class="text-viol underline decoration-viol/40">BE3</a>)</td><td class="px-4 py-3">Redis</td><td class="px-4 py-3">Per-job <code class="inline">attempts</code> and <code class="inline">backoff</code>, delayed jobs, job schedulers for repeating work, custom job IDs for de-duplication</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Celery</td><td class="px-4 py-3">Python (Django, Flask)</td><td class="px-4 py-3">RabbitMQ or Redis</td><td class="px-4 py-3">Mature and feature-rich, with many settings. Celery beat runs periodic tasks.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">ARQ</td><td class="px-4 py-3">Python asyncio / FastAPI (<a href="./be4.html" class="text-viol underline decoration-viol/40">BE4</a>)</td><td class="px-4 py-3">Redis</td><td class="px-4 py-3">Small and async-native. Deferred jobs, job IDs, and cron functions.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">asynq</td><td class="px-4 py-3">Go / Gin (<a href="./be5.html" class="text-viol underline decoration-viol/40">BE5</a>)</td><td class="px-4 py-3">Redis</td><td class="px-4 py-3">Retries, scheduled tasks, unique tasks, and a periodic task scheduler</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Argon2id</td><td class="px-4 py-3">First choice</td><td class="px-4 py-3">Minimum around 19 MiB memory, 2 iterations, parallelism 1. Memory-hard, so GPUs don't help much.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">scrypt</td><td class="px-4 py-3">Good</td><td class="px-4 py-3">When Argon2id isn't available</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">bcrypt</td><td class="px-4 py-3">Good, and very common</td><td class="px-4 py-3">Cost factor 10 or more. Only the first 72 bytes of input are used, so cap the password length.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">PBKDF2-HMAC-SHA256</td><td class="px-4 py-3">Acceptable when FIPS compliance requires it</td><td class="px-4 py-3">600,000 iterations or more</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">MD5, SHA-1, SHA-256 (even salted)</td><td class="px-4 py-3">Reject in review</td><td class="px-4 py-3">Too fast. Billions of guesses per second on one GPU.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Encrypted or plain text</td><td class="px-4 py-3">Reject, and escalate</td><td class="px-4 py-3">Reversible means one stolen key exposes every password</td></tr>
           </tbody>
         </table>
       </div>
       <div class="mt-4">
-        <span class="code-label">the same job in three stacks — Sidekiq · Celery · asynq</span>
-        <pre class="code"><span class="cm"># Ruby / Sidekiq</span>
-<span class="kw">class</span> <span class="fn">BookingConfirmationJob</span>
-  <span class="kw">include</span> Sidekiq::Job
-  sidekiq_options retry: <span class="st">8</span>
-  <span class="kw">def</span> <span class="fn">perform</span>(booking_id) = BookingMailer.confirm(booking_id)
-<span class="kw">end</span>
-BookingConfirmationJob.perform_async(booking.id)          <span class="cm"># args must be simple JSON types</span>
+        <span class="code-label">auth/passwords — Node (bcrypt) · Python (argon2-cffi)</span>
+        <pre class="code"><span class="cm">// Node: the salt is generated and stored inside the hash string</span>
+<span class="kw">const</span> hash = <span class="kw">await</span> bcrypt.hash(password, <span class="st">12</span>);             <span class="cm">// cost 12 ≈ 2^12 rounds</span>
+<span class="kw">const</span> ok   = <span class="kw">await</span> bcrypt.compare(attempt, user.passwordHash); <span class="cm">// constant-time compare</span>
 
-<span class="cm"># Python / Celery</span>
-<span class="kw">@app.task</span>(bind=<span class="kw">True</span>, autoretry_for=(ProviderError,), retry_backoff=<span class="kw">True</span>, max_retries=<span class="st">8</span>)
-<span class="kw">def</span> <span class="fn">send_confirmation</span>(self, booking_id): ...
-send_confirmation.delay(booking.id)
-
-<span class="cm">// Go / asynq</span>
-task := asynq.NewTask(<span class="st">"booking:confirm"</span>, payload)       <span class="cm">// payload = JSON {"booking_id": 91}</span>
-client.Enqueue(task, asynq.MaxRetry(<span class="st">8</span>), asynq.TaskID(<span class="st">"confirm-91"</span>))</pre>
+<span class="cm"># Python: sensible defaults; check_needs_rehash lets you raise cost over time</span>
+<span class="kw">from</span> argon2 <span class="kw">import</span> PasswordHasher
+ph = PasswordHasher()
+stored = ph.hash(password)
+ph.verify(stored, attempt)            <span class="cm"># raises VerifyMismatchError on a wrong password</span>
+<span class="kw">if</span> ph.check_needs_rehash(stored):
+    stored = ph.hash(attempt)         <span class="cm"># upgrade silently at the next successful login</span></pre>
       </div>
-
       <p class="mt-3 text-[15px] leading-relaxed">
-        Whatever the library, review the <strong>payload</strong> the agent chose. It is stored in Redis or the broker,
-        often in plain text, sometimes for days, and it is shown in dashboards:
+        The hash is only one part of login. Review the rest of the flow against this list:
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Payload</th><th class="px-4 py-3">Problem</th><th class="px-4 py-3">Better</th></tr></thead>
+            <th class="px-4 py-3">Flow</th><th class="px-4 py-3">Good</th><th class="px-4 py-3">Bad version agents write</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">The whole booking object</td><td class="px-4 py-3">Stale by the time the job runs, and a copy of personal data in Redis</td><td class="px-4 py-3"><code class="inline">{"bookingId": 91}</code></td></tr>
-            <tr><td class="px-4 py-3 font-semibold">An ORM model instance</td><td class="px-4 py-3">Won't serialise, or serialises into something fragile</td><td class="px-4 py-3">IDs and simple JSON types only</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">The patient's phone number and diagnosis</td><td class="px-4 py-3">Health data sitting in a queue and a job dashboard</td><td class="px-4 py-3">Load it inside the worker, from the database</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">An API token for the job to use</td><td class="px-4 py-3">A secret stored in plain text in the queue</td><td class="px-4 py-3">The worker reads secrets from its environment (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">No version field, for a long-lived queue</td><td class="px-4 py-3">A deploy changes the job's arguments while old jobs are still waiting</td><td class="px-4 py-3">Keep old arguments working for one release, or add a <code class="inline">v</code> field</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Login errors</td><td class="px-4 py-3">One message: "Email or password is incorrect"</td><td class="px-4 py-3">"No account with that email", which lets attackers list your users</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Brute force</td><td class="px-4 py-3">Rate limit per account and per IP (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>), with a growing delay</td><td class="px-4 py-3">Unlimited attempts</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Password reset</td><td class="px-4 py-3">Random token from a secure generator, stored hashed, single-use, expires in minutes</td><td class="px-4 py-3">A 6-digit code with no attempt limit, or a token that never expires</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">After login</td><td class="px-4 py-3">Issue a <em>new</em> session ID (prevents session fixation)</td><td class="px-4 py-3">Keeping the pre-login session ID</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Staff accounts</td><td class="px-4 py-3">MFA required for clinic staff and admins</td><td class="px-4 py-3">Same login strength as patients, for accounts that can see every record</td></tr>
           </tbody>
         </table>
       </div>
 
-      <div class="mt-4 callout callout-info">
-        <strong>Redis-backed queues are only as durable as your Redis.</strong> Sidekiq, BullMQ, ARQ and asynq keep jobs
-        in Redis, so its persistence settings matter. A managed Redis with persistence switched off, or an eviction
-        policy that is allowed to evict keys under memory pressure, can silently lose queued jobs. Use a separate
-        Redis (or database) for the queue and for the cache in <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>,
-        configured with persistence on and <code class="inline">noeviction</code>.
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Message brokers</h3>
+      <h3 class="font-semibold text-lg mt-8">Sessions vs JWTs</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        You reach for a broker when messages cross service or language boundaries, when several consumers need the
-        same event, or when you want a managed service with no Redis to run. The four you'll meet most:
+        After login, the server has to recognise the user on every later request. There are two main designs. With a
+        <strong>server-side session</strong>, the server stores the session (in the database or Redis) and gives the
+        browser a random, meaningless ID in a cookie. With a <strong>JWT</strong> (JSON Web Token), the server gives
+        the client a signed token that <em>contains</em> the user ID and an expiry, and any server holding the key can
+        verify it without a lookup.
       </p>
-      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Broker</th><th class="px-4 py-3">Model</th><th class="px-4 py-3">Ordering</th><th class="px-4 py-3">After it's consumed</th><th class="px-4 py-3">Right when</th></tr></thead>
+            <th class="px-4 py-3">Question</th><th class="px-4 py-3">Server-side session + cookie</th><th class="px-4 py-3">JWT access token</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Amazon SQS</td><td class="px-4 py-3">Managed queue. Consumers poll, and messages are hidden while being processed (visibility timeout).</td><td class="px-4 py-3">Standard: best-effort. FIFO: ordered per message group.</td><td class="px-4 py-3">Deleted when the consumer deletes it</td><td class="px-4 py-3">You're on AWS and want zero servers to run (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">RabbitMQ</td><td class="px-4 py-3">Broker with exchanges that route messages into queues by rules</td><td class="px-4 py-3">Per queue, with caveats on redelivery</td><td class="px-4 py-3">Removed on ack</td><td class="px-4 py-3">Flexible routing, many consumers, self-hosted or managed</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Apache Kafka</td><td class="px-4 py-3">Distributed, partitioned <em>log</em>. Consumers track their own position (offset).</td><td class="px-4 py-3">Strict within a partition</td><td class="px-4 py-3"><strong>Kept</strong> for the retention period. New consumers can replay history.</td><td class="px-4 py-3">High-volume event streams, several teams consuming the same events, replay</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Redis Streams</td><td class="px-4 py-3">An append-only log inside Redis, with consumer groups and acks</td><td class="px-4 py-3">Within a stream</td><td class="px-4 py-3">Kept until trimmed</td><td class="px-4 py-3">You already run Redis and want a lightweight event log</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Log out, or "sign out all devices"</td><td class="px-4 py-3">Delete the session row. It takes effect immediately.</td><td class="px-4 py-3">The token stays valid until it expires, unless you add a denylist, which is a session store again</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ban a user, or change their role</td><td class="px-4 py-3">Immediate</td><td class="px-4 py-3">Old claims live until expiry, so keep access tokens short (5–15 min)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lookup cost per request</td><td class="px-4 py-3">One Redis or DB read</td><td class="px-4 py-3">None: verify the signature locally</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Several services or APIs verify it</td><td class="px-4 py-3">They all need the session store</td><td class="px-4 py-3">Each one only needs the public key. This is the JWT's real strength.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Mobile apps and third-party API clients</td><td class="px-4 py-3">Possible, but cookies are awkward outside browsers</td><td class="px-4 py-3">Natural fit, as a Bearer token</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Typical fit</td><td class="px-4 py-3"><strong>A web app with its own backend</strong>: Rails, Django, Next.js with a server</td><td class="px-4 py-3">Mobile plus API, several services, or a managed auth provider that issues them</td></tr>
           </tbody>
         </table>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        The key conceptual difference is <strong>queue vs log</strong>. In a queue, a message is work: one consumer
-        takes it and it is gone. In a log (Kafka, Redis Streams), a message is a fact that stays. Each consumer
-        group reads at its own pace, and a new group can start from the beginning.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Choosing, for a typical client project</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Most Golden Owl-sized projects need a job queue and nothing more. Don't let an agent add Kafka to a
-        booking app with 2,000 users a day. Walk this decision from the top:
-      </p>
-      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
-        <pre class="mermaid">
-flowchart TD
-    A["Need work done outside the request?"] -->|"one app, one language"| B["Job queue for your stack<br/>Sidekiq, BullMQ, Celery, ARQ, asynq"]
-    A -->|"several services consume it"| C{"Must consumers replay<br/>history, or is volume huge?"}
-    C -->|"no"| D{"On AWS?"}
-    D -->|"yes"| E["SNS topic + SQS queue per consumer"]
-    D -->|"no"| F["RabbitMQ, or Redis Streams"]
-    C -->|"yes"| G["Kafka or a managed equivalent"]
-    B --> H["Already have Redis? Use it.<br/>No Redis? Consider SQS or a DB-backed queue"]
-        </pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        A <strong>database-backed queue</strong> (a <code class="inline">jobs</code> table polled with
-        <code class="inline">SELECT … FOR UPDATE SKIP LOCKED</code>) is a legitimate choice too. Rails' Solid Queue works
-        this way. Its big advantage is that the job is inserted in the <em>same transaction</em> as the booking, so the
-        gap described in Part I disappears.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Anatomy of a good worker</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Whatever the tool, a worker you can trust in production has the same shape. It loads fresh state by ID, checks
-        whether the work is still needed, does the side effect once, and records that it did:
-      </p>
-      <div class="mt-4">
-        <span class="code-label">workers/email.worker.ts — BullMQ worker</span>
-        <pre class="code"><span class="kw">new</span> <span class="fn">Worker</span>(<span class="st">"email"</span>, <span class="kw">async</span> (job) =&gt; {
-  <span class="kw">const</span> booking = <span class="kw">await</span> db.booking.find(job.data.bookingId);  <span class="cm">// 1. fresh state, by ID</span>
-  <span class="kw">if</span> (!booking || booking.status !== <span class="st">"booked"</span>) <span class="kw">return</span>;         <span class="cm">// 2. still needed? if not, succeed quietly</span>
-  <span class="cm">// 3. atomic claim: UPDATE … SET confirm_claimed_at = now()</span>
-  <span class="cm">//    WHERE id = $1 AND confirm_claimed_at IS NULL  → 0 rows = done already</span>
-  <span class="kw">if</span> (!(<span class="kw">await</span> db.booking.claimConfirmation(booking.id))) <span class="kw">return</span>;
-  <span class="kw">await</span> mailer.send(confirmationEmail(booking), {
-    idempotencyKey: <span class="st">`confirm-${booking.id}`</span>,                  <span class="cm">// 4. provider de-dupes too, if supported</span>
-  });
-  <span class="kw">await</span> db.booking.markConfirmationSent(booking.id);            <span class="cm">// 5. record it</span>
-}, { connection, concurrency: <span class="st">10</span> });</pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Each numbered comment answers a question that Part III will ask: what if the booking changed, what if this
-        is the second attempt, and what if the process dies between sending and recording. Note that step 3 is a
-        single conditional <code class="inline">UPDATE</code>, not "read the flag, then check it in code". Two workers
-        running at the same moment would both pass a read-then-check, which is the same race as double booking in
-        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>.
-      </p>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Test the job body as a plain function, without the queue in between. Export the processor, call it directly
-        with a fake provider, and call it <em>twice</em>. One integration test with a real Redis in CI
-        (<a href="./qa1.html" class="text-viol underline decoration-viol/40">QA1</a>) then proves the wiring.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">email.worker.test.ts — the duplicate-run test</span>
-        <pre class="code">it(<span class="st">"sends the confirmation once, even if the job runs twice"</span>, <span class="kw">async</span> () =&gt; {
-  <span class="kw">const</span> booking = <span class="kw">await</span> factory.booking({ status: <span class="st">"booked"</span> });
-  <span class="kw">const</span> job = { data: { bookingId: booking.id } } <span class="kw">as</span> Job;
-
-  <span class="kw">await</span> Promise.all([processConfirmation(job), processConfirmation(job)]); <span class="cm">// concurrent retry</span>
-
-  expect(fakeMailer.sent).toHaveLength(<span class="st">1</span>);                               <span class="cm">// the assertion that matters</span>
-});</pre>
-      </div>
-
-      <!-- ═══════════════ PART III ═══════════════ -->
-      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Delivery, idempotency &amp; failure</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Assume every job runs twice, and some never succeed</h2>
-      <p class="mt-4 text-[15px] leading-relaxed">
-        This Part is the heart of the module. Queues make promises about delivery, and the promise you actually get
-        is weaker than most people assume. Your job code has to be correct under that weaker promise.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-7">Delivery semantics</h3>
-      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Semantics</th><th class="px-4 py-3">How it works</th><th class="px-4 py-3">What can go wrong</th><th class="px-4 py-3">Use for</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">At-most-once</td><td class="px-4 py-3">Ack (remove) the message <em>before</em> processing</td><td class="px-4 py-3">A crash mid-job loses it for ever</td><td class="px-4 py-3">Metrics, "user is typing" signals: anything cheap to lose</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">At-least-once</td><td class="px-4 py-3">Ack <em>after</em> processing. No ack in time means redelivery.</td><td class="px-4 py-3"><strong>Duplicates</strong>: the job ran, but the ack was lost or late</td><td class="px-4 py-3">Almost everything. It is the default of SQS, Sidekiq, BullMQ and most brokers.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">"Exactly-once"</td><td class="px-4 py-3">At-least-once delivery <em>plus</em> de-duplication or transactions</td><td class="px-4 py-3">The guarantee usually stops at the broker's edge. Your email, payment or HTTP call can still happen twice.</td><td class="px-4 py-3">A marketing term. Achieve the <em>effect</em> with idempotent consumers.</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Kafka transactions and SQS FIFO de-duplication are real features, but read the fine print: they prevent
-        duplicates <em>inside</em> the messaging system (or, for SQS FIFO, within a de-duplication window). They cannot
-        un-send an SMS. Here is how a duplicate happens with a perfectly healthy queue:
+        "JWTs are stateless and therefore better" is the claim to push back on. For a single web app, a session cookie
+        is simpler and easier to revoke. Choose JWTs when you actually need their property, which is verification
+        without a shared store. When you do use them, the standard shape is a <strong>short-lived access token</strong>
+        plus a <strong>long-lived refresh token</strong> that is stored server-side, can be revoked, and is
+        <em>rotated</em> on every use:
       </p>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
 sequenceDiagram
     autonumber
-    participant Q as Queue (SQS)
-    participant W1 as Worker 1
-    participant P as SMS provider
-    participant W2 as Worker 2
-    Q->>W1: reminder for booking 91<br/>hidden for 30 s
-    W1->>P: send SMS
-    Note over W1: GC pause / slow network<br/>35 s pass, no delete yet
-    Note over Q: visibility timeout expires,<br/>message visible again
-    Q->>W2: reminder for booking 91
-    W2->>P: send SMS again ❌
-    W1->>Q: delete (too late)
+    participant App as Mobile app
+    participant API as API
+    participant DB as Token store
+    App->>API: GET /bookings, access token (expired)
+    API-->>App: 401, token expired
+    App->>API: POST /auth/refresh, refresh token R1
+    API->>DB: R1 valid and unused?
+    DB-->>API: yes. Mark R1 used, store R2
+    API-->>App: new access token + refresh token R2
+    Note over API,DB: If R1 is ever presented again, it was stolen.<br/>Revoke the whole token family and force login.
         </pre>
       </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Nothing is broken here. A worker got slow, and the queue did exactly what it promises. The only defence is a
-        job that notices it has already done the work.
-      </p>
 
-      <h3 class="font-semibold text-lg mt-8">Idempotent jobs</h3>
+      <h3 class="font-semibold text-lg mt-8">Where the token lives</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        A job is <strong>idempotent</strong> if running it twice has the same effect as running it once. Some work is
-        naturally idempotent: "set booking 91's status to confirmed" or "recompute clinic 7's rating". Work with side
-        effects ("send", "charge", "increment", "append") is not, and you have to make it so. The robust technique is a
-        <strong>record of what was done, protected by a unique constraint</strong>, so the database refuses the second
-        attempt even if two workers race:
-      </p>
-      <div class="mt-4">
-        <span class="code-label">reminders.py — idempotent reminder with ARQ and a unique constraint</span>
-        <pre class="code"><span class="cm"># migration:  CREATE TABLE sent_notifications (
-#   booking_id bigint, kind text, sent_at timestamptz DEFAULT now(),
-#   PRIMARY KEY (booking_id, kind));        -- the de-dup record</span>
-
-<span class="kw">async def</span> <span class="fn">send_reminder</span>(ctx, booking_id: int):
-    <span class="kw">async with</span> db.transaction():
-        booking = <span class="kw">await</span> repo.get_booking(booking_id)
-        <span class="kw">if</span> booking <span class="kw">is None or</span> booking.status != <span class="st">"booked"</span>:
-            <span class="kw">return</span>                                    <span class="cm"># cancelled since → nothing to do</span>
-        claimed = <span class="kw">await</span> db.execute(
-            <span class="st">"INSERT INTO sent_notifications (booking_id, kind) VALUES ($1, 'reminder_24h') "</span>
-            <span class="st">"ON CONFLICT DO NOTHING"</span>, booking_id)
-        <span class="kw">if</span> claimed.rowcount == <span class="st">0</span>:
-            <span class="kw">return</span>                                    <span class="cm"># another attempt already claimed it</span>
-    <span class="kw">await</span> sms.send(booking.patient_phone, reminder_text(booking),
-                   idempotency_key=<span class="st">f"reminder-24h-{booking_id}"</span>)</pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Look at the order: claim first, then send. If the SMS call fails after the claim, this version won't resend,
-        so you trade a possible duplicate for a possible miss. For reminders that is usually the right trade. For
-        must-happen work, record the claim with a status, send, then mark it done, and have a sweeper retry
-        claims stuck in "pending". Either way, <strong>decide which failure you prefer and write it down</strong>.
-        When the provider accepts an idempotency key (many payment and messaging APIs do), pass one as well. Your
-        stack's HTTP API idempotency keys are covered in <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>.
-      </p>
-      <div class="mt-4 callout callout-warn">
-        <strong>Queue-level de-duplication is a helper, not a guarantee.</strong> A BullMQ custom
-        <code class="inline">jobId</code> or an asynq <code class="inline">TaskID</code> stops the same job being
-        <em>enqueued</em> twice while the first one is still stored. It does nothing about one job being
-        <em>executed</em> twice after a lost ack, and the ID is free again once the old job is removed. Idempotency
-        belongs in the job's own logic and the database.
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Retries with backoff and jitter</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Retry transient failures, and don't retry permanent ones. Space retries out <strong>exponentially</strong>
-        (1 s, 2 s, 4 s, 8 s …) so a struggling provider gets room to recover, and add <strong>jitter</strong> so that a
-        thousand jobs that failed together don't all retry in the same second. Cap the attempts, and the total time,
-        at what the business can accept: a reminder that arrives after the appointment is worse than none.
+        Wherever the credential is stored, anything that can read it can impersonate the user. In the browser the
+        choice is mainly between JavaScript-readable storage and an <code class="inline">HttpOnly</code> cookie that
+        scripts can't read:
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Error</th><th class="px-4 py-3">Retry?</th><th class="px-4 py-3">Instead</th></tr></thead>
+            <th class="px-4 py-3">Storage</th><th class="px-4 py-3">XSS can steal it?</th><th class="px-4 py-3">CSRF risk?</th><th class="px-4 py-3">Verdict</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Timeout, connection reset, 502/503/504</td><td class="px-4 py-3">Yes, with backoff</td><td class="px-4 py-3">—</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">429 Too Many Requests</td><td class="px-4 py-3">Yes, after the <code class="inline">Retry-After</code> the provider gives</td><td class="px-4 py-3">Also lower worker concurrency for that queue</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">400 / 422: invalid phone number</td><td class="px-4 py-3">No: it will fail identically for ever</td><td class="px-4 py-3">Mark the notification failed, record the reason, and let the job succeed</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">401 / 403 from the provider</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Alert a human: the API key is wrong or expired</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Booking not found</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Succeed quietly and log it. It was deleted or never committed.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">A bug in your code (TypeError)</td><td class="px-4 py-3">Retries won't fix it</td><td class="px-4 py-3">Let it reach the DLQ, fix and deploy, then replay</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">localStorage</code></td><td class="px-4 py-3">Yes: any injected script reads it</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Avoid for long-lived tokens. It's what agents default to.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">HttpOnly; Secure; SameSite</code> cookie</td><td class="px-4 py-3">No (scripts can still <em>use</em> the session while on the page, but can't take it away)</td><td class="px-4 py-3">Reduced by SameSite, and removed with CSRF tokens (Part IV)</td><td class="px-4 py-3"><strong>Default for web apps</strong></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">JavaScript memory only</td><td class="px-4 py-3">Harder, and lost on reload</td><td class="px-4 py-3">No</td><td class="px-4 py-3">For short access tokens, paired with a refresh token in an HttpOnly cookie</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Mobile Keychain / Keystore</td><td class="px-4 py-3">No</td><td class="px-4 py-3">No</td><td class="px-4 py-3">The right place on iOS and Android (Flutter: a secure-storage plugin)</td></tr>
           </tbody>
         </table>
       </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Timeouts, backoff formulas and circuit breakers for calls in general are owned by
-        <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>. The queue-specific point is that
-        your job library already implements backoff (Part II), so configure it rather than writing
-        <code class="inline">sleep()</code> loops inside a job, which hold a worker slot hostage.
-      </p>
-
       <div class="mt-4">
-        <span class="code-label">backoff.py — exponential backoff with full jitter</span>
-        <pre class="code"><span class="kw">def</span> <span class="fn">retry_delay</span>(attempt: int, base: float = <span class="st">2.0</span>, cap: float = <span class="st">3600</span>) -&gt; float:
-    <span class="cm"># attempt 1 → up to 2 s, 2 → up to 4 s, 3 → up to 8 s … never more than an hour</span>
-    <span class="kw">return</span> random.uniform(<span class="st">0</span>, min(cap, base * <span class="st">2</span> ** attempt))
-<span class="cm"># "full jitter": a random delay in [0, limit] spreads a burst of failures evenly.
-# Your job library has this built in; read its docs before writing your own.</span></pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Put together, a job moves through a small state machine. Most job dashboards show exactly these states, so
-        learn to read them:
-      </p>
-      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
-        <pre class="mermaid">
-stateDiagram-v2
-    [*] --> Waiting: enqueued
-    Waiting --> Active: worker takes it
-    Active --> Completed: success, ack
-    Active --> Retrying: transient error
-    Retrying --> Waiting: after backoff delay
-    Active --> Dead: attempts exhausted<br/>or permanent error
-    Dead --> Waiting: replay after fix
-    Completed --> [*]
-        </pre>
+        <span class="code-label">HTTP response — a well-formed session cookie</span>
+        <pre class="code">Set-Cookie: <span class="st">__Host-session=9f1c…e2</span>; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800
+<span class="cm"># HttpOnly  → document.cookie can't read it (limits XSS damage)
+# Secure    → only sent over HTTPS
+# SameSite  → not sent on most cross-site requests (first CSRF defence)
+# __Host-   → browser enforces Secure, Path=/ and no Domain (no subdomain can overwrite it)
+# Max-Age   → 7 days; the server-side session should expire too, and rotate its ID at login</span></pre>
       </div>
 
-      <h3 class="font-semibold text-lg mt-8">Dead-letter queues and poison messages</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        A <strong>poison message</strong> is one that fails every time: malformed data, a missing record, or a bug
-        that crashes on this input. Without a limit, it is retried for ever, blocks ordered queues, and fills the logs.
-        A <strong>dead-letter queue (DLQ)</strong> is where messages go after too many failed attempts. On SQS you set
-        a <em>redrive policy</em> with <code class="inline">maxReceiveCount</code>, Sidekiq has its Dead set,
-        RabbitMQ has dead-letter exchanges, and BullMQ keeps failed jobs in a failed list.
-      </p>
-      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>Alert on DLQ size above zero.</strong> A DLQ nobody watches is just a slower way of losing data.</li>
-        <li><strong>Keep enough context to debug:</strong> the payload, the error, the attempt count and a trace ID.</li>
-        <li><strong>Have a replay path.</strong> After the fix is deployed, move messages back to the main queue. SQS has a
-          built-in redrive for this, and most job dashboards have a "retry" button. Replay only works safely because
-          your jobs are idempotent.</li>
-        <li><strong>Set the visibility timeout above the job's worst-case duration</strong> on SQS, or a slow job gets
-          redelivered while it is still running (the diagram above).</li>
-      </ul>
-
-      <!-- ═══════════════ PART IV ═══════════════ -->
-      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Scheduling, fan-out, ordering &amp; monitoring</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Time, fan-out and order are where queues surprise you</h2>
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · OAuth, OIDC &amp; managed auth</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Don't build login yourself unless you must</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Once basic jobs work, the next requirements are "do it at a certain time", "several things should react to
-        this event", and "these must happen in order". Each one has a simple-looking implementation that breaks in
-        production, and a boring one that doesn't.
+        Password reset, email verification, MFA, social login, brute-force protection, account linking: login is a
+        product in its own right, and every piece has well-known ways to go wrong. For most client projects the
+        right move is a standard protocol and a managed provider, so your code only has to <em>verify</em> identity,
+        not produce it.
       </p>
 
-      <h3 class="font-semibold text-lg mt-7">The booking reminder: delayed job vs periodic scan</h3>
+      <h3 class="font-semibold text-lg mt-7">OAuth 2.0 vs OpenID Connect</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        "Send an SMS 24 hours before the appointment" has two designs. A <strong>delayed job</strong> is enqueued at
-        booking time with a run-at timestamp. A <strong>periodic scan</strong> is a cron job that runs every few minutes,
-        finds bookings due for a reminder, and enqueues one job each.
+        <strong>OAuth 2.0</strong> is about <em>delegated authorization</em>: a user lets your app act on their behalf at
+        another service ("let the clinic app add events to my Google Calendar"). The result is an
+        <strong>access token</strong> for that service's API. <strong>OpenID Connect (OIDC)</strong> is a layer on top
+        of OAuth that adds <em>authentication</em>: it also returns an <strong>ID token</strong>, a JWT that says who
+        the user is. "Sign in with Google" is OIDC. Calendar access is OAuth.
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Question</th><th class="px-4 py-3">Delayed job at booking time</th><th class="px-4 py-3">Periodic scan (every 5 min)</th></tr></thead>
+            <th class="px-4 py-3">Token</th><th class="px-4 py-3">From</th><th class="px-4 py-3">Meant for</th><th class="px-4 py-3">Common mistake</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Booking is rescheduled</td><td class="px-4 py-3">The old job fires at the wrong time unless you find and cancel it</td><td class="px-4 py-3">The scan reads the current time. Nothing to cancel.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Booking is cancelled</td><td class="px-4 py-3">The job must re-check status when it runs</td><td class="px-4 py-3">Cancelled bookings aren't selected</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Redis is flushed or migrated</td><td class="px-4 py-3">Months of scheduled reminders are lost</td><td class="px-4 py-3">The truth is in Postgres, so the next scan recovers</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Booking made 3 hours before</td><td class="px-4 py-3">Needs a special case</td><td class="px-4 py-3">The scan's window logic decides</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Precision</td><td class="px-4 py-3">To the second</td><td class="px-4 py-3">Within the scan interval</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Verdict</td><td class="px-4 py-3">Fine for short, fixed delays ("retry in 10 minutes", "send survey 1 hour after the visit")</td><td class="px-4 py-3"><strong>Prefer for anything days away</strong> or tied to data that can change</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ID token (OIDC)</td><td class="px-4 py-3">The identity provider</td><td class="px-4 py-3">Your app, to learn who logged in</td><td class="px-4 py-3">Sending it to your API as if it were an access token</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Access token</td><td class="px-4 py-3">The authorization server</td><td class="px-4 py-3">The API named in its <code class="inline">aud</code> (audience) claim</td><td class="px-4 py-3">Accepting a token issued for a <em>different</em> API because the signature is valid</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Refresh token</td><td class="px-4 py-3">The authorization server</td><td class="px-4 py-3">Getting new access tokens</td><td class="px-4 py-3">Storing it in <code class="inline">localStorage</code>, or never rotating it</td></tr>
           </tbody>
         </table>
       </div>
-      <div class="mt-4">
-        <span class="code-label">jobs/reminder_scan.rb — cron every 5 minutes (Sidekiq)</span>
-        <pre class="code"><span class="kw">class</span> <span class="fn">ReminderScanJob</span>
-  <span class="kw">include</span> Sidekiq::Job
-  <span class="kw">def</span> <span class="fn">perform</span>
-    Booking.booked
-           .where(starts_at: Time.current..<span class="st">24</span>.hours.from_now)    <span class="cm"># due within 24 h</span>
-           .where.missing(:reminder_24h)                          <span class="cm"># no sent_notifications row yet</span>
-           .find_each { |b| SendReminderJob.perform_async(b.id) }
-  <span class="kw">end</span>
-<span class="kw">end</span>
-<span class="cm"># Overlapping scans or a double enqueue are harmless: SendReminderJob is idempotent (Part III).
-# Scheduled with the cron feature of your job library (Sidekiq Enterprise, sidekiq-cron,
-# Celery beat, BullMQ job schedulers, ARQ cron, asynq Scheduler), not the server's crontab.</span></pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Two cron traps are worth naming. First, if you run three app servers and each one has the same crontab
-        entry, the job runs three times: use a scheduler that elects a single runner, or make the job idempotent (you
-        did). Second, cron times are in some time zone. A reminder for a clinic in Ho Chi Minh City scheduled
-        "at 9:00" on a UTC server goes out at 16:00 local time. Store times as <code class="inline">timestamptz</code>
-        (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>) and convert deliberately.
-      </p>
 
-      <h3 class="font-semibold text-lg mt-8">Fan-out and pub/sub</h3>
+      <h3 class="font-semibold text-lg mt-8">Authorization code flow with PKCE</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        When a booking is created, four things should happen: confirmation email, calendar sync, analytics, and a
-        notification to the clinic's dashboard. Enqueuing four jobs from the booking handler couples it to every
-        consumer. <strong>Publish/subscribe</strong> inverts that. The handler publishes one event,
-        <code class="inline">booking.created</code>, and each consumer subscribes with its own queue. On AWS the
-        standard shape is an SNS topic with one SQS queue per consumer:
+        This is the flow to use for web apps, single-page apps and mobile apps. The older "implicit" flow, which returned
+        tokens directly in the URL, is deprecated. <strong>PKCE</strong> (Proof Key for Code Exchange, pronounced
+        "pixie") stops a stolen authorization code from being useful: the app invents a random secret, sends only
+        its hash at the start, and must present the original secret to exchange the code.
       </p>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
-flowchart LR
-    API["Booking service<br/>(via outbox, SD7)"] --> T(["SNS topic<br/>booking-events"])
-    T --> Q1["SQS email-queue"] --> W1["Email worker"]
-    T --> Q2["SQS calendar-queue"] --> W2["Calendar sync"]
-    T --> Q3["SQS analytics-queue"] --> W3["Analytics loader"]
-    Q2 -.->|"after 5 failed receives"| D2["calendar-dlq"]
+sequenceDiagram
+    autonumber
+    participant U as Patient's browser
+    participant App as Clinic app
+    participant IdP as Google (OIDC)
+    App->>App: make code_verifier (random)<br/>code_challenge = SHA256(verifier)
+    App->>U: redirect to IdP with client_id, redirect_uri,<br/>state, code_challenge
+    U->>IdP: log in and consent
+    IdP->>U: redirect to redirect_uri with code and state
+    U->>App: code, state
+    App->>App: check state matches (CSRF defence)
+    App->>IdP: POST /token with code + code_verifier
+    IdP-->>App: ID token, access token
+    App->>App: verify ID token signature, iss, aud, exp, nonce
+    App-->>U: set own session cookie
         </pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Each consumer gets its own copy, its own retry policy, its own DLQ and its own pace. A Google Calendar outage
-        fills <code class="inline">calendar-queue</code> and leaves email untouched. The same shape is a fanout
-        exchange in RabbitMQ, or several consumer groups on one Kafka topic or Redis stream. The architecture-level
-        question of when to use events between services at all is in
-        <a href="./sd4.html" class="text-viol underline decoration-viol/40">SD4</a>, and getting the event out reliably
-        is the outbox in <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>.
+        You should almost never hand-write this. Use your provider's SDK or a maintained library (Auth.js, Devise with
+        OmniAuth, Authlib, a Go OIDC library). What you <em>review</em> is the configuration: an exact-match allowlist of
+        redirect URIs, <code class="inline">state</code> and PKCE switched on, and ID tokens verified rather than just
+        decoded.
       </p>
 
-      <h3 class="font-semibold text-lg mt-8">Ordering: rarely global, sometimes per key</h3>
+      <h3 class="font-semibold text-lg mt-8">Social login and account linking</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        With several workers and retries, messages finish out of order. A retry of "booking 91 created" can land after
-        "booking 91 cancelled". Global ordering is expensive, because it means one worker at a time, and it is almost
-        never what you need. What you usually need is <strong>order per entity</strong>: all messages for booking 91 in
-        sequence, while different bookings run in parallel.
+        The dangerous part of social login is not the protocol. It is the code that decides <em>which local account</em>
+        a social identity maps to. A classic agent-written bug is "find the user by email, and log them in". If a
+        provider lets someone sign up with an email address they don't control, that is an account takeover.
       </p>
       <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>SQS FIFO</strong>: set <code class="inline">MessageGroupId</code> to the booking ID. Messages in one
-          group are delivered in order, one at a time. Different groups proceed in parallel.</li>
-        <li><strong>Kafka</strong>: use the booking ID as the message key. The same key always goes to the same
-          partition, and a partition is consumed in order.</li>
-        <li><strong>Or don't depend on order at all</strong>: include a version or <code class="inline">updated_at</code>
-          in the message, and have the consumer ignore anything older than what it has already applied. This is often
-          the simplest and most robust fix.</li>
+        <li><strong>Link identities by the provider's stable subject ID</strong> (<code class="inline">sub</code>), stored
+          next to the provider name, not by email.</li>
+        <li><strong>Only auto-link by email when the provider says it is verified</strong>
+          (<code class="inline">email_verified: true</code>), and preferably ask the user to confirm with their existing
+          login first.</li>
+        <li><strong>Treat profile data as untrusted input</strong>: names and avatars from providers go through the same
+          validation and escaping as a form field.</li>
       </ul>
 
-      <h3 class="font-semibold text-lg mt-8">Throughput: concurrency, rate limits and big batches</h3>
+      <h3 class="font-semibold text-lg mt-8">Managed auth providers</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        The queue lets you choose how fast work drains, and that speed must match the slowest thing downstream.
-        Your SMS provider may allow 10 messages per second. Twenty workers with a concurrency of 10 each can
-        attempt 200, and 190 of those come back as 429s. Limit the <em>consumer</em>, not the producer:
+        A managed provider runs the login UI, password storage, MFA, social login and token issuing. Your backend
+        verifies the tokens it issues and keeps your own <code class="inline">users</code> table for app data.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Provider</th><th class="px-4 py-3">Fits when</th><th class="px-4 py-3">Watch for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Supabase Auth</td><td class="px-4 py-3">You already use Supabase Postgres (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>). User JWTs work directly with Postgres Row Level Security.</td><td class="px-4 py-3">RLS must be enabled and correct on every exposed table (Part III)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Auth0</td><td class="px-4 py-3">Enterprise needs: SSO with clients' identity providers, rich rules, many apps</td><td class="px-4 py-3">Pricing grows with users and features</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Amazon Cognito</td><td class="px-4 py-3">You are all-in on AWS (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>)</td><td class="px-4 py-3">A steeper developer experience, and some settings are hard to change later</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clerk and similar</td><td class="px-4 py-3">A Next.js app that wants ready-made UI components</td><td class="px-4 py-3">Lock-in of your user store to the vendor</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Framework built-ins</td><td class="px-4 py-3">Rails authentication generator or Devise, Django auth: a single web app with sessions</td><td class="px-4 py-3">You now own reset flows, MFA and lockout</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info">
+        <strong>Managed auth answers "who", never "may they".</strong> Supabase, Auth0 or Cognito can tell you the
+        request comes from user 812 with role <code class="inline">patient</code>. Whether user 812 may cancel booking 91
+        is still your code's decision, and that is where the serious bugs live.
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Putting Parts I and II together, most client projects land on one of a few designs. Walk it from the top, and
+        write the answer into the project's decision log:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    A["New project needs login"] --> B{"Already on Supabase,<br/>or need SSO for enterprise clients?"}
+    B -->|"Supabase"| S["Supabase Auth + RLS"]
+    B -->|"enterprise SSO"| M["Auth0 or Cognito"]
+    B -->|"neither"| C{"Clients besides one web app?<br/>mobile, partners, several services"}
+    C -->|"no, one web app"| W["Framework sessions<br/>HttpOnly cookie"]
+    C -->|"yes"| J["Managed provider issuing JWTs<br/>short access + rotated refresh"]
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Verifying a JWT properly</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Whichever provider issues the tokens, your API must <strong>verify</strong> each one: the signature against the
+        provider's published keys, the algorithm you expect, the issuer, the audience, and the expiry. "Decode" is not
+        "verify". A decoded but unverified JWT is just a JSON object the attacker wrote.
       </p>
       <div class="mt-4">
-        <span class="code-label">workers/sms.worker.ts — match the provider's limit</span>
-        <pre class="code"><span class="kw">new</span> <span class="fn">Worker</span>(<span class="st">"sms"</span>, sendSms, {
-  connection,
-  concurrency: <span class="st">5</span>,
-  limiter: { max: <span class="st">10</span>, duration: <span class="st">1000</span> },   <span class="cm">// at most 10 jobs per second for this queue</span>
+        <span class="code-label">auth/verify.ts — using the jose library</span>
+        <pre class="code"><span class="kw">import</span> { createRemoteJWKSet, jwtVerify } <span class="kw">from</span> <span class="st">"jose"</span>;
+
+<span class="kw">const</span> JWKS = createRemoteJWKSet(<span class="kw">new</span> URL(<span class="st">`${ISSUER}/.well-known/jwks.json`</span>)); <span class="cm">// cached public keys</span>
+
+<span class="kw">export async function</span> <span class="fn">authenticate</span>(token: <span class="kw">string</span>) {
+  <span class="kw">const</span> { payload } = <span class="kw">await</span> jwtVerify(token, JWKS, {
+    issuer: ISSUER,                <span class="cm">// tokens from another tenant or provider → rejected</span>
+    audience: <span class="st">"clinic-api"</span>,        <span class="cm">// tokens minted for another API → rejected</span>
+    algorithms: [<span class="st">"RS256"</span>],        <span class="cm">// never let the token choose its own algorithm</span>
+  });                              <span class="cm">// exp and nbf are checked automatically</span>
+  <span class="kw">return</span> { userId: payload.sub!, role: payload.role };
+}
+<span class="cm">// ✗ red flag: jwt.decode(token) or JSON.parse(atob(token.split(".")[1])) used for auth</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Authorization</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every query must answer "whose is this?"</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Broken access control is number one in the OWASP Top 10 (2025), and it has been at or near the top for years.
+        It is also the category agents produce most reliably, because the model writes the endpoint the prompt asked
+        for and nothing in the prompt says "and only for the owner".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Three models: roles, attributes, ownership</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Model</th><th class="px-4 py-3">Rule looks like</th><th class="px-4 py-3">Clinic example</th><th class="px-4 py-3">Limit</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">RBAC (role-based)</td><td class="px-4 py-3">Role → allowed actions</td><td class="px-4 py-3"><code class="inline">clinic_admin</code> may edit doctors. <code class="inline">patient</code> may create bookings.</td><td class="px-4 py-3">Says nothing about <em>which</em> clinic or booking</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ownership (resource-based)</td><td class="px-4 py-3">The record belongs to the user</td><td class="px-4 py-3">A patient may view and cancel <em>their own</em> bookings</td><td class="px-4 py-3">Needs every query to be scoped</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ABAC (attribute-based)</td><td class="px-4 py-3">A policy over user, resource and context attributes</td><td class="px-4 py-3">A doctor may view a booking if it is at their clinic <em>and</em> within their working hours <em>and</em> the booking isn't older than a year</td><td class="px-4 py-3">More power, more to test. Often a policy library.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Real apps combine them: a <strong>role</strong> check ("is this a clinic admin?") <em>and</em> a
+        <strong>scope</strong> check ("of <em>this</em> clinic?"). Most security bugs are a role check with the scope
+        check missing: the admin of clinic A can edit doctors at clinic B.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">IDOR: the bug you will find in agent code this month</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Insecure Direct Object Reference</strong>: the endpoint takes an ID from the request and loads that
+        record without checking that it belongs to the caller. Because IDs are sequential
+        (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>), an attacker just counts:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Minh (patient 812)
+    participant API as Clinic API
+    participant DB as Postgres
+    M->>API: GET /bookings/9101 (his own)
+    API->>DB: SELECT * FROM bookings WHERE id = 9101
+    API-->>M: 200, his booking ✅
+    M->>API: GET /bookings/9100 (edits the URL)
+    API->>DB: SELECT * FROM bookings WHERE id = 9100
+    API-->>M: 200, Lan's booking, doctor, diagnosis note ❌
+    Note over M,DB: a loop from 1 to 9101 downloads every patient
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">bookings/routes.ts — vulnerable vs fixed (Express)</span>
+        <pre class="code"><span class="cm">// ✗ authenticated, but not authorized: any logged-in user reads any booking</span>
+router.get(<span class="st">"/bookings/:id"</span>, requireAuth, <span class="kw">async</span> (req, res) =&gt; {
+  <span class="kw">const</span> booking = <span class="kw">await</span> db.booking.findUnique({ where: { id: +req.params.id } });
+  res.json(booking);
+});
+
+<span class="cm">// ✓ the owner is part of the query itself: another user's ID simply finds nothing</span>
+router.get(<span class="st">"/bookings/:id"</span>, requireAuth, <span class="kw">async</span> (req, res) =&gt; {
+  <span class="kw">const</span> booking = <span class="kw">await</span> db.booking.findFirst({
+    where: { id: +req.params.id, patientId: req.user.id },   <span class="cm">// scope from the SESSION, not the request</span>
+  });
+  <span class="kw">if</span> (!booking) <span class="kw">return</span> res.sendStatus(<span class="st">404</span>);                   <span class="cm">// don't reveal that 9100 exists</span>
+  res.json(booking);
 });</pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        For bulk work, such as "send the new-clinic announcement to 40,000 patients", don't write one job that loops
-        over 40,000 rows. It runs for an hour, can't be retried halfway, and blocks a worker. Use one small
-        <strong>coordinator</strong> job that pages through the IDs and enqueues one job per patient (or per batch of
-        100). Each child job is small, retried on its own, and idempotent.
+        The same fix in other stacks is the same idea: <strong>start the query from the current user</strong>, so the
+        scope cannot be forgotten.
       </p>
+      <div class="mt-4">
+        <span class="code-label">scoped lookups — Rails · FastAPI</span>
+        <pre class="code"><span class="cm"># Rails: go through the association; RecordNotFound becomes a 404</span>
+@booking = current_user.bookings.find(params[:id])
 
-      <h3 class="font-semibold text-lg mt-8">Monitoring: depth, age, failures</h3>
+<span class="cm"># FastAPI: the current user comes from a dependency, never from the body</span>
+<span class="kw">@router.get</span>(<span class="st">"/bookings/{booking_id}"</span>)
+<span class="kw">def</span> <span class="fn">get_booking</span>(booking_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    booking = db.scalar(select(Booking).where(Booking.id == booking_id,
+                                              Booking.patient_id == user.id))
+    <span class="kw">if not</span> booking:
+        <span class="kw">raise</span> HTTPException(status_code=<span class="st">404</span>)
+    <span class="kw">return</span> booking</pre>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>UUIDs don't fix IDOR.</strong> Random IDs make guessing harder, but IDs leak through URLs, emails, logs,
+        shared screenshots and other API responses. They are defence in depth, not access control. The check must be
+        in the query or the policy.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Where to enforce it: one place, deny by default</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        A queue fails quietly. Nothing errors in the API, and customers simply stop getting emails. Put these on a
-        dashboard for every queue, with alerts (<a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>
-        covers observability tooling):
+        Checks copied into every handler get forgotten in the fortieth one. Put authorization in <strong>one
+        layer</strong> that every request passes through, and make the default answer "no". Framework options include
+        Pundit or Action Policy (Rails), guards and CASL (NestJS), dependencies (FastAPI), middleware (Gin), and Postgres
+        Row Level Security as a database-level backstop. Where business rules live in your layers is covered in
+        <a href="./sd2.html" class="text-viol underline decoration-viol/40">SD2</a>, and the middleware pattern in
+        <a href="./sd5.html" class="text-viol underline decoration-viol/40">SD5</a>.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Then test it as a <strong>matrix</strong>: every role against every sensitive action, including "someone else's
+        record". A table like this, turned into tests (<a href="./qa1.html" class="text-viol underline decoration-viol/40">QA1</a>),
+        is the single most useful security artifact on a project:
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Metric</th><th class="px-4 py-3">What it tells you</th><th class="px-4 py-3">Example alert</th></tr></thead>
+            <th class="px-4 py-3">Action</th><th class="px-4 py-3">Anonymous</th><th class="px-4 py-3">Patient (owner)</th><th class="px-4 py-3">Other patient</th><th class="px-4 py-3">Doctor, same clinic</th><th class="px-4 py-3">Admin, other clinic</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Queue depth (waiting jobs)</td><td class="px-4 py-3">Arrivals vs throughput. Rising steadily means workers can't keep up.</td><td class="px-4 py-3">Depth still growing after 15 min</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Age of the oldest message</td><td class="px-4 py-3">The user-facing delay. It catches stuck workers even when depth is small. SQS exposes it as <code class="inline">ApproximateAgeOfOldestMessage</code>.</td><td class="px-4 py-3">Email queue oldest &gt; 5 min</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Failure and retry rate</td><td class="px-4 py-3">A provider outage or a bad deploy</td><td class="px-4 py-3">&gt; 5% of jobs failing over 10 min</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">DLQ size</td><td class="px-4 py-3">Work that will never happen without a human</td><td class="px-4 py-3">Any message in any DLQ</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Job duration (p95)</td><td class="px-4 py-3">Slow dependencies, and whether the visibility timeout is still safe</td><td class="px-4 py-3">p95 above half the timeout</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">View booking 91</td><td class="px-4 py-3">401</td><td class="px-4 py-3">200</td><td class="px-4 py-3">404</td><td class="px-4 py-3">200</td><td class="px-4 py-3">404</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cancel booking 91</td><td class="px-4 py-3">401</td><td class="px-4 py-3">200</td><td class="px-4 py-3">404</td><td class="px-4 py-3">200</td><td class="px-4 py-3">404</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Edit doctor's schedule</td><td class="px-4 py-3">401</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403 (own schedule only: 200)</td><td class="px-4 py-3">404</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Export all patients</td><td class="px-4 py-3">401</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403</td><td class="px-4 py-3">403</td></tr>
           </tbody>
         </table>
       </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Finally, workers need <strong>graceful shutdown</strong>. On deploy, a worker should stop taking new jobs and
-        finish (or give back) the ones in progress before it exits. Every library here supports it, but a container
-        that is killed too quickly skips it. Check that your platform's stop timeout is longer than your longest job,
-        or keep jobs short enough that it doesn't matter.
+
+      <h3 class="font-semibold text-lg mt-8">Multi-tenancy isolation, in brief</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        If one deployment serves many clinics (tenants), a missing tenant filter leaks one clinic's patients to another
+        clinic. The common design is a <code class="inline">clinic_id</code> (tenant ID) on every tenant-owned table, set
+        from the authenticated user and never from the request body, applied by a default scope or repository, and
+        backed by Postgres <strong>Row Level Security</strong> so that a forgotten <code class="inline">WHERE</code> returns
+        nothing instead of everything. Remember the tenant in cache keys too
+        (<a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>).
       </p>
+      <div class="mt-4">
+        <span class="code-label">migration — RLS as the backstop (Supabase-style)</span>
+        <pre class="code"><span class="kw">ALTER TABLE</span> bookings <span class="kw">ENABLE ROW LEVEL SECURITY</span>;
+
+<span class="cm">-- patients see only their own bookings; auth.uid() is the user id from the verified JWT</span>
+<span class="kw">CREATE POLICY</span> <span class="fn">patient_reads_own</span> <span class="kw">ON</span> bookings <span class="kw">FOR SELECT</span>
+  <span class="kw">USING</span> (patient_user_id = auth.uid());
+
+<span class="cm">-- with RLS enabled and no matching policy, the answer is zero rows: deny by default</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On Supabase this matters doubly, because the browser can query tables directly with the public key. A table
+        exposed without RLS is readable by anyone who opens the developer tools. Stronger isolation options, such as a
+        schema or database per tenant, trade simplicity for isolation and are an architecture decision for your mentor.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Mass assignment</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The quiet cousin of IDOR. The handler passes the whole request body to the ORM, so the attacker adds fields
+        the form never had: <code class="inline">"role": "admin"</code>, <code class="inline">"patientId": 5</code>, or
+        <code class="inline">"status": "paid"</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">profile update — vulnerable vs allowlisted</span>
+        <pre class="code"><span class="cm">// ✗ every column is writable from the request</span>
+<span class="kw">await</span> db.user.update({ where: { id: req.user.id }, data: req.body });
+
+<span class="cm">// ✓ an explicit schema: only these fields, with types; everything else is dropped</span>
+<span class="kw">const</span> ProfileUpdate = z.object({ fullName: z.string().max(<span class="st">100</span>), phone: z.string().max(<span class="st">20</span>) });
+<span class="kw">await</span> db.user.update({ where: { id: req.user.id }, data: ProfileUpdate.parse(req.body) });
+
+<span class="cm"># Rails equivalent: params.require(:user).permit(:full_name, :phone)
+# FastAPI: a Pydantic model with only the allowed fields (BE1 covers validation)</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Reviewing agent code for security</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Read every diff as the attacker would</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The OWASP Top 10 is a ranked list of the most common and damaging web application risks. You don't need to
+        memorise it. You need to turn it into questions you ask of every diff. The 2025 edition, mapped to what to look
+        for in code an agent wrote:
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">OWASP Top 10 (2025) as a review checklist</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Category</th><th class="px-4 py-3">What to check in the diff</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A01 Broken Access Control</td><td class="px-4 py-3">Every ID from the request is scoped to the caller (IDOR). Role <em>and</em> tenant checks. Deny by default. It now also includes SSRF and CSRF.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A02 Security Misconfiguration</td><td class="px-4 py-3">Debug mode or stack traces in production, CORS <code class="inline">*</code> with credentials, default passwords, public storage buckets, missing security headers</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A03 Software Supply Chain Failures</td><td class="px-4 py-3">New dependencies the agent added: do they exist, are they maintained, is the name spelled right? Lockfile committed? CI actions pinned? How to vet a package is in <a href="./co5.html" class="text-viol underline decoration-viol/40">CO5</a>.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A04 Cryptographic Failures</td><td class="px-4 py-3">Fast hashes for passwords, home-made crypto, secrets in code, HTTP instead of HTTPS, <code class="inline">Math.random()</code> for tokens</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A05 Injection</td><td class="px-4 py-3">String-built SQL, shell commands or HTML. <code class="inline">eval</code>. Raw queries in ORMs.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A06 Insecure Design</td><td class="px-4 py-3">Missing business limits: unlimited bookings per patient, reset codes with no attempt limit, no rate limits on costly actions</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A07 Authentication Failures</td><td class="px-4 py-3">JWT decoded but not verified, sessions not rotated at login, no brute-force protection, user enumeration in error messages</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A08 Software or Data Integrity Failures</td><td class="px-4 py-3">Unverified webhooks (check the provider's signature), deserialising untrusted data, auto-updates without integrity checks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A09 Security Logging and Alerting Failures</td><td class="px-4 py-3">No log of logins, permission denials and admin actions. Or the opposite: passwords, tokens and health data written to logs.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A10 Mishandling of Exceptional Conditions</td><td class="px-4 py-3">Errors that "fail open" (the permission check throws, and the catch block lets the request through), leaked error details, swallowed exceptions</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Injection: never build queries or commands with strings</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Injection happens whenever user input is pasted into something that will be <em>interpreted</em>: SQL, a shell
+        command, HTML, a template. The fix is always the same idea: pass data as <strong>parameters</strong>, separately
+        from the code. ORMs do this for you until someone reaches for the raw-query escape hatch, which agents do when a
+        query gets complicated.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">search — injectable vs parameterised</span>
+        <pre class="code"><span class="cm">// ✗ q = "x' OR '1'='1" returns every patient; worse inputs can drop tables</span>
+<span class="kw">await</span> db.$queryRawUnsafe(<span class="st">`SELECT * FROM patients WHERE name ILIKE '%${q}%'`</span>);
+
+<span class="cm">// ✓ parameterised: the driver sends q as data, never as SQL</span>
+<span class="kw">await</span> db.$queryRaw<span class="st">`SELECT * FROM patients WHERE name ILIKE ${"%" + q + "%"}`</span>;
+
+<span class="cm"># ✗ shell injection: filename = "a.pdf; rm -rf /"</span>
+os.system(<span class="st">f"convert {filename} out.png"</span>)
+<span class="cm"># ✓ argument list, no shell</span>
+subprocess.run([<span class="st">"convert"</span>, filename, <span class="st">"out.png"</span>], check=<span class="kw">True</span>)</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">XSS and CSRF</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Cross-site scripting (XSS)</strong> is injection into HTML: a patient's "notes to the doctor" field
+        contains a <code class="inline">&lt;script&gt;</code>, and it runs in the doctor's browser with the doctor's
+        session. React, Vue, Rails views and Jinja escape output by default, so XSS comes back through the escape
+        hatches: <code class="inline">dangerouslySetInnerHTML</code>, <code class="inline">v-html</code>,
+        <code class="inline">html_safe</code> / <code class="inline">raw</code>, <code class="inline">| safe</code>, and
+        building HTML strings for emails. If rich text is truly needed, sanitise it with a maintained library, and add a
+        Content-Security-Policy header as a second layer. What this looks like in a React or Next.js diff
+        (sanitising, token storage, headers in <code class="inline">next.config</code>) is in <a href="./fe6.html" class="text-viol underline decoration-viol/40">FE6</a>.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Cross-site request forgery (CSRF)</strong> works the other way round. A malicious site makes the victim's
+        browser send a request to your app, and the browser attaches your session cookie automatically. Defences, in
+        layers: <code class="inline">SameSite=Lax</code> or <code class="inline">Strict</code> cookies, the framework's CSRF
+        token on every state-changing form (Rails, Django and Laravel have it on by default, so don't let an agent
+        disable it "to make the API work"), and never changing state on a <code class="inline">GET</code>. APIs that
+        authenticate only with a Bearer header, not cookies, aren't exposed to CSRF in the same way.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Attack</th><th class="px-4 py-3">Victim's browser is tricked into</th><th class="px-4 py-3">Main defence</th><th class="px-4 py-3">Agent red flag</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">XSS</td><td class="px-4 py-3">Running the attacker's script on <em>your</em> page</td><td class="px-4 py-3">Output escaping, sanitising, CSP</td><td class="px-4 py-3"><code class="inline">dangerouslySetInnerHTML={{ __html: note }}</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CSRF</td><td class="px-4 py-3">Sending a request to your app from <em>another</em> site</td><td class="px-4 py-3">SameSite cookies, CSRF tokens</td><td class="px-4 py-3"><code class="inline">skip_forgery_protection</code>, <code class="inline">@csrf_exempt</code>, a GET that cancels a booking</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">SSRF: when your server fetches a URL someone gave it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Server-side request forgery</strong> appears whenever your backend fetches a user-supplied URL: "import
+        avatar from URL", a webhook endpoint a clinic configures, a link-preview feature, or an AI tool that "reads this
+        web page". The attacker supplies an internal address instead, such as
+        <code class="inline">http://169.254.169.254/</code> (the cloud metadata service, which can hand out credentials)
+        or <code class="inline">http://localhost:6379</code>, and your server fetches it from <em>inside</em> your
+        network.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Allowlist</strong> destinations when you can (only <code class="inline">https</code>, only known
+          domains).</li>
+        <li>Otherwise, <strong>resolve the hostname and reject private, loopback and link-local addresses</strong>, and
+          re-check after redirects (or disable redirects).</li>
+        <li>On AWS, require <strong>IMDSv2</strong> for instance metadata, and give the fetching service no credentials it
+          doesn't need (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>).</li>
+        <li>Set short timeouts and a response size limit, and never return the raw response body to the user.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Webhooks and headers: two quick wins</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A webhook endpoint (from a payment provider, an SMS gateway, a calendar) is a public URL that changes data. If
+        you don't verify that the request really came from the provider, anyone can POST
+        <code class="inline">{"status": "paid"}</code> to it. Providers sign each request with a shared secret, and your
+        code must check that signature before trusting anything in the body (OWASP A08):
+      </p>
+      <div class="mt-4">
+        <span class="code-label">webhooks/verify.py — HMAC signature check</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">verify_webhook</span>(raw_body: bytes, signature: str, secret: bytes) -&gt; bool:
+    expected = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+    <span class="kw">return</span> hmac.compare_digest(expected, signature)   <span class="cm"># constant-time, never ==</span>
+<span class="cm"># Use the RAW body bytes, before JSON parsing. Also reject old timestamps if the
+# provider sends one (replay protection). Prefer the provider's SDK helper when it has one.</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Security headers are the other cheap layer, and they are easy to check with <code class="inline">curl -I</code>.
+        Most frameworks have a middleware that sets sensible defaults (Helmet for Express, and the defaults built into
+        Rails and Django):
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Header</th><th class="px-4 py-3">Protects against</th><th class="px-4 py-3">Typical value</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Strict-Transport-Security</td><td class="px-4 py-3">Downgrade to plain HTTP</td><td class="px-4 py-3"><code class="inline">max-age=31536000; includeSubDomains</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Content-Security-Policy</td><td class="px-4 py-3">XSS impact: limits which scripts may run</td><td class="px-4 py-3">Start with <code class="inline">default-src 'self'</code> and loosen deliberately</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">X-Content-Type-Options</td><td class="px-4 py-3">Browsers guessing a file is a script</td><td class="px-4 py-3"><code class="inline">nosniff</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">frame-ancestors (CSP) or X-Frame-Options</td><td class="px-4 py-3">Clickjacking in a hidden iframe</td><td class="px-4 py-3"><code class="inline">frame-ancestors 'none'</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Access-Control-Allow-Origin (CORS)</td><td class="px-4 py-3">Other sites reading your API responses with the user's cookies</td><td class="px-4 py-3">An explicit list of your front-end origins, never <code class="inline">*</code> with credentials</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Secrets management</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        API keys, database passwords and signing keys never go in the repository, in client-side code, in logs, or in
+        a job payload. Locally they live in an uncommitted <code class="inline">.env</code>. In production they live in
+        the platform's secret store, such as AWS Secrets Manager or SSM Parameter Store
+        (<a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a>) or Vercel and Supabase environment
+        variables (<a href="./op3.html" class="text-viol underline decoration-viol/40">OP3</a>), and are injected at
+        runtime.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Leak path</th><th class="px-4 py-3">How agents cause it</th><th class="px-4 py-3">Prevention</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Committed to git</td><td class="px-4 py-3">"I added your key to config.ts so it works"</td><td class="px-4 py-3"><code class="inline">.env</code> in <code class="inline">.gitignore</code>, GitHub secret scanning and push protection, a pre-commit secret scanner</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shipped to the browser</td><td class="px-4 py-3">Server-only key given a public prefix (<code class="inline">NEXT_PUBLIC_</code>, <code class="inline">VITE_</code>) to fix an "undefined" error</td><td class="px-4 py-3">Only publishable keys get public prefixes. Secret calls go through your server.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Written to logs</td><td class="px-4 py-3">Logging the full request, headers or config while debugging</td><td class="px-4 py-3">Redact <code class="inline">authorization</code>, cookies, passwords and tokens in the logger</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Pasted into a chat or prompt</td><td class="px-4 py-3">The key is in the terminal output the agent reads</td><td class="px-4 py-3">Keep production secrets off your laptop. Use scoped, revocable dev keys.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>A leaked secret is rotated, not deleted.</strong> Removing the key in a new commit doesn't help: it is in
+        git history, forks and CI logs, and bots scan public repos within minutes. Revoke and reissue the key first,
+        then clean up, then tell your mentor. Rotating quickly is normal. Hiding a leak is the real incident.
+      </div>
 
       <!-- ═══════════════ Claude Code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Agents write workers, enqueue calls and retry configuration fluently. What they skip is the hostile
-        environment: duplicates, crashes between two lines, cancellations while a job waits, and poison messages.
-        Make the agent reason about those explicitly, and make it prove the job is idempotent with a test.
+        Claude Code ships a built-in <code class="inline">/security-review</code> command, which analyses the changes on
+        your current branch (the diff against the default branch on <code class="inline">origin</code>) for risks such as
+        injection, auth issues and data exposure. Run it before every PR that touches auth, data access, uploads or
+        external calls. It is a strong second reader, not a substitute for your own authorization matrix, because it
+        can't know your business rules ("doctors may only see bookings at their own clinic") unless you tell it.
       </p>
       <div class="mt-4">
-        <span class="code-label">prompt — design the job before writing it</span>
-        <pre class="code">We need a 24h SMS reminder for bookings (clinic app, BullMQ + Postgres).
-Before coding, answer in a short design note:
-1. Delayed job or periodic scan? Justify against reschedule, cancel and Redis loss.
-2. What is the message payload? (IDs only.)
-3. How is the job idempotent? Name the unique constraint or de-dup record.
-4. Which errors retry, which don't, max attempts, backoff. Where do failures go?
-5. What happens if the worker crashes between sending the SMS and recording it?
-6. Which metrics and alerts will tell us reminders stopped?
-Stop after the note. Don't write code yet.</pre>
+        <span class="code-label">prompt — targeted access-control review</span>
+        <pre class="code">Act as a penetration tester reviewing this branch. Our rules (docs/authz.md):
+patients see only their bookings; doctors see bookings at their clinic;
+clinic admins manage only their clinic. For EVERY route changed in this diff:
+- which ID(s) come from the request, and how each is scoped to the caller
+- the role check AND the clinic (tenant) check, with file:line
+- fields accepted from the body (mass assignment?)
+Output a table: route | inputs | scoping | verdict. Don't fix anything yet.</pre>
       </div>
-      <pre class="code mt-3">Write a test that runs SendReminderJob twice concurrently for the same booking
-and asserts the SMS client was called exactly once. Then a test where the booking
-is cancelled after enqueue and asserts it was called zero times. Paste the output.</pre>
-      <pre class="code mt-3">Audit every enqueue call in this repo: list job name, payload fields, retry config,
-and whether the payload contains personal data or whole records instead of IDs.
-Output a table; don't change code.</pre>
+      <pre class="code mt-3">Turn docs/authz-matrix.md into integration tests: for each action, call it as
+anonymous, owner, other patient, same-clinic doctor and other-clinic admin, and assert
+the status code in the matrix. Run them and paste the results.</pre>
+      <pre class="code mt-3">/security-review
+<span class="cm"># then, for each finding: explain the attack in one sentence, show a request that
+# exploits it, and write a failing test before you fix it</span></pre>
       <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>Wire the queue library, workers and scheduler config</li>
-            <li>Write the de-dup migration and the idempotent job body</li>
-            <li>Write duplicate-run and cancel-in-between tests</li>
-            <li>Classify provider errors into retry and don't-retry</li>
-            <li>Add queue-depth, age and DLQ metrics to the dashboard</li>
+            <li>Integrate the auth provider's SDK and JWT verification</li>
+            <li>Run <code class="inline">/security-review</code> and explain each finding</li>
+            <li>Generate the authorization test matrix from your rules</li>
+            <li>Write scoped queries, policies and RLS policies</li>
+            <li>Grep for raw SQL, <code class="inline">dangerouslySetInnerHTML</code>, CSRF exemptions and secrets</li>
           </ul>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-coral">You must check</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>That the work really should be async, and what the user sees if it fails</li>
-            <li>Idempotency that relies on the database, not on luck or the job ID alone</li>
-            <li>Max attempts and total retry time against the business deadline</li>
-            <li>That the DLQ exists, alerts, and has a replay path</li>
-            <li>Payloads: IDs only, with no secrets or health data</li>
+            <li>Every route with an ID: try another user's ID yourself</li>
+            <li>That the tenant and owner come from the session, never the body</li>
+            <li>Token verification settings: issuer, audience, algorithm, expiry</li>
+            <li>Cookie flags and where tokens are stored</li>
+            <li>No secret in the diff, the client bundle or the logs</li>
           </ul>
         </div>
       </div>
       <div class="mt-4 callout callout-warn">
-        <strong>Red flags in agent-written async code:</strong> an email, SMS or HTTP call to a third party inside the
-        request handler · a job that sends, charges or increments with no de-dup check · <code class="inline">retry: true</code>
-        with no limit, or retries on 4xx errors · <code class="inline">sleep()</code> inside a job to "wait and retry" ·
-        whole objects or personal data in the payload · a reminder scheduled months ahead as a delayed job with no
-        cancel path · a cron entry on every app server · no DLQ, or a DLQ with no alert · "exactly-once" in a comment
-        as the reason no idempotency is needed.
+        <strong>Red flags in agent-written security code:</strong> <code class="inline">findUnique({ where: { id } })</code>
+        on a user-owned resource with no owner filter · <code class="inline">jwt.decode</code> where
+        <code class="inline">verify</code> belongs · tokens in <code class="inline">localStorage</code> · <code class="inline">req.body</code>
+        passed straight to <code class="inline">update</code> · <code class="inline">userId</code> or
+        <code class="inline">clinicId</code> read from the request body · CSRF protection disabled "to fix a 422" ·
+        CORS <code class="inline">origin: "*"</code> with credentials · a catch block around an auth check that
+        continues · a new dependency you've never heard of · an API key in a file, a test fixture or a
+        <code class="inline">NEXT_PUBLIC_</code> variable · tests that only ever log in as an admin.
       </div>
 
       <!-- ═══════════════ skill ladder ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Does everything inside the request, and has never run a worker process.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can enqueue a job with the stack's library. Assumes each job runs exactly once.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Moves slow work to jobs with retries configured. Needs review to catch non-idempotent side effects, retries on permanent errors, or a missing DLQ.</div></div>
-        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses a job queue or broker with reasons. Writes idempotent jobs backed by a unique constraint, with tests for duplicates and cancellation. Classifies errors, configures backoff and a DLQ with an alert, prefers a periodic scan for far-future work, and monitors depth and age.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Designs fan-out and ordering for multi-service flows, runs DLQ replays during incidents, and sets the team's conventions for job design and queue alerts.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Treats "the user is logged in" as "the user may do this". Has never tried someone else's ID.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can explain AuthN vs AuthZ, sessions vs JWT, and what IDOR is. Doesn't yet find these issues in a diff unprompted.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Integrates a managed auth provider and scopes the obvious queries. Needs review to catch a missing tenant check, mass assignment, or a weak token setting.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses sessions or JWTs with reasons and stores tokens correctly. Verifies tokens fully. Scopes every query to owner and tenant, enforces authorization in one layer, and backs it with a tested role-by-action matrix. Reviews diffs against the OWASP list, runs <code class="inline">/security-review</code>, and handles secrets without leaks.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Designs the authorization model and tenant isolation for a new product, runs threat-modelling sessions, leads the response to a leaked secret or a reported vulnerability, and teaches IDOR hunting to other interns.</div></div>
       </div>
       <div class="mt-4 callout callout-tip">
-        <strong>Self-check before claiming 3:</strong> for one job you wrote, explain what happens if it runs twice at
-        the same moment, if the worker is killed halfway through, and if the provider returns 400. Can you show where
-        its failures end up and who gets alerted?
+        <strong>Self-check before claiming 3:</strong> pick any endpoint in your project that takes an ID. Can you say,
+        without looking, what stops user B from reading user A's record, and point to the test that proves it? Can you
+        say where each secret your app uses is stored, and how you would rotate it today?
       </div>
 
       <!-- ═══════════════ pitfalls ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
       <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Enqueuing before the commit</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The worker picks up the job in 5 ms, looks for booking 91, and doesn't find it because the transaction hasn't committed. Enqueue after commit, or use the outbox (<a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>).</p>
+          <div class="font-semibold text-rose-500">✗ Hiding the button instead of checking the API</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The "Delete clinic" button is hidden for non-admins, but <code class="inline">DELETE /clinics/7</code> works for anyone with curl. The UI is a convenience. The server is the security boundary.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ One queue for everything</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A 10,000-row CSV import sits in front of password-reset emails. Separate queues (or priorities) for user-facing and bulk work.</p>
+          <div class="font-semibold text-rose-500">✗ Testing only as the admin</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Seeded as <code class="inline">admin@example.com</code>, everything works, and every missing check stays invisible. Seed at least two patients and two clinics.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Unbounded retries</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A poison message retried for ever burns worker time and hides real failures in noise. Cap the attempts, and send the rest to a DLQ.</p>
+          <div class="font-semibold text-rose-500">✗ Rolling your own crypto or tokens</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Home-made "encrypted" IDs, reset tokens from <code class="inline">Math.random()</code>, or a custom JWT parser. Use the platform's secure random generator and maintained libraries.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Store notification state in the database</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A <code class="inline">sent_notifications</code> table gives you idempotency, an audit trail, and an answer when a patient says "I never got the SMS".</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write docs/authz.md first</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Half a page of "who may do what" gives the agent the rules it can't guess, gives <code class="inline">/security-review</code> context, and becomes your test matrix.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Run workers locally from day one</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Put the worker in your <code class="inline">docker compose</code> or Procfile next to the API, so async bugs appear on your laptop and not first in staging.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Make the safe path the easy path</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A <code class="inline">currentUser.bookings</code>-style scoped repository means the secure query is also the shortest one to write, for you and for the agent.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Kill a worker on purpose</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Stop the worker mid-job and watch what happens to the message. Ten minutes of this teaches more about delivery semantics than any article.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Put security in the Definition of Done</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A <code class="inline">/security-review</code> run and the cross-user test belong in the PR checklist for any auth or data-access change (<a href="./qa3.html" class="text-viol underline decoration-viol/40">QA3</a>).</p>
         </div>
       </div>
 
       <!-- ═══════════════ evidence & resources ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="move-async"> <span>Moved a slow third-party call out of a request into a job, and showed the endpoint's latency before and after.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="idempotent"> <span>Made a side-effecting job idempotent with a unique constraint, and a test proves two concurrent runs cause one side effect.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="retry-dlq"> <span>Configured bounded retries with backoff, skipped retries for permanent errors, and watched a poison message land in the DLQ.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="queue-metrics"> <span>Can show queue depth, oldest-message age and DLQ size for my project's queues, with at least one alert.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="reminder-pr"> <span class="font-semibold">Opened a PR that adds booking confirmation emails and 24-hour SMS reminders (a fake SMS provider is fine) using your stack's job library: periodic scan, <code class="inline">sent_notifications</code> de-dup table, error classification, a DLQ, tests for duplicates and cancellation, and a short design note answering the six questions from the prompt above (mentor evidence ✓).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="auth-choice"> <span>Wrote down for my project whether it uses sessions or JWTs and why, where tokens are stored, and how logout and revocation work.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="idor"> <span>Found (or ruled out) an IDOR by requesting another user's record, and fixed any hit with a scoped query plus a test.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="authz-matrix"> <span>Turned a role-by-action authorization matrix into passing integration tests, including "other user" and "other tenant" columns.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="secrets"> <span>Confirmed that no secret is in the repo, the client bundle or the logs, and know how each production secret is stored and rotated.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="security-pr"> <span class="font-semibold">Ran a security review of one feature (for example clinic booking): <code class="inline">docs/authz.md</code> with the rules and matrix, <code class="inline">/security-review</code> output plus your own OWASP-checklist notes, at least one real finding fixed with a failing-then-passing test, and the matrix tests in CI, all in one PR (mentor evidence ✓).</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
       <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
-        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html" target="_blank" rel="noopener">AWS — SQS visibility timeout</a> — why at-least-once delivery produces duplicates, and how to size the timeout.</li>
-        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html" target="_blank" rel="noopener">AWS — SQS dead-letter queues</a> — redrive policies, <code class="inline">maxReceiveCount</code> and redriving back to the source queue.</li>
-        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/sns/latest/dg/sns-sqs-as-subscriber.html" target="_blank" rel="noopener">AWS — Fanout to SQS queues with SNS</a> — the pub/sub shape from Part IV.</li>
-        <li><a class="text-coral underline" href="https://github.com/sidekiq/sidekiq/wiki/Error-Handling" target="_blank" rel="noopener">Sidekiq — Error handling</a> — retry schedule, the Dead set, and the advice that jobs must be idempotent.</li>
-        <li><a class="text-coral underline" href="https://docs.bullmq.io/guide/retrying-failing-jobs" target="_blank" rel="noopener">BullMQ — Retrying failing jobs</a> · <a class="text-coral underline" href="https://docs.bullmq.io/guide/jobs/job-ids" target="_blank" rel="noopener">Job IDs</a> — attempts, backoff and de-duplication by ID.</li>
-        <li><a class="text-coral underline" href="https://docs.celeryq.dev/en/stable/userguide/tasks.html" target="_blank" rel="noopener">Celery — Tasks</a> · <a class="text-coral underline" href="https://arq-docs.helpmanual.io/" target="_blank" rel="noopener">ARQ</a> — retries, acks and idempotency advice for Python.</li>
-        <li><a class="text-coral underline" href="https://github.com/hibiken/asynq/wiki" target="_blank" rel="noopener">asynq — Wiki</a> — retries, unique tasks and the periodic task scheduler in Go.</li>
-        <li><a class="text-coral underline" href="https://kafka.apache.org/documentation/#semantics" target="_blank" rel="noopener">Apache Kafka — Message delivery semantics</a> — what "exactly-once" means inside Kafka, and where it stops.</li>
+        <li><a class="text-coral underline" href="https://top10.owasp.org/2025/" target="_blank" rel="noopener">OWASP — Top 10:2025</a> — the categories in Part IV, each with examples and prevention advice.</li>
+        <li><a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP — Password Storage Cheat Sheet</a> — algorithms and parameters for Part I.</li>
+        <li><a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP — Session Management Cheat Sheet</a> — cookie flags, session expiry and rotation.</li>
+        <li><a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP — IDOR Prevention Cheat Sheet</a> · <a class="text-coral underline" href="https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html" target="_blank" rel="noopener">SSRF Prevention</a> — the two bugs agents produce most.</li>
+        <li><a class="text-coral underline" href="https://datatracker.ietf.org/doc/html/rfc9700" target="_blank" rel="noopener">IETF — RFC 9700, OAuth 2.0 Security Best Current Practice</a> — why PKCE everywhere and no implicit flow.</li>
+        <li><a class="text-coral underline" href="https://supabase.com/docs/guides/auth" target="_blank" rel="noopener">Supabase — Auth</a> · <a class="text-coral underline" href="https://supabase.com/docs/guides/database/postgres/row-level-security" target="_blank" rel="noopener">Row Level Security</a> — managed auth plus database-enforced authorization (<a class="text-coral underline" href="./op3.html">OP3</a>).</li>
+        <li><a class="text-coral underline" href="https://code.claude.com/docs/en/security" target="_blank" rel="noopener">Claude Code — Security</a> · <a class="text-coral underline" href="https://code.claude.com/docs/en/commands" target="_blank" rel="noopener">Commands</a> — <code class="inline">/security-review</code> and safe use of the agent itself.</li>
       </ul>
 
       <nav id="page-nav" class="mt-14 flex gap-4"></nav>
     </article>
 
     <footer class="px-6 py-8 text-center text-xs text-mute dark:text-mutedark">
-      AI-Native Developer Internship · SD9 Queues, Background Jobs &amp; Async Processing
+      AI-Native Developer Internship · SD9 Authentication, Authorization &amp; Security Design
     </footer>
   </main>
 </div>

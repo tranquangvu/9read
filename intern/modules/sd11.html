@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SD11 · Reliability &amp; Scaling — AI-Native Developer Internship</title>
+<title>SD11 · System Design Case Studies — AI-Native Developer Internship</title>
 <script>(function(){if(localStorage.getItem('fde-theme')==='dark')document.documentElement.classList.add('dark');if(localStorage.getItem('fde-nav')==='collapsed')document.documentElement.classList.add('nav-collapsed');})();</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -40,7 +40,7 @@ tailwind.config = {
     <div class="px-5 py-5 border-b border-line dark:border-linedark">
       <a href="../index.html" class="block">
         <div class="font-display text-lg font-bold leading-tight">AI-Native Developer</div>
-        <div class="text-xs text-mute dark:text-mutedark mt-0.5">12-week Internship Program</div>
+        <div class="text-xs text-mute dark:text-mutedark mt-0.5">9-week Internship Program</div>
       </a>
     </div>
     <nav id="module-nav" class="flex-1 overflow-y-auto px-2 py-3"></nav>
@@ -59,870 +59,796 @@ tailwind.config = {
           <span data-group-chip class="badge"></span>
           <span class="badge badge-critical">Core</span>
           <span class="badge badge-neutral">Target score: 3 / 4</span>
-          <span class="badge badge-accent">~2 days · guided practice</span>
+          <span class="badge badge-accent">~3 days · guided practice</span>
         </div>
-        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Reliability &amp; Scaling</h1>
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">System Design Case Studies</h1>
         <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
-          Networks drop packets, databases pause, payment providers time out, and deploys restart servers in the
-          middle of requests. Reliable systems are not the ones where nothing fails. They are the ones that
-          <em>expect</em> failure and contain it. This module covers the defences (timeouts, retries, circuit
-          breakers, bulkheads, idempotency keys, rate limits), how an app grows past one server, how you see what
-          production is doing, and how to estimate capacity on the back of an envelope before you build anything.
+          SD1 to SD10 taught the parts: schemas, diagrams, layers, queues, caches, auth, reliability. This module is
+          about putting them together. You learn one repeatable method for designing a system, then watch it work
+          on four systems you will meet on real client projects: a URL shortener, the clinic booking app end to
+          end, a notification service and an image upload pipeline. It ends with the design-doc template you use
+          for every real feature.
         </p>
         <div class="mt-6 callout callout-why">
-          <strong>Why it matters when AI writes the code:</strong> agent-written code is written for the happy path.
-          It calls the payment API with no timeout, retries in a tight loop, keeps sessions in memory, and logs
-          <code class="inline">console.log("error")</code>. All of it passes local tests, because locally nothing is
-          slow and there is only one server. The failure shows up at 9 a.m. on a Monday when the SMS provider is
-          slow and every request thread is stuck waiting for it. You are the one who has to ask "what happens when
-          this call hangs?"
+          <strong>Why it matters when AI writes the code:</strong> ask an agent to "design a booking system" and you
+          get a confident diagram with Kafka, Kubernetes and six microservices, and no answer to "what stops two
+          patients booking the same slot?" Agents produce architecture that <em>looks</em> right. The method in this
+          module makes you produce the requirements, numbers and hard questions first, so you can judge the
+          agent's design against them instead of being impressed by it.
         </div>
       </article>
     </div>
 
     <article class="max-w-[52rem] mx-auto px-6 pb-12 prose-fde">
       <!-- ═══════════════ PART I ═══════════════ -->
-      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Failure is normal</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Every remote call needs a timeout, a retry policy and a plan B</h2>
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · The method</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Seven steps, in order, written down, every time</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Our running example is the <strong>clinic booking app</strong> from
-        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>. To book a slot, the API talks to
-        Postgres, Redis, a payment provider for the deposit, and an SMS provider for the confirmation. That is four
-        things that can be slow or down, and only one of them (Postgres) is something you control well. The
-        question for every one of those calls is the same: <strong>what does my code do when it doesn't answer?</strong>
-      </p>
-
-      <h3 class="font-semibold text-lg mt-7">The ways a dependency fails</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        "Down" is the easy case, because you get an error fast. The dangerous cases are the slow ones, because
-        a slow dependency holds on to your threads, connections and memory while you wait.
-      </p>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Failure mode</th><th class="px-4 py-3">What you see</th><th class="px-4 py-3">Main defence</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Hard down</td><td class="px-4 py-3">Connection refused, DNS failure, 503. Fast errors.</td><td class="px-4 py-3">Retry a little, then degrade gracefully</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Slow</td><td class="px-4 py-3">p99 latency goes from 200 ms to 30 s. Requests pile up, then <em>your</em> service falls over.</td><td class="px-4 py-3">Timeouts, circuit breaker, bulkhead</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Flaky</td><td class="px-4 py-3">1 in 50 calls fails with a 502 or a reset connection</td><td class="px-4 py-3">Retries with backoff and jitter</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Overloaded</td><td class="px-4 py-3">429 Too Many Requests, or errors that get worse the more you retry</td><td class="px-4 py-3">Respect <code class="inline">Retry-After</code>, retry budgets, rate limits</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Unknown outcome</td><td class="px-4 py-3">The request timed out. Did the payment go through or not?</td><td class="px-4 py-3">Idempotency keys (Part II)</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        The last row is the one interns miss. A timeout does <strong>not</strong> mean the operation failed. It
-        means you don't know. The provider may have charged the card and then lost the response on the way back.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Timeouts everywhere, and shorter than you think</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Many HTTP clients and database drivers have <strong>no timeout by default</strong>, or one measured in
-        minutes. That means one hung connection can hold a request forever. Set a timeout on every outbound call:
-        HTTP clients, database queries, Redis commands, and queue publishes. Choose the number from the
-        dependency's real latency: a bit above its p99 in normal conditions, not "30 seconds to be safe".
-      </p>
-      <div class="mt-4">
-        <span class="code-label">payments.ts — a timeout on every outbound call</span>
-        <pre class="code"><span class="kw">const</span> res = <span class="kw">await</span> <span class="fn">fetch</span>(<span class="st">`${PAY_URL}/charges`</span>, {
-  method: <span class="st">"POST"</span>,
-  headers: { <span class="st">"Idempotency-Key"</span>: booking.paymentKey },   <span class="cm">// see Part II</span>
-  body: JSON.<span class="fn">stringify</span>(charge),
-  signal: AbortSignal.<span class="fn">timeout</span>(<span class="st">3000</span>),   <span class="cm">// ← without this, fetch can wait indefinitely</span>
-});</pre>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">postgres — server-side limits as a safety net</span>
-        <pre class="code"><span class="kw">ALTER ROLE</span> booking_api <span class="kw">SET</span> statement_timeout = <span class="st">'5s'</span>;
-<span class="cm">-- one runaway query can't hold a connection for minutes</span>
-<span class="kw">ALTER ROLE</span> booking_api <span class="kw">SET</span> idle_in_transaction_session_timeout = <span class="st">'10s'</span>;
-<span class="cm">-- a transaction left open by a crashed handler releases its locks</span></pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Think in <strong>deadlines</strong>, not just per-call timeouts. If the user's request to
-        <code class="inline">POST /bookings</code> has a 10-second budget at the load balancer, the inner calls must
-        fit inside it together. Three calls with a 10-second timeout each, plus retries, can take 60 seconds, long
-        after the user gave up and the load balancer returned a 504.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Retries: exponential backoff plus jitter</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Retrying hides flaky failures from the user. Retrying badly turns a small outage into a big one: if 1,000
-        clients all retry immediately, then again after exactly 1 second, the recovering service gets hit by
-        synchronised waves. <strong>Exponential backoff</strong> spreads retries out over time (wait 0.2 s, 0.4 s,
-        0.8 s…). <strong>Jitter</strong> randomises each wait so clients stop moving in lockstep.
+        Good designs don't come from inspiration. They come from asking the same questions in the same order, so
+        nothing important is skipped. The order matters: each step's output is the input to the next. Designing
+        the database before you know the queries, or picking a queue before you know the volume, is how you
+        end up with the wrong one.
       </p>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
-        <svg viewBox="0 0 700 230" class="w-full min-w-[620px]" role="img" aria-label="Retries without jitter arrive in synchronised waves, with full jitter they spread out">
-          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">NO JITTER · every client retries at the same moment</text>
-          <line x1="20" y1="80" x2="690" y2="80" stroke="#A8A49B" stroke-width="1"/>
-          <g class="anim-pulse"><rect x="20" y="36" width="40" height="44" rx="4" fill="#DB2777"/></g>
-          <g class="anim-pulse d1"><rect x="120" y="36" width="40" height="44" rx="4" fill="#DB2777"/></g>
-          <g class="anim-pulse d2"><rect x="320" y="36" width="40" height="44" rx="4" fill="#DB2777"/></g>
-          <g class="anim-pulse d3"><rect x="620" y="36" width="40" height="44" rx="4" fill="#DB2777"/></g>
-          <text x="40" y="96" text-anchor="middle" font-size="9" fill="#6E6B64">t=0</text>
-          <text x="140" y="96" text-anchor="middle" font-size="9" fill="#6E6B64">+1s</text>
-          <text x="340" y="96" text-anchor="middle" font-size="9" fill="#6E6B64">+2s</text>
-          <text x="640" y="96" text-anchor="middle" font-size="9" fill="#6E6B64">+4s</text>
-          <text x="480" y="56" text-anchor="middle" font-size="10" fill="#DB2777" class="anim-bounce">spikes knock the service over again</text>
-          <text x="12" y="130" font-size="11" font-weight="700" fill="#6E6B64">FULL JITTER · wait = random(0, base × 2^attempt)</text>
-          <line x1="20" y1="200" x2="690" y2="200" stroke="#A8A49B" stroke-width="1"/>
-          <rect x="20" y="170" width="40" height="30" rx="4" fill="#0D9488"/>
-          <rect x="70" y="186" width="14" height="14" rx="3" fill="#0D9488"/><rect x="104" y="184" width="14" height="16" rx="3" fill="#0D9488"/>
-          <rect x="150" y="188" width="14" height="12" rx="3" fill="#0D9488"/><rect x="196" y="185" width="14" height="15" rx="3" fill="#0D9488"/>
-          <rect x="240" y="188" width="14" height="12" rx="3" fill="#0D9488"/><rect x="292" y="186" width="14" height="14" rx="3" fill="#0D9488"/>
-          <rect x="350" y="189" width="14" height="11" rx="3" fill="#0D9488"/><rect x="410" y="188" width="14" height="12" rx="3" fill="#0D9488"/>
-          <rect x="470" y="190" width="14" height="10" rx="3" fill="#0D9488"/><rect x="540" y="189" width="14" height="11" rx="3" fill="#0D9488"/>
-          <rect x="610" y="191" width="14" height="9" rx="3" fill="#0D9488"/>
-          <text x="480" y="160" text-anchor="middle" font-size="10" fill="#0D9488">the same retries, spread into a load the service can absorb</text>
-          <text x="350" y="222" text-anchor="middle" font-size="10" fill="#A8A49B">bar height = requests arriving at the recovering service</text>
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="The seven-step system design method, from requirements to trade-offs">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">THE METHOD · each box produces a section of the design doc</text>
+          <g class="anim-pulse"><rect x="10" y="36" width="92" height="56" rx="9" fill="#2563EB"/>
+            <text x="56" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1 Require-</text>
+            <text x="56" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ments</text>
+            <text x="56" y="85" text-anchor="middle" fill="#ffffffbb" font-size="9">what and how well</text></g>
+          <g class="anim-pulse d1"><rect x="108" y="36" width="92" height="56" rx="9" fill="#2563EB"/>
+            <text x="154" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">2 Estimates</text>
+            <text x="154" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">QPS, storage</text></g>
+          <g class="anim-pulse d2"><rect x="206" y="36" width="92" height="56" rx="9" fill="#6d5acd"/>
+            <text x="252" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">3 API</text>
+            <text x="252" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">the contract</text></g>
+          <g class="anim-pulse d3"><rect x="304" y="36" width="92" height="56" rx="9" fill="#6d5acd"/>
+            <text x="350" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">4 Data model</text>
+            <text x="350" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">ERD, queries</text></g>
+          <g class="anim-pulse d4"><rect x="402" y="36" width="92" height="56" rx="9" fill="#0D9488"/>
+            <text x="448" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">5 Diagram</text>
+            <text x="448" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">boxes and arrows</text></g>
+          <g class="anim-pulse d1"><rect x="500" y="36" width="92" height="56" rx="9" fill="#D97757"/>
+            <text x="546" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">6 Deep dives</text>
+            <text x="546" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">the hard 20%</text></g>
+          <g class="anim-pulse d2"><rect x="598" y="36" width="92" height="56" rx="9" fill="#DB2777"/>
+            <text x="644" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">7 Trade-offs</text>
+            <text x="644" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">what you gave up</text></g>
+          <line x1="102" y1="64" x2="108" y2="64" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="200" y1="64" x2="206" y2="64" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="298" y1="64" x2="304" y2="64" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="396" y1="64" x2="402" y2="64" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="494" y1="64" x2="500" y2="64" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="592" y1="64" x2="598" y2="64" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <path d="M 546 92 C 546 150, 154 150, 154 92" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="350" y="140" text-anchor="middle" font-size="10" fill="#6E6B64" class="anim-bounce">a deep dive often sends you back to change the estimate or the API</text>
+          <text x="350" y="180" text-anchor="middle" font-size="10" fill="#A8A49B">time box for a feature-sized design: about half a day in total, most of it on steps 1 and 6</text>
         </svg>
       </div>
-      <div class="mt-4">
-        <span class="code-label">retry.ts — capped exponential backoff with full jitter</span>
-        <pre class="code"><span class="kw">async function</span> <span class="fn">withRetry</span>&lt;T&gt;(fn: () =&gt; Promise&lt;T&gt;, max = <span class="st">3</span>, baseMs = <span class="st">200</span>, capMs = <span class="st">5000</span>) {
-  <span class="kw">for</span> (<span class="kw">let</span> attempt = <span class="st">0</span>; ; attempt++) {
-    <span class="kw">try</span> { <span class="kw">return await</span> <span class="fn">fn</span>(); }
-    <span class="kw">catch</span> (err) {
-      <span class="kw">if</span> (attempt &gt;= max || !<span class="fn">isRetryable</span>(err)) <span class="kw">throw</span> err;  <span class="cm">// ← give up on 4xx, and after N tries</span>
-      <span class="kw">const</span> ceiling = Math.<span class="fn">min</span>(capMs, baseMs * <span class="st">2</span> ** attempt);
-      <span class="kw">const</span> wait = err.retryAfterMs ?? Math.<span class="fn">random</span>() * ceiling;  <span class="cm">// full jitter, or obey Retry-After</span>
-      <span class="kw">await</span> <span class="fn">sleep</span>(wait);
-    }
-  }
-}</pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        In real projects you rarely write this loop by hand: most HTTP clients, cloud SDKs and job frameworks have
-        a retry option. Your job is to check that it is configured: a small maximum, backoff, jitter, and a list of
-        what counts as retryable. Retrying <em>jobs</em> in a queue is its own topic, with dead-letter queues, in
-        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
-      </p>
 
-      <h3 class="font-semibold text-lg mt-8">What is safe to retry</h3>
+      <h3 class="font-semibold text-lg mt-7">What each step produces</h3>
       <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Response</th><th class="px-4 py-3">Retry?</th><th class="px-4 py-3">Why</th></tr></thead>
+            <th class="px-4 py-3">Step</th><th class="px-4 py-3">Output</th><th class="px-4 py-3">Owner module for the details</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Connection reset, timeout, 502, 503, 504</td><td class="px-4 py-3">Yes, with backoff</td><td class="px-4 py-3">Transient. But for a non-idempotent POST, only with an idempotency key.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">429 Too Many Requests</td><td class="px-4 py-3">Yes, after <code class="inline">Retry-After</code></td><td class="px-4 py-3">The server told you when. Retrying sooner makes it worse.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">500 Internal Server Error</td><td class="px-4 py-3">Maybe once</td><td class="px-4 py-3">Often a bug, which will fail the same way every time</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">400, 401, 403, 404, 409, 422</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Your request is wrong. Sending it again gives the same answer.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">1 · Requirements</td><td class="px-4 py-3">Functional list (what users can do), non-functional list (latency, availability, consistency, privacy), and explicit <em>non-goals</em></td><td class="px-4 py-3"><a href="./ag3.html" class="text-viol underline decoration-viol/40">AG3</a> for writing specs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">2 · Estimates</td><td class="px-4 py-3">Avg and peak QPS for reads and writes, storage per year, fan-out counts</td><td class="px-4 py-3"><a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a> Part IV</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">3 · API</td><td class="px-4 py-3">Endpoints with methods, request and response shapes, error cases</td><td class="px-4 py-3"><a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">4 · Data model</td><td class="px-4 py-3">ERD, constraints, the query list and its indexes</td><td class="px-4 py-3"><a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">5 · High-level diagram</td><td class="px-4 py-3">One container diagram, plus a sequence diagram for the main flow</td><td class="px-4 py-3"><a href="./co7.html" class="text-viol underline decoration-viol/40">CO7</a>, <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">6 · Deep dives</td><td class="px-4 py-3">The 2–4 hardest problems, each with options and a decision</td><td class="px-4 py-3">Whichever of <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>–<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a> applies</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">7 · Trade-offs</td><td class="px-4 py-3">What you chose, what you rejected and why, what would make you revisit it</td><td class="px-4 py-3">This module</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Step 1 is where most designs go wrong</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Requirements from a client arrive as a sentence: "patients book appointments online". Your first job is to
+        turn that into questions, because every answer changes the design. Ask these before drawing anything:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Who are the users, and how many?</strong> 50 staff in one office and 1 million public users are different systems.</li>
+        <li><strong>What must never happen?</strong> Double bookings, double charges, a patient seeing another patient's record. These become constraints and deep dives.</li>
+        <li><strong>How fresh must data be?</strong> Slot availability must be exact. A "popular doctors" list can be an hour old. This decides where caching is allowed.</li>
+        <li><strong>What happens when a third party is down?</strong> Payments, SMS, maps. This produces the dependency table from SD10.</li>
+        <li><strong>What is out of scope?</strong> Writing "no multi-currency, no video consultations in v1" prevents the agent (and the client) from growing the design silently.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Steps 5 to 7: diagram, then dig, then admit the costs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The high-level diagram should be boring: clients, a load balancer, an app, a database, maybe a cache and a
+        queue. If your first diagram has more than about eight boxes, you have probably designed for problems you
+        don't have. The value is in the <strong>deep dives</strong>: pick the two to four places where the system could
+        be wrong, slow or expensive, and for each one write the options, the choice and the reason. Finish with the
+        <strong>trade-offs</strong>, stated honestly: every design gives something up, and a design doc that claims
+        no downsides hasn't been thought through.
+      </p>
+      <div class="mt-4 callout callout-info">
+        <strong>The same method at every size.</strong> A system design interview compresses it into 45 minutes. A
+        new feature on a client project might take half a day. A new product might take a week. The steps don't
+        change, only how deep each one goes. In the case studies below, each step is marked so you can see the
+        method, not just the result.
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Case 1: URL shortener</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A small system where the whole method fits on one page</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The clinic chain wants short links in its SMS reminders (<code class="inline">clinic.link/aB3x9Kq</code>),
+        because SMS pricing is per 160 characters and long URLs cost money. It is the classic warm-up: small enough
+        to finish, with one interesting decision (how to generate the codes) and one scaling pattern (a read-heavy
+        redirect path).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Steps 1–3: requirements, estimates, API</h3>
+      <div class="mt-3 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-sky-600 dark:text-sky-400">Functional</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Create a short link for a long URL, with an optional expiry</li>
+            <li>Visiting the short link redirects to the long URL</li>
+            <li>Count clicks per link (for "did patients open the reminder?")</li>
+            <li>Non-goal: custom vanity aliases, a public sign-up</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Non-functional</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Redirects are fast (well under 100 ms at the server)</li>
+            <li>Codes never collide and are not guessable in sequence</li>
+            <li>Redirects keep working if the analytics part is down</li>
+            <li>Only internal services can create links</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">docs/design/shortener.md — estimates and API</span>
+        <pre class="code">New links     ~150,000 / day (one per reminder SMS)  ≈ 2 / s avg
+Redirects     assume 60% of reminders are opened     ≈ 90,000 / day ≈ 1 / s avg, 20 / s peak
+Storage       150k × 365 ≈ 55 M links / yr × ~300 B ≈ <span class="out">16 GB / yr</span>  → one Postgres is fine
+Code space    base62, 7 chars = 62^7 ≈ <span class="out">3.5 × 10^12</span> codes → collisions are rare
+
+POST /links         { "url": "https://...", "expires_at": "..." }   <span class="cm"># internal auth only</span>
+  → 201 { "code": "aB3x9Kq", "short_url": "https://clinic.link/aB3x9Kq" }
+GET  /{code}        → 302 Location: https://...   <span class="cm"># 404 if unknown, 410 Gone if expired</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The numbers already made a decision for us: this does not need a special database, a cluster or a cache
+        on day one. We add a cache because it is cheap and redirects are 100% reads, not because we must.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Step 4 and the key decision: how to generate codes</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">How</th><th class="px-4 py-3">Problem</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Counter + base62</td><td class="px-4 py-3">Encode the row's ID: 1 → <code class="inline">1</code>, 1,000,000 → <code class="inline">4c92</code></td><td class="px-4 py-3">Sequential and guessable: anyone can walk through every patient's reminder link</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hash of the URL</td><td class="px-4 py-3">First 7 chars of a hash of the long URL</td><td class="px-4 py-3">Same URL gives the same code (sometimes wanted, sometimes not), and truncated hashes still collide</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Random + unique constraint ✓</td><td class="px-4 py-3">7 random base62 characters from a secure random source. INSERT, and on a unique violation, generate again.</td><td class="px-4 py-3">Almost none at this scale. The database constraint makes it correct even under concurrency.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">schema.sql — the whole data model</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">links</span> (
+  id          bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  code        text <span class="kw">NOT NULL UNIQUE</span>,            <span class="cm">-- ← the unique index is also the redirect lookup</span>
+  target_url  text <span class="kw">NOT NULL CHECK</span> (target_url <span class="kw">LIKE</span> <span class="st">'https://%'</span>),
+  created_by  text <span class="kw">NOT NULL</span>,                   <span class="cm">-- which internal service</span>
+  expires_at  timestamptz,
+  created_at  timestamptz <span class="kw">NOT NULL DEFAULT</span> now()
+);
+<span class="kw">CREATE TABLE</span> <span class="fn">link_clicks_daily</span> (          <span class="cm">-- aggregated, not one row per click</span>
+  link_id bigint <span class="kw">NOT NULL REFERENCES</span> links(id), day date <span class="kw">NOT NULL</span>,
+  clicks  int <span class="kw">NOT NULL DEFAULT</span> 0, <span class="kw">PRIMARY KEY</span> (link_id, day)
+);</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Steps 5–6: the diagram and two deep dives</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    SMS["Reminder job"] -->|"POST /links"| API["Shortener API"]
+    User["Patient's phone"] -->|"GET /aB3x9Kq"| EDGE["CDN / edge"]
+    EDGE --> API
+    API -->|"1 lookup code"| C[("Redis<br/>code to URL")]
+    C -.->|"miss"| DB[("Postgres<br/>links")]
+    API -->|"2 fire and forget"| Q["Click events queue"]
+    Q --> W["Aggregator worker<br/>batches +N per link per day"]
+    W --> DB
+    API -->|"3 302 redirect"| User
+        </pre>
+      </div>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Deep dive: the redirect path.</strong> Look up the code in Redis (cache-aside with a TTL, see
+          <a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a>), fall back to Postgres, then redirect.
+          Cache "not found" briefly too, or a bot scanning random codes hits the database every time. Rate limit per IP at
+          the edge (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>).</li>
+        <li><strong>Deep dive: counting clicks without slowing redirects.</strong> Writing a row (or running
+          <code class="inline">UPDATE clicks = clicks + 1</code>) on every redirect puts a database write on the hot path
+          and creates lock contention on popular links. Publish an event instead, and let a worker aggregate batches
+          (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>). If the queue is down, the redirect
+          still works and we lose a few counts, which the requirements allow.</li>
+        <li><strong>301 or 302?</strong> A <code class="inline">301 Moved Permanently</code> lets browsers cache the redirect,
+          so repeat clicks never reach you: faster, but invisible to analytics, and you can't change or expire the
+          link later. We want counts and expiry, so <code class="inline">302</code>.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Step 7: trade-offs we accepted</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Decision</th><th class="px-4 py-3">We gain</th><th class="px-4 py-3">We give up</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">302, not 301</td><td class="px-4 py-3">Click counts, expiry, the ability to fix a wrong target</td><td class="px-4 py-3">Every click costs us a request</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Async click counting</td><td class="px-4 py-3">Fast redirects that survive analytics outages</td><td class="px-4 py-3">Counts are delayed and can be slightly low</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">One Postgres, no sharding</td><td class="px-4 py-3">Simple operations, real constraints</td><td class="px-4 py-3">Revisit at roughly 100× today's volume</td></tr>
           </tbody>
         </table>
       </div>
       <div class="mt-4 callout callout-warn">
-        <strong>Retry at one layer only.</strong> If the mobile app retries 3 times, the API gateway retries 3 times,
-        and the API retries the payment call 3 times, one user tap can become 27 calls to the payment provider
-        during an outage. Pick one layer (usually the one closest to the failing call), and make the other layers
-        fail fast. Large systems also use a <em>retry budget</em>: retries may add at most about 10% extra load,
-        and beyond that, errors are returned without retrying.
+        <strong>An open redirect is a phishing tool.</strong> If anyone can create links on your domain, attackers
+        will point <code class="inline">clinic.link/…</code> at fake login pages, and the clinic's trusted brand makes the
+        scam work. Keep creation behind internal auth, allow only <code class="inline">https</code> targets, and consider an
+        allow-list of the client's own domains. Security review of flows like this belongs to
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>.
       </div>
 
-      <h3 class="font-semibold text-lg mt-8">Circuit breakers: stop calling a dependency that is clearly down</h3>
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Case 2: clinic booking, end to end</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The hard parts of booking are concurrency, money and time</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        This is the running example of the whole SD track, now designed as one system. The CRUD screens are easy
+        and an agent writes them in an afternoon. Three things are not: two patients wanting the same slot, a
+        deposit that must be charged exactly once, and reminders that must go out exactly on time, once, and not
+        for cancelled bookings.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Steps 1–3: requirements, estimates, API</h3>
+      <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Functional:</strong> search doctors by clinic and specialty · see free slots · book a slot and pay a
+          100,000 VND deposit · cancel up to 24 h before for a refund · reminders by SMS or push 24 h and 2 h before ·
+          clinic admins manage doctors' schedules.</li>
+        <li><strong>Must never happen:</strong> two active bookings for one slot · a deposit charged twice · a
+          reminder for a cancelled booking · a patient seeing someone else's booking.</li>
+        <li><strong>Estimates:</strong> the worked example in <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>
+          Part IV: about 6 writes/s and 120 reads/s at peak, 22 GB a year, 120,000 reminders a day. One Postgres, two
+          app servers, one worker.</li>
+        <li><strong>Non-goals for v1:</strong> video consultations, insurance claims, multi-currency.</li>
+      </ul>
+      <div class="mt-4">
+        <span class="code-label">docs/design/booking-api.md — the endpoints that matter</span>
+        <pre class="code">GET  /doctors?clinic_id=12&amp;specialty=cardiology   <span class="cm"># public, cacheable for a minute</span>
+GET  /doctors/{id}/slots?from=2026-10-01&amp;to=2026-10-07   <span class="cm"># never cached: must be exact</span>
+POST /bookings            { slot_id }   Idempotency-Key: ...
+     → 201 { id, status: "pending_payment", checkout_url, hold_expires_at }
+     → 409 slot already taken
+POST /bookings/{id}/cancel              <span class="cm"># owner only; refund if more than 24 h before</span>
+GET  /me/bookings?cursor=...            <span class="cm"># the patient's own bookings only</span>
+POST /webhooks/payments                 <span class="cm"># called by the payment provider, signature-verified</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The full conventions (status codes, error format, pagination) are in
+        <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>, which uses this same API as its example.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Step 4: the booking lifecycle is the data model</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Timeouts limit how long <em>one</em> call waits. But if the SMS provider has been failing for two minutes,
-        every booking still waits the full 3 seconds before giving up. A <strong>circuit breaker</strong> wraps the
-        calls to one dependency and counts failures. When the failure rate crosses a threshold, it
-        <em>opens</em>: calls fail instantly without touching the network. After a cool-down it lets a few trial
-        calls through (<em>half-open</em>) to see whether the dependency has recovered.
+        SD1's schema had two statuses, <code class="inline">booked</code> and <code class="inline">cancelled</code>. Payment adds
+        a state in between: the slot has to be <em>held</em> while the patient pays, and released if they walk
+        away. Draw the states before writing code, because every arrow is a piece of logic and a test.
       </p>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
 stateDiagram-v2
-    [*] --> Closed
-    Closed --> Closed: call succeeds
-    Closed --> Open: over half of<br/>the last 20 calls failed
-    Open --> Open: calls fail fast,<br/>no network call made
-    Open --> HalfOpen: cool-down of 30 s passes
-    HalfOpen --> Closed: trial calls succeed
-    HalfOpen --> Open: a trial call fails
+    [*] --> pending_payment: POST /bookings<br/>slot held for 10 min
+    pending_payment --> confirmed: payment webhook succeeded
+    pending_payment --> expired: hold timer runs out<br/>slot released
+    pending_payment --> cancelled: patient cancels
+    confirmed --> cancelled: patient cancels<br/>refund if over 24 h before
+    confirmed --> completed: appointment time passes
+    expired --> [*]
+    cancelled --> [*]
+    completed --> [*]
         </pre>
       </div>
       <div class="mt-4">
-        <span class="code-label">sms.ts — a breaker around the SMS provider (Node, opossum library)</span>
-        <pre class="code"><span class="kw">import</span> CircuitBreaker <span class="kw">from</span> <span class="st">"opossum"</span>;
+        <span class="code-label">migration — the lifecycle as constraints</span>
+        <pre class="code"><span class="kw">ALTER TABLE</span> bookings
+  <span class="kw">ADD COLUMN</span> hold_expires_at timestamptz,
+  <span class="kw">ADD CONSTRAINT</span> bookings_status_check <span class="kw">CHECK</span> (status <span class="kw">IN</span>
+    (<span class="st">'pending_payment'</span>, <span class="st">'confirmed'</span>, <span class="st">'expired'</span>, <span class="st">'cancelled'</span>, <span class="st">'completed'</span>));
 
-<span class="kw">const</span> smsBreaker = <span class="kw">new</span> <span class="fn">CircuitBreaker</span>(sendSmsViaProvider, {
-  timeout: <span class="st">2000</span>,                  <span class="cm">// a call slower than this counts as a failure</span>
-  errorThresholdPercentage: <span class="st">50</span>,    <span class="cm">// open when half the recent calls fail</span>
-  resetTimeout: <span class="st">30000</span>,            <span class="cm">// try again (half-open) after 30 s</span>
-});
-smsBreaker.<span class="fn">fallback</span>((msg) =&gt; outbox.<span class="fn">enqueue</span>(msg));  <span class="cm">// ← plan B: send it later from a job</span>
+<span class="cm">-- SD1's index, widened: a HELD slot is also taken</span>
+<span class="kw">CREATE UNIQUE INDEX</span> <span class="fn">bookings_one_active_per_slot</span> <span class="kw">ON</span> bookings (slot_id)
+  <span class="kw">WHERE</span> status <span class="kw">IN</span> (<span class="st">'pending_payment'</span>, <span class="st">'confirmed'</span>);
 
-<span class="kw">await</span> smsBreaker.<span class="fn">fire</span>({ to: patient.phone, text });</pre>
+<span class="kw">CREATE TABLE</span> <span class="fn">payments</span> (
+  id bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  booking_id bigint <span class="kw">NOT NULL REFERENCES</span> bookings(id),
+  provider_ref text <span class="kw">UNIQUE</span>,        <span class="cm">-- the provider's payment ID: a webhook can't apply twice</span>
+  amount_vnd bigint <span class="kw">NOT NULL CHECK</span> (amount_vnd &gt; 0),   <span class="cm">-- integer minor units, never float</span>
+  status text <span class="kw">NOT NULL</span>
+);</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Step 5: the high-level diagram</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    PA["Patient app<br/>web and mobile"] --> CDN["CDN / edge<br/>rate limits"]
+    AD["Clinic admin web"] --> CDN
+    CDN --> API["Booking API<br/>modular monolith"]
+    API --> DB[("Postgres<br/>bookings, slots,<br/>payments, outbox")]
+    API --> RD[("Redis<br/>cache, sessions")]
+    API -->|"create checkout"| PAY["Payment provider"]
+    PAY -->|"webhook"| API
+    DB -->|"outbox relay"| Q["Job queue"]
+    SCH["Scheduler<br/>every minute"] --> Q
+    Q --> WK["Workers<br/>reminders, expiry,<br/>refunds"]
+    WK --> NS["Notification service<br/>case 3"]
+    WK --> DB
+        </pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Equivalent libraries exist in every stack (Resilience4j in Java, gobreaker in Go), and service meshes can
-        do it outside the code. When you review, look for the <strong>fallback</strong>. A breaker without a plan B
-        only makes the error arrive faster. Also check that the breaker's state shows up in metrics, or nobody will
-        know it is open.
+        One deployable API, organised in modules (<a href="./sd2.html" class="text-viol underline decoration-viol/40">SD2</a>,
+        <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>), one database, and a worker for anything
+        slow or scheduled. At 6 writes a second there is no case for microservices. Every box here is something an
+        intern team can run.
       </p>
 
-      <h3 class="font-semibold text-lg mt-8">Bulkheads: one slow dependency must not sink the ship</h3>
+      <h3 class="font-semibold text-lg mt-8">Deep dive 1: holding a slot without double booking</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        A ship is divided into watertight compartments, so one hole doesn't flood the whole hull. In software, a
-        <strong>bulkhead</strong> gives each dependency or workload its own limited pool of resources. If the
-        reporting feature uses the same 20 database connections as booking, one heavy report can use all of them
-        and booking stops. Give each one a separate pool, or a concurrency limit, and the damage stays local.
+        <code class="inline">POST /bookings</code> inserts a row with status <code class="inline">pending_payment</code> and
+        <code class="inline">hold_expires_at = now() + 10 min</code>. The partial unique index guarantees that only one
+        request wins; the loser gets a unique violation, which the API turns into <code class="inline">409 Conflict</code>
+        ("this slot was just taken"). No application-level check can do this reliably, as SD1 showed. A worker runs
+        every minute and expires stale holds:
       </p>
-      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
-        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
-          <div class="font-semibold text-rose-500">Without bulkheads</div>
-          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>One shared pool of 20 DB connections for everything</li>
-            <li>An admin exports a year of bookings as CSV</li>
-            <li>The export holds 18 connections for 40 seconds</li>
-            <li>Patients booking slots time out waiting for a connection</li>
-          </ul>
-        </div>
-        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">With bulkheads</div>
-          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>Exports run in a background worker (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>) with its own small pool</li>
-            <li>Or they read from a replica (Part III)</li>
-            <li>Calls to the SMS provider are capped at 10 in flight</li>
-            <li>The booking path keeps its own capacity no matter what</li>
-          </ul>
-        </div>
+      <div class="mt-4">
+        <span class="code-label">jobs/expire-holds.sql — idempotent, safe to run twice</span>
+        <pre class="code"><span class="kw">UPDATE</span> bookings <span class="kw">SET</span> status = <span class="st">'expired'</span>
+<span class="kw">WHERE</span> status = <span class="st">'pending_payment'</span>
+  <span class="kw">AND</span> hold_expires_at &lt; now() - <span class="kw">interval</span> <span class="st">'1 minute'</span>   <span class="cm">-- grace for late webhooks</span>
+<span class="kw">RETURNING</span> id;
+<span class="cm">-- the WHERE clause makes it race-safe: a booking confirmed a millisecond earlier
+-- no longer matches status = 'pending_payment', so it is never expired</span></pre>
       </div>
-
-      <h3 class="font-semibold text-lg mt-8">Graceful degradation: decide the plan B before the outage</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        For each dependency, decide ahead of time what the product does without it. Some features can be switched
-        off. Others can use stale data. A few must fail loudly. This is a product decision as much as a technical
-        one, so write it down and agree it with your lead.
-      </p>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Dependency down</th><th class="px-4 py-3">Degraded behaviour</th><th class="px-4 py-3">Never do this</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">SMS provider</td><td class="px-4 py-3">Confirm the booking on screen and by email. Queue the SMS for later.</td><td class="px-4 py-3">Fail the whole booking because a text message couldn't be sent</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Redis cache</td><td class="px-4 py-3">Read from Postgres directly, perhaps with a lower rate limit (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>)</td><td class="px-4 py-3">Return a 500 on every page</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Recommendation service</td><td class="px-4 py-3">Hide the "Doctors you might like" panel</td><td class="px-4 py-3">Block the page render waiting for it</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Payment provider</td><td class="px-4 py-3">Hold the slot as "pending payment" for 10 minutes, or show a clear "try again shortly"</td><td class="px-4 py-3">Mark the booking as paid and hope</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Primary database</td><td class="px-4 py-3">Read-only mode: browsing still works, booking is paused with a banner</td><td class="px-4 py-3">Accept writes into memory and lose them</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="mt-4 callout callout-info">
-        <strong>Critical path vs nice-to-have.</strong> Draw the booking request and colour each call: must succeed
-        for the booking to be correct (database, payment) or nice to have (SMS, analytics, recommendations).
-        Nice-to-have calls should move off the request path entirely, into a background job or an event. That
-        single change removes most "the whole app is down because X is slow" incidents.
-      </div>
-
-      <!-- ═══════════════ PART II ═══════════════ -->
-      <div class="kicker text-viol mt-14">Part II · Safe retries &amp; fair limits</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Make every write safe to repeat, and every client share the capacity</h2>
-      <p class="mt-4 text-[15px] leading-relaxed">
-        Part I made callers retry. That creates two new problems. First, a retried write can happen twice: two
-        bookings, two charges. Second, one misbehaving client (or attacker) retrying in a loop can use up capacity
-        that everyone else needs. Idempotency keys solve the first; rate limits solve the second.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-7">Idempotency: the same request twice has the effect of once</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        HTTP already defines <code class="inline">GET</code>, <code class="inline">PUT</code> and
-        <code class="inline">DELETE</code> as idempotent: repeating them leaves the server in the same state.
-        <code class="inline">POST</code> is not. "Create a booking and charge 200,000 VND" sent twice creates two of
-        each. The patient's phone lost signal after tapping <em>Pay</em>, the app retried, and now there are two
-        charges and an angry support ticket.
-      </p>
       <p class="mt-3 text-[15px] leading-relaxed">
-        The fix is an <strong>idempotency key</strong>: the client generates a unique ID (a UUID) for the
-        <em>intent</em> "pay for this booking", and sends it with every attempt in an
-        <code class="inline">Idempotency-Key</code> header. The server remembers the key and the response. A repeat
-        with the same key gets the stored response back instead of running the operation again. Stripe's API works
-        this way, and it is the model to copy.
+        The slot list shown to patients hides held slots, which is correct: they are not bookable. The 10-minute
+        hold is a product decision (too short and patients lose the slot while typing their card number, too long
+        and bots can hold every slot), so rate limit bookings per patient as well.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Deep dive 2: payments that happen exactly once</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Use the provider's hosted checkout so card data never touches your servers. The subtle part is knowing when
+        the payment succeeded. The browser redirect back to your site is <strong>not</strong> proof: the user may close
+        the tab, and a redirect URL can be faked. The provider's <strong>webhook</strong>, a server-to-server call with a
+        signature, is the source of truth.
       </p>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
 sequenceDiagram
     autonumber
-    participant App as Patient app
+    participant P as Patient app
     participant API as Booking API
     participant DB as Postgres
     participant Pay as Payment provider
-    App->>API: POST /payments<br/>Idempotency-Key: 7f3c...
-    API->>DB: INSERT idempotency_keys (7f3c, in_progress)
-    API->>Pay: charge 200,000 VND<br/>with the same key
-    Pay-->>API: charged, ch_91
-    API->>DB: save response for 7f3c
-    API--xApp: 201 Created, lost on a bad network
-    Note over App: timeout, so retry with the SAME key
-    App->>API: POST /payments<br/>Idempotency-Key: 7f3c...
-    API->>DB: key 7f3c exists, completed
-    API-->>App: the stored 201 response. No second charge.
+    participant W as Worker
+    P->>API: POST /bookings, Idempotency-Key k1
+    API->>DB: INSERT booking pending_payment
+    API->>Pay: create checkout, idempotency key from booking id
+    API-->>P: 201 with checkout_url
+    P->>Pay: pays on the hosted page
+    Pay->>API: webhook payment.succeeded, signed
+    API->>API: verify signature
+    API->>DB: in one transaction, payment row,<br/>booking confirmed, outbox BookingConfirmed
+    API-->>Pay: 200 OK
+    Note over Pay,API: the provider may resend the webhook.<br/>UNIQUE provider_ref makes the replay a no-op
+    DB-->>W: outbox relay publishes BookingConfirmed
+    W->>W: schedule reminders, send confirmation
         </pre>
       </div>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Idempotent at both ends.</strong> The patient's retries are covered by the
+          <code class="inline">Idempotency-Key</code> header, and the provider's webhook replays by the unique
+          <code class="inline">provider_ref</code> (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>).</li>
+        <li><strong>The transactional outbox.</strong> "Confirm the booking" and "tell the rest of the system" must not
+          get out of sync. Writing the event to an outbox table in the same transaction, and publishing it afterwards,
+          is the pattern from <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a>.</li>
+        <li><strong>The late webhook.</strong> If the payment succeeds <em>after</em> the hold expired and someone else
+          took the slot, don't confirm. Refund automatically and tell the patient. Write this case into the tests,
+          because it will happen.</li>
+        <li><strong>Reconciliation.</strong> A nightly job compares the provider's list of payments with yours and alerts
+          on any difference. Webhooks are reliable, not perfect.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Deep dive 3: reminders on time, once, never for cancelled bookings</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Approach</th><th class="px-4 py-3">How</th><th class="px-4 py-3">Weak spot</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Delayed job per reminder</td><td class="px-4 py-3">At confirmation, enqueue "send at T−24 h" and "send at T−2 h"</td><td class="px-4 py-3">Cancel or reschedule means finding and deleting queued jobs. Long delays in some queues are unreliable.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Polling scheduler ✓</td><td class="px-4 py-3">Every minute, query "confirmed bookings starting in the reminder window with no reminder sent yet", and enqueue each</td><td class="px-4 py-3">A query every minute, which is trivial with the right index. Current state is always re-read, so cancellations just work.</td></tr>
+          </tbody>
+        </table>
+      </div>
       <div class="mt-4">
-        <span class="code-label">idempotency.sql — the table behind the header</span>
-        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">idempotency_keys</span> (
-  key            text <span class="kw">NOT NULL</span>,
-  user_id        bigint <span class="kw">NOT NULL</span>,
-  request_hash   text <span class="kw">NOT NULL</span>,          <span class="cm">-- same key + different body → reject with 422</span>
-  status         text <span class="kw">NOT NULL CHECK</span> (status <span class="kw">IN</span> (<span class="st">'in_progress'</span>, <span class="st">'completed'</span>)),
-  response_code  int,
-  response_body  jsonb,
-  created_at     timestamptz <span class="kw">NOT NULL DEFAULT</span> now(),
-  <span class="kw">PRIMARY KEY</span> (user_id, key)             <span class="cm">-- ← the UNIQUE check is what makes it race-safe</span>
+        <span class="code-label">schema.sql — "once" is a unique constraint again</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">reminders_sent</span> (
+  booking_id bigint <span class="kw">NOT NULL REFERENCES</span> bookings(id),
+  kind       text <span class="kw">NOT NULL CHECK</span> (kind <span class="kw">IN</span> (<span class="st">'24h'</span>, <span class="st">'2h'</span>)),
+  sent_at    timestamptz <span class="kw">NOT NULL DEFAULT</span> now(),
+  <span class="kw">PRIMARY KEY</span> (booking_id, kind)   <span class="cm">-- ← a duplicate job's INSERT fails, so it doesn't send</span>
 );
-<span class="cm">-- a nightly job deletes rows older than 24 h: keys protect retries, not history</span></pre>
-      </div>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">A request arrives and the key is…</th><th class="px-4 py-3">Server does</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">New</td><td class="px-4 py-3">Insert the key as <code class="inline">in_progress</code>, run the operation, store the response, mark <code class="inline">completed</code></td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Completed, same request body</td><td class="px-4 py-3">Return the stored response, unchanged. Don't run anything.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Completed, different body</td><td class="px-4 py-3">Reject (for example <code class="inline">422</code>): the client reused a key for a different intent, which is a client bug</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">In progress</td><td class="px-4 py-3">Return <code class="inline">409 Conflict</code> and let the client retry shortly. Never run it a second time in parallel.</td></tr>
-          </tbody>
-        </table>
+<span class="cm">-- worker: BEGIN; INSERT INTO reminders_sent ... ; re-check booking is still 'confirmed';
+--         hand the message to the notification service (case 3); COMMIT;</span></pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Two details matter. The key is generated <strong>once per intent on the client</strong> and reused on every
-        retry: a key generated inside the retry loop protects nothing. And the key is passed <strong>downstream</strong>:
-        our API sends its own idempotency key to the payment provider, so even if our server crashes between
-        "charged" and "saved", the next attempt can't charge twice. Consumers of queue messages need the same
-        property; that side is covered in <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>,
-        and the header's place in the API contract is in <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>.
+        Two more details interns miss. Store times in UTC (<code class="inline">timestamptz</code>) and convert to the
+        clinic's time zone only for display. And never run the scheduler inside every web server, or three servers
+        send three reminders (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>).
       </p>
 
-      <h3 class="font-semibold text-lg mt-8">Rate limiting: token bucket and sliding window</h3>
+      <h3 class="font-semibold text-lg mt-8">Deep dive 4 and step 7: access rules and trade-offs</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        A rate limit caps how many requests one client (an IP, a user, an API key) can make in a period. It
-        protects you from abuse such as password guessing and scraping, from buggy clients stuck in a loop, and it
-        keeps one tenant from starving the others. The two algorithms you will meet most:
-      </p>
-      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
-        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="Token bucket: tokens refill at a steady rate, each request takes one, empty bucket means 429">
-          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">TOKEN BUCKET · capacity 10, refill 1 token per second, per user</text>
-          <g class="anim-pulse"><rect x="20" y="60" width="130" height="50" rx="9" fill="#6d5acd"/>
-            <text x="85" y="82" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Refill</text>
-            <text x="85" y="97" text-anchor="middle" fill="#ffffffbb" font-size="9">+1 token / second</text></g>
-          <line x1="150" y1="85" x2="250" y2="85" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <rect x="250" y="40" width="150" height="110" rx="12" fill="none" stroke="#6E6B64" stroke-width="2"/>
-          <circle cx="280" cy="130" r="9" fill="#D97757"/><circle cx="305" cy="130" r="9" fill="#D97757"/>
-          <circle cx="330" cy="130" r="9" fill="#D97757"/><circle cx="355" cy="130" r="9" fill="#D97757"/>
-          <circle cx="292" cy="108" r="9" fill="#D97757"/><circle cx="317" cy="108" r="9" fill="#D97757"/>
-          <text x="325" y="62" text-anchor="middle" font-size="10" fill="#6E6B64">6 of 10 tokens left</text>
-          <line x1="400" y1="95" x2="470" y2="95" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <g class="anim-pulse d1"><rect x="470" y="40" width="210" height="46" rx="9" fill="#0D9488"/>
-            <text x="575" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Token available</text>
-            <text x="575" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">take one → request allowed</text></g>
-          <g class="anim-pulse d2"><rect x="470" y="104" width="210" height="46" rx="9" fill="#DB2777"/>
-            <text x="575" y="124" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Bucket empty</text>
-            <text x="575" y="139" text-anchor="middle" fill="#ffffffbb" font-size="9">429 + Retry-After: 1</text></g>
-          <text x="350" y="185" text-anchor="middle" font-size="10" fill="#A8A49B">allows short bursts (up to 10 at once) while holding the long-run average to 1 per second</text>
-          <text x="350" y="205" text-anchor="middle" font-size="10" fill="#A8A49B">state per client is just two numbers: tokens, last_refill_time</text>
-        </svg>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">rate-limit.ts — the token bucket logic (state lives in Redis in production)</span>
-        <pre class="code"><span class="kw">function</span> <span class="fn">allow</span>(b: Bucket, now: number, capacity = <span class="st">10</span>, perSec = <span class="st">1</span>): boolean {
-  <span class="kw">const</span> refill = ((now - b.last) / <span class="st">1000</span>) * perSec;
-  b.tokens = Math.<span class="fn">min</span>(capacity, b.tokens + refill);  <span class="cm">// top up for the time that passed</span>
-  b.last = now;
-  <span class="kw">if</span> (b.tokens &lt; <span class="st">1</span>) <span class="kw">return false</span>;                 <span class="cm">// → 429 Too Many Requests</span>
-  b.tokens -= <span class="st">1</span>;
-  <span class="kw">return true</span>;
-}
-<span class="cm">// With 3 app servers, an in-memory Map gives each user 3× the limit.
-// Keep the bucket in Redis and update it atomically (a Lua script or a library).</span></pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        A <strong>fixed window</strong> ("100 requests per calendar minute") is the simplest, but a client can send
-        100 at 10:00:59 and 100 more at 10:01:00, which is 200 in two seconds. A <strong>sliding window</strong>
-        fixes that by counting the last 60 seconds from <em>now</em>. The cheap version, the sliding window counter,
-        estimates it from two fixed windows:
-        <code class="inline">count = current + previous × (fraction of the previous window still inside the last 60 s)</code>.
-        Use a token bucket when you want to allow bursts, such as an app loading a screen with 8 parallel calls. Use
-        a sliding window when you want a strict "N per period", such as 5 login attempts per 15 minutes.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Where to apply rate limits</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Limits belong in layers. The further out a request is stopped, the cheaper it is to stop, but the less the
-        layer knows about who is asking.
+        Every query for a booking is scoped to its owner: <code class="inline">WHERE id = $1 AND patient_id = $current_user</code>,
+        and clinic admins are scoped to their clinic. Missing that scope is the IDOR bug from
+        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>, and with medical data it is a
+        reportable breach.
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Layer</th><th class="px-4 py-3">Knows about the caller</th><th class="px-4 py-3">Good for</th></tr></thead>
+            <th class="px-4 py-3">Decision</th><th class="px-4 py-3">We gain</th><th class="px-4 py-3">We give up / revisit when</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Edge / CDN (Cloudflare rate limiting rules)</td><td class="px-4 py-3">IP, path, and on higher plans headers, cookies and more</td><td class="px-4 py-3">Floods, bots, brute force on <code class="inline">/login</code>, before traffic reaches your servers (<a href="./op5.html" class="text-viol underline decoration-viol/40">OP5</a>)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">API gateway / load balancer</td><td class="px-4 py-3">API key, route</td><td class="px-4 py-3">Per-client quotas on a public API, overall protection of the backend</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Application (middleware + Redis)</td><td class="px-4 py-3">The logged-in user, their plan, the business action</td><td class="px-4 py-3">"3 OTP SMS per phone per hour", "20 bookings per clinic admin per minute", plan-based limits</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Outbound (your calls to others)</td><td class="px-4 py-3">The provider's published limit</td><td class="px-4 py-3">Staying under the SMS or email provider's quota, so they don't throttle you</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hold-then-pay with a 10 min hold</td><td class="px-4 py-3">No one pays for a slot they can't have</td><td class="px-4 py-3">Slots look taken during abandoned checkouts</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Webhook as the source of truth</td><td class="px-4 py-3">Correct even if the browser never returns</td><td class="px-4 py-3">Confirmation can lag a few seconds, so show "confirming…"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Polling scheduler for reminders</td><td class="px-4 py-3">Cancellation and rescheduling need no cleanup</td><td class="px-4 py-3">Up to a minute of delay, which is fine for reminders</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Modular monolith</td><td class="px-4 py-3">One deploy, real transactions across modules</td><td class="px-4 py-3">Revisit if separate teams need to deploy independently</td></tr>
           </tbody>
         </table>
       </div>
-      <div class="mt-4">
-        <span class="code-label">HTTP — what a well-behaved limit returns</span>
-        <pre class="code">HTTP/1.1 <span class="kw">429 Too Many Requests</span>
-Retry-After: 30                          <span class="cm"># seconds; clients must wait at least this long</span>
-Content-Type: application/problem+json   <span class="cm"># the error format from BE1</span>
 
-{ <span class="st">"type"</span>: <span class="st">"https://api.clinic.example/errors/rate-limited"</span>,
-  <span class="st">"title"</span>: <span class="st">"Too many OTP requests"</span>, <span class="st">"status"</span>: 429,
-  <span class="st">"detail"</span>: <span class="st">"You can request 3 codes per hour. Try again in 30 seconds."</span> }</pre>
-      </div>
-      <div class="mt-4 callout callout-warn">
-        <strong>The SMS-pumping trap.</strong> An unprotected "send OTP" endpoint is a favourite target: attackers
-        trigger thousands of texts to premium-rate numbers and the client gets the bill. Every endpoint that costs
-        money per call (SMS, email, AI model calls, image processing) needs an application-level limit per user
-        <em>and</em> per target phone or email, not just a per-IP limit at the edge. Security design for these flows
-        continues in <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
-      </div>
-
-      <!-- ═══════════════ PART III ═══════════════ -->
-      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Scaling</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Scale the boring way: stateless servers, then the database, in that order</h2>
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Cases 3 &amp; 4, and the design doc</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Fan-out and file pipelines: move slow work off the request, then own the failures</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Most Golden Owl client projects never need clever scaling. A single well-indexed Postgres and two or three
-        app servers handle far more traffic than people expect. Scaling work should start from a measured
-        bottleneck, not from a diagram of how Netflix does it. When you do need to grow, there is a well-worn
-        order of steps.
+        The last two cases are shared services that almost every client project needs. Both follow the same
+        shape: accept the request quickly, do the slow and failure-prone part asynchronously, and track the state
+        so you can answer "did it happen?"
       </p>
 
-      <h3 class="font-semibold text-lg mt-7">Vertical vs horizontal</h3>
+      <h3 class="font-semibold text-lg mt-7">Case 3: a notification service. Requirements and model</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>Vertical scaling</strong> means a bigger machine: more CPU, more RAM. It needs no code changes,
-        and it is usually the right first move for a database. It has a ceiling and it leaves one machine as a
-        single point of failure. <strong>Horizontal scaling</strong> means more machines behind a load balancer.
-        It has almost no ceiling for app servers, and it gives you redundancy, but only if the servers are
-        <em>stateless</em>.
+        Booking confirmations, reminders, OTP codes, marketing campaigns: every feature wants to "send the user a
+        message". Without a shared service, each feature calls the SMS provider directly, and nobody can answer
+        "why didn't this patient get their reminder?" or "how do I stop marketing SMS for this user?"
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Functional:</strong> one internal call, <code class="inline">notify(user, type, data)</code> · channels
+          email, SMS and push · per-user preferences by category (a patient can turn off marketing, not security codes)
+          · quiet hours (no SMS at 2 a.m. except OTPs) · templates in Vietnamese and English · delivery status per message.</li>
+        <li><strong>Estimates:</strong> 120,000 reminders a day steadily, plus a marketing campaign to 1 million users
+          a few times a month. OTP codes are few but must arrive within seconds, even during a campaign.</li>
+        <li><strong>Must never happen:</strong> duplicate OTPs or reminders · messages to users who opted out ·
+          a campaign delaying a login code.</li>
+      </ul>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The channels are not interchangeable. Their cost, speed and failure behaviour drive the routing rules, so
+        put them side by side before designing the router:
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Step</th><th class="px-4 py-3">Do it when you measure…</th><th class="px-4 py-3">Cost / catch</th></tr></thead>
+            <th class="px-4 py-3">Channel</th><th class="px-4 py-3">Cost per message</th><th class="px-4 py-3">Reliability</th><th class="px-4 py-3">Best for</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">0 · Fix the query</td><td class="px-4 py-3">A slow endpoint. Check for a missing index or N+1 first (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>).</td><td class="px-4 py-3">Nearly free. Solves most "we need to scale" conversations.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">1 · Cache and CDN</td><td class="px-4 py-3">The same data read again and again, static assets served by the app</td><td class="px-4 py-3">Invalidation becomes your problem (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">2 · More app servers</td><td class="px-4 py-3">App CPU high, DB fine</td><td class="px-4 py-3">Needs stateless servers and a load balancer</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">3 · Connection pooler</td><td class="px-4 py-3">"too many connections" errors as app servers grow</td><td class="px-4 py-3">Some session features break in transaction mode</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">4 · Bigger DB machine</td><td class="px-4 py-3">DB CPU, memory or IO near the limit</td><td class="px-4 py-3">Money, and a short restart</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">5 · Read replicas</td><td class="px-4 py-3">Mostly reads, and the primary is busy</td><td class="px-4 py-3">Replication lag: stale reads</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">6 · Partition, then shard</td><td class="px-4 py-3">One table is huge, or write volume exceeds one machine</td><td class="px-4 py-3">Large, often permanent, complexity</td></tr>
-          </tbody>
-        </table>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Stateless app servers behind a load balancer</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        A load balancer spreads requests across identical app servers and stops sending traffic to one that fails
-        its health check (Part IV). That only works if <strong>any server can handle any request</strong>. So every
-        piece of state has to live somewhere shared, not in the server's memory or on its disk.
-      </p>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">State the agent kept locally</th><th class="px-4 py-3">What breaks with 2+ servers</th><th class="px-4 py-3">Where it belongs</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Sessions in memory</td><td class="px-4 py-3">Users are logged out at random when the next request lands on another server</td><td class="px-4 py-3">Redis or the database, or a signed token (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Uploaded files on local disk</td><td class="px-4 py-3">The file exists on one server only, and disappears on redeploy</td><td class="px-4 py-3">Object storage such as S3 (<a href="./sd12.html" class="text-viol underline decoration-viol/40">SD12</a> case 4)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">In-memory cache or rate-limit counters</td><td class="px-4 py-3">Each server has a different copy, and limits multiply by the server count</td><td class="px-4 py-3">Redis</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">A cron job inside the web process</td><td class="px-4 py-3">Three servers send every reminder three times</td><td class="px-4 py-3">One scheduler, or a job with a lock (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">WebSocket connections</td><td class="px-4 py-3">A message published on server A never reaches a user connected to server B</td><td class="px-4 py-3">A pub/sub channel (Redis, or a managed service) between servers</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SMS</td><td class="px-4 py-3">Highest: real money per message, so abuse costs the client directly</td><td class="px-4 py-3">Reaches any phone. Delivery reports can be late or missing.</td><td class="px-4 py-3">OTP codes, reminders for patients without the app</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Push</td><td class="px-4 py-3">Near zero</td><td class="px-4 py-3">Only if the app is installed and notifications allowed. Tokens go stale.</td><td class="px-4 py-3">Reminders and updates for app users</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Email</td><td class="px-4 py-3">Low</td><td class="px-4 py-3">Can land in spam. Needs SPF, DKIM and DMARC set up on the sending domain.</td><td class="px-4 py-3">Receipts, long content, marketing</td></tr>
           </tbody>
         </table>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        The quick test: run two copies of the app locally behind a simple proxy, or just on two ports, and click
-        through the main flows alternating between them. If anything breaks, you found hidden state. "Sticky
-        sessions" at the load balancer hide the problem instead of fixing it, and they lose users every deploy.
+        A sensible routing rule for reminders is "push if the user has a fresh token, otherwise SMS", which can cut
+        the SMS bill by more than half. OTPs go by SMS (or the channel the user chose) and nothing else.
       </p>
+      <div class="mt-4">
+        <span class="code-label">schema.sql — notifications, deliveries, preferences</span>
+        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">notifications</span> (
+  id          bigint <span class="kw">GENERATED ALWAYS AS IDENTITY PRIMARY KEY</span>,
+  user_id     bigint <span class="kw">NOT NULL</span>,
+  type        text <span class="kw">NOT NULL</span>,              <span class="cm">-- 'booking_reminder_24h', 'otp', 'campaign_oct'</span>
+  category    text <span class="kw">NOT NULL CHECK</span> (category <span class="kw">IN</span> (<span class="st">'security'</span>, <span class="st">'transactional'</span>, <span class="st">'marketing'</span>)),
+  dedupe_key  text <span class="kw">NOT NULL UNIQUE</span>,       <span class="cm">-- ← e.g. 'reminder:881:24h': the producer's retry is harmless</span>
+  data        jsonb <span class="kw">NOT NULL</span>,
+  created_at  timestamptz <span class="kw">NOT NULL DEFAULT</span> now()
+);
+<span class="kw">CREATE TABLE</span> <span class="fn">deliveries</span> (                <span class="cm">-- one row per channel attempt</span>
+  notification_id bigint <span class="kw">NOT NULL REFERENCES</span> notifications(id),
+  channel  text <span class="kw">NOT NULL</span>,  provider text,  provider_message_id text,
+  status   text <span class="kw">NOT NULL</span>,  <span class="cm">-- queued | sent | delivered | failed | skipped_by_preference</span>
+  attempts int <span class="kw">NOT NULL DEFAULT</span> 0,  last_error text,
+  <span class="kw">PRIMARY KEY</span> (notification_id, channel)
+);
+<span class="cm">-- notification_preferences(user_id, category, channel, enabled) and
+-- push_tokens(user_id, token, platform, last_seen_at) complete the model</span></pre>
+      </div>
 
-      <h3 class="font-semibold text-lg mt-8">The shape of a scaled system</h3>
+      <h3 class="font-semibold text-lg mt-8">Case 3: fan-out, priorities and failures</h3>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
 flowchart LR
-    U["Browsers and apps"] --> CDN["CDN / edge<br/>static assets, cached GETs,<br/>rate limits, WAF"]
-    CDN --> LB["Load balancer<br/>health checks"]
-    LB --> A1["App server 1"]
-    LB --> A2["App server 2"]
-    LB --> A3["App server 3"]
-    A1 --> R[("Redis<br/>sessions, cache, limits")]
-    A2 --> R
-    A3 --> R
-    A1 --> PB["PgBouncer<br/>connection pool"]
-    A2 --> PB
-    A3 --> PB
-    PB --> P[("Postgres primary<br/>all writes")]
-    PB --> RR[("Read replica<br/>reports, search")]
-    P -.->|streaming replication| RR
-    A1 --> Q["Queue"]
-    Q --> W["Workers<br/>SMS, email, exports"]
-    W --> PB
+    B["Booking module"] --> N["notify API<br/>dedupe_key check"]
+    A["Auth module, OTP"] --> N
+    M["Campaign tool"] --> N
+    N --> DB[("notifications")]
+    N --> HQ["High-priority queue<br/>security, transactional"]
+    N --> LQ["Low-priority queue<br/>marketing"]
+    HQ --> R["Router<br/>preferences, quiet hours,<br/>template and language"]
+    LQ --> R
+    R --> EQ["Email queue"]
+    R --> SQ["SMS queue"]
+    R --> PQ["Push queue"]
+    EQ --> EW["Email worker"] --> EP["Email provider"]
+    SQ --> SW["SMS worker<br/>provider rate limit"] --> SP["SMS provider A<br/>fallback B"]
+    PQ --> PW["Push worker"] --> PP["FCM and APNs"]
+    EP -.->|"delivery webhooks"| ST["Status updater"]
+    SP -.-> ST
+    ST --> DB
         </pre>
       </div>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Priority queues are bulkheads.</strong> A 1-million-user campaign fills the low-priority queue; OTPs
+          travel on a separate queue with its own workers, so a login code never waits behind a promotion
+          (<a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>).</li>
+        <li><strong>Per-channel queues.</strong> If the SMS provider is down, SMS messages retry with backoff and land in a
+          dead-letter queue after N attempts, while email and push keep flowing
+          (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>). A circuit breaker on provider A can
+          switch SMS to provider B.</li>
+        <li><strong>Outbound rate limits.</strong> Providers cap your send rate. The worker must stay under it with a
+          token bucket, or the provider throttles you and everything slows down at once.</li>
+        <li><strong>Preferences are checked at send time</strong>, not when the campaign was created, so an opt-out made
+          a minute ago is respected. Record a <code class="inline">skipped_by_preference</code> delivery so support can see why.</li>
+        <li><strong>Dead push tokens.</strong> When the push service reports a token as no longer registered (the app was
+          uninstalled), delete it. Otherwise the list of tokens grows forever and every campaign wastes calls on it.</li>
+        <li><strong>Dedupe at the edges.</strong> The unique <code class="inline">dedupe_key</code> makes producer retries safe,
+          and the <code class="inline">(notification_id, channel)</code> key makes worker retries safe. "Exactly once" for
+          SMS doesn't exist, but these two constraints get you close.</li>
+      </ul>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Read it from left to right. Everything to the left of the database can be multiplied. The primary database
-        is the one component you can't simply copy, which is why the rest of Part III is about it. How to draw and
-        present diagrams like this one is <a href="./sd2.html" class="text-viol underline decoration-viol/40">SD2</a>'s topic.
+        The pattern underneath is publish/subscribe with priorities. The event-driven side of it (whether the booking
+        module calls <code class="inline">notify()</code> or publishes <code class="inline">BookingConfirmed</code> for the
+        notification module to react to) is a service-boundary decision covered in
+        <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>.
       </p>
 
-      <h3 class="font-semibold text-lg mt-8">Connection pooling: PgBouncer</h3>
+      <h3 class="font-semibold text-lg mt-8">Case 4: file upload and image processing</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Each Postgres connection is a separate server process with its own memory, so a database handles
-        hundreds of connections, not tens of thousands (<code class="inline">max_connections</code> defaults to 100).
-        Six app servers × 4 processes × a pool of 10 is already 240 connections, most of them idle.
-        <strong>PgBouncer</strong> sits in between: the apps open as many cheap connections to it as they like, and it
-        shares a small number of real database connections among them.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">pgbouncer.ini — the settings that matter</span>
-        <pre class="code">[pgbouncer]
-pool_mode = transaction        <span class="cm">; a server connection is lent out for one transaction only</span>
-max_client_conn = 2000         <span class="cm">; app-side connections PgBouncer accepts</span>
-default_pool_size = 20         <span class="cm">; real Postgres connections per database/user pair</span>
-<span class="cm">; ← transaction mode breaks session features: SET, LISTEN, session advisory locks,
-;   and (unless max_prepared_statements is set) protocol-level prepared statements</span></pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Many managed Postgres services (Supabase, Neon, AWS RDS Proxy) offer a pooler built in; check which pooling
-        mode yours uses, because an ORM that relies on session state will fail in odd ways behind a transaction
-        pooler. Serverless functions make pooling mandatory: every cold start opens a new connection.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Read replicas and the stale-read bug</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        A <strong>read replica</strong> is a copy of the primary that receives its changes continuously and serves
-        read-only queries. It takes load off the primary for reports, search and dashboards. The catch is
-        <strong>replication lag</strong>: the replica is usually milliseconds behind, and sometimes seconds.
+        Doctors upload profile photos, which are public and shown everywhere in three sizes. Patients upload
+        photos of insurance cards and test results, which are private medical documents. The naive design sends
+        the file through the API server: a 10 MB upload holds a request (and memory) for as long as the patient's
+        slow 4G connection takes, and the file ends up on the server's local disk, which SD10 told you not to use.
+        The standard design keeps file bytes away from your API completely.
       </p>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
 sequenceDiagram
-    participant U as Patient
-    participant API as API
-    participant P as Primary
-    participant R as Replica
-    U->>API: POST /bookings
-    API->>P: INSERT booking 881
-    P-->>API: ok
-    API-->>U: 201 Created
-    U->>API: GET /me/bookings
-    API->>R: SELECT bookings for patient
-    Note over P,R: replication still 300 ms behind
-    R-->>API: list without booking 881
-    API-->>U: "Where is my booking?"
+    autonumber
+    participant C as App
+    participant API as Booking API
+    participant S3 as S3 uploads bucket
+    participant Q as Queue
+    participant W as Image worker
+    participant CDN as CDN
+    C->>API: POST /uploads, type image/jpeg, size 4.2 MB
+    API->>API: check user, type, size, quota
+    API-->>C: 201 upload_id, presigned URL, expires in 5 min
+    C->>S3: PUT file bytes directly
+    S3->>Q: event, object created
+    Q->>W: process upload_id
+    W->>S3: read original
+    W->>W: verify real type, strip EXIF,<br/>resize to 64, 256, 1024 px
+    W->>S3: write thumbnails to the public bucket
+    W->>API: mark upload ready
+    C->>CDN: GET the 256 px photo
+    CDN->>S3: first request only, then cached
         </pre>
       </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        The fix is <strong>read-your-writes</strong>: send a user's reads to the primary for a short time after
-        they write, or always read from the primary for anything the user just changed. Keep the replica for
-        queries that can tolerate a few seconds of staleness. And never send a check-then-write read (is the slot
-        free?) to a replica.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Partitioning and sharding: know the words, avoid the work</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>Partitioning</strong> splits one big table into pieces inside the same database, for example
-        <code class="inline">bookings</code> by month. Queries that filter on the partition key touch only the relevant
-        pieces, and old months can be detached or dropped cheaply. <strong>Sharding</strong> splits data across
-        <em>separate databases</em>, for example clinics 1–1,000 on one server and 1,001–2,000 on another. It
-        multiplies write capacity, and it makes cross-shard joins, transactions and unique constraints hard.
-      </p>
       <div class="mt-4">
-        <span class="code-label">migration — declarative partitioning in Postgres</span>
-        <pre class="code"><span class="kw">CREATE TABLE</span> <span class="fn">booking_events</span> (
-  id bigint <span class="kw">GENERATED ALWAYS AS IDENTITY</span>,
-  booking_id bigint <span class="kw">NOT NULL</span>,
-  created_at timestamptz <span class="kw">NOT NULL</span>,
-  payload jsonb
-) <span class="kw">PARTITION BY RANGE</span> (created_at);          <span class="cm">-- the partition key</span>
-
-<span class="kw">CREATE TABLE</span> booking_events_2026_09 <span class="kw">PARTITION OF</span> booking_events
-  <span class="kw">FOR VALUES FROM</span> (<span class="st">'2026-09-01'</span>) <span class="kw">TO</span> (<span class="st">'2026-10-01'</span>);
-<span class="cm">-- a scheduled job creates next month's partition ahead of time</span></pre>
+        <span class="code-label">uploads.ts — issuing a presigned upload (AWS SDK v3)</span>
+        <pre class="code"><span class="kw">const</span> key = <span class="st">`uploads/${user.id}/${crypto.randomUUID()}`</span>;   <span class="cm">// ← never the user's filename</span>
+<span class="kw">const</span> url = <span class="kw">await</span> <span class="fn">getSignedUrl</span>(s3, <span class="kw">new</span> <span class="fn">PutObjectCommand</span>({
+  Bucket: <span class="st">"clinic-uploads-private"</span>,
+  Key: key,
+  ContentType: body.contentType,       <span class="cm">// the upload must send this same type</span>
+}), { expiresIn: <span class="st">300</span> });                <span class="cm">// 5 minutes is plenty</span>
+<span class="kw">await</span> db.uploads.<span class="fn">insert</span>({ key, userId: user.id, status: <span class="st">"pending"</span>, declaredSize: body.size });
+<span class="cm">// A presigned PUT can't cap the size. Use a presigned POST with a
+// content-length-range condition, or check the real size in the worker.</span></pre>
       </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Partitioning is a reasonable tool for append-only tables such as events, logs and audit trails once they
-        reach hundreds of millions of rows. Sharding is a last resort. If an agent proposes sharding for a clinic
-        app, ask it for the capacity estimate that justifies it (Part IV). There won't be one.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">CDN offload</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        The cheapest request is the one that never reaches your servers. A CDN caches static assets (JS, CSS,
-        images) and, with the right <code class="inline">Cache-Control</code> headers, public GET responses such as
-        the list of clinics, close to the user. On a typical site that is most of the bytes served. The headers and
-        invalidation rules are <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>'s topic, and
-        Cloudflare setup is <a href="./op5.html" class="text-viol underline decoration-viol/40">OP5</a>'s. Here, just
-        remember the order: before adding app servers, check what the CDN could serve instead.
-      </p>
-
-      <!-- ═══════════════ PART IV ═══════════════ -->
-      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Observability &amp; capacity</div>
-      <h2 class="font-display text-2xl font-bold mt-2">You can't fix what you can't see, or size what you haven't estimated</h2>
-      <p class="mt-4 text-[15px] leading-relaxed">
-        Everything in Parts I–III is a guess until production tells you what is happening. Observability is how it
-        tells you. Capacity estimation is how you make a sensible guess <em>before</em> there is any production.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-7">Logs, metrics and traces: three questions</h3>
-      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Signal</th><th class="px-4 py-3">Answers</th><th class="px-4 py-3">Booking-app example</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Metrics</td><td class="px-4 py-3"><em>Is</em> something wrong? Cheap numbers over time, good for dashboards and alerts.</td><td class="px-4 py-3">Requests per second, error rate, p95 latency of <code class="inline">POST /bookings</code>, DB pool in use, breaker state</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Logs</td><td class="px-4 py-3"><em>What</em> happened in this one case? Detailed, searchable events.</td><td class="px-4 py-3">"booking 881 failed: payment timeout after 3000 ms, attempt 2"</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Traces</td><td class="px-4 py-3"><em>Where</em> did the time go across services? One request as a tree of timed steps.</td><td class="px-4 py-3">1.8 s total: 20 ms DB, 1.7 s waiting on the SMS provider, which should not be on this path</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        <strong>OpenTelemetry</strong> is the vendor-neutral standard for producing all three. Instrument once, then
-        send the data to whichever backend the client uses (Datadog, Grafana, New Relic, a cloud provider's own).
-        The thread that ties them together is a <strong>request ID or trace ID</strong>: it is created at the edge,
-        passed along in a header (the W3C <code class="inline">traceparent</code> header for traces), and written on
-        every log line, so one ID finds everything about one request.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">log output — structured, not prose</span>
-        <pre class="code"><span class="cm"># ✗ what agents write by default</span>
-console.log("Error creating booking", err)
-
-<span class="cm"># ✓ one JSON object per event: filterable, countable, joinable by trace_id</span>
-{<span class="st">"level"</span>:<span class="st">"error"</span>,<span class="st">"msg"</span>:<span class="st">"payment_failed"</span>,<span class="st">"trace_id"</span>:<span class="st">"4bf92f35..."</span>,
- <span class="st">"booking_id"</span>:881,<span class="st">"clinic_id"</span>:12,<span class="st">"provider"</span>:<span class="st">"payco"</span>,
- <span class="st">"error"</span>:<span class="st">"timeout"</span>,<span class="st">"elapsed_ms"</span>:3004,<span class="st">"attempt"</span>:2}
-<span class="cm"># never log: passwords, tokens, full card numbers, medical notes</span></pre>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Health checks: liveness vs readiness</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        The load balancer and the container platform ask each server "are you OK?" and act on the answer. There are
-        two different questions, and mixing them up causes outages.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">health.ts — two endpoints, two meanings</span>
-        <pre class="code"><span class="cm">// Liveness: is this process alive at all? If not → restart it.</span>
-app.<span class="fn">get</span>(<span class="st">"/livez"</span>, (_req, res) =&gt; res.<span class="fn">status</span>(<span class="st">200</span>).<span class="fn">send</span>(<span class="st">"ok"</span>));   <span class="cm">// no DB call!</span>
-
-<span class="cm">// Readiness: can it serve traffic right now? If not → stop routing to it.</span>
-app.<span class="fn">get</span>(<span class="st">"/readyz"</span>, <span class="kw">async</span> (_req, res) =&gt; {
-  <span class="kw">const</span> dbOk = <span class="kw">await</span> db.<span class="fn">query</span>(<span class="st">"SELECT 1"</span>, { timeout: <span class="st">500</span> }).<span class="fn">then</span>(() =&gt; <span class="kw">true</span>, () =&gt; <span class="kw">false</span>);
-  res.<span class="fn">status</span>(dbOk ? <span class="st">200</span> : <span class="st">503</span>).<span class="fn">json</span>({ db: dbOk });
-});
-<span class="cm">// ← don't check optional dependencies (SMS, Redis cache) here: if the SMS provider
-//   is down, every server reports "not ready" and the whole app goes dark.</span></pre>
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">SLIs and SLOs in plain words</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        An <strong>SLI</strong> (service level indicator) is a measurement of what users experience, such as "the
-        share of booking requests that succeed in under 1 second". An <strong>SLO</strong> (objective) is the target
-        for it: "99.5% over 30 days". The gap between 100% and the target is the <strong>error budget</strong>. While
-        there is budget left, ship features. When it is spent, reliability work comes first. An SLA is the contract
-        version with penalties, which is a business decision rather than an engineering one.
-      </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">SLO</th><th class="px-4 py-3">Allowed "bad" time per 30 days</th><th class="px-4 py-3">Realistic for</th></tr></thead>
+            <th class="px-4 py-3">Concern</th><th class="px-4 py-3">Decision</th><th class="px-4 py-3">Module</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">99%</td><td class="px-4 py-3">about 7.2 hours</td><td class="px-4 py-3">Internal tools, admin back offices</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">99.5%</td><td class="px-4 py-3">about 3.6 hours</td><td class="px-4 py-3">A typical client MVP on one region</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">99.9%</td><td class="px-4 py-3">about 43 minutes</td><td class="px-4 py-3">A mature product with redundancy, alerting and an on-call rota</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">99.99%</td><td class="px-4 py-3">about 4.3 minutes</td><td class="px-4 py-3">Payments infrastructure. Needs multi-region and a dedicated team.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Trusting the client's file type</td><td class="px-4 py-3">The worker checks the file's real format from its bytes, and rejects anything that isn't an image or PDF</td><td class="px-4 py-3"><a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Location in photo metadata</td><td class="px-4 py-3">Strip EXIF data during processing: phone photos can contain GPS coordinates of the patient's home</td><td class="px-4 py-3"><a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Private documents</td><td class="px-4 py-3">Private bucket, never on the CDN. Serve with a short-lived presigned GET, issued only after an ownership check.</td><td class="px-4 py-3"><a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Public photos</td><td class="px-4 py-3">Versioned keys (<code class="inline">doctor-17/v3/256.webp</code>) with a long cache lifetime. A new photo gets a new key, so no CDN purge is needed.</td><td class="px-4 py-3"><a href="./sd7.html" class="text-viol underline decoration-viol/40">SD7</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Duplicate or retried events</td><td class="px-4 py-3">Storage events are delivered at least once. Processing is idempotent: same input key, same output keys, overwrite is harmless.</td><td class="px-4 py-3"><a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Abandoned uploads</td><td class="px-4 py-3">A lifecycle rule deletes objects under <code class="inline">uploads/</code> that were never marked ready after a day</td><td class="px-4 py-3"><a href="./op4.html" class="text-viol underline decoration-viol/40">OP4</a></td></tr>
           </tbody>
         </table>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Each extra nine costs roughly ten times more. When a client says "it must never go down", the useful reply
-        is this table and a question: which of these are you willing to pay for? Alert on the SLO (errors are
-        burning the budget fast), not on every CPU spike, or people learn to ignore the alerts.
+        The same design works on other stacks: Supabase Storage and Cloudflare R2 both offer signed upload URLs.
+        What matters is the shape: API issues permission, client sends bytes to storage, a worker processes, a CDN serves.
       </p>
 
-      <h3 class="font-semibold text-lg mt-8">Back-of-the-envelope capacity estimation</h3>
+      <h3 class="font-semibold text-lg mt-8">The design-doc template for your features</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Before choosing an architecture, spend ten minutes on arithmetic. You want the order of magnitude, not
-        precision: is this 10 requests per second or 10,000? Gigabytes or terabytes? The answer decides whether
-        one Postgres is plenty (almost always) or whether you need the heavier tools. A few reference numbers,
-        rounded to be memorable:
-      </p>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Quantity</th><th class="px-4 py-3">Rough value</th><th class="px-4 py-3">Use it for</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Seconds in a day</td><td class="px-4 py-3">86,400 ≈ 100,000</td><td class="px-4 py-3">Daily count ÷ 100k ≈ average per second</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Peak vs average</td><td class="px-4 py-3">×3 to ×10 (more for launches and sales)</td><td class="px-4 py-3">Traffic is never flat. Size for the peak.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Simple indexed Postgres query</td><td class="px-4 py-3">~1 ms or less on the server</td><td class="px-4 py-3">One modest Postgres serves thousands of simple queries per second</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Round trip in one data centre</td><td class="px-4 py-3">~0.5 ms</td><td class="px-4 py-3">Why N+1 queries hurt: 200 round trips is 100 ms of pure waiting</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Round trip Vietnam ↔ US East</td><td class="px-4 py-3">~200 ms or more</td><td class="px-4 py-3">Why region choice and CDNs matter for Vietnamese users</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Typical row with indexes</td><td class="px-4 py-3">0.5–1 KB</td><td class="px-4 py-3">Storage estimates</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        <strong>Worked example: a clinic booking platform for a national chain.</strong> 300 clinics, 3,000 doctors,
-        1 million registered patients.
+        Every case above fits this template, and it is the format for any design you propose on a real
+        project. Keep it in the repo as
+        <code class="inline">docs/design/&lt;feature&gt;.md</code>, next to the code it describes, so the agent can read it on
+        every task and reviewers can comment on it in a PR.
       </p>
       <div class="mt-4">
-        <span class="code-label">docs/capacity.md — the estimate, written down</span>
-        <pre class="code">Bookings      60,000 / day                    <span class="cm"># from the client: ~20 per doctor per day</span>
-Write QPS     60,000 / 100,000 ≈ <span class="out">0.6 / s avg</span>   → peak ×10 (7–9 a.m. rush) ≈ <span class="out">6 / s</span>
-Reads         ~20 slot views per booking     → 1.2 M / day ≈ 12 / s avg ≈ <span class="out">120 / s peak</span>
-Reminders     2 per booking (24 h + 2 h)     → 120,000 SMS/email per day, in bursts
-Storage       60k × 365 ≈ 22 M bookings / yr × ~1 KB ≈ <span class="out">22 GB / yr</span> incl. indexes
-Photos        (none in scope; see SD12 case 4 if added)
+        <span class="code-label">docs/design/TEMPLATE.md</span>
+        <pre class="code"># &lt;Feature or system name&gt; — design
+Author · reviewers · status (draft | reviewed | accepted) · date
 
-Conclusion    One Postgres (4 vCPU) + 2 app servers + 1 worker. No replicas,
-              no sharding. Put the effort into the double-booking constraint
-              (SD1), idempotent payments (Part II), and reminder delivery (SD9).
-Re-check when bookings pass ~1 M / day or storage passes ~500 GB.</pre>
+## 1. Context and goals          <span class="cm">why now, who asked, what success looks like</span>
+## 2. Requirements               <span class="cm">functional · non-functional · MUST NEVER HAPPEN · non-goals</span>
+## 3. Estimates                  <span class="cm">avg/peak QPS, storage/yr, fan-out, with the arithmetic shown</span>
+## 4. API                        <span class="cm">endpoints, key request/response shapes, error cases (link openapi.yaml)</span>
+## 5. Data model                 <span class="cm">Mermaid ERD, constraints, docs/queries.md with indexes</span>
+## 6. Architecture               <span class="cm">one container diagram + one sequence diagram for the main flow</span>
+## 7. Deep dives                 <span class="cm">2–4 hard problems: options → decision → why</span>
+## 8. Failure modes              <span class="cm">dependency table: timeout, retries, idempotent, fallback</span>
+## 9. Security and privacy       <span class="cm">who can see/do what, sensitive data, abuse cases</span>
+## 10. Observability             <span class="cm">key metrics, alerts, what gets logged (and what never does)</span>
+## 11. Trade-offs and alternatives <span class="cm">what we rejected, what would make us revisit</span>
+## 12. Rollout and verification  <span class="cm">migration order, feature flag, how we prove it works</span>
+## 13. Open questions</pre>
       </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Notice what the estimate is for: it <em>removes</em> work. Most of the reliability risk in this system is
-        correctness under concurrency and flaky third parties, not raw load. Estimates like this are the second step
-        of every design in <a href="./sd12.html" class="text-viol underline decoration-viol/40">SD12</a>, so practise
-        them until they take ten minutes. Then confirm with a load test (k6, Locust, or similar) before a big launch.
-      </p>
-      <div class="mt-4 callout callout-danger">
-        <strong>Load-test staging, never production, and never with real providers.</strong> A load test that
-        creates 50,000 bookings against a staging environment still wired to the real SMS provider sends 50,000
-        real text messages, and the client pays for all of them. Point every paid integration at a sandbox or a
-        stub before you start.
+      <div class="mt-4 callout callout-tip">
+        <strong>Score-4 move:</strong> section 2's "must never happen" list is the most valuable part of the doc.
+        Turn each line into a test (a constraint test, a concurrency test, a replayed-webhook test) and link the
+        tests from the doc. Then the design isn't just a promise, it is checked on every CI run.
       </div>
 
       <!-- ═══════════════ Claude Code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Agents are good at finding every outbound call in a codebase, adding consistent timeout and retry wrappers,
-        writing failure-injection tests and doing the capacity arithmetic. They are poor at deciding what the
-        product should do when a dependency is down. Give them the policy and let them apply it everywhere.
+        Use the agent as a fast drafter and a relentless reviewer of the design, and keep the decisions yourself.
+        The trick is order: make it follow the method one step at a time, and stop it from jumping to the
+        architecture. Plan mode (<a href="./ag3.html" class="text-viol underline decoration-viol/40">AG3</a>) is the
+        natural place for this work, since nothing should be written to code yet.
       </p>
       <div class="mt-4">
-        <span class="code-label">prompt — a failure-mode audit</span>
-        <pre class="code">Find every outbound call in this repo: HTTP clients, DB, Redis, queues, SDKs.
-For each one, output a table:
-  file:line | dependency | timeout (value or MISSING) | retries (policy or none)
-  | idempotent? | on the critical path of a user request? | fallback
-Don't change code. Flag any POST retried without an idempotency key.</pre>
+        <span class="code-label">prompt — step 1 only</span>
+        <pre class="code">We are designing &lt;feature&gt;. Client brief is in docs/brief.md.
+Do ONLY step 1 of docs/design/TEMPLATE.md: list functional requirements,
+non-functional requirements, a "must never happen" list, and non-goals.
+Then list the 10 questions you would ask the client before going further.
+Do not propose any architecture or technology yet.</pre>
       </div>
-      <pre class="code mt-3">Implement Idempotency-Key support for POST /payments following docs/idempotency.md.
-Then write a test that sends the same request twice concurrently and asserts
-exactly one charge was made on the payment stub. Paste the test output.</pre>
-      <pre class="code mt-3">Make the SMS provider stub hang for 30 s. Run the booking flow and show me:
-the response time of POST /bookings, what the user sees, and the logs.
-<span class="cm"># failure injection: prove the timeout and fallback work, don't assume</span></pre>
-      <pre class="code mt-3">Here are the client's numbers (docs/requirements.md). Do a back-of-the-envelope
-estimate: avg and peak QPS for reads and writes, storage per year, messages per day.
-Show each step of the arithmetic, then tell me which scaling steps are NOT needed.</pre>
+      <pre class="code mt-3">Here is my design doc (docs/design/booking.md). Act as a strict reviewer.
+For each "must never happen" item, show the mechanism that prevents it
+(constraint, lock, idempotency key, auth check). Mark any item with NO mechanism.
+Then list every component in the diagram that the estimates don't justify.</pre>
+      <pre class="code mt-3">Walk through this failure: the payment webhook arrives 15 minutes late,
+after the hold expired and another patient booked the slot. Trace it through
+our design step by step. What does each component do? What does each user see?</pre>
       <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>Inventory outbound calls and their timeouts</li>
-            <li>Add timeout, retry and breaker wrappers to a policy you wrote</li>
-            <li>Write idempotency middleware and its concurrency test</li>
-            <li>Build stubs that fail, hang or return 429 on demand</li>
-            <li>Convert logging to structured JSON with a trace ID</li>
-            <li>Do the capacity arithmetic, step by step</li>
+            <li>Draft requirements and client questions from a brief</li>
+            <li>Do the estimate arithmetic, showing each step</li>
+            <li>Draw Mermaid ERDs, container and sequence diagrams</li>
+            <li>List options for a deep dive, with pros and cons</li>
+            <li>Play "what if X fails?" against your design</li>
+            <li>Turn the "must never happen" list into test cases</li>
           </ul>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-coral">You must check</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>The timeout values against real latency, not defaults</li>
-            <li>That retries happen at one layer only, with jitter</li>
-            <li>That non-idempotent calls are never retried without a key</li>
-            <li>The degraded behaviour for each dependency, agreed with your lead</li>
-            <li>That the app has no hidden local state (run two copies)</li>
-            <li>The assumptions behind the capacity numbers</li>
+            <li>That the requirements match what the client actually said</li>
+            <li>The assumptions behind every estimate</li>
+            <li>That every box in the diagram is justified by a number or a requirement</li>
+            <li>The mechanism behind each "must never happen" item</li>
+            <li>The decision in each deep dive, and its stated downside</li>
+            <li>That the design is something your team can run</li>
           </ul>
         </div>
       </div>
       <div class="mt-4 callout callout-warn">
-        <strong>Red flags in agent-written reliability code:</strong> an HTTP client created with no timeout ·
-        <code class="inline">while (true)</code> retry loops, or retries with a fixed delay · retrying on every error,
-        including 400s · <code class="inline">catch (e) {}</code> that swallows a failure and reports success · an
-        idempotency key generated inside the retry loop · a health check that pings every dependency · in-memory
-        <code class="inline">Map</code> used for sessions or rate limits · cron jobs started inside the web server ·
-        a proposal for sharding, Kafka or microservices with no numbers behind it.
+        <strong>Red flags in agent-generated designs:</strong> microservices, Kafka or Kubernetes for a system doing
+        single-digit writes per second · no estimates, or estimates that are never used · "the payment is confirmed
+        when the user returns to the success page" · reminders sent from a cron inside the web server · files
+        uploaded through the API to local disk · "exactly once delivery" claimed with no dedupe mechanism · a
+        design with no trade-offs section, or one where every trade-off is positive · diagrams with arrows but no
+        labels, so nobody can tell what flows where.
       </div>
 
       <!-- ═══════════════ skill ladder ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Assumes calls succeed. Has never thought about what happens when a dependency is slow.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows the words (timeout, retry, circuit breaker, replica, SLO) and can explain them, but doesn't spot their absence in a diff.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds timeouts and retries when reminded. Needs review to catch non-idempotent retries, hidden local state or a health check that is too deep.</div></div>
-        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Every outbound call in their features has a timeout, a retry policy and a decided fallback. Implements idempotency keys for payment-like POSTs and proves them with a concurrent test. Keeps servers stateless, logs in structured form with a trace ID, and writes a capacity estimate that justifies the architecture.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Defines SLOs and alerting with the client, runs failure-injection drills, leads the scaling plan when real load arrives, and reviews other people's designs for failure modes.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Starts coding straight from the ticket. Has never written a design before building.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can follow a design someone else wrote and explain its diagram. Can't yet produce the requirements, estimates or deep dives alone.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Fills in the template for a feature. Needs the mentor to find the missing "must never happen" items, the unjustified components or the unhandled failure.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Designs a feature-sized system with the seven steps: clear requirements, numbers that drive decisions, an API and data model, labelled diagrams, deep dives on concurrency, payments or async work, and honest trade-offs. Uses the agent to draft and attack the design, and can defend every decision without it.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Runs design reviews for other interns, spots the missing failure mode in their docs, and presents a design and its trade-offs to a client in plain language.</div></div>
       </div>
       <div class="mt-4 callout callout-tip">
-        <strong>Self-check before claiming 3:</strong> pick one feature you built. Without looking, can you name every
-        external call it makes, the timeout on each, and what the user sees when each one hangs? If the user taps
-        "Pay" twice on a bad connection, can you show the test that proves they are charged once?
+        <strong>Self-check before claiming 3:</strong> take any of the four cases and cover the page. Can you redo steps
+        1 to 7 on a whiteboard in 45 minutes? When your mentor asks "what if the webhook comes twice?" or "what if a
+        campaign and an OTP go out at the same time?", do you already have the answer in the doc?
       </div>
 
       <!-- ═══════════════ pitfalls ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
       <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Treating a timeout as "failed"</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A timed-out payment may have succeeded. Marking it failed and letting the user pay again is how double charges happen. Record it as "unknown" and reconcile with the provider.</p>
+          <div class="font-semibold text-rose-500">✗ Starting from the architecture</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Choosing "Next.js, NestJS, Redis, RabbitMQ" before writing requirements means the design serves the tools, not the problem. Technology goes in step 5 at the earliest.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Scaling before measuring</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Adding replicas, Kafka or Kubernetes for a system that does 5 writes a second adds cost and failure modes, and doesn't fix the missing index that was the real problem.</p>
+          <div class="font-semibold text-rose-500">✗ Designing only the happy path</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Every case above was interesting because of what goes wrong: races, replays, late webhooks, provider outages. A design with no failure section is half a design.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Slow side effects on the request path</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Sending the SMS, generating the PDF and calling analytics inside <code class="inline">POST /bookings</code> ties your uptime to theirs. Move nice-to-have work to a job.</p>
+          <div class="font-semibold text-rose-500">✗ A design doc nobody updates</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">When the implementation changes a decision, change the doc in the same PR. A stale doc misleads reviewers and, worse, the agent that reads it next week.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write a dependency table</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">One row per external call: timeout, retries, idempotent, fallback, owner. It fits in the design doc and turns vague "resilience" into a reviewable checklist.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write the "must never happen" list first</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">It tells you where the deep dives are, and each item becomes a constraint or a test.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Inject failures on purpose</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A stub that can hang, return 503 or return 429 turns "I think it degrades gracefully" into a test you can run in CI.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Reuse the four shapes</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Read-heavy lookup (shortener), stateful workflow with money (booking), fan-out with priorities (notifications), async pipeline (uploads). Most client features are one of these, or two combined.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Put the trace ID in error messages</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Show a short reference in the error the user sees. When the client forwards a screenshot, you find the exact request in seconds.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Label every arrow</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">"POST /links", "webhook", "outbox relay". An unlabelled arrow hides the most important information in the diagram: what crosses the boundary, and whether it is sync or async.</p>
         </div>
       </div>
 
       <!-- ═══════════════ evidence & resources ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dep-table"> <span>Produced a dependency table for one feature (timeout, retries, idempotent, fallback per call) and fixed every missing timeout it found.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="failure-test"> <span>Wrote a failure-injection test: a stub that hangs or returns 503, and an assertion on what the user sees and how long it takes.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="stateless"> <span>Ran two copies of the app side by side, found any hidden local state (sessions, files, counters, cron), and moved it somewhere shared.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="capacity"> <span>Wrote a back-of-the-envelope capacity estimate for a real or capstone project and used it to rule out at least one piece of infrastructure.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="idem-pr"> <span class="font-semibold">Opened a PR that adds <code class="inline">Idempotency-Key</code> support and a per-user rate limit to a payment-like or OTP endpoint, with a concurrent duplicate-request test, a 429 test showing <code class="inline">Retry-After</code>, and the test output pasted in the description (mentor evidence ✓)</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="method"> <span>Redid one of the four cases from memory with the seven steps, and compared my version to the module.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="never-list"> <span>Wrote a "must never happen" list for a feature and named the mechanism (constraint, lock, key, auth check) for every item.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="failure-walk"> <span>Walked a failure scenario (late webhook, duplicate event, provider outage) through a design with the agent, and fixed the gap it exposed.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="design-review"> <span>Presented a design to my mentor or another intern for 15 minutes and recorded the review comments and my changes in the doc.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="design-doc"> <span class="font-semibold">Wrote a complete design doc from <code class="inline">TEMPLATE.md</code> for one new system (for example a waitlist that offers freed slots to waiting patients, or a clinic review system), with estimates, an API, a Mermaid ERD, a container and a sequence diagram, two deep dives and a trade-offs table, and merged it as a PR (mentor evidence ✓)</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
       <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
-        <li><a class="text-coral underline" href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">AWS Architecture Blog — Exponential Backoff and Jitter</a> — the simulation behind "full jitter" in Part I.</li>
-        <li><a class="text-coral underline" href="https://martinfowler.com/bliki/CircuitBreaker.html" target="_blank" rel="noopener">Martin Fowler — Circuit Breaker</a> — the pattern's short, canonical description.</li>
-        <li><a class="text-coral underline" href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener">Stripe — Idempotent requests</a> — the idempotency-key design most APIs copy, including key reuse and expiry rules.</li>
-        <li><a class="text-coral underline" href="https://developers.cloudflare.com/waf/rate-limiting-rules/" target="_blank" rel="noopener">Cloudflare — Rate limiting rules</a> — edge rate limits, and what each plan can count by.</li>
-        <li><a class="text-coral underline" href="https://www.pgbouncer.org/features.html" target="_blank" rel="noopener">PgBouncer — Features</a> — pooling modes and the session features transaction pooling breaks.</li>
-        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/hot-standby.html" target="_blank" rel="noopener">PostgreSQL — Hot Standby</a> · <a class="text-coral underline" href="https://www.postgresql.org/docs/current/ddl-partitioning.html" target="_blank" rel="noopener">Table Partitioning</a> — read replicas and partitioning, from the source.</li>
-        <li><a class="text-coral underline" href="https://opentelemetry.io/docs/concepts/signals/" target="_blank" rel="noopener">OpenTelemetry — Signals</a> — traces, metrics and logs, and how context is propagated.</li>
-        <li><a class="text-coral underline" href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener">Google SRE Book — Service Level Objectives</a> — SLIs, SLOs and error budgets explained by the people who coined them.</li>
+        <li><a class="text-coral underline" href="https://c4model.com/" target="_blank" rel="noopener">The C4 model</a> — the container and context diagrams used in step 5.</li>
+        <li><a class="text-coral underline" href="https://mermaid.js.org/syntax/flowchart.html" target="_blank" rel="noopener">Mermaid — Flowchart</a> · <a class="text-coral underline" href="https://mermaid.js.org/syntax/sequenceDiagram.html" target="_blank" rel="noopener">Sequence diagram</a> — the syntax behind every diagram in the design docs.</li>
+        <li><a class="text-coral underline" href="https://docs.stripe.com/webhooks" target="_blank" rel="noopener">Stripe — Webhooks</a> — signatures, retries and duplicate events, the reference for case 2's payment flow.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html" target="_blank" rel="noopener">AWS — S3 presigned URLs</a> — expiry, permissions and upload rules for case 4.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html" target="_blank" rel="noopener">AWS — S3 event notifications</a> — triggering the image worker, and the delivery guarantees you design around.</li>
+        <li><a class="text-coral underline" href="https://firebase.google.com/docs/cloud-messaging" target="_blank" rel="noopener">Firebase — Cloud Messaging</a> — push delivery and token lifecycle for case 3.</li>
+        <li><a class="text-coral underline" href="https://sre.google/sre-book/addressing-cascading-failures/" target="_blank" rel="noopener">Google SRE Book — Addressing Cascading Failures</a> — why the priority queues and bulkheads in case 3 matter.</li>
       </ul>
 
       <nav id="page-nav" class="mt-14 flex gap-4"></nav>
     </article>
 
     <footer class="px-6 py-8 text-center text-xs text-mute dark:text-mutedark">
-      AI-Native Developer Internship · SD11 Reliability &amp; Scaling
+      AI-Native Developer Internship · SD11 System Design Case Studies
     </footer>
   </main>
 </div>

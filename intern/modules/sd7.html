@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SD7 · Backend Patterns: Repository, CQRS, Outbox &amp; Saga — AI-Native Developer Internship</title>
+<title>SD7 · Caching Strategies — AI-Native Developer Internship</title>
 <script>(function(){if(localStorage.getItem('fde-theme')==='dark')document.documentElement.classList.add('dark');if(localStorage.getItem('fde-nav')==='collapsed')document.documentElement.classList.add('nav-collapsed');})();</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -40,7 +40,7 @@ tailwind.config = {
     <div class="px-5 py-5 border-b border-line dark:border-linedark">
       <a href="../index.html" class="block">
         <div class="font-display text-lg font-bold leading-tight">AI-Native Developer</div>
-        <div class="text-xs text-mute dark:text-mutedark mt-0.5">12-week Internship Program</div>
+        <div class="text-xs text-mute dark:text-mutedark mt-0.5">9-week Internship Program</div>
       </a>
     </div>
     <nav id="module-nav" class="flex-1 overflow-y-auto px-2 py-3"></nav>
@@ -61,741 +61,672 @@ tailwind.config = {
           <span class="badge badge-neutral">Target score: 3 / 4</span>
           <span class="badge badge-accent">~2 days · guided practice</span>
         </div>
-        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Backend Patterns: Repository, CQRS, Outbox &amp; Saga</h1>
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Caching Strategies</h1>
         <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
-          The patterns that sit between an HTTP handler and the database, and between your service and the rest of
-          the world. Service layer, repository and unit of work organise a single request. Active record vs data
-          mapper, DTOs and specifications decide how objects meet tables. CQRS splits reads from writes when one
-          model can't serve both. The transactional outbox, idempotent consumers and sagas keep data consistent
-          once a single transaction is no longer enough.
+          Decide what is worth caching and where: the browser, the CDN, the application's Redis, or the database
+          itself. Pick a read and write pattern, choose TTLs on purpose, and invalidate without serving yesterday's
+          prices. Recognise the failure modes: stampedes, stale reads, and one patient's data served to another.
+          Managed Redis on AWS (ElastiCache) is in <a href="./op5.html" class="text-viol underline decoration-viol/40">OP5</a>.
+          Then prove the cache is earning its keep with a hit-rate number.
         </p>
         <div class="mt-6 callout callout-why">
-          <strong>Why it matters when AI writes the code:</strong> agents have read thousands of "clean architecture"
-          repos, so they reach for these patterns by reflex. You will get a <code class="inline">GenericRepository&lt;T&gt;</code>
-          wrapped around an ORM that already is one, CQRS on a CRUD admin panel, and, far worse, code that saves a
-          booking and then publishes an event with nothing to catch the crash in between. Your job is to know which
-          pattern solves which problem, spot the pattern that solves nothing, and spot the missing one that
-          prevents lost payments.
+          <strong>Why it matters when AI writes the code:</strong> ask an agent to "make this endpoint faster" and it
+          will often wrap it in a cache. The diff is five lines and the benchmark improves, so it looks like a win. The
+          costs arrive later: a key that forgets the user ID, a TTL nobody chose, and a write path that never
+          invalidates. Caching bugs don't fail tests. They show up as "I saw someone else's booking" or "the price
+          was wrong for an hour". You are the one who has to ask what the key is, how long the copy lives, and who
+          clears it.
         </div>
       </article>
     </div>
 
     <article class="max-w-[52rem] mx-auto px-6 pb-12 prose-fde">
       <!-- ═══════════════ PART I ═══════════════ -->
-      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Service layer, repository, unit of work</div>
-      <h2 class="font-display text-2xl font-bold mt-2">One use case, one place, one transaction</h2>
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Why cache, and what it costs</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A cache is a copy you have agreed to let go stale</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        These three patterns come from Martin Fowler's <em>Patterns of Enterprise Application Architecture</em>, and
-        they travel together. The <strong>service layer</strong> says <em>what</em> a use case does. The
-        <strong>repository</strong> hides <em>how</em> objects are loaded and saved. The <strong>unit of
-        work</strong> makes sure everything the use case changed is committed together, or not at all. Where each
-        one sits in your folder structure is <a href="./sd3.html" class="text-viol underline decoration-viol/40">SD3</a>'s
-        topic. Here we care about what each one is for and when it is dead weight.
+        A cache stores the result of some expensive work (a query, a render, an API call) somewhere faster, so the
+        next request can skip the work. That is the whole idea. The price is also the whole idea: from the moment you
+        copy the data, there are two versions of it, and they can disagree. Every caching decision is a trade
+        between <strong>speed</strong> and <strong>freshness</strong>, and you should be able to say out loud how
+        stale each cached thing is allowed to be.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The latency numbers that justify it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You don't need exact figures, but you need the orders of magnitude. The rows run roughly from fastest to
+        slowest, and the gap between the top and the bottom is about a million times. Caching moves a request up
+        this table.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Where the data comes from</th><th class="px-4 py-3">Rough time</th><th class="px-4 py-3">Clinic-app example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Browser cache (no network at all)</td><td class="px-4 py-3">~0 ms</td><td class="px-4 py-3">The clinic logo and JS bundle on a repeat visit</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">In-process memory (a map in your app)</td><td class="px-4 py-3">well under 1 µs</td><td class="px-4 py-3">The list of specialties, loaded once at boot</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Redis in the same data centre</td><td class="px-4 py-3">~0.2–1 ms per round trip</td><td class="px-4 py-3">A doctor's public profile</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Indexed Postgres query</td><td class="px-4 py-3">~1–10 ms</td><td class="px-4 py-3">One booking by ID (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a> indexes)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CDN edge near the user</td><td class="px-4 py-3">~10–40 ms, measured from the user</td><td class="px-4 py-3">The public clinic page for a user in Hanoi, served from a nearby edge</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Heavy aggregate query</td><td class="px-4 py-3">100 ms – seconds</td><td class="px-4 py-3">"Free slots per clinic for the next 14 days"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Origin server on another continent</td><td class="px-4 py-3">~150–300 ms per round trip</td><td class="px-4 py-3">A user in Vietnam hitting a server in us-east-1</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Third-party API</td><td class="px-4 py-3">100 ms – several seconds, and rate-limited</td><td class="px-4 py-3">Insurance eligibility check, geocoding an address</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice that an indexed query is already fast. Caching a 3 ms query in Redis saves about 2 ms and adds a
+        whole invalidation problem. Caching a 900 ms aggregate or a rate-limited third-party call is where the
+        payoff is. <strong>Measure first</strong>: find the slow or expensive thing with real timings before you
+        cache anything.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Where caches live</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A request passes through several layers, and each one can answer from a copy instead of passing the request
+        on. The closer to the user a layer is, the faster it is, and the less it knows about who is asking.
       </p>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
-        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Request flows from controller to service to repositories inside one unit of work">
-          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">POST /bookings · ONE REQUEST, ONE USE CASE</text>
-          <g class="anim-pulse"><rect x="10" y="70" width="120" height="56" rx="9" fill="#37474F"/>
-            <text x="70" y="94" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Controller</text>
-            <text x="70" y="110" text-anchor="middle" fill="#ffffffbb" font-size="9">parse DTO · auth</text></g>
-          <g class="anim-pulse d1"><rect x="165" y="70" width="140" height="56" rx="9" fill="#2563EB"/>
-            <text x="235" y="94" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">BookingService</text>
-            <text x="235" y="110" text-anchor="middle" fill="#ffffffbb" font-size="9">the use case, the rules</text></g>
-          <rect x="330" y="36" width="230" height="130" rx="12" fill="none" stroke="#6d5acd" stroke-width="2" stroke-dasharray="5 4"/>
-          <text x="445" y="54" text-anchor="middle" font-size="10" font-weight="700" fill="#6d5acd">UNIT OF WORK (one DB transaction)</text>
-          <g class="anim-pulse d2"><rect x="345" y="66" width="200" height="38" rx="9" fill="#0D9488"/>
-            <text x="445" y="84" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SlotRepository</text>
-            <text x="445" y="97" text-anchor="middle" fill="#ffffffbb" font-size="9">findForUpdate(slotId)</text></g>
-          <g class="anim-pulse d3"><rect x="345" y="114" width="200" height="38" rx="9" fill="#0D9488"/>
-            <text x="445" y="132" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">BookingRepository</text>
-            <text x="445" y="145" text-anchor="middle" fill="#ffffffbb" font-size="9">add(booking)</text></g>
-          <g class="anim-pulse d4"><rect x="590" y="70" width="100" height="56" rx="9" fill="#D97757"/>
-            <text x="640" y="94" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Postgres</text>
-            <text x="640" y="110" text-anchor="middle" fill="#ffffffbb" font-size="9">COMMIT once</text></g>
-          <line x1="130" y1="98" x2="165" y2="98" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="305" y1="98" x2="330" y2="98" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <line x1="560" y1="98" x2="590" y2="98" stroke="#D97757" stroke-width="2" class="anim-flow"/>
-          <text x="350" y="190" text-anchor="middle" font-size="10" fill="#A8A49B">the controller knows HTTP, the service knows the rules, the repositories know SQL</text>
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Cache layers from browser to database">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">A REQUEST FOR /clinics/7 — EACH LAYER MAY ANSWER FROM A COPY</text>
+          <g class="anim-pulse"><rect x="10" y="44" width="120" height="58" rx="9" fill="#2563EB"/>
+            <text x="70" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Browser</text>
+            <text x="70" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">Cache-Control, ETag</text></g>
+          <g class="anim-pulse d1"><rect x="150" y="44" width="120" height="58" rx="9" fill="#6d5acd"/>
+            <text x="210" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">CDN edge</text>
+            <text x="210" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">shared, public only</text></g>
+          <g class="anim-pulse d2"><rect x="290" y="44" width="120" height="58" rx="9" fill="#0D9488"/>
+            <text x="350" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">App server</text>
+            <text x="350" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">in-process memory</text></g>
+          <g class="anim-pulse d3"><rect x="430" y="44" width="120" height="58" rx="9" fill="#D97757"/>
+            <text x="490" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Redis</text>
+            <text x="490" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">shared by all servers</text></g>
+          <g class="anim-pulse d4"><rect x="570" y="44" width="120" height="58" rx="9" fill="#37474F"/>
+            <text x="630" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Postgres</text>
+            <text x="630" y="82" text-anchor="middle" fill="#ffffffbb" font-size="9">buffers, mat. views</text></g>
+          <line x1="130" y1="73" x2="150" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="270" y1="73" x2="290" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="410" y1="73" x2="430" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="550" y1="73" x2="570" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="70" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">one user</text>
+          <text x="210" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">everyone in a region</text>
+          <text x="350" y="128" text-anchor="middle" fill="#6E6B64" font-size="9">one server process</text>
+          <text x="490" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">every server</text>
+          <text x="630" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">the source of truth</text>
+          <text x="12" y="162" font-size="10" fill="#A8A49B">← faster, cheaper, knows less about the user</text>
+          <text x="688" y="162" text-anchor="end" font-size="10" fill="#A8A49B">slower, authoritative, knows everything →</text>
+          <text x="350" y="188" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">a hit at any layer means every layer to its right does no work</text>
         </svg>
       </div>
 
-      <h3 class="font-semibold text-lg mt-7">Service layer: where the use case lives</h3>
+      <h3 class="font-semibold text-lg mt-8">What is worth caching</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>The problem.</strong> "Book a slot" involves checking the slot, checking the patient, creating the
-        booking, taking a deposit and sending a confirmation. If that logic lives in the controller, the admin panel,
-        the mobile API and the nightly import job each grow their own slightly different copy. A service layer puts
-        each use case in one method that every entry point calls. Controllers become thin: parse input, call the
-        service, format the output.
+        Good candidates share three properties: they are <strong>read far more often than written</strong>, they
+        are <strong>expensive</strong> to produce, and a <strong>little staleness is acceptable</strong>. Go through
+        the data in your app and sort it. For the clinic booking app:
       </p>
-      <div class="mt-4">
-        <span class="code-label">booking.service.ts — a use case, not a CRUD wrapper</span>
-        <pre class="code"><span class="kw">export class</span> <span class="fn">BookingService</span> {
-  <span class="kw">constructor</span>(<span class="kw">private</span> uow: UnitOfWork, <span class="kw">private</span> clock: Clock) {}
-
-  <span class="kw">async</span> <span class="fn">book</span>(cmd: BookSlotCommand): Promise&lt;Booking&gt; {
-    <span class="kw">return this</span>.uow.<span class="fn">run</span>(<span class="kw">async</span> (repos) =&gt; {
-      <span class="kw">const</span> slot = <span class="kw">await</span> repos.slots.<span class="fn">findForUpdate</span>(cmd.slotId);   <span class="cm">// row lock (SD1)</span>
-      <span class="kw">if</span> (!slot || slot.startsAt &lt; <span class="kw">this</span>.clock.<span class="fn">now</span>()) <span class="kw">throw new</span> <span class="fn">SlotUnavailable</span>();
-      <span class="kw">const</span> booking = Booking.<span class="fn">create</span>(slot, cmd.patientId);    <span class="cm">// rules on the entity</span>
-      <span class="kw">await</span> repos.bookings.<span class="fn">add</span>(booking);
-      <span class="kw">return</span> booking;                                         <span class="cm">// commit happens in uow.run</span>
-    });
-  }
-}
-<span class="cm">// The controller only does: const dto = parse(req.body); return service.book(dto);</span></pre>
-      </div>
-      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>How to spot it:</strong> classes named <code class="inline">*Service</code>, <code class="inline">*UseCase</code>,
-          <code class="inline">*Interactor</code> or Rails "service objects" in <code class="inline">app/services/</code> with a
-          single <code class="inline">call</code> method. NestJS <code class="inline">@Injectable()</code> providers usually play this role.</li>
-        <li><strong>Good version:</strong> method names are business verbs (<code class="inline">book</code>,
-          <code class="inline">cancel</code>, <code class="inline">reschedule</code>), and each method is one transaction.</li>
-        <li><strong>Over-engineering:</strong> a <code class="inline">UserService</code> whose methods are
-          <code class="inline">create</code>, <code class="inline">findById</code>, <code class="inline">update</code> and
-          <code class="inline">delete</code>, each forwarding one line to the repository. That is an extra file with no
-          rules in it. For plain CRUD, let the controller call the ORM or repository directly.</li>
-      </ul>
-
-      <h3 class="font-semibold text-lg mt-8">Repository: a collection-like interface over storage</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>The problem.</strong> Business code that builds SQL strings, or calls the ORM's query builder in
-        twenty places, is hard to test and hard to read. A repository gives the domain an interface that looks like
-        an in-memory collection: <code class="inline">get</code>, <code class="inline">add</code>, and a handful of named
-        queries such as <code class="inline">findFreeSlots(doctorId, day)</code>. The implementation behind it is SQL.
-        In tests you swap it for an in-memory fake.
-      </p>
-      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
-        <pre class="mermaid">
-classDiagram
-    class BookingService {
-        +book(cmd) Booking
-    }
-    class BookingRepository {
-        &lt;&lt;interface&gt;&gt;
-        +get(id) Booking
-        +add(booking)
-        +activeForPatient(patientId) List~Booking~
-    }
-    class SqlBookingRepository {
-        -session
-        +get(id) Booking
-        +add(booking)
-        +activeForPatient(patientId) List~Booking~
-    }
-    class InMemoryBookingRepository {
-        -rows dict
-    }
-    BookingService --> BookingRepository : depends on
-    BookingRepository &lt;|.. SqlBookingRepository : production
-    BookingRepository &lt;|.. InMemoryBookingRepository : unit tests
-        </pre>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">repositories.py — SQLAlchemy behind a narrow interface</span>
-        <pre class="code"><span class="kw">class</span> <span class="fn">SqlBookingRepository</span>:
-    <span class="kw">def</span> <span class="fn">__init__</span>(self, session: Session):
-        self.session = session                     <span class="cm"># injected, owned by the unit of work</span>
-
-    <span class="kw">def</span> <span class="fn">get</span>(self, booking_id: int) -&gt; Booking | <span class="kw">None</span>:
-        <span class="kw">return</span> self.session.get(Booking, booking_id)
-
-    <span class="kw">def</span> <span class="fn">add</span>(self, booking: Booking) -&gt; <span class="kw">None</span>:
-        self.session.add(booking)                  <span class="cm"># no commit here, ever</span>
-
-    <span class="kw">def</span> <span class="fn">active_for_patient</span>(self, patient_id: int) -&gt; list[Booking]:
-        stmt = (select(Booking)
-                .where(Booking.patient_id == patient_id, Booking.status == <span class="st">"booked"</span>)
-                .order_by(Booking.created_at.desc()))
-        <span class="kw">return</span> list(self.session.scalars(stmt))    <span class="cm"># a named query, not a generic filter()</span></pre>
-      </div>
-      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>How to spot it:</strong> <code class="inline">*Repository</code> classes; Spring Data and TypeORM ship a
-          built-in <code class="inline">Repository</code> type (<code class="inline">dataSource.getRepository(Booking)</code>);
-          Go projects usually hand-write a <code class="inline">BookingStore</code> interface over <code class="inline">database/sql</code>.</li>
-        <li><strong>Good version:</strong> methods named after questions the business asks. The repository never
-          commits and never contains business rules.</li>
-        <li><strong>Over-engineering:</strong> a <code class="inline">GenericRepository&lt;T&gt;</code> with
-          <code class="inline">find(where: any)</code> wrapped around an ORM. It hides nothing (callers still write ORM
-          filters), and it blocks ORM features such as eager loading. In a Rails app, adding repositories on top of
-          Active Record fights the framework: use model scopes instead.</li>
-      </ul>
-
-      <h3 class="font-semibold text-lg mt-8">Unit of work: commit everything together, once</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>The problem.</strong> A use case changes several objects. If each repository call commits on its own,
-        a crash halfway leaves a booking with no slot lock, or a paid order with no line items. A unit of work
-        tracks every change during the use case and writes them in <strong>one database transaction</strong> at the
-        end (transactions themselves are covered in
-        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>). You almost never write one from
-        scratch: most ORMs already are one.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">booking_service.go — explicit unit of work with database/sql</span>
-        <pre class="code"><span class="kw">func</span> (s *BookingService) <span class="fn">Book</span>(ctx context.Context, slotID, patientID <span class="kw">int64</span>) (err <span class="kw">error</span>) {
-    tx, err := s.db.<span class="fn">BeginTx</span>(ctx, <span class="kw">nil</span>)
-    <span class="kw">if</span> err != <span class="kw">nil</span> { <span class="kw">return</span> err }
-    <span class="kw">defer</span> tx.<span class="fn">Rollback</span>()                       <span class="cm">// no-op after a successful Commit</span>
-
-    slots, bookings := NewSlotStore(tx), NewBookingStore(tx)   <span class="cm">// same tx, both stores</span>
-    <span class="kw">if</span> err = slots.<span class="fn">LockFree</span>(ctx, slotID); err != <span class="kw">nil</span> { <span class="kw">return</span> err }
-    <span class="kw">if</span> err = bookings.<span class="fn">Insert</span>(ctx, slotID, patientID); err != <span class="kw">nil</span> { <span class="kw">return</span> err }
-    <span class="kw">return</span> tx.<span class="fn">Commit</span>()                          <span class="cm">// the single commit point</span>
-}</pre>
-      </div>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Stack</th><th class="px-4 py-3">The unit of work is…</th><th class="px-4 py-3">What to look for in a review</th></tr></thead>
+            <th class="px-4 py-3">Data</th><th class="px-4 py-3">Read / write ratio</th><th class="px-4 py-3">Staleness allowed</th><th class="px-4 py-3">Verdict</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">SQLAlchemy</td><td class="px-4 py-3">The <code class="inline">Session</code>. It tracks new, changed and deleted objects and flushes them on commit.</td><td class="px-4 py-3">One session per request or job. <code class="inline">with session.begin():</code> around the use case, no stray <code class="inline">commit()</code> in helpers.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">TypeORM</td><td class="px-4 py-3"><code class="inline">dataSource.transaction(async (manager) =&gt; …)</code></td><td class="px-4 py-3">Every query inside uses <code class="inline">manager</code>, not the global repository, or it runs outside the transaction.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Rails</td><td class="px-4 py-3"><code class="inline">ActiveRecord::Base.transaction do … end</code></td><td class="px-4 py-3">Multi-record changes wrapped in a block. Side effects (emails, HTTP) in <code class="inline">after_commit</code>, not inside the block.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Spring / NestJS</td><td class="px-4 py-3"><code class="inline">@Transactional</code> or a transaction interceptor</td><td class="px-4 py-3">The annotation is on the use-case method, and not bypassed by a self-call inside the same class.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Go</td><td class="px-4 py-3">A <code class="inline">*sql.Tx</code> passed to every store</td><td class="px-4 py-3"><code class="inline">defer tx.Rollback()</code> right after <code class="inline">BeginTx</code>, and exactly one <code class="inline">Commit</code>.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clinic profile, opening hours, photos</td><td class="px-4 py-3">Thousands : 1</td><td class="px-4 py-3">Minutes</td><td class="px-4 py-3">Cache at the CDN and in Redis</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">List of specialties</td><td class="px-4 py-3">Huge : almost never</td><td class="px-4 py-3">Hours</td><td class="px-4 py-3">In-process memory, or even a constant</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Free-slot counts on the search page</td><td class="px-4 py-3">High : medium</td><td class="px-4 py-3">Seconds (it's a hint)</td><td class="px-4 py-3">Cache with a short TTL, and <strong>re-check at booking time</strong></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Whether slot 42 is free, at the moment of booking</td><td class="px-4 py-3">—</td><td class="px-4 py-3">None</td><td class="px-4 py-3">Never cache. The database constraint decides (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>).</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A patient's own bookings</td><td class="px-4 py-3">Low : low</td><td class="px-4 py-3">None (they just made one)</td><td class="px-4 py-3">Usually don't cache. The indexed query is fast enough.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Insurance API response</td><td class="px-4 py-3">Medium, and each call costs money</td><td class="px-4 py-3">A day</td><td class="px-4 py-3">Cache per patient in Redis, never at the CDN</td></tr>
           </tbody>
         </table>
       </div>
       <div class="mt-4 callout callout-info">
-        <strong>When it's over-engineering:</strong> a hand-written <code class="inline">UnitOfWork</code> class with
-        <code class="inline">registerNew</code> / <code class="inline">registerDirty</code> on top of an ORM session that
-        already does exactly that. Write your own only when you have no ORM (Go with raw SQL), and even then a
-        function that takes a <code class="inline">tx</code> is usually enough.
+        <strong>A cache can show, but must never decide.</strong> It is fine for the search page to say "3 slots
+        left" from a 10-second-old cache. It is not fine for the booking endpoint to trust that number. Any decision
+        that moves money or reserves something reads from the source of truth, inside a transaction.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The cost you sign up for</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every cache adds four things to your system: <strong>a staleness window</strong> (how long users can see old
+        data), <strong>an invalidation path</strong> (code that must run on every write), <strong>a new failure
+        mode</strong> (what happens when Redis is down or empty), and <strong>a memory budget</strong>. If you can't
+        name all four for a cache in your code, you don't yet understand that cache. A good first step is to
+        write them as a comment right next to it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinics/cache.ts — document every cache like this</span>
+        <pre class="code"><span class="cm">/**
+ * CACHE: clinic public profile
+ * key:          clinic:v3:{clinicId}:profile     (no user data inside)
+ * staleness:    up to 5 min, or until invalidated on update
+ * invalidation: ClinicService.update() deletes the key after COMMIT
+ * on failure:   Redis down → read from Postgres, log a warning, don't crash
+ */</span>
+<span class="kw">export const</span> <span class="fn">CLINIC_PROFILE_TTL_S</span> = <span class="st">300</span>;</pre>
       </div>
 
       <!-- ═══════════════ PART II ═══════════════ -->
-      <div class="kicker text-viol mt-14">Part II · Objects meet tables</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Active Record is fine until the domain fights back</h2>
+      <div class="kicker text-viol mt-14">Part II · The cache layers</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Cache as close to the user as the data's privacy allows</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Every backend has to turn rows into objects and back. There are two classic answers, and your framework
-        picked one for you. Then there are the shapes that cross your API boundary (DTOs), and the reusable query
-        rules (specifications). None of these is "better". Each one fits a certain size of problem.
+        Each layer from the diagram above has its own controls and its own risks. The browser and the CDN are
+        driven by <strong>HTTP headers</strong> that your server sends. Redis and in-process caches are driven by
+        <strong>your code</strong>. The database has a few tricks of its own. Start at the outside and move in.
       </p>
 
-      <h3 class="font-semibold text-lg mt-7">Active record vs data mapper</h3>
+      <h3 class="font-semibold text-lg mt-7">HTTP caching: Cache-Control and ETag</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>Active record:</strong> one class per table, and the object knows how to save itself
-        (<code class="inline">booking.save</code>). Data and persistence live together. <strong>Data mapper:</strong>
-        the domain object is a plain class that knows nothing about the database. A separate mapper (a repository, an
-        ORM session, an entity manager) moves it in and out of tables.
-      </p>
-      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
-        <pre class="mermaid">
-classDiagram
-    direction LR
-    class ActiveRecordBooking {
-        +slot_id
-        +status
-        +cancel()
-        +save()
-        +where()$
-    }
-    class Booking {
-        +slotId
-        +status
-        +cancel()
-    }
-    class BookingMapper {
-        +load(id) Booking
-        +save(booking)
-    }
-    class bookings_table {
-        &lt;&lt;table&gt;&gt;
-    }
-    ActiveRecordBooking --> bookings_table : reads and writes itself
-    BookingMapper --> Booking : builds and saves
-    BookingMapper --> bookings_table : SQL lives here
-        </pre>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">app/models/booking.rb — Rails Active Record</span>
-        <pre class="code"><span class="kw">class</span> <span class="fn">Booking</span> &lt; ApplicationRecord
-  belongs_to <span class="st">:slot</span>
-  belongs_to <span class="st">:patient</span>
-  scope <span class="st">:active</span>, -&gt; { where(status: <span class="st">"booked"</span>) }     <span class="cm"># query lives on the model</span>
-
-  <span class="kw">def</span> <span class="fn">cancel!</span>(now: Time.current)
-    <span class="kw">raise</span> TooLate <span class="kw">if</span> slot.starts_at - now &lt; 24.hours     <span class="cm"># business rule</span>
-    update!(status: <span class="st">"cancelled"</span>, cancelled_at: now)       <span class="cm"># ...and persistence, same object</span>
-  <span class="kw">end</span>
-<span class="kw">end</span></pre>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">booking.entity.ts — TypeORM in data-mapper style</span>
-        <pre class="code">@Entity(<span class="st">"bookings"</span>)
-<span class="kw">export class</span> <span class="fn">Booking</span> {
-  @PrimaryGeneratedColumn() id: number;
-  @Column() status: <span class="st">"booked"</span> | <span class="st">"cancelled"</span>;
-  @ManyToOne(() =&gt; Slot) slot: Slot;
-
-  <span class="fn">cancel</span>(now: Date) {                                  <span class="cm">// pure logic, no DB access</span>
-    <span class="kw">if</span> (<span class="kw">this</span>.slot.startsAt.getTime() - now.getTime() &lt; DAY) <span class="kw">throw new</span> <span class="fn">TooLate</span>();
-    <span class="kw">this</span>.status = <span class="st">"cancelled"</span>;
-  }
-}
-<span class="cm">// elsewhere: booking.cancel(now); await bookingRepo.save(booking);  ← the mapper persists</span></pre>
-      </div>
-      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3"></th><th class="px-4 py-3">Active record</th><th class="px-4 py-3">Data mapper</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Where you see it</td><td class="px-4 py-3">Rails Active Record, Laravel Eloquent, Django ORM, TypeORM's <code class="inline">BaseEntity</code> mode</td><td class="px-4 py-3">SQLAlchemy ORM, TypeORM repositories, Hibernate / JPA, Doctrine, hand-written Go stores</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Strength</td><td class="px-4 py-3">Very little code. Fast for CRUD-heavy apps. Everyone on a Rails team knows it.</td><td class="px-4 py-3">Domain objects are testable without a DB, and the schema can differ from the object shape.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Weakness</td><td class="px-4 py-3">Models grow to 1,000 lines. Any code can call <code class="inline">save</code> or a query from anywhere, including views.</td><td class="px-4 py-3">More files, more mapping. Overkill for a form-over-table admin.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Smell in agent code</td><td class="px-4 py-3">Queries inside loops in templates (N+1, see SD1), callbacks doing HTTP calls</td><td class="px-4 py-3">Domain classes importing the ORM session, or a mapper for every single table "for consistency"</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        <strong>The rule:</strong> follow your framework's grain. In Rails, keep Active Record, keep models thin with
-        concerns, scopes and service objects, and don't bolt a repository layer on top. In a NestJS or FastAPI
-        service with real domain rules, the data-mapper style pays for itself. Mixing both styles in one codebase
-        is the worst option, and agents do it often when asked to "add a repository" to a Rails app.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">DTOs and mappers: the shape at the boundary</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>The problem.</strong> Returning an ORM entity straight from an API leaks internal columns
-        (<code class="inline">password_hash</code>, <code class="inline">internal_notes</code>, a doctor's cost price),
-        triggers lazy loads while serialising, and freezes your schema into your public API. Accepting an entity as
-        input is worse: a client can post <code class="inline">"status": "paid"</code> and the ORM happily saves it
-        (mass assignment). A <strong>DTO</strong> (data transfer object) is a plain shape for one boundary: a request
-        DTO for what the client may send, and a response DTO for what they may see. A <strong>mapper</strong> is the
-        small function that converts between the entity and the DTO.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">booking.dto.ts — request and response shapes are not the entity</span>
-        <pre class="code"><span class="kw">export class</span> <span class="fn">CreateBookingDto</span> {          <span class="cm">// what the client MAY send</span>
-  @IsInt() slotId: number;
-  @IsOptional() @MaxLength(<span class="st">500</span>) note?: string;          <span class="cm">// no status, no patientId, no price</span>
-}
-
-<span class="kw">export type</span> <span class="fn">BookingResponse</span> = {                  <span class="cm">// what the client MAY see</span>
-  id: number; status: string; startsAt: string; doctorName: string;
-};
-
-<span class="kw">export const</span> <span class="fn">toBookingResponse</span> = (b: Booking): BookingResponse =&gt; ({
-  id: b.id,
-  status: b.status,
-  startsAt: b.slot.startsAt.toISOString(),
-  doctorName: b.slot.doctor.displayName,                 <span class="cm">// flattened on purpose</span>
-});                                                      <span class="cm">// patientId comes from the session, never the body</span></pre>
-      </div>
-      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>How to spot it:</strong> NestJS <code class="inline">*.dto.ts</code> with class-validator decorators,
-          Pydantic models in FastAPI (<code class="inline">response_model=</code>), Rails strong parameters
-          (<code class="inline">params.require(:booking).permit(:slot_id, :note)</code>) plus serializers or Jbuilder views,
-          Go request/response structs with JSON tags.</li>
-        <li><strong>Good version:</strong> input DTOs list exactly the fields a client may set. Validation rules live
-          on them (validation and error formats belong to
-          <a href="./be1.html" class="text-viol underline decoration-viol/40">BE1</a>).</li>
-        <li><strong>Over-engineering:</strong> an AutoMapper-style library plus a DTO, a "domain model", a "persistence
-          model" and a "view model" for a table with four columns, all field-for-field copies. Two shapes (input and
-          output) and one hand-written mapper function is enough for most endpoints.</li>
-      </ul>
-      <div class="mt-4 callout callout-warn">
-        <strong>Mass assignment is a security bug, not a style issue.</strong> Watch for agent code like
-        <code class="inline">Booking.create(req.body)</code>, <code class="inline">repo.save({ ...req.body })</code>,
-        <code class="inline">Booking(**payload.dict())</code> or <code class="inline">params.permit!</code>. Each one lets a
-        client set fields such as <code class="inline">status</code>, <code class="inline">price</code> or
-        <code class="inline">role</code>. The fix is an explicit input DTO or permit list. Authorization design is in
-        <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Specification, in brief</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>The problem.</strong> The same business rule, such as "a booking the patient can still cancel for
-        free", appears in a list query, in an eligibility check and in a nightly report, each written slightly
-        differently. A <strong>specification</strong> gives the rule a name and makes it composable
-        (<code class="inline">active.and(cancellableFree)</code>). In practice you rarely need the full GoF-style
-        class hierarchy. Named, composable query pieces do the job:
-      </p>
-      <div class="mt-4">
-        <span class="code-label">app/models/booking.rb — scopes are specifications</span>
-        <pre class="code">scope <span class="st">:active</span>,          -&gt; { where(status: <span class="st">"booked"</span>) }
-scope <span class="st">:free_cancellable</span>, -&gt;(now = Time.current) {
-  joins(<span class="st">:slot</span>).where(<span class="st">"slots.starts_at &gt; ?"</span>, now + 24.hours)
-}
-<span class="cm"># composed where needed, one definition of the rule:</span>
-Booking.active.free_cancellable.where(patient: current_patient)</pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        In SQLAlchemy the same idea is a function that returns a <code class="inline">where</code> clause; in
-        TypeORM it is a function that adds to a <code class="inline">QueryBuilder</code>. <strong>Over-engineering:</strong>
-        an <code class="inline">ISpecification&lt;T&gt;</code> interface with <code class="inline">AndSpecification</code>,
-        <code class="inline">OrSpecification</code> and <code class="inline">NotSpecification</code> classes for three
-        filters. Reach for it only when users build filters at runtime (a saved-search feature, a rules engine).
-      </p>
-
-      <!-- ═══════════════ PART III ═══════════════ -->
-      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · CQRS</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Split reads from writes only when one model can't serve both</h2>
-      <p class="mt-4 text-[15px] leading-relaxed">
-        <strong>CQRS</strong> (Command Query Responsibility Segregation) means using one model to <em>change</em>
-        data and a different model to <em>read</em> it. It sounds like a big architecture. In most projects it is a
-        small, boring and very useful idea at its lowest level, and an expensive mistake at its highest.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-7">The problem: one model pulled in two directions</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        The write side of the clinic app wants small, strict objects: a <code class="inline">Booking</code> with
-        rules about cancellation windows and one active booking per slot. The read side wants the opposite: the
-        clinic dashboard shows "today's bookings with patient name, doctor, specialty, deposit status and no-show
-        history" in one table, sorted and filtered twelve ways. Forcing both through the same entity gives you
-        either entities stuffed with display fields, or a dashboard that loads 400 entities and their relations
-        to show one page (the N+1 queries from
-        <a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>).
-      </p>
-      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
-        <pre class="mermaid">
-flowchart LR
-    C["Client"] -->|"POST /bookings<br/>(command)"| CMD["BookingService<br/>domain rules"]
-    CMD --> W[("bookings<br/>normalised tables")]
-    W -.->|"same DB view,<br/>or events → projector"| R[("dashboard_bookings<br/>read model")]
-    C -->|"GET /dashboard<br/>(query)"| Q["DashboardQuery<br/>plain SQL, no entities"]
-    Q --> R
-        </pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        The dotted line is the whole cost of CQRS. If the read model is a view or a query over the same tables, it
-        is always up to date and costs nothing. If it is a separate table updated from events, it is
-        <strong>eventually consistent</strong>: there is a gap, usually milliseconds, sometimes minutes during an
-        incident, when the dashboard doesn't show the booking that was just made.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">The four levels, and where to stop</h3>
-      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
-        <table class="w-full text-sm bg-card dark:bg-carddark">
-          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Level</th><th class="px-4 py-3">What it looks like</th><th class="px-4 py-3">Consistency</th><th class="px-4 py-3">Use it when</th></tr></thead>
-          <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">0 · Query objects</td><td class="px-4 py-3">Commands go through the service and entities. Screens use hand-written SQL that returns DTOs directly.</td><td class="px-4 py-3">Immediate</td><td class="px-4 py-3">Almost always. This is the default for any non-trivial list screen.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">1 · DB view</td><td class="px-4 py-3">A SQL view, or a materialized view refreshed on a schedule, shaped for the screen.</td><td class="px-4 py-3">Immediate (view) · stale until refresh (materialized)</td><td class="px-4 py-3">Reporting and dashboards with heavy joins or aggregates.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">2 · Projected table</td><td class="px-4 py-3">A denormalised read table, updated by a projector that consumes domain events (Part IV).</td><td class="px-4 py-3">Eventual</td><td class="px-4 py-3">Reads are far heavier than writes, and the read shape joins many aggregates or services.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">3 · Separate store</td><td class="px-4 py-3">Writes in Postgres, reads in Elasticsearch, Redis or a read replica cluster.</td><td class="px-4 py-3">Eventual</td><td class="px-4 py-3">Full-text search, huge fan-out reads, or a different scaling profile. Needs a team that can run it.</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">dashboard_query.py — level 0: a query object that skips the domain model</span>
-        <pre class="code"><span class="kw">DASHBOARD_SQL</span> = text(<span class="st">"""
-  SELECT b.id, s.starts_at, p.full_name AS patient, d.display_name AS doctor,
-         b.status, pay.status AS deposit_status
-  FROM bookings b
-  JOIN slots s    ON s.id = b.slot_id
-  JOIN doctors d  ON d.id = s.doctor_id
-  JOIN patients p ON p.id = b.patient_id
-  LEFT JOIN payments pay ON pay.booking_id = b.id
-  WHERE d.clinic_id = :clinic_id AND s.starts_at::date = :day
-  ORDER BY s.starts_at
-"""</span>)
-
-<span class="kw">def</span> <span class="fn">todays_bookings</span>(session, clinic_id: int, day: date) -&gt; list[DashboardRow]:
-    rows = session.execute(DASHBOARD_SQL, {<span class="st">"clinic_id"</span>: clinic_id, <span class="st">"day"</span>: day})
-    <span class="kw">return</span> [DashboardRow(**r._mapping) <span class="kw">for</span> r <span class="kw">in</span> rows]   <span class="cm"># one query, rows → DTOs, no entities</span></pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        That is CQRS: commands go through <code class="inline">BookingService</code> and its rules, and this query
-        goes straight to SQL. No bus, no events, no second database. Check the query plan with EXPLAIN as in SD1.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">A projected read model, when you really need one</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        At level 2, a <strong>projector</strong> listens for events such as <code class="inline">BookingCreated</code>
-        and <code class="inline">PaymentCaptured</code>, and upserts one flat row per booking. It must be
-        <strong>idempotent</strong> (the same event twice gives the same row) and able to <strong>rebuild</strong>
-        from scratch, because one day you will change the read shape or find a bug in the projector.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">projector.go — upsert, never blind insert</span>
-        <pre class="code"><span class="kw">func</span> (p *DashboardProjector) <span class="fn">OnPaymentCaptured</span>(ctx context.Context, e PaymentCaptured) <span class="kw">error</span> {
-    _, err := p.db.<span class="fn">ExecContext</span>(ctx, <span class="st">`
-        UPDATE dashboard_bookings
-           SET deposit_status = 'paid', version = $2
-         WHERE booking_id = $1 AND version &lt; $2`</span>,   <span class="cm">// ignore stale or duplicate events</span>
-        e.BookingID, e.Version)
-    <span class="kw">return</span> err
-}</pre>
-      </div>
-      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>How to spot it:</strong> folders named <code class="inline">commands/</code> and
-          <code class="inline">queries/</code>, NestJS <code class="inline">@nestjs/cqrs</code> with
-          <code class="inline">CommandBus</code> / <code class="inline">QueryBus</code> and handlers, MediatR in .NET,
-          tables or collections named <code class="inline">*_read_model</code> / <code class="inline">*_view</code>,
-          classes named <code class="inline">*Projector</code> or <code class="inline">*Projection</code>.</li>
-        <li><strong>Read-your-writes:</strong> with an eventually consistent read model, the user who just booked
-          may not see their booking. Common fixes: return the new booking in the command response and show it
-          directly, or read the patient's own bookings from the write side.</li>
-      </ul>
-      <div class="mt-4 callout callout-warn">
-        <strong>When CQRS is over-engineering:</strong> a CRUD admin with a command bus, a query bus, a handler class
-        per endpoint and an event-sourced read store, built by an agent because you said "make it scalable". Every
-        extra level adds eventual consistency, a rebuild procedure and one more thing to monitor. Start at level 0.
-        Move up one level only when you can show the slow query or the load profile that forces it.
-      </div>
-
-      <!-- ═══════════════ PART IV ═══════════════ -->
-      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Outbox, idempotent consumers &amp; saga</div>
-      <h2 class="font-display text-2xl font-bold mt-2">Once work leaves the transaction, assume every step can crash</h2>
-      <p class="mt-4 text-[15px] leading-relaxed">
-        A database transaction protects you only inside one database. The moment a use case also publishes a
-        message, calls Stripe or sends an email, you have two systems that can disagree. The three patterns in this
-        Part are how production systems stay consistent anyway. The messaging infrastructure itself (queues,
-        retries, dead-letter queues) is <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>'s
-        topic, and when to split into services at all is
-        <a href="./sd4.html" class="text-viol underline decoration-viol/40">SD4</a>'s.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-7">The dual-write problem</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>The problem.</strong> The booking service saves a booking and then publishes
-        <code class="inline">BookingCreated</code> so that the notification service sends a confirmation and the
-        dashboard projector updates. That is two writes to two systems, with no transaction spanning both. Whichever
-        order you choose, a crash or timeout between them loses consistency:
-      </p>
-      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
-        <pre class="mermaid">
-sequenceDiagram
-    participant S as BookingService
-    participant DB as Postgres
-    participant MQ as Message broker
-    Note over S,MQ: Order A · commit first, then publish
-    S->>DB: INSERT booking + COMMIT ✅
-    S--xMQ: publish BookingCreated
-    Note over S: pod killed during deploy<br/>booking exists, nobody is told ❌
-    Note over S,MQ: Order B · publish first, then commit
-    S->>MQ: publish BookingCreated ✅
-    S->>DB: INSERT booking
-    DB-->>S: unique_violation, ROLLBACK
-    Note over MQ: patient gets a confirmation<br/>for a booking that does not exist ❌
-        </pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Retrying doesn't fix it, because the process that would retry is the one that died. This is the most
-        common consistency bug in agent-written event code: <code class="inline">await repo.save(booking);
-        await bus.publish(event);</code>, two lines that look obviously correct.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Transactional outbox: turn two writes into one</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>The fix.</strong> Don't publish from the use case. Instead, insert the event as a row in an
-        <code class="inline">outbox</code> table <strong>in the same transaction</strong> as the booking. Either both
-        rows commit or neither does. A separate <strong>relay</strong> process reads unpublished outbox rows, publishes
-        them to the broker, and marks them as sent.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">booking.service.ts — booking and event commit together</span>
-        <pre class="code"><span class="kw">await this</span>.dataSource.<span class="fn">transaction</span>(<span class="kw">async</span> (manager) =&gt; {
-  <span class="kw">const</span> booking = <span class="kw">await</span> manager.<span class="fn">save</span>(Booking, { slotId, patientId, status: <span class="st">"booked"</span> });
-  <span class="kw">await</span> manager.<span class="fn">insert</span>(OutboxMessage, {               <span class="cm">// same manager = same transaction</span>
-    id: <span class="fn">randomUUID</span>(),                                   <span class="cm">// becomes the message id consumers dedupe on</span>
-    topic: <span class="st">"booking.created"</span>,
-    payload: { bookingId: booking.id, slotId, patientId },
-  });
-});                                                      <span class="cm">// no bus.publish() anywhere in the use case</span></pre>
-      </div>
-      <div class="mt-4">
-        <span class="code-label">relay.go — the polling publisher</span>
-        <pre class="code"><span class="kw">for</span> {
-    tx, _ := db.<span class="fn">BeginTx</span>(ctx, <span class="kw">nil</span>)
-    rows := <span class="fn">query</span>(tx, <span class="st">`SELECT id, topic, payload FROM outbox
-                     WHERE sent_at IS NULL ORDER BY created_at
-                     LIMIT 100 FOR UPDATE SKIP LOCKED`</span>)      <span class="cm">// several relays can run safely</span>
-    <span class="kw">for</span> _, m := <span class="kw">range</span> rows {
-        <span class="kw">if</span> err := broker.<span class="fn">Publish</span>(m.Topic, m.ID, m.Payload); err != <span class="kw">nil</span> { <span class="kw">break</span> }
-        tx.<span class="fn">Exec</span>(<span class="st">`UPDATE outbox SET sent_at = now() WHERE id = $1`</span>, m.ID)
-    }
-    tx.<span class="fn">Commit</span>()   <span class="cm">// crash before this line → rows are published AGAIN next loop</span>
-    time.<span class="fn">Sleep</span>(<span class="st">500</span> * time.Millisecond)
-}</pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Read the last comment twice. The outbox guarantees <strong>at-least-once</strong> delivery, never exactly-once:
-        a crash after publishing and before marking the row sends the same message again. That is fine, as long as
-        every consumer is idempotent (next section). Error handling is trimmed here to fit the page.
+        Every HTTP response can tell browsers and CDNs whether they may keep a copy, who may share it, and for how
+        long. This is the cheapest cache you will ever build, because you write no cache code at all: you set a
+        header. It is also the easiest to get dangerously wrong, because a wrong header on a personal page lets a
+        shared cache hand that page to the next person. (<a href="./co4.html" class="text-viol underline decoration-viol/40">CO4</a>
+        covers HTTP basics.)
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">What you see in code</th><th class="px-4 py-3">Is it an outbox?</th><th class="px-4 py-3">Why</th></tr></thead>
+            <th class="px-4 py-3">Directive</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">Use it for</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">outbox</code> table + relay worker</td><td class="px-4 py-3">Yes (polling publisher)</td><td class="px-4 py-3">The classic form. Simple, and adds some polling latency.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Debezium or another CDC tool reading the Postgres WAL</td><td class="px-4 py-3">Yes (log tailing)</td><td class="px-4 py-3">Change data capture streams committed outbox rows. Debezium ships an "outbox event router" for exactly this. Lower latency, more infrastructure.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">A job enqueued into a queue stored in the <em>same</em> database, inside the transaction</td><td class="px-4 py-3">Effectively yes</td><td class="px-4 py-3">The job row commits atomically with the booking. Check that the queue really shares the connection and transaction.</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Rails <code class="inline">after_commit { publish }</code> or TypeORM subscriber that publishes</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Runs after the commit in the same process. A crash between the two still loses the event (Order A above).</td></tr>
-            <tr><td class="px-4 py-3 font-semibold"><code class="inline">publish()</code> inside the transaction block</td><td class="px-4 py-3">No, and worse</td><td class="px-4 py-3">The message goes out even if the transaction then rolls back (Order B above).</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">public</code></td><td class="px-4 py-3">Shared caches (CDN, proxies) may store it</td><td class="px-4 py-3">The public clinic page, images</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">private</code></td><td class="px-4 py-3">Only the user's own browser may store it</td><td class="px-4 py-3">"My bookings" JSON, if you cache it at all</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">no-store</code></td><td class="px-4 py-3">Nobody stores it, anywhere</td><td class="px-4 py-3">Medical records, payment pages, anything after login that is sensitive</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">no-cache</code></td><td class="px-4 py-3">You may store it, but must revalidate with the server before each use. It does <em>not</em> mean "don't cache".</td><td class="px-4 py-3">HTML pages that change often, combined with an ETag</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">max-age=N</code></td><td class="px-4 py-3">Fresh for N seconds in any cache</td><td class="px-4 py-3">Everything cacheable</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">s-maxage=N</code></td><td class="px-4 py-3">Overrides <code class="inline">max-age</code> for shared caches only</td><td class="px-4 py-3">Short in the browser, longer at the CDN, where you can purge</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">stale-while-revalidate=N</code></td><td class="px-4 py-3">After expiry, serve the stale copy for up to N more seconds while fetching a fresh one in the background</td><td class="px-4 py-3">Pages where "a few seconds old" beats "slow"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">immutable</code></td><td class="px-4 py-3">It will never change at this URL, so don't even revalidate</td><td class="px-4 py-3">Build assets with a content hash in the filename, such as <code class="inline">app.3f9a1c.js</code></td></tr>
           </tbody>
         </table>
       </div>
-      <div class="mt-4 callout callout-info">
-        <strong>When the outbox is over-engineering:</strong> when nothing outside the database needs to know. If the
-        "event handler" only updates another table in the same database, do it in the same transaction. If the side
-        effect is a best-effort nicety (an analytics ping) and losing one is acceptable, <code class="inline">after_commit</code>
-        is fine. Use the outbox when a lost message means a lost payment, a missing confirmation or a stale
-        read model that nobody will notice.
-      </div>
-
-      <h3 class="font-semibold text-lg mt-8">Idempotent consumers: duplicates are normal</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        Outbox relays, brokers and retries all deliver <strong>at least once</strong>. So the consumer, not the
-        producer, is where "exactly once" <em>effects</em> are made. The standard technique: record each processed
-        message id in the <strong>same transaction</strong> as the consumer's own change, and skip ids you have
-        already seen. Queue mechanics and dead-letter handling are in
-        <a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>; idempotency keys on incoming HTTP
-        requests are in <a href="./sd11.html" class="text-viol underline decoration-viol/40">SD11</a>.
-      </p>
-      <div class="mt-4">
-        <span class="code-label">notifications/consumer.py — dedupe and effect in one transaction</span>
-        <pre class="code"><span class="kw">def</span> <span class="fn">handle_booking_created</span>(msg):
-    <span class="kw">with</span> Session(engine) <span class="kw">as</span> session, session.begin():
-        inserted = session.execute(
-            insert(ProcessedMessage)
-            .values(message_id=msg.id, consumer=<span class="st">"notifications"</span>)
-            .on_conflict_do_nothing()                  <span class="cm"># postgres dialect insert</span>
-        ).rowcount
-        <span class="kw">if</span> inserted == <span class="st">0</span>:
-            <span class="kw">return</span>                                     <span class="cm"># seen before: ack and skip</span>
-        session.add(EmailToSend(booking_id=msg.payload[<span class="st">"bookingId"</span>],
-                                template=<span class="st">"booking_confirmed"</span>))
-    <span class="cm"># the email itself is sent by another outbox-style worker, not from here</span></pre>
-      </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Some effects are naturally idempotent and need no table: "set status to paid", an upsert, or a
-        version-guarded update like the projector in Part III. Effects that are <em>not</em>, such as sending an
-        email, charging a card or incrementing a counter, always need a dedupe key.
-      </p>
-
-      <h3 class="font-semibold text-lg mt-8">Saga: a long transaction made of local ones</h3>
-      <p class="mt-2 text-[15px] leading-relaxed">
-        <strong>The problem.</strong> Booking a paid appointment touches three systems: our database (hold the
-        slot), a payment provider (charge the deposit) and a notification service (confirm to the patient). There is
-        no transaction across Postgres and Stripe, and distributed two-phase commit is not something you want.
-        A <strong>saga</strong> breaks the business transaction into a sequence of local steps, each committed on its
-        own, and gives every step that can be undone a <strong>compensating action</strong>: a new step that
-        semantically reverses it (release the slot, refund the charge). A saga never "rolls back" in the database
-        sense. It moves forward to a consistent end state.
+        An <strong>ETag</strong> is a fingerprint of a response, such as a hash of the body or a version number.
+        The browser sends it back in <code class="inline">If-None-Match</code>. If nothing changed, the server replies
+        <code class="inline">304 Not Modified</code> with no body. The server still does some work, but the payload
+        doesn't travel again:
       </p>
       <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
         <pre class="mermaid">
 sequenceDiagram
     autonumber
-    participant O as BookingSaga (orchestrator)
-    participant B as Booking (our DB)
-    participant P as Payments (Stripe)
-    participant N as Notifications
-    O->>B: hold slot 42 → booking PENDING
-    B-->>O: held
-    O->>P: charge deposit (idempotency key = booking id)
-    alt payment succeeds
-        P-->>O: captured
-        O->>B: confirm booking → CONFIRMED
-        O->>N: send confirmation
-    else card declined or timeout after retries
-        P-->>O: failed
-        O->>B: compensate: release slot → CANCELLED
-        O->>N: send payment-failed notice
-    end
+    participant B as Browser
+    participant S as API server
+    B->>S: GET /clinics/7
+    S-->>B: 200 OK, body 48 KB<br/>ETag "v42", Cache-Control no-cache
+    Note over B: stores body and ETag
+    B->>S: GET /clinics/7<br/>If-None-Match "v42"
+    Note over S: clinic.version is still 42
+    S-->>B: 304 Not Modified, no body
+    Note over B: reuses the stored 48 KB
         </pre>
       </div>
+      <div class="mt-4">
+        <span class="code-label">HTTP responses — three typical header sets</span>
+        <pre class="code"><span class="cm"># Hashed static asset: cache for a year, never revalidate</span>
+Cache-Control: public, max-age=31536000, immutable
+
+<span class="cm"># Public clinic page: 1 min in browsers, 10 min at the CDN, serve stale while refreshing</span>
+Cache-Control: public, max-age=60, s-maxage=600, stale-while-revalidate=60
+ETag: <span class="st">"clinic-7-v42"</span>
+
+<span class="cm"># Anything personal or sensitive: no copies anywhere</span>
+Cache-Control: <span class="kw">no-store</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The CDN: a shared cache at the edge</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A CDN such as Cloudflare or CloudFront keeps copies of your responses in data centres close to users. It
+        makes public pages and assets fast for everyone, and it absorbs traffic spikes before they reach your
+        servers. Setup, cache rules and purging are covered in
+        <a href="./op6.html" class="text-viol underline decoration-viol/40">OP6 Cloudflare Essentials</a>. For design
+        purposes, three ideas matter:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>The cache key.</strong> By default a CDN stores one copy per URL (plus a few details). If the
+          response varies by something that isn't in the URL, such as a cookie, a language header or the logged-in
+          user, then either that thing must be part of the key (the <code class="inline">Vary</code> header, or a CDN
+          rule) or the response must not be shared at all.</li>
+        <li><strong>Purging.</strong> CDNs let you purge by URL, and some also by tag or prefix. A long
+          <code class="inline">s-maxage</code> plus a purge on update gives you fast pages and fresh data at the same
+          time.</li>
+        <li><strong>Only public content.</strong> Treat any response that depends on who is logged in as
+          uncacheable at the CDN, unless you have a very specific, reviewed setup. This is the layer where a leak
+          reaches the most people.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Application caches: in-process vs Redis</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Inside your backend you choose between a cache in the process's own memory and a shared cache server,
+        usually Redis (or a compatible server such as Valkey). Most production apps with more than one server
+        instance use Redis for anything that changes, and in-process memory only for small, near-constant data.
+      </p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Property</th><th class="px-4 py-3">In-process (a map or LRU in the app)</th><th class="px-4 py-3">Redis (shared)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Speed</td><td class="px-4 py-3">Fastest: no network</td><td class="px-4 py-3">One network round trip, well under a millisecond nearby</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shared across servers</td><td class="px-4 py-3">No. Each of 4 instances has its own copy, and they drift apart.</td><td class="px-4 py-3">Yes. One copy, one place to invalidate.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Survives a deploy</td><td class="px-4 py-3">No, every restart starts cold</td><td class="px-4 py-3">Yes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Invalidation</td><td class="px-4 py-3">Hard: you must reach every process</td><td class="px-4 py-3">One <code class="inline">DEL</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Memory</td><td class="px-4 py-3">Competes with your app, so it can cause out-of-memory crashes</td><td class="px-4 py-3">Its own budget, with an eviction policy</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Good for</td><td class="px-4 py-3">Config, feature lists, specialties, compiled templates</td><td class="px-4 py-3">Profiles, computed pages, API responses, sessions, rate-limit counters</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn">
+        <strong>In-process caches and serverless don't mix well.</strong> On Vercel, Lambda or any autoscaled platform,
+        you may have dozens of short-lived instances. Each one starts empty, and a <code class="inline">new Map()</code>
+        at module level gives you dozens of caches that disagree with each other. If an agent adds a module-level map
+        "as a cache" in serverless code, ask what happens on the other instances.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Database-level caching</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Postgres already keeps recently used data pages in memory (its <em>shared buffers</em>, plus the operating
+        system's file cache), which is why a query often runs faster the second time. But it has <strong>no result
+        cache</strong>: it doesn't store the answer to a query and hand it back. (MySQL had a query cache and removed
+        it in 8.0, because invalidating it hurt more than it helped.) The database-side tool you will actually use
+        is the <strong>materialized view</strong>: a query whose result is saved as a table and refreshed when you
+        choose.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">migration — a materialized view for the search page</span>
+        <pre class="code"><span class="kw">CREATE MATERIALIZED VIEW</span> <span class="fn">clinic_free_slots_14d</span> <span class="kw">AS</span>
+<span class="kw">SELECT</span> d.clinic_id, date(s.starts_at) <span class="kw">AS</span> day, count(*) <span class="kw">AS</span> free_slots
+<span class="kw">FROM</span> slots s <span class="kw">JOIN</span> doctors d <span class="kw">ON</span> d.id = s.doctor_id
+<span class="kw">WHERE</span> s.starts_at <span class="kw">BETWEEN</span> now() <span class="kw">AND</span> now() + interval <span class="st">'14 days'</span>
+  <span class="kw">AND NOT EXISTS</span> (<span class="kw">SELECT</span> 1 <span class="kw">FROM</span> bookings b <span class="kw">WHERE</span> b.slot_id = s.id <span class="kw">AND</span> b.status = <span class="st">'booked'</span>)
+<span class="kw">GROUP BY</span> 1, 2;
+
+<span class="kw">CREATE UNIQUE INDEX ON</span> clinic_free_slots_14d (clinic_id, day);  <span class="cm">-- required for CONCURRENTLY</span>
+
+<span class="cm">-- run every minute from a scheduled job (SD8); readers are not blocked</span>
+<span class="kw">REFRESH MATERIALIZED VIEW CONCURRENTLY</span> clinic_free_slots_14d;</pre>
+      </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        Notice the <strong>order of steps</strong>. The cheapest-to-undo step (holding a slot in our own DB) goes
-        first. Steps that can't be undone at all, such as sending an email, go last, after the decision point.
-        You can refund a charge, but you can't unsend "Your booking is confirmed".
+        The view is exactly as stale as your refresh interval, which suits a search page and does not suit the
+        booking decision. Refreshing is scheduled work, so it belongs in a background job
+        (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>). Adding a read replica is a
+        different tool, for a different problem, covered in <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
       </p>
 
-      <h3 class="font-semibold text-lg mt-8">Orchestration vs choreography</h3>
+      <h3 class="font-semibold text-lg mt-8">Framework caches</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        There are two ways to coordinate the steps. In <strong>orchestration</strong>, one component (above,
-        <code class="inline">BookingSaga</code>) tells each participant what to do and keeps the saga's state. In
-        <strong>choreography</strong>, there is no coordinator: each service reacts to the previous service's event
-        (<code class="inline">BookingHeld</code> → payments charges → <code class="inline">PaymentFailed</code> →
-        booking releases the slot). Choreography is event-driven design from
-        <a href="./sd4.html" class="text-viol underline decoration-viol/40">SD4</a>, and it relies on every event
-        going through an outbox.
+        Most frameworks wrap these layers in their own API. The concepts in this module still apply, but the names
+        change. Know which one your stack uses, and read its docs before you trust its defaults:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Next.js</strong>: with Cache Components enabled, the <code class="inline">'use cache'</code>
+          directive caches a function or component, <code class="inline">cacheLife</code> sets how long,
+          <code class="inline">cacheTag</code> labels entries, and <code class="inline">updateTag</code> /
+          <code class="inline">revalidateTag</code> invalidate them after a mutation. See
+          <a href="./fe2.html" class="text-viol underline decoration-viol/40">FE2</a> and the
+          <a class="text-coral underline" href="https://nextjs.org/docs/app/api-reference/directives/use-cache" target="_blank" rel="noopener">use cache docs</a>.</li>
+        <li><strong>Rails</strong>: <code class="inline">Rails.cache.fetch(key, expires_in:)</code> is cache-aside in one
+          call, and fragment caching with key-based expiry is the Rails idiom for versioned keys
+          (<a href="./be2.html" class="text-viol underline decoration-viol/40">BE2</a>).</li>
+        <li><strong>NestJS</strong>: the cache manager module and an interceptor that caches GET responses
+          (<a href="./be3.html" class="text-viol underline decoration-viol/40">BE3</a>). Check what the key is before you
+          put it on an authenticated route.</li>
+        <li><strong>FastAPI and Gin</strong>: no built-in cache, so you call Redis directly with redis-py or go-redis
+          (<a href="./be4.html" class="text-viol underline decoration-viol/40">BE4</a>,
+          <a href="./be5.html" class="text-viol underline decoration-viol/40">BE5</a>).</li>
+      </ul>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Patterns, TTLs &amp; invalidation</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Decide the write path first, and the read path follows</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Almost every caching bug is a write bug: the data changed and the cache didn't hear about it. So when you
+        review a cache, don't start at the <code class="inline">get</code>. Start by finding every place that
+        <em>writes</em> the underlying data and checking what each one does to the cache.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Cache-aside: the default you'll see 90% of the time</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In <strong>cache-aside</strong> (also called lazy loading), the application manages the cache itself. On a
+        read it tries the cache, and on a miss it loads from the database and stores the result. On a write it
+        updates the database and then <strong>deletes</strong> the cache key, so the next read loads fresh data.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    R["GET clinic 7"] --> C{"key in Redis?"}
+    C -- "hit" --> H["return cached JSON"]
+    C -- "miss" --> D["SELECT from Postgres"]
+    D --> S["SET key with TTL"]
+    S --> H2["return fresh JSON"]
+    W["UPDATE clinic 7"] --> DB["write Postgres, COMMIT"]
+    DB --> X["DEL key"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinics/profile.ts — cache-aside with ioredis</span>
+        <pre class="code"><span class="kw">export async function</span> <span class="fn">getClinicProfile</span>(id: <span class="kw">number</span>) {
+  <span class="kw">const</span> key = <span class="st">`clinic:v3:${id}:profile`</span>;
+  <span class="kw">try</span> {
+    <span class="kw">const</span> hit = <span class="kw">await</span> redis.get(key);
+    <span class="kw">if</span> (hit) <span class="kw">return</span> JSON.parse(hit);
+  } <span class="kw">catch</span> (err) {
+    log.warn({ err }, <span class="st">"redis read failed, falling back to db"</span>); <span class="cm">// cache down ≠ site down</span>
+  }
+  <span class="kw">const</span> profile = <span class="kw">await</span> db.clinic.findPublicProfile(id);
+  <span class="kw">if</span> (profile) {
+    <span class="kw">const</span> ttl = <span class="st">300</span> + Math.floor(Math.random() * <span class="st">60</span>);           <span class="cm">// TTL + jitter (Part IV)</span>
+    <span class="kw">await</span> redis.set(key, JSON.stringify(profile), <span class="st">"EX"</span>, ttl).catch(() =&gt; {});
+  }
+  <span class="kw">return</span> profile;
+}
+
+<span class="kw">export async function</span> <span class="fn">updateClinic</span>(id: <span class="kw">number</span>, input: ClinicUpdate) {
+  <span class="kw">await</span> db.clinic.update(id, input);                <span class="cm">// commits first…</span>
+  <span class="kw">await</span> redis.del(<span class="st">`clinic:v3:${id}:profile`</span>);      <span class="cm">// …then invalidates. Delete, don't set.</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two details separate a good version from a bad one. The good version <strong>deletes</strong> the key on
+        write instead of writing the new value into it: setting it risks racing with a concurrent reader, and it
+        caches a shape that the read path may build differently. It also <strong>survives Redis being down</strong>
+        by falling back to the database. The same pattern in Python and Ruby:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinics/profile.py (redis-py) · clinic.rb (Rails)</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">get_clinic_profile</span>(clinic_id: int) -&gt; dict | None:
+    key = <span class="st">f"clinic:v3:{clinic_id}:profile"</span>
+    <span class="kw">if</span> (hit := r.get(key)) <span class="kw">is not None</span>:
+        <span class="kw">return</span> json.loads(hit)
+    profile = repo.find_public_profile(clinic_id)
+    <span class="kw">if</span> profile:
+        r.set(key, json.dumps(profile), ex=<span class="st">300</span>)
+    <span class="kw">return</span> profile
+
+<span class="cm"># Rails: cache-aside in one call; the block runs only on a miss</span>
+Rails.cache.fetch(<span class="st">"clinic:v3:#{id}:profile"</span>, expires_in: <span class="st">5</span>.minutes) <span class="kw">do</span>
+  Clinic.find(id).public_profile
+<span class="kw">end</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Read-through, write-through and write-behind</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The other named patterns move responsibility around. In <strong>read-through</strong>, a cache library or
+        service loads from the database on a miss, so your code only ever talks to the cache. Rails'
+        <code class="inline">fetch</code> above is close to this. In <strong>write-through</strong>, every write goes
+        to the cache and the database together, so the cache is never stale, but you pay on every write. In
+        <strong>write-behind</strong> (write-back), writes go to the cache and are flushed to the database later,
+        which is fast and risky.
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3"></th><th class="px-4 py-3">Orchestration</th><th class="px-4 py-3">Choreography</th></tr></thead>
+            <th class="px-4 py-3">Pattern</th><th class="px-4 py-3">Read path</th><th class="px-4 py-3">Write path</th><th class="px-4 py-3">Staleness</th><th class="px-4 py-3">Right when</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Where the flow lives</td><td class="px-4 py-3">In one place you can read top to bottom</td><td class="px-4 py-3">Spread across the event handlers of every service</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">"Where is booking 812 stuck?"</td><td class="px-4 py-3">Look at the saga's state row</td><td class="px-4 py-3">Correlate logs across services by booking id</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Coupling</td><td class="px-4 py-3">The orchestrator knows every participant</td><td class="px-4 py-3">Services know only events, so adding a listener is easy</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Risk</td><td class="px-4 py-3">The orchestrator becomes a "god service"</td><td class="px-4 py-3">Cyclic event chains, and nobody can draw the whole flow</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Good default for</td><td class="px-4 py-3">Business-critical flows with money and compensations, and 3+ steps</td><td class="px-4 py-3">Simple fan-out: "booking confirmed → email, analytics, loyalty points"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cache-aside</td><td class="px-4 py-3">App checks cache, loads DB on miss</td><td class="px-4 py-3">App writes DB, deletes key</td><td class="px-4 py-3">Up to TTL if an invalidation is missed</td><td class="px-4 py-3">The default for web apps. Simple, and it survives cache outages.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Read-through</td><td class="px-4 py-3">Cache layer loads DB on miss</td><td class="px-4 py-3">Usually paired with delete or write-through</td><td class="px-4 py-3">Same as cache-aside</td><td class="px-4 py-3">A framework or library already provides it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Write-through</td><td class="px-4 py-3">Always from cache</td><td class="px-4 py-3">Write DB and cache in the same operation</td><td class="px-4 py-3">Low, but a failed half-write leaves them different</td><td class="px-4 py-3">Data read immediately after writing, such as a user's settings</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Write-behind</td><td class="px-4 py-3">Always from cache</td><td class="px-4 py-3">Write cache, flush to DB later in batches</td><td class="px-4 py-3">DB lags behind, and a crash can <strong>lose writes</strong></td><td class="px-4 py-3">High-volume counters where losing a few is acceptable: view counts, "last seen"</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger">
+        <strong>Never use write-behind for anything that matters.</strong> A booking, a payment or an order written
+        only to Redis and "flushed later" is lost if Redis restarts before the flush. If an agent proposes buffering
+        business writes in the cache for speed, the answer is no. Use a queue with durable storage
+        (<a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a>) instead.
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Choosing a TTL on purpose</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The TTL (time to live) is your safety net. Even if every invalidation works, a TTL puts an upper bound on how
+        wrong the cache can be when one doesn't. Every key gets one. Pick it from the business question "how stale
+        can this be before a user is harmed or confused?", not from habit:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Data</th><th class="px-4 py-3">TTL</th><th class="px-4 py-3">Also invalidated on write?</th><th class="px-4 py-3">Reasoning</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Specialties list</td><td class="px-4 py-3">1 day</td><td class="px-4 py-3">Yes, on admin edit</td><td class="px-4 py-3">Changes a few times a year</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clinic profile</td><td class="px-4 py-3">5–15 min</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">The TTL only catches a missed invalidation</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Free-slot counts</td><td class="px-4 py-3">10–30 s</td><td class="px-4 py-3">No, too many writers</td><td class="px-4 py-3">A hint only. The booking re-checks.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Exchange rates from an API</td><td class="px-4 py-3">1 hour</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Matches the provider's update rate</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Session data</td><td class="px-4 py-3">The session length, such as 7 days sliding</td><td class="px-4 py-3">Deleted on logout</td><td class="px-4 py-3">The TTL is the security property (<a href="./sd9.html" class="text-viol underline decoration-viol/40">SD9</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A key with no TTL at all is a bug waiting for a missed invalidation, and it also slowly fills memory with keys
+        for records nobody reads any more. In review, <code class="inline">redis.set(key, value)</code> with no
+        expiry should always prompt the question "why not?".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Four invalidation strategies</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "There are only two hard things in computer science: cache invalidation and naming things." Invalidation
+        is hard because the code that writes data is often far away from the code that caches it. Pick a strategy
+        per cache, deliberately:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Strategy</th><th class="px-4 py-3">How</th><th class="px-4 py-3">Strength</th><th class="px-4 py-3">Weakness</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">TTL only</td><td class="px-4 py-3">Let entries expire</td><td class="px-4 py-3">No write-path code at all</td><td class="px-4 py-3">Always stale for up to the TTL</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Delete on write</td><td class="px-4 py-3">The service that writes deletes the key after commit</td><td class="px-4 py-3">Simple and immediate</td><td class="px-4 py-3">Every writer must remember, including admin scripts and jobs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Event-based</td><td class="px-4 py-3">Writes publish <code class="inline">clinic.updated</code>, and a consumer deletes the keys</td><td class="px-4 py-3">Writers don't need to know about caches</td><td class="px-4 py-3">Needs reliable events: the outbox from <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a> and consumers from <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Versioned keys</td><td class="px-4 py-3">Put a version in the key. A write bumps the version, so old keys are never read again and expire on their own.</td><td class="px-4 py-3">No delete race, and invalidating many keys is one increment</td><td class="px-4 py-3">Old entries occupy memory until their TTL</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tag-based</td><td class="px-4 py-3">Label entries with tags (<code class="inline">clinic:7</code>) and invalidate by tag</td><td class="px-4 py-3">"Everything about clinic 7" in one call</td><td class="px-4 py-3">Needs framework or CDN support, such as Next.js <code class="inline">cacheTag</code> or CDN purge-by-tag</td></tr>
           </tbody>
         </table>
       </div>
       <div class="mt-4">
-        <span class="code-label">app/sagas/booking_saga.rb — an orchestrator as a persisted state machine</span>
-        <pre class="code"><span class="kw">class</span> <span class="fn">BookingSaga</span>
-  <span class="kw">def</span> <span class="fn">step</span>(saga)                         <span class="cm"># called by a job; safe to call again</span>
-    <span class="kw">case</span> saga.state
-    <span class="kw">when</span> <span class="st">"slot_held"</span>
-      result = Payments.charge(saga.booking, idempotency_key: <span class="st">"dep-#{saga.booking_id}"</span>)
-      saga.update!(state: result.ok? ? <span class="st">"paid"</span> : <span class="st">"compensating"</span>)
-    <span class="kw">when</span> <span class="st">"paid"</span>
-      Booking.transaction <span class="kw">do</span>
-        saga.booking.update!(status: <span class="st">"confirmed"</span>)
-        Outbox.add!(<span class="st">"booking.confirmed"</span>, booking_id: saga.booking_id)
-        saga.update!(state: <span class="st">"done"</span>)
-      <span class="kw">end</span>
-    <span class="kw">when</span> <span class="st">"compensating"</span>
-      Booking.transaction <span class="kw">do</span>
-        saga.booking.update!(status: <span class="st">"cancelled"</span>)    <span class="cm"># releases the slot (SD1 partial index)</span>
-        Outbox.add!(<span class="st">"booking.payment_failed"</span>, booking_id: saga.booking_id)
-        saga.update!(state: <span class="st">"compensated"</span>)
-      <span class="kw">end</span>
-    <span class="kw">end</span>
-  <span class="kw">end</span>
-<span class="kw">end</span></pre>
-      </div>
-      <p class="mt-3 text-[15px] leading-relaxed">
-        Three properties make this safe, and they are what you check in review. The state is <strong>persisted</strong>,
-        so a crash resumes from the last step instead of starting over. Every external call carries an
-        <strong>idempotency key</strong>, so a retried charge doesn't charge twice (Stripe supports this through an
-        <code class="inline">Idempotency-Key</code> header). Every compensation is itself <strong>idempotent</strong> and
-        <strong>retried until it succeeds</strong>, because a failed compensation leaves the system in the
-        inconsistent state the saga exists to prevent. The state column is the State pattern from
-        <a href="./sd6.html" class="text-viol underline decoration-viol/40">SD6</a> applied to a workflow.
-      </p>
-      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
-        <li><strong>How to spot it:</strong> classes or tables named <code class="inline">*Saga</code>,
-          <code class="inline">*Workflow</code> or <code class="inline">*ProcessManager</code>; status values like
-          <code class="inline">payment_pending</code> / <code class="inline">compensating</code>; workflow engines such as
-          Temporal or AWS Step Functions (both are orchestrators); in choreography, pairs of events like
-          <code class="inline">PaymentFailed</code> → <code class="inline">SlotReleased</code>.</li>
-        <li><strong>Over-engineering:</strong> a saga for steps that all live in one database. That is a transaction.
-          Also, a monolith that charges one card and sends one email rarely needs a saga framework: a status column,
-          an idempotency key and a retrying job <em>is</em> a small orchestrated saga, and that is enough.</li>
-      </ul>
-      <div class="mt-4 callout callout-danger">
-        <strong>The incident this prevents:</strong> an agent writes <code class="inline">createBooking(); charge();
-        sendEmail();</code> in one request handler with a try/catch that "rolls back" by deleting the booking. Stripe
-        times out, the handler deletes the booking, but the charge actually went through. The patient is charged
-        for an appointment that no longer exists, and no row anywhere records it. Persist the saga state
-        <em>before</em> calling out, and compensate with a refund, never with a delete.
+        <span class="code-label">clinics/cache.go — versioned keys with go-redis</span>
+        <pre class="code"><span class="cm">// One counter per clinic. Every cached thing about the clinic embeds it.</span>
+<span class="kw">func</span> <span class="fn">clinicKey</span>(ctx context.Context, id <span class="kw">int64</span>, part <span class="kw">string</span>) <span class="kw">string</span> {
+    ver, _ := rdb.Get(ctx, fmt.Sprintf(<span class="st">"clinic:%d:ver"</span>, id)).Int64() <span class="cm">// missing → 0</span>
+    <span class="kw">return</span> fmt.Sprintf(<span class="st">"clinic:%d:v%d:%s"</span>, id, ver, part)
+}
+
+<span class="cm">// After the DB transaction commits: one INCR invalidates profile, doctors, reviews…</span>
+<span class="kw">func</span> <span class="fn">invalidateClinic</span>(ctx context.Context, id <span class="kw">int64</span>) <span class="kw">error</span> {
+    <span class="kw">return</span> rdb.Incr(ctx, fmt.Sprintf(<span class="st">"clinic:%d:ver"</span>, id)).Err()
+}</pre>
       </div>
 
-      <h3 class="font-semibold text-lg mt-8">The module on one page</h3>
+      <h3 class="font-semibold text-lg mt-8">The stale-set race, and why "after commit" matters</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Use this table in code review. If you can't fill in the middle column for a pattern in the diff, ask why it
-        is there.
+        Cache-aside has one well-known race. A slow reader loads old data, a writer updates the database and deletes
+        the key, and then the slow reader puts the old data back. The cache is now wrong until the TTL expires:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    participant R as Reader (slow)
+    participant C as Redis
+    participant DB as Postgres
+    participant W as Writer
+    R->>C: GET clinic:7 → miss
+    R->>DB: SELECT clinic 7 → old hours
+    W->>DB: UPDATE clinic 7, COMMIT
+    W->>C: DEL clinic:7
+    R->>C: SET clinic:7 = old hours
+    Note over C: stale until TTL expires ❌<br/>the TTL is what saves you
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The race is rare and the TTL bounds it, which is why cache-aside is still the default. A related bug is
+        worse and common in agent code: deleting the key <strong>inside</strong> the database transaction, before
+        it commits. A reader can then refill the cache from the not-yet-updated row. Always invalidate
+        <strong>after commit</strong> (ORMs offer after-commit hooks, such as Rails' <code class="inline">after_commit</code>).
+        If the data really can't tolerate the window, use versioned keys, a shorter TTL, or no cache.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Failure modes, keys &amp; measurement</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Caches fail in crowds and leak in silence</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A cache that works on your laptop can still take production down in two ways: everyone misses at once, or the
+        wrong person hits. Neither shows up in a unit test. This Part covers how to recognise both, how to design keys
+        that prevent the second, and how to prove the cache helps at all.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Cache stampede (thundering herd)</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A popular key expires. In the next 50 ms, 500 requests miss at the same time, and all 500 run the same
+        expensive query against the database. The database slows down, so the queries take longer, so even more
+        requests pile up behind them. The same thing happens after a deploy that flushes the cache, or when Redis
+        restarts empty. The cache was hiding how much load the database could really take.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 220" class="w-full min-w-[620px]" role="img" aria-label="Cache stampede without and with single-flight">
+          <text x="12" y="20" font-size="11" font-weight="700" fill="#6E6B64">KEY "search:hanoi:cardio" EXPIRES AT 09:00:00 — 500 REQUESTS ARRIVE IN THE SAME SECOND</text>
+          <text x="12" y="46" font-size="10" font-weight="700" fill="#DB2777">WITHOUT PROTECTION</text>
+          <g class="anim-pulse"><rect x="10" y="56" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="75" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">500 requests</text>
+            <text x="75" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">all miss</text></g>
+          <g class="anim-pulse d1"><rect x="250" y="56" width="170" height="50" rx="9" fill="#DB2777"/>
+            <text x="335" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">500 × heavy query</text>
+            <text x="335" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">each 900 ms, then slower</text></g>
+          <g class="anim-pulse d2"><rect x="530" y="56" width="160" height="50" rx="9" fill="#37474F"/>
+            <text x="610" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Postgres at 100% CPU</text>
+            <text x="610" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">every page slows down</text></g>
+          <line x1="140" y1="81" x2="250" y2="81" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="420" y1="81" x2="530" y2="81" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="12" y="138" font-size="10" font-weight="700" fill="#0D9488">WITH SINGLE-FLIGHT + STALE-WHILE-REVALIDATE</text>
+          <g class="anim-pulse d1"><rect x="10" y="148" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="75" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">500 requests</text>
+            <text x="75" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">1 wins the lock</text></g>
+          <g class="anim-pulse d2"><rect x="250" y="148" width="170" height="50" rx="9" fill="#0D9488"/>
+            <text x="335" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1 × heavy query</text>
+            <text x="335" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">499 get the stale copy</text></g>
+          <g class="anim-pulse d3"><rect x="530" y="148" width="160" height="50" rx="9" fill="#6d5acd"/>
+            <text x="610" y="169" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Cache refilled</text>
+            <text x="610" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">DB barely notices</text></g>
+          <line x1="140" y1="173" x2="250" y2="173" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="420" y1="173" x2="530" y2="173" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Defence</th><th class="px-4 py-3">What it does</th><th class="px-4 py-3">Cost</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">TTL jitter</td><td class="px-4 py-3">Add a random few percent to each TTL, so keys written together don't expire together</td><td class="px-4 py-3">One line. Always do it.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Single-flight (request coalescing)</td><td class="px-4 py-3">Only one caller recomputes a missing key. The rest wait for its result.</td><td class="px-4 py-3">In-process is easy. Across servers you need a short Redis lock.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Serve stale while refreshing</td><td class="px-4 py-3">Keep a "soft" expiry inside the value. After it passes, serve the old value and refresh in the background.</td><td class="px-4 py-3">Users see slightly old data during the refresh</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Early refresh / pre-warming</td><td class="px-4 py-3">Refresh hot keys shortly before they expire, or fill them from a job after a deploy</td><td class="px-4 py-3">Needs to know which keys are hot</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">search/cache.go — single-flight inside one process</span>
+        <pre class="code"><span class="kw">import</span> <span class="st">"golang.org/x/sync/singleflight"</span>
+
+<span class="kw">var</span> group singleflight.Group
+
+<span class="kw">func</span> <span class="fn">FreeSlots</span>(ctx context.Context, city, spec <span class="kw">string</span>) ([]Slot, <span class="kw">error</span>) {
+    key := <span class="st">"search:"</span> + city + <span class="st">":"</span> + spec
+    <span class="kw">if</span> s, ok := cacheGet(ctx, key); ok {
+        <span class="kw">return</span> s, <span class="kw">nil</span>
+    }
+    <span class="cm">// 500 concurrent misses for the same key → one DB query, 500 shared results</span>
+    v, err, _ := group.Do(key, <span class="kw">func</span>() (any, <span class="kw">error</span>) {
+        s, err := db.FreeSlots(ctx, city, spec)
+        <span class="kw">if</span> err == <span class="kw">nil</span> { cacheSet(ctx, key, s, jitter(<span class="st">30</span>*time.Second)) }
+        <span class="kw">return</span> s, err
+    })
+    <span class="kw">if</span> err != <span class="kw">nil</span> { <span class="kw">return nil</span>, err }
+    <span class="kw">return</span> v.([]Slot), <span class="kw">nil</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Across several servers, the same idea uses a short lock in Redis: <code class="inline">SET lock:KEY token NX PX 5000</code>
+        succeeds for exactly one caller, which recomputes. The others briefly wait and retry the cache, or serve the
+        stale copy. Always give the lock an expiry, so a crashed holder can't block the key forever.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">What never to cache, and how keys leak data</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The most serious caching bug is not staleness. It is <strong>serving one user's data to another</strong>. It
+        happens when a response depends on who is asking, but the cache key doesn't include who is asking. The agent
+        wraps <code class="inline">GET /me/bookings</code> in a cache keyed by the URL, the first patient's bookings
+        get cached, and every other patient now sees them.
+      </p>
+      <div class="mt-4 callout callout-danger">
+        <strong>The per-user leak, three ways it ships:</strong> a cache key built from the path only
+        (<code class="inline">cache:/api/me/bookings</code>) · a CDN or proxy caching an authenticated response because
+        it had <code class="inline">Cache-Control: public</code> or no header at all · a framework "cache this page"
+        helper put on a page that reads cookies. The rule: if the response depends on the user, the tenant or the
+        permissions, either that identity is <em>in the key</em>, or the response is <code class="inline">no-store</code>
+        and never shared. For health data, prefer no-store.
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Also keep out of any cache: secrets and tokens (they belong in a secrets manager or a session store with a
+        TTL), full payment details, and anything whose correctness decides money or capacity, such as stock levels or
+        slot availability at the moment of purchase.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Key design</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A good key is <strong>namespaced</strong>, <strong>versioned</strong>, and contains <strong>every input that
+        changes the output</strong>, and nothing else. Use a fixed shape such as
+        <code class="inline">app:entity:version:id:variant</code>, separated by colons, which is the Redis convention.
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
           <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
-            <th class="px-4 py-3">Pattern</th><th class="px-4 py-3">The failure it prevents</th><th class="px-4 py-3">Skip it when</th></tr></thead>
+            <th class="px-4 py-3">Bad key</th><th class="px-4 py-3">Problem</th><th class="px-4 py-3">Better key</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
-            <tr><td class="px-4 py-3 font-semibold">Service layer</td><td class="px-4 py-3">The same use case copied, slightly differently, into every entry point</td><td class="px-4 py-3">The endpoint is plain CRUD with no rules</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Repository</td><td class="px-4 py-3">Query code scattered through business logic, and untestable rules</td><td class="px-4 py-3">You're in Rails, or it would just wrap the ORM one-to-one</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Unit of work</td><td class="px-4 py-3">Half-saved use cases after a crash</td><td class="px-4 py-3">Never skip the idea. Skip writing your own: the ORM has one</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">DTO + mapper</td><td class="px-4 py-3">Leaked columns, mass assignment, schema frozen into the API</td><td class="px-4 py-3">Internal scripts that never cross a trust boundary</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Specification</td><td class="px-4 py-3">One business rule written three different ways</td><td class="px-4 py-3">A named scope or query function already covers it</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">CQRS</td><td class="px-4 py-3">Screens that load hundreds of entities to render one table</td><td class="px-4 py-3">A query object or view is fast enough (almost always)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Outbox</td><td class="px-4 py-3">Events lost or sent for rolled-back data</td><td class="px-4 py-3">Nothing outside the database needs to know</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Idempotent consumer</td><td class="px-4 py-3">Double charges and duplicate emails on redelivery</td><td class="px-4 py-3">The effect is naturally idempotent (an upsert, a set)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Saga</td><td class="px-4 py-3">Money taken for a booking that doesn't exist</td><td class="px-4 py-3">All steps live in one database: use a transaction</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">bookings</code></td><td class="px-4 py-3">Same for every user: a data leak</td><td class="px-4 py-3"><code class="inline">clinic:bookings:v1:patient:812</code>, or don't cache it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">clinic_7</code></td><td class="px-4 py-3">No namespace or version. A changed JSON shape after a deploy breaks the readers.</td><td class="px-4 py-3"><code class="inline">clinic:v3:7:profile</code>. Bump <code class="inline">v3</code> when the shape changes.</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">search:hanoi</code></td><td class="px-4 py-3">Forgets the specialty, date and language inputs</td><td class="px-4 py-3"><code class="inline">search:v1:hanoi:cardio:2026-10-01:vi</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">search:{JSON of all params}</code></td><td class="px-4 py-3">Params in a different order give a different key, which kills the hit rate</td><td class="px-4 py-3">Normalise: sort params, lowercase, and hash if long</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">report:tenant</code></td><td class="px-4 py-3">Multi-tenant app with no tenant ID in the key</td><td class="px-4 py-3"><code class="inline">t:42:report:v2:monthly:2026-09</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Measure the hit rate, or it's a guess</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Hit rate</strong> = hits ÷ (hits + misses). A cache with a 20% hit rate adds a network hop to 80% of
+        requests and saves little. Hot, well-keyed data usually shows 90% or more. Watch three numbers: hit rate
+        <em>per cache</em> (a global number hides a useless cache), <strong>evictions</strong> (Redis is out of memory
+        and throwing keys away), and the latency of the uncached path.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">redis-cli — global counters, and a per-cache metric in code</span>
+        <pre class="code">$ redis-cli INFO stats | grep -E <span class="st">"keyspace_(hits|misses)|evicted_keys"</span>
+<span class="out">keyspace_hits:1843021
+keyspace_misses:96112          # ≈ 95% global hit rate
+evicted_keys:0                 # &gt; 0 and rising → memory too small</span>
+
+$ redis-cli CONFIG GET maxmemory-policy
+<span class="out">allkeys-lru</span>                    <span class="cm"># for a pure cache: evict least-recently-used keys</span>
+
+<span class="cm">// per-cache counters: emit one metric per hit and miss, labelled with the cache name</span>
+metrics.increment(<span class="st">"cache.lookup"</span>, { cache: <span class="st">"clinic_profile"</span>, result: hit ? <span class="st">"hit"</span> : <span class="st">"miss"</span> });</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Dashboards and alerts are covered in <a href="./sd10.html" class="text-viol underline decoration-viol/40">SD10</a>.
+        For a PR, the minimum is before-and-after latency for the endpoint under realistic load, plus the hit rate
+        after a warm-up.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Redis data structures, briefly</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Redis is not just a key-to-string store. Picking the right structure often removes a whole round of
+        serialising and reloading:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Type</th><th class="px-4 py-3">Commands</th><th class="px-4 py-3">Use in the clinic app</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">String</td><td class="px-4 py-3"><code class="inline">GET SET INCR EXPIRE</code></td><td class="px-4 py-3">Cached JSON, version counters, simple rate-limit counters</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hash</td><td class="px-4 py-3"><code class="inline">HGET HSET HGETALL</code></td><td class="px-4 py-3">A clinic's fields, when you update one field at a time</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">List</td><td class="px-4 py-3"><code class="inline">LPUSH LRANGE LTRIM</code></td><td class="px-4 py-3">"Recently viewed clinics", capped at 10</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Set</td><td class="px-4 py-3"><code class="inline">SADD SISMEMBER</code></td><td class="px-4 py-3">Tags: which keys belong to clinic 7, for tag-based invalidation</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sorted set</td><td class="px-4 py-3"><code class="inline">ZADD ZRANGE</code></td><td class="px-4 py-3">Top-rated doctors leaderboard, sliding-window rate limits</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Stream</td><td class="px-4 py-3"><code class="inline">XADD XREADGROUP</code></td><td class="px-4 py-3">A lightweight event log with consumer groups, covered in <a href="./sd8.html" class="text-viol underline decoration-viol/40">SD8</a></td></tr>
           </tbody>
         </table>
       </div>
@@ -803,128 +734,130 @@ sequenceDiagram
       <!-- ═══════════════ Claude Code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
-        Agents write these patterns fluently and choose them badly. Ask for a diagnosis before you ask for code, and
-        always make the agent name the failure a pattern prevents. If it can't, the pattern probably isn't needed.
+        Agents are good at writing the cache plumbing, the load test and the metrics. They are weak at the questions
+        that make caching safe: what the key must contain, how stale is acceptable, and which writers must
+        invalidate. Give the agent those answers, or ask it to find them, before it writes a line.
       </p>
       <div class="mt-4">
-        <span class="code-label">prompt — find the dual writes</span>
-        <pre class="code">Search this repo for every place where we commit a DB transaction AND publish a
-message, enqueue a job outside the transaction, call an external API, or send email
-in the same use case. For each one, give file:line, the order of the two writes,
-and exactly what is lost if the process dies between them. Don't change code yet.</pre>
+        <span class="code-label">prompt — caching plan before code</span>
+        <pre class="code">GET /clinics/:id/search-summary is slow (p95 1.2 s, see the trace below).
+Before writing any code, produce a caching plan:
+1. Measure: where the time goes (queries, external calls). Paste EXPLAIN for the top query.
+2. Proposal: which layer (HTTP / CDN / Redis / materialized view) and why.
+3. For each cache: exact key format, TTL + jitter, max staleness in business terms.
+4. List EVERY code path that writes the underlying tables (grep for it) and how
+   each one invalidates. Include jobs, admin actions and seeds.
+5. Does the response vary by user, tenant, role or locale? If yes, say how the key covers it.
+Stop after the plan.</pre>
       </div>
-      <pre class="code mt-3">Before adding a repository/CQRS/saga here, tell me: which concrete problem in THIS
-code does it solve, what does it cost (files, consistency, ops), and what is the
-simplest version that solves it? Recommend "don't" if that's the honest answer.</pre>
-      <pre class="code mt-3">Add a transactional outbox for booking.created: migration for the outbox table,
-insert in the same transaction as the booking, a relay using FOR UPDATE SKIP LOCKED,
-and a test that kills the relay after publish but before marking sent, then shows
-the consumer processes the duplicate only once.</pre>
-      <pre class="code mt-3">Draw the booking + payment + notification saga as a Mermaid sequenceDiagram,
-including every failure branch and its compensation. Mark which steps are
-irreversible. I'll review the diagram before you write any code.</pre>
+      <pre class="code mt-3">Review this diff only for caching risks: keys missing user/tenant/locale, SET without TTL,
+invalidation inside a transaction instead of after commit, Cache-Control on authenticated
+routes, and what happens when Redis is unreachable. Cite file:line for each finding.</pre>
+      <pre class="code mt-3">Write a load test (k6 or autocannon) that hits the endpoint with 200 concurrent users
+right after a cache flush. Report DB query count and p95 with and without the
+single-flight lock. Paste the raw numbers.</pre>
       <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>Find dual writes, commits outside the unit of work, and mass assignment</li>
-            <li>Write DTOs, mappers and the query objects for list screens</li>
-            <li>Scaffold the outbox table, relay and processed-messages table</li>
-            <li>Draw the saga's happy and failure paths as a diagram</li>
-            <li>Write the crash-in-the-middle and duplicate-delivery tests</li>
+            <li>Profile the endpoint and find where the time goes</li>
+            <li>Write the cache-aside wrapper, invalidation hooks and key helpers</li>
+            <li>Grep for every writer of a table</li>
+            <li>Add hit and miss metrics, and write the load test</li>
+            <li>Write a test that user A never receives user B's cached response</li>
           </ul>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
           <div class="font-semibold text-coral">You must check</div>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
-            <li>That each pattern answers a problem you can name, and isn't there "for clean code"</li>
-            <li>That the outbox insert really uses the same transaction handle as the business write</li>
-            <li>That every consumer and compensation is idempotent</li>
-            <li>The order of saga steps: irreversible steps after the decision point</li>
-            <li>Whether a CQRS read model's staleness is acceptable to the user who sees it</li>
+            <li>That caching is needed at all: the numbers before and after</li>
+            <li>Every input that changes the output is in the key</li>
+            <li>The TTL matches a staleness the business accepts</li>
+            <li>Every write path invalidates, after commit</li>
+            <li>The <code class="inline">Cache-Control</code> header on every authenticated route</li>
           </ul>
         </div>
       </div>
       <div class="mt-4 callout callout-warn">
-        <strong>Red flags in AI output for this topic:</strong> <code class="inline">save()</code> followed by
-        <code class="inline">publish()</code> with nothing in between · <code class="inline">publish()</code> inside a
-        transaction block · repositories that call <code class="inline">commit()</code> · a
-        <code class="inline">GenericRepository&lt;T&gt;</code> over an ORM, or repositories bolted onto Rails models ·
-        entities returned from controllers, or <code class="inline">create(req.body)</code> · a command bus and query
-        bus for a CRUD screen · "rollback" of an external call by deleting a local row · consumers with no dedupe
-        key · the phrase "exactly-once delivery".
+        <strong>Red flags in agent-written caching:</strong> a cache added with no measurement ("this should be faster")
+        · <code class="inline">set(key, value)</code> with no TTL · a key built from the URL path on an authenticated
+        route · <code class="inline">Cache-Control: public</code> on anything under <code class="inline">/me</code>,
+        <code class="inline">/account</code> or <code class="inline">/admin</code> · a module-level
+        <code class="inline">Map</code> as a cache in serverless code · invalidation only in the API handler, while
+        jobs and admin tools write the same table · caching the result that a booking or payment decision reads ·
+        Redis errors that crash the request instead of falling back.
       </div>
 
       <!-- ═══════════════ skill ladder ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Puts queries, rules and HTTP calls in the controller. Has not heard of an outbox or a saga.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can name each pattern in this module and recognise it in a codebase, but can't yet say when it is unnecessary.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Uses a service layer, DTOs and the framework's unit of work correctly. Needs review to catch dual writes, non-idempotent consumers, or a pattern added for its own sake.</div></div>
-        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Keeps each use case in one transaction. Chooses active record or data mapper to fit the framework. Starts CQRS at query objects. Finds and fixes a dual write with an outbox and an idempotent consumer, and designs a saga with ordered steps and idempotent compensations. Proves each with a crash or duplicate test.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Removes unnecessary layers from agent-generated code in reviews. Sets the team's conventions for events, outbox and sagas. Runs the incident review when a saga gets stuck, and designs the monitoring that catches it next time.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Thinks of caching as "put it in Redis and it gets faster". Accepts any cache an agent adds.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows cache-aside and TTLs, and can read <code class="inline">Cache-Control</code>. Doesn't yet ask who invalidates, or what the key is missing.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Implements cache-aside with a TTL for a clear case. Needs review to catch a missed writer, a key without the user, or a stampede risk.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Measures before caching. Chooses the layer and pattern with a reason. Designs keys that include every input, sets TTLs from business staleness, invalidates on every write path after commit, handles Redis being down, and reports the hit rate.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the team's key conventions and caching checklist. Designs stampede protection and CDN strategy for high-traffic launches. Spots per-user leaks in other people's reviews.</div></div>
       </div>
       <div class="mt-4 callout callout-tip">
-        <strong>Self-check before claiming 3:</strong> for one real use case in your project, can you point to the single
-        commit, list every write that happens outside it, and say what happens to each if the pod dies after line N?
-        Can you explain why a pattern the agent proposed is <em>not</em> needed?
+        <strong>Self-check before claiming 3:</strong> for one cache in your project, can you state from memory its key
+        format, its TTL and why, every code path that invalidates it, and what happens when Redis is down? Could you
+        show a test proving two different users never share a cached response?
       </div>
 
       <!-- ═══════════════ pitfalls ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
       <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Patterns as decoration</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An interface, a repository, a service, a DTO and a mapper for a table with one screen. Every layer is a file that must change with every new field. Add layers when a real problem appears.</p>
+          <div class="font-semibold text-rose-500">✗ Caching to hide a missing index</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The query is slow because of a Seq Scan. A cache hides it until the first miss after a deploy. Fix the query first (<a href="./sd1.html" class="text-viol underline decoration-viol/40">SD1</a>), then cache only if it's still needed.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Trusting "exactly once"</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Brokers, relays and retries deliver at least once. Code that only works when each message arrives exactly once will double-charge or double-email in production.</p>
+          <div class="font-semibold text-rose-500">✗ Trusting the cache for decisions</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A cached "slot is free" or "5 in stock" used to accept a booking or an order. Show from the cache, decide from the database.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-rose-500">✗ Compensating by deleting</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Deleting the booking when payment fails destroys the evidence. Move it to a <code class="inline">cancelled</code> or <code class="inline">payment_failed</code> state, and refund with a real refund call.</p>
+          <div class="font-semibold text-rose-500">✗ Flushing everything on deploy</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">FLUSHALL</code> in a deploy script causes a stampede at the busiest moment. Bump a key version for the caches whose shape changed instead.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Test the crash, not just the happy path</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Inject a failure between the commit and the publish, and between the publish and the mark-as-sent. If the outcome is still correct, the design is correct.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write the four facts next to every cache</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Key, staleness, invalidation and failure behaviour, as a comment. Reviewers and future agents can check the code against it.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Monitor the outbox age</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Alert on the oldest unsent outbox row and on sagas stuck in one state for too long. A dead relay is silent otherwise: writes succeed and nothing downstream happens.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Add a cross-user test</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Log in as patient A, fetch, log in as patient B, fetch, and assert that the responses differ. It takes ten minutes and catches the worst caching bug there is.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
-          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Follow the framework's grain</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Rails wants Active Record and service objects. SQLAlchemy already gives you a unit of work. Use what the framework gives you before writing your own layer.</p>
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Start with HTTP headers</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">For public pages, a correct <code class="inline">Cache-Control</code> plus the CDN often beats any Redis code, with nothing to invalidate by hand except a purge.</p>
         </div>
       </div>
 
       <!-- ═══════════════ evidence & resources ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="uow"> <span>For one use case in my project, I can show the service method, the repositories it uses, and the single place the transaction commits.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dto"> <span>Replaced an entity-in / entity-out endpoint with explicit request and response DTOs, and showed that a posted <code class="inline">status</code> field is now ignored or rejected.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="overeng"> <span>Rejected or removed one unnecessary pattern from agent-written code (a generic repository, a CRUD service, a command bus), with a one-paragraph justification my mentor agreed with.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="saga-diagram"> <span>Drew the booking + payment + notification saga as a sequence diagram with every failure branch, compensation and irreversible step marked.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="outbox-pr"> <span class="font-semibold">Opened a PR that finds a dual write in a small booking or shop app and fixes it with a transactional outbox, a relay and an idempotent consumer, including a test that crashes between publish and mark-as-sent and proves the duplicate has no second effect (mentor evidence ✓).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="measure"> <span>Measured an endpoint's latency and found where the time goes before proposing any cache.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="headers"> <span>Set correct <code class="inline">Cache-Control</code> and ETag headers for a public route and <code class="inline">no-store</code> for a personal one, and verified them with <code class="inline">curl -I</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="invalidate"> <span>Listed every writer of a cached table and showed each one invalidates after commit.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="leak-test"> <span>Wrote a test proving two users never receive each other's cached data.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cache-pr"> <span class="font-semibold">Opened a PR that adds a Redis cache-aside layer to one slow, read-heavy endpoint (for example the clinic search summary), with the four facts documented, TTL jitter, a Redis-down fallback, a cross-user test, a hit-rate metric, and before-and-after p95 numbers from a load test (mentor evidence ✓).</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
       <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
-        <li><a class="text-coral underline" href="https://martinfowler.com/eaaCatalog/" target="_blank" rel="noopener">Martin Fowler — Catalog of Patterns of Enterprise Application Architecture</a> — the original short definitions of service layer, repository, unit of work, active record and data mapper.</li>
-        <li><a class="text-coral underline" href="https://martinfowler.com/bliki/CQRS.html" target="_blank" rel="noopener">Martin Fowler — CQRS</a> — the idea in one page, including the warning that most systems don't need it.</li>
-        <li><a class="text-coral underline" href="https://microservices.io/patterns/data/transactional-outbox.html" target="_blank" rel="noopener">microservices.io — Transactional outbox</a> · <a class="text-coral underline" href="https://microservices.io/patterns/data/saga.html" target="_blank" rel="noopener">Saga</a> — the pattern write-ups behind Part IV.</li>
-        <li><a class="text-coral underline" href="https://learn.microsoft.com/en-us/azure/architecture/patterns/saga" target="_blank" rel="noopener">Microsoft Learn — Saga distributed transactions pattern</a> — orchestration vs choreography with failure handling.</li>
-        <li><a class="text-coral underline" href="https://learn.microsoft.com/en-us/azure/architecture/patterns/cqrs" target="_blank" rel="noopener">Microsoft Learn — CQRS pattern</a> — read models, eventual consistency, and when not to use it.</li>
-        <li><a class="text-coral underline" href="https://docs.sqlalchemy.org/en/20/orm/session_basics.html" target="_blank" rel="noopener">SQLAlchemy — Session basics</a> — the unit of work you already have in Python.</li>
-        <li><a class="text-coral underline" href="https://guides.rubyonrails.org/active_record_basics.html" target="_blank" rel="noopener">Rails Guides — Active Record basics</a> · <a class="text-coral underline" href="https://typeorm.io/docs/guides/active-record-data-mapper" target="_blank" rel="noopener">TypeORM — Active Record vs Data Mapper</a> — the two styles in the frameworks you'll meet.</li>
+        <li><a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching" target="_blank" rel="noopener">MDN — HTTP caching</a> — freshness, validation, and how browsers and shared caches treat each header.</li>
+        <li><a class="text-coral underline" href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control" target="_blank" rel="noopener">MDN — Cache-Control</a> — the exact meaning of every directive in Part II.</li>
+        <li><a class="text-coral underline" href="https://redis.io/docs/latest/develop/data-types/" target="_blank" rel="noopener">Redis — Data types</a> — strings, hashes, sets, sorted sets and streams, with command references.</li>
+        <li><a class="text-coral underline" href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" rel="noopener">Redis — Key eviction</a> — <code class="inline">maxmemory</code> and choosing an eviction policy for a cache.</li>
+        <li><a class="text-coral underline" href="https://www.postgresql.org/docs/current/rules-materializedviews.html" target="_blank" rel="noopener">PostgreSQL — Materialized views</a> — creating and refreshing them, including <code class="inline">CONCURRENTLY</code>.</li>
+        <li><a class="text-coral underline" href="https://nextjs.org/docs/app/getting-started/caching" target="_blank" rel="noopener">Next.js — Caching</a> · <a class="text-coral underline" href="https://nextjs.org/docs/app/api-reference/functions/cacheTag" target="_blank" rel="noopener">cacheTag</a> — framework-level caching and tag invalidation (<a class="text-coral underline" href="./fe2.html">FE2</a>).</li>
+        <li><a class="text-coral underline" href="https://developers.cloudflare.com/cache/" target="_blank" rel="noopener">Cloudflare — Cache</a> — CDN cache rules, cache keys and purging (<a class="text-coral underline" href="./op6.html">OP6</a>).</li>
       </ul>
 
       <nav id="page-nav" class="mt-14 flex gap-4"></nav>
     </article>
 
     <footer class="px-6 py-8 text-center text-xs text-mute dark:text-mutedark">
-      AI-Native Developer Internship · SD7 Backend Patterns: Repository, CQRS, Outbox &amp; Saga
+      AI-Native Developer Internship · SD7 Caching Strategies
     </footer>
   </main>
 </div>
