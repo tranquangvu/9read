@@ -111,8 +111,8 @@ const INTERN_MODULES = [
   { code: "OP1", name: "Linux, Shell & Networking Basics", critical: true, soon: true },
   { code: "OP2", name: "Docker & CI/CD with GitHub Actions", critical: true, soon: true },
   { code: "OP3", name: "Fast Deploy: Vercel + Supabase", critical: true, soon: true },
-  { code: "OP4", name: "AWS Core Services", critical: true, soon: true },
-  { code: "OP5", name: "Cloudflare Essentials", critical: true, soon: true },
+  { code: "OP4", name: "AWS Core Services", critical: true },
+  { code: "OP5", name: "Cloudflare Essentials", critical: true },
   { code: "AG5", name: "AI Agent Systems: RAG, Tools, MCP, Memory", critical: true, soon: true },
   { code: "CP1", name: "Capstone Project", critical: true, soon: true },
 ];
