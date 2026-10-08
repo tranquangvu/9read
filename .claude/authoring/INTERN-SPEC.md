@@ -89,7 +89,7 @@ this one wins for `intern/`.
 | Modular monolith vs microservices, service boundaries, event-driven, sync vs async communication | SD3 |
 | GoF creational + structural (factory, builder, singleton vs DI, adapter, decorator, facade, proxy) | SD4 |
 | GoF behavioral (strategy, observer, command, state, template method, chain of responsibility / middleware) | SD5 |
-| Repository, unit of work, service layer, DTO/mapper, CQRS, transactional outbox, saga | SD6 |
+| Service layer, unit of work, repository, active record vs data mapper, specification, DTO/mapper, query objects | SD6 |
 | Cache-aside / write-through, TTL, invalidation, HTTP/CDN caching, Redis | SD7 |
 | Queues, background jobs, retries, DLQ, scheduling, pub/sub, idempotent consumers | SD8 |
 | Sessions vs JWT, OAuth/OIDC, RBAC/ABAC, IDOR, OWASP Top 10, secrets | SD9 |
@@ -101,6 +101,7 @@ this one wins for `intern/`.
 | Third-party API integration, webhooks in and out, data sync, bulk import/export, long-running operations | SD15 |
 | Realtime transport and scaling, time zones and scheduling, geo search | SD16 |
 | PII and data protection law, retention and deletion, field encryption, feature flags and config | SD17 |
+| CQRS levels and read models, dual writes, transactional outbox, idempotent consumers, sagas | SD18 |
 | REST design, validation, errors, OpenAPI | BE1 |
 | Unit and integration tests | QA1 |
 | Playwright and Playwright MCP | QA2 |
