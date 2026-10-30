@@ -1,0 +1,712 @@
+<!-- meta: days=3 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Incident Management, On-call &amp; Postmortems</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          The burn-rate alerts from <a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a> tell you
+          that patients cannot book. This module is about what happens in the next hour and the next two weeks: declaring
+          an incident with the right severity, running it with clear roles, communicating with the clinic and its patients,
+          designing an on-call rotation people can sustain, writing runbooks that work at 3 a.m., and turning each incident
+          into a blameless postmortem whose action items actually get done.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> the difference between a 20-minute incident and a 3-hour one is
+          rarely technical skill. It is whether someone declared it early, whether one person was in charge, whether the
+          responder found a runbook or started from zero, and whether the obvious mitigation (roll back) happened before the
+          interesting investigation. Clients forgive outages that are handled well and communicated honestly. They do not
+          forgive silence, and they do not forgive the same outage twice.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · The incident lifecycle</div>
+      <h2 class="font-display text-2xl font-bold mt-2">An incident is a process you declare, not a feeling you have</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An incident is any unplanned event that hurts users or threatens to, and that needs a coordinated response.
+        "Declaring" one is a deliberate act: it opens a channel, assigns a commander, starts the clock and tells everyone
+        else to stay out of the way. Declaring too often costs a few minutes. Declaring too late costs hours. So the rule
+        is simple: <strong>if you are wondering whether it is an incident, declare it</strong>, and downgrade later.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Severity levels decide who is woken and how often you talk</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Severity is about <strong>user impact</strong>, not about how hard the fix is or how worried the engineer feels.
+        Define it with examples from your own system, because "major degradation" means nothing at 3 a.m. Severity is set
+        by the incident commander, and it can change as you learn more.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Level</th><th class="px-4 py-3">Clinic booking example</th><th class="px-4 py-3">Response</th><th class="px-4 py-3">External comms</th><th class="px-4 py-3">Postmortem</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">SEV1</td><td class="px-4 py-3">No patient can book; patient data exposed; data loss</td><td class="px-4 py-3">Page primary, secondary and IC now; ack in 5 min</td><td class="px-4 py-3">Status page in 15 min, updates every 30 min, client lead phoned</td><td class="px-4 py-3">Always, within 5 working days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SEV2</td><td class="px-4 py-3">&gt; 5% of bookings failing, or one clinic group fully down</td><td class="px-4 py-3">Page primary; ack in 10 min; IC assigned</td><td class="px-4 py-3">Status page in 30 min, hourly updates</td><td class="px-4 py-3">Always</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SEV3</td><td class="px-4 py-3">Reminders delayed under 1 h; admin report slow; workaround exists</td><td class="px-4 py-3">Ticket, business hours</td><td class="px-4 py-3">Only if the client asks</td><td class="px-4 py-3">If it burned &gt; 20% of a budget</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SEV4</td><td class="px-4 py-3">Near miss: failover worked, no user impact</td><td class="px-4 py-3">Ticket</td><td class="px-4 py-3">None</td><td class="px-4 py-3">Optional short learning review</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note what is <em>not</em> a factor: whether it is a weekend, whether the cause is AWS, or whether a VP noticed. A
+        security incident (leaked key, compromised task) is always at least SEV2 and also follows the security playbook in
+        <a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Six phases and the clocks between them</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every incident moves through the same phases. Naming them lets you measure where the time went. In the clinic
+        incident reviewed in Part IV, detection took 10 minutes, acknowledgement 3, and mitigation 24 more. The biggest
+        chunk was the gap between "we know it's broken" and "we rolled back", which is the gap a good process shrinks.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 740 220" class="w-full min-w-[660px]" role="img" aria-label="Incident lifecycle: detect, triage, declare, mitigate, resolve, review, with time-to-detect, acknowledge, mitigate and resolve">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">INCIDENT LIFECYCLE · measure each gap</text>
+          <g class="anim-pulse"><rect x="10" y="50" width="105" height="50" rx="9" fill="#DB2777"/>
+            <text x="62" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Detect</text>
+            <text x="62" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">burn-rate page</text></g>
+          <g class="anim-pulse d1"><rect x="133" y="50" width="105" height="50" rx="9" fill="#D97757"/>
+            <text x="185" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Triage</text>
+            <text x="185" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">ack · impact?</text></g>
+          <g class="anim-pulse d2"><rect x="256" y="50" width="105" height="50" rx="9" fill="#6d5acd"/>
+            <text x="308" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Declare</text>
+            <text x="308" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">SEV · IC · channel</text></g>
+          <g class="anim-pulse d3"><rect x="379" y="50" width="105" height="50" rx="9" fill="#2563EB"/>
+            <text x="431" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Mitigate</text>
+            <text x="431" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">stop the bleeding</text></g>
+          <g class="anim-pulse d4"><rect x="502" y="50" width="105" height="50" rx="9" fill="#0D9488"/>
+            <text x="554" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Resolve</text>
+            <text x="554" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">stable · all-clear</text></g>
+          <g class="anim-pulse"><rect x="625" y="50" width="105" height="50" rx="9" fill="#37474F"/>
+            <text x="677" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Review</text>
+            <text x="677" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">postmortem</text></g>
+          <line x1="115" y1="75" x2="133" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="238" y1="75" x2="256" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="361" y1="75" x2="379" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="484" y1="75" x2="502" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="607" y1="75" x2="625" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="10" y1="130" x2="62" y2="130" stroke="#DB2777" stroke-width="3"/>
+          <text x="10" y="146" font-size="10" fill="#6E6B64">TTD: impact → page</text>
+          <text x="10" y="159" font-size="10" font-weight="700" fill="#DB2777">10 min</text>
+          <line x1="62" y1="175" x2="185" y2="175" stroke="#D97757" stroke-width="3"/>
+          <text x="70" y="191" font-size="10" fill="#6E6B64">TTA: page → ack · 3 min</text>
+          <line x1="62" y1="130" x2="431" y2="130" stroke="#2563EB" stroke-width="3"/>
+          <text x="250" y="146" font-size="10" fill="#6E6B64">TTM: impact → mitigated</text>
+          <text x="250" y="159" font-size="10" font-weight="700" fill="#2563EB">37 min (target for SEV2: 30)</text>
+          <line x1="62" y1="175" x2="554" y2="175" stroke="#0D9488" stroke-width="1.5" stroke-dasharray="4 3"/>
+          <text x="400" y="191" font-size="10" fill="#6E6B64">TTR: impact → resolved · 66 min</text>
+          <text x="370" y="212" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">the mitigation gap is the one you can shrink with process</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Track these per incident in the postmortem, and look at the median across a quarter rather than the mean: one
+        six-hour incident distorts the mean for months. The DORA "time to restore" key
+        (<a href="./fn1.html" class="text-viol underline decoration-viol/40">FN1</a>) is the same TTM measured across all
+        failed changes.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Mitigate first, find the root cause later</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        During an incident your job is to restore service, not to understand it. If the incident started within an hour of
+        a deploy, roll back <strong>before</strong> you have proved the deploy is the cause: a rollback that turns out to be
+        unnecessary costs five minutes, an investigation that delays it costs the error budget. Keep a short list of levers
+        and how long each takes on the clinic platform.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Lever</th><th class="px-4 py-3">Use when</th><th class="px-4 py-3">Time to effect</th><th class="px-4 py-3">Owned by</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Roll back the deploy</td><td class="px-4 py-3">Impact began after a release</td><td class="px-4 py-3">3–6 min (ECS), 1–2 min (Argo Rollouts abort)</td><td class="px-4 py-3"><a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>, <a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Turn off a feature flag</td><td class="px-4 py-3">The new code path is behind a flag</td><td class="px-4 py-3">Under 1 min</td><td class="px-4 py-3">CI2</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scale out</td><td class="px-4 py-3">Saturation: CPU, connections, queue age</td><td class="px-4 py-3">2–4 min for Fargate tasks</td><td class="px-4 py-3"><a href="./cn2.html" class="text-viol underline decoration-viol/40">CN2</a>, <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Fail over</td><td class="px-4 py-3">A single AZ or the RDS writer is unhealthy</td><td class="px-4 py-3">1–2 min for RDS Multi-AZ</td><td class="px-4 py-3"><a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shed load</td><td class="px-4 py-3">Abusive traffic or a retry storm</td><td class="px-4 py-3">1–5 min with a WAF rate rule</td><td class="px-4 py-3"><a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">runbooks/levers.sh — the two rollbacks you will run most</span>
+        <pre class="code"><span class="cm"># ECS: point the service back at the previous task definition revision</span>
+aws ecs describe-services --cluster clinic-prod --services booking-api \
+  --query 'services[0].deployments[*].[status,taskDefinition]' --output text
+<span class="out">PRIMARY   arn:aws:ecs:ap-southeast-1:444455556666:task-definition/booking-api:88
+ACTIVE    arn:aws:ecs:ap-southeast-1:444455556666:task-definition/booking-api:87</span>
+aws ecs update-service --cluster clinic-prod --service booking-api \
+  --task-definition booking-api:87                <span class="cm"># then revert the image tag in Git</span>
+
+<span class="cm"># EKS with Argo Rollouts: abort the canary, traffic returns to the stable ReplicaSet</span>
+kubectl argo rollouts abort booking-api -n booking
+<span class="out">rollout 'booking-api' aborted</span></pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>A rollback outside Git does not stay rolled back.</strong> Argo CD
+        re-syncs the bad version if auto-sync is on, and on ECS the deploy pipeline owns the running image (Terraform
+        ignores <code class="inline">task_definition</code>), so the next pipeline run re-deploys the tag still in Git.
+        The IC's checklist must include "open the revert PR" as part of mitigation, not as clean-up.</div>
+
+
+      <h3 class="font-semibold text-lg mt-8">Closing an incident is a decision too</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Mitigated" and "resolved" are different states. Mitigated means users are fine but the system may be held together
+        by a manual change. Resolved means the IC has checked a short list and is willing to hand the service back to normal
+        on-call. Closing too early is how the same incident reopens at 2 a.m. with a different IC and no context.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>The SLI is back at baseline for 30 minutes</strong>, not just for one dashboard refresh (the October incident waited from 10:01 to 10:30).</li>
+        <li><strong>Every manual change is in Git</strong>: the revert PR is merged, or the console change is reproduced in Terraform.</li>
+        <li><strong>Silences and temporary scale-ups have an expiry</strong> and an owner, written in the channel.</li>
+        <li><strong>The final status page update is posted</strong> and the clinic lead has been told directly.</li>
+        <li><strong>A postmortem owner and due date are set</strong> before the channel is archived.</li>
+      </ul>
+      <pre class="code mt-3">/incident resolve
+<span class="out">Incident #inc-20261014-booking-5xx resolved at 10:30 ICT (duration 49 min since declare)
+Checklist: SLI baseline 30m ✓ · revert PR golden-owl/clinic-app#1187 merged ✓
+           silences 0 active ✓ · status page "Resolved" posted ✓
+Postmortem owner: @minh · due 2026-10-17 · doc created from TEMPLATE.md</span></pre>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Roles &amp; communication</div>
+      <h2 class="font-display text-2xl font-bold mt-2">One commander, one channel, one voice to the outside</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Incidents go wrong in predictable social ways: five engineers debug the same thing, nobody updates the client,
+        two people roll back and forward at the same time, and the person who knows the system best is also trying to
+        answer the account manager. The Incident Command System, borrowed from firefighting, fixes this by separating
+        roles. On a small team one person may hold two roles, but every role has a name next to it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The roles and what each one does not do</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Role</th><th class="px-4 py-3">Does</th><th class="px-4 py-3">Does not</th><th class="px-4 py-3">Clinic SEV2 staffing</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Incident commander (IC)</td><td class="px-4 py-3">Sets severity, assigns roles, decides on mitigations, runs a status check every 15 min</td><td class="px-4 py-3">Type commands. The moment the IC opens a terminal, nobody is coordinating.</td><td class="px-4 py-3">On-call secondary or the DevOps lead</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ops lead</td><td class="px-4 py-3">Investigates and executes changes, announces each one before running it</td><td class="px-4 py-3">Talk to the client or decide severity</td><td class="px-4 py-3">On-call primary</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Comms lead</td><td class="px-4 py-3">Status page, client updates, internal stakeholders, on the cadence for the severity</td><td class="px-4 py-3">Promise an ETA the IC has not approved</td><td class="px-4 py-3">Project manager for the clinic account</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scribe</td><td class="px-4 py-3">Keeps the timeline: what was seen, decided and done, with timestamps</td><td class="px-4 py-3">Filter: they write everything, including dead ends</td><td class="px-4 py-3">Any engineer; often the IC with a bot</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Subject-matter experts</td><td class="px-4 py-3">Answer specific questions the ops lead asks (DB, app code, AWS)</td><td class="px-4 py-3">Start parallel fixes without telling the IC</td><td class="px-4 py-3">Backend lead, paged only if needed</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Handing over command is explicit: "I am handing IC to Minh, Minh please confirm." Long incidents rotate the IC and
+        ops lead every 3–4 hours. Tired people make the worst changes of the day.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The first 15 minutes, in order</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The opening minutes are where most time is lost, so make them mechanical. A chat-ops bot (incident.io, the
+        PagerDuty Slack app, or a small Slack workflow) should do the first three steps with one command.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant AM as Alertmanager / Datadog
+    participant PD as PagerDuty
+    participant P as On-call primary
+    participant S as Slack #inc-…
+    participant IC as Incident commander
+    participant C as Comms lead
+    AM->>PD: BookingApiErrorBudgetBurnFast (severity=page)
+    PD->>P: phone + push
+    P->>PD: acknowledge (≤ 5 min)
+    P->>S: /incident declare sev2 "booking-api 5xx"
+    S->>IC: page secondary as IC
+    IC->>S: roles assigned, first status check at +15 min
+    IC->>C: draft status page "Investigating"
+    P->>S: "rolling back booking-api to :87" (announce, then act)
+    Note over S: scribe timeline runs from step 4<br/>every action is posted before it is done
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">Slack — the IC's opening message (pinned)</span>
+        <pre class="code">:rotating_light: SEV2 declared 09:41 ICT · #inc-20261014-booking-5xx
+Impact:   ~9% of POST /bookings returning 503 since ~09:24
+IC:       @linh     Ops lead: @minh     Comms: @thao     Scribe: @linh (+bot)
+Status:   investigating. Last deploy: booking-api 1.9.0 at 09:12.
+Next:     rollback decision by 09:50. Next status check 09:56.
+Rules:    announce every change here BEFORE running it. Side chat → thread.</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Status page and client updates that say something</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        External updates have one job: let the clinic decide what to do (switch to phone bookings, warn front-desk staff).
+        Say what users experience, what you are doing, and when the next update comes. Never speculate on cause, never
+        blame a vendor publicly, and never miss a promised update time. "No change, still working on it" posted on time
+        builds more trust than a detailed update posted late.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">status page templates — Investigating / Identified / Resolved</span>
+        <pre class="code">[Investigating · 09:45] Some patients are seeing errors when booking appointments
+online. Viewing existing appointments works. We are investigating and will update
+by 10:15. Front desks can continue to book by phone.
+
+[Identified · 10:05] We identified the cause and applied a fix at 10:01. Error rates
+have returned to normal. We are monitoring and will update by 10:35.
+
+[Resolved · 10:30] Online booking was degraded from 09:24 to 10:01 ICT. About 9% of
+booking attempts failed; no data was lost and no bookings were duplicated. Patients
+who saw an error can book again now. A full review will be shared with the clinic
+team by 21 October.</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Audience</th><th class="px-4 py-3">Channel</th><th class="px-4 py-3">SEV1 cadence</th><th class="px-4 py-3">SEV2 cadence</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Patients</td><td class="px-4 py-3">Status page (<code class="inline">status.clinic.example.com</code>), in-app banner</td><td class="px-4 py-3">First in 15 min, then every 30 min</td><td class="px-4 py-3">First in 30 min, then hourly</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clinic operations lead</td><td class="px-4 py-3">Phone call, then shared Slack channel</td><td class="px-4 py-3">Phone call within 15 min</td><td class="px-4 py-3">Message within 30 min</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Golden Owl management</td><td class="px-4 py-3"><code class="inline">#incidents</code> summary</td><td class="px-4 py-3">Every 30 min</td><td class="px-4 py-3">At declare and resolve</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">When the cause is AWS</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Check the provider early, in parallel with your own investigation, but never wait for it: AWS Health often
+        confirms a regional problem 15–30 minutes after customers see it. The account-specific AWS Health events are more
+        useful than the public status page because they name your affected resources. The Health API needs a Business or
+        higher support plan, and its global endpoint lives in <code class="inline">us-east-1</code>.
+      </p>
+      <pre class="code mt-3">aws health describe-events --region us-east-1 \
+  --filter eventStatusCodes=open,regions=ap-southeast-1 \
+  --query 'events[*].[service,eventTypeCode,startTime]' --output table
+<span class="out">----------------------------------------------------------------------
+|                           DescribeEvents                           |
++------+------------------------------------+------------------------+
+|  RDS |  AWS_RDS_OPERATIONAL_ISSUE         |  2026-08-03T14:02:00   |
++------+------------------------------------+------------------------+</span>
+<span class="cm"># from an August incident: an open RDS issue in your region. Tell the IC, keep mitigating anyway</span></pre>
+      <div class="mt-4 callout callout-info"><strong>Even when AWS is the cause, the budget still burns</strong> (see the
+        policy in <a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a>). The postmortem question
+        becomes "what design would have hidden this from patients?", which is an
+        <a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a> conversation, not "nothing we could do".</div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · On-call &amp; runbooks</div>
+      <h2 class="font-display text-2xl font-bold mt-2">On-call is a product your team designs, not a punishment it endures</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A sustainable on-call has four parts: enough people in the rotation, few enough pages per shift, a clear escalation
+        path when the first person does not answer, and runbooks that let a tired engineer act without deep context.
+        Leading the on-call program as a whole (compensation, hiring for it, cross-team policy) is a senior skill covered
+        in <a href="./ar5.html" class="text-viol underline decoration-viol/40">AR5</a>. Here you learn to build and run one.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Designing the rotation</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The maths of a rotation is unforgiving. With a weekly primary shift, each engineer is on call one week in N. Below
+        about six people, on-call becomes every month or more, people burn out, and they leave. The clinic rotation mixes
+        DevOps and backend engineers, because half of all pages end in application code.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Model</th><th class="px-4 py-3">Right when</th><th class="px-4 py-3">People needed</th><th class="px-4 py-3">Catch</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Weekly primary + secondary, 24/7</td><td class="px-4 py-3">One timezone, user traffic most of the day</td><td class="px-4 py-3">6–8: each primary one week in 6–8</td><td class="px-4 py-3">Night pages land on the same person all week</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Business hours + after-hours</td><td class="px-4 py-3">Traffic mostly 07:00–22:00 (the clinic case)</td><td class="px-4 py-3">5+ for each layer</td><td class="px-4 py-3">Handoff twice a day; after-hours pages must be SEV1/SEV2 only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Follow the sun</td><td class="px-4 py-3">Teams in two or three timezones</td><td class="px-4 py-3">3–4 per site</td><td class="px-4 py-3">Context lost at every handoff; needs excellent notes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Shift change on a weekday morning</strong> (Monday 10:00 ICT), never Friday evening, so handoff happens with everyone awake.</li>
+        <li><strong>Primary is shadowed for two shifts</strong> before a new engineer goes on the rotation alone, with the secondary as a named coach.</li>
+        <li><strong>A night page earns the morning off.</strong> Write it into the policy so nobody has to ask.</li>
+        <li><strong>Page budget:</strong> at most two paging incidents per 12-hour shift averaged over a month, as defined in <a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a>. Above that, fixing alerts beats new features.</li>
+      </ul>
+
+      <h3 class="font-semibold text-lg mt-8">Escalation policies as code</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An escalation policy answers: if nobody acknowledges in N minutes, who next? Keep it in Terraform in
+        <code class="inline">clinic-infra</code>, so a holiday swap or a new hire is a reviewed change and the policy is
+        never "whatever someone clicked in 2024". PagerDuty is shown; Opsgenie is being retired by Atlassian, and
+        incident.io or Grafana OnCall follow the same model.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    A["Page: booking-api<br/>severity=page"] --> P1["Primary on-call<br/>phone + push"]
+    P1 -->|"no ack in 5 min"| P2["Secondary on-call"]
+    P2 -->|"no ack in 10 min"| L["DevOps lead"]
+    L -->|"no ack in 15 min"| R["Repeat from primary<br/>(2 loops)"]
+    P1 -->|ack| IC{"SEV1 or SEV2?"}
+    IC -->|yes| D["Declare incident<br/>secondary becomes IC"]
+    IC -->|no| T["Handle alone<br/>note in on-call log"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/oncall/pagerduty.tf</span>
+        <pre class="code">resource <span class="st">"pagerduty_schedule"</span> <span class="st">"clinic_primary"</span> {
+  name      = <span class="st">"clinic-primary"</span>
+  time_zone = <span class="st">"Asia/Ho_Chi_Minh"</span>
+  layer {
+    name                         = <span class="st">"weekly"</span>
+    start                        = <span class="st">"2026-01-05T10:00:00+07:00"</span>   <span class="cm"># Monday 10:00 handoff</span>
+    rotation_virtual_start       = <span class="st">"2026-01-05T10:00:00+07:00"</span>
+    rotation_turn_length_seconds = <span class="st">604800</span>                        <span class="cm"># one week</span>
+    users                        = [for u <span class="kw">in</span> data.pagerduty_user.rotation : u.id]
+  }
+}
+resource <span class="st">"pagerduty_escalation_policy"</span> <span class="st">"clinic"</span> {
+  name      = <span class="st">"clinic-prod"</span>
+  num_loops = <span class="st">2</span>
+  rule {
+    escalation_delay_in_minutes = <span class="st">5</span>
+    target {
+      type = <span class="st">"schedule_reference"</span>
+      id   = pagerduty_schedule.clinic_primary.id
+    }
+  }
+  rule {
+    escalation_delay_in_minutes = <span class="st">10</span>
+    target {
+      type = <span class="st">"schedule_reference"</span>
+      id   = pagerduty_schedule.clinic_secondary.id
+    }
+  }
+  <span class="cm"># third rule: user_reference to the DevOps lead after 15 min</span>
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Test the pager, not just the alert.</strong> Once a month, trigger a
+        test incident on the PagerDuty service at an agreed time and check the primary's phone actually rings. Silent
+        mode, a changed phone number, and an expired app login have all caused "the alert fired and nobody came".</div>
+
+      <h3 class="font-semibold text-lg mt-8">Handoffs carry context, not just the pager</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        At every shift change the outgoing primary posts a short handoff in <code class="inline">#clinic-oncall</code> and
+        the two engineers talk for ten minutes. The written note is also raw data for toil reduction in Part IV: every page
+        and every manual task goes in it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">#clinic-oncall — weekly handoff template</span>
+        <pre class="code">Handoff 2026-10-20 10:00 · @minh → @an
+Pages:        3 (2 actionable, 1 noise: RDS storage ticket fired as page → PR #412)
+Incidents:    SEV2 2026-10-14 booking-api 5xx (postmortem draft in review)
+Open risks:   RDS Proxy rollout to staging Wed; reminder queue lag spikes 07:00–07:15
+Manual work:  2× re-drove SQS DLQ by hand (40 min) → toil ticket OPS-188
+Silences:     none active          Error budget: booking-api 61% left
+Watch:        1.9.1 deploy planned Tue 14:00 (canary)</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Runbooks that work at 3 a.m.</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A runbook is linked from the alert, starts with the impact and the safest mitigation, and contains copy-paste
+        commands with expected output. It is not a design document. Every page has exactly one runbook, every runbook has
+        a "last tested" date, and anything not tested in six months is assumed broken.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/runbooks/booking-api-5xx.md</span>
+        <pre class="code"># booking-api: elevated 5xx (BookingApiErrorBudgetBurnFast)
+Impact:   patients cannot book online. Default severity: SEV2 (SEV1 if &gt; 50% failing)
+Owner:    clinic team · Last tested: 2026-09-30 game day (SR3)
+Dashboard: grafana.clinic.example.com/d/booking-api-slo
+
+## 1. Did something change in the last 2 hours? → roll back first
+aws ecs describe-services --cluster clinic-prod --services booking-api \
+  --query 'services[0].deployments[*].[status,taskDefinition,createdAt]'
+If a deployment is newer than the error start: run levers.sh rollback, open revert PR.
+
+## 2. Which dependency? (Logs Insights, last 15 min)
+fields @timestamp, error.type | filter level = "error"
+| stats count() by error.type | sort count() desc | limit 5
+
+## 3. Map the top error to an action
+  ConnectionRefused/TooManyConnections (Postgres) → step 4
+  Valkey timeout → app degrades without cache; scale tasks, see SD10
+  no healthy targets at ALB → task crash loop: check stoppedReason
+## 4. Escalate: backend SME if app code; DevOps lead if RDS failover needed</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice what is missing: background on how booking works, history of the service, opinions. Those belong in the
+        service README. The runbook gets the responder from page to mitigation, and it links to
+        <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a> for the full EKS troubleshooting
+        playbook rather than copying it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Measure on-call health every month</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You cannot fix an on-call you do not measure. Pull four numbers per rotation from the paging tool once a month and
+        put them next to the error budget in the ops review. Trends matter more than any single month: a slow rise in
+        night pages is how a healthy rotation becomes a resignation letter.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Metric</th><th class="px-4 py-3">Healthy</th><th class="px-4 py-3">Act when</th><th class="px-4 py-3">Clinic, September 2026</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Paging incidents per 12 h shift</td><td class="px-4 py-3">≤ 2 on average</td><td class="px-4 py-3">Above 2 for two months running</td><td class="px-4 py-3">0.3 (17 pages over 60 shifts)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Actionable pages</td><td class="px-4 py-3">≥ 80%</td><td class="px-4 py-3">Below 80%: alert review before new alerts</td><td class="px-4 py-3">76%: 4 of 17 were noise</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sleep-hour interruptions</td><td class="px-4 py-3">≤ 1 per engineer per week on call</td><td class="px-4 py-3">Any week with 3+</td><td class="px-4 py-3">5 in the month</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Mean time to acknowledge</td><td class="px-4 py-3">≤ 5 min</td><td class="px-4 py-3">Above 10 min: check phones and escalation</td><td class="px-4 py-3">3 min 40 s</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">oncall/monthly-report.sh — PagerDuty Analytics API</span>
+        <pre class="code">curl -s https://api.pagerduty.com/analytics/metrics/incidents/all \
+  -H "Authorization: Token token=$PD_TOKEN" \
+  -H "Accept: application/vnd.pagerduty+json;version=2" -H "Content-Type: application/json" \
+  -d '{"filters":{"created_at_start":"2026-09-01T00:00:00+07:00",
+       "created_at_end":"2026-10-01T00:00:00+07:00",
+       "service_ids":["'"$PD_BOOKING_API"'"],"urgency":"high"}}' \
+  | jq '.data[0] | {total_incident_count, mean_seconds_to_first_ack,
+         total_sleep_hour_interruptions, mean_seconds_to_resolve}'
+<span class="out">{
+  "total_incident_count": 17,
+  "mean_seconds_to_first_ack": 220,
+  "total_sleep_hour_interruptions": 5,
+  "mean_seconds_to_resolve": 2410
+}</span>
+<span class="cm"># "actionable" is not in the API: it comes from the tag you set in the weekly review</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        September's 76% actionable rate put the team just under the bar, so October's first ops sync deleted or demoted
+        the four noisy alerts before anyone wrote a new one. That is the loop: measure, review, fix the alerts, repeat.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Postmortems &amp; toil</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The postmortem is where the incident pays for itself</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        You already paid for the incident in error budget, client trust and a ruined morning. The postmortem is how you get
+        something back: a shared understanding of how the system really behaves and a small number of changes that make
+        this class of failure less likely or less painful. It only works if it is blameless, specific and followed up.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Blameless means looking at the system, not excusing everyone</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Blameless does not mean nobody did anything. It means assuming everyone acted reasonably given what they knew, and
+        asking why the system let a reasonable action cause harm. If the answer is "Minh should have been more careful",
+        the next engineer will make the same mistake, because nothing changed. Language is the quickest test.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Blameful</th><th class="px-4 py-3">Blameless</th><th class="px-4 py-3">What it leads to</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">"Minh set the pool size too high."</td><td class="px-4 py-3">"The PR raised the pool to 50. Nothing in review or CI compared pool × max tasks with <code class="inline">max_connections</code>."</td><td class="px-4 py-3">A CI check, not a reprimand</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"On-call was slow to respond."</td><td class="px-4 py-3">"The page fired 10 minutes after errors started because the 1 h window had to fill."</td><td class="px-4 py-3">Look at detection design</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Human error."</td><td class="px-4 py-3">"The console allowed an unreviewed change to prod."</td><td class="px-4 py-3">Permission boundaries, GitOps</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">A worked postmortem: the October booking 5xx</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The timeline is the spine of the document. Build it from the Slack channel, deploy history and metrics, not from
+        memory. Mark where the system changed state and where people made decisions, because the gaps between them are
+        where the action items hide.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[660px]" role="img" aria-label="Timeline of the 14 October booking-api incident from deploy to resolution">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">TIMELINE · 2026-10-14, ICT</text>
+          <rect x="207" y="96" width="257" height="22" rx="4" fill="#DB2777" opacity="0.25"/>
+          <text x="335" y="111" text-anchor="middle" font-size="10" font-weight="700" fill="#DB2777">user impact · 37 min · ~9% of bookings failing</text>
+          <line x1="40" y1="130" x2="700" y2="130" stroke="#A8A49B" stroke-width="1.5"/>
+          <text x="40" y="146" text-anchor="middle" font-size="9" fill="#6E6B64">09:00</text>
+          <text x="457" y="146" text-anchor="middle" font-size="9" fill="#6E6B64">10:00</text>
+          <circle cx="123" cy="130" r="5" fill="#6d5acd"/><text x="123" y="80" text-anchor="middle" font-size="9" fill="#6E6B64">09:12 deploy 1.9.0</text>
+          <line x1="123" y1="84" x2="123" y2="125" stroke="#A8A49B" stroke-dasharray="2 2"/>
+          <circle cx="179" cy="130" r="5" fill="#37474F"/><text x="179" y="60" text-anchor="middle" font-size="9" fill="#6E6B64">09:20 autoscale 6→12</text>
+          <line x1="179" y1="64" x2="179" y2="125" stroke="#A8A49B" stroke-dasharray="2 2"/>
+          <circle cx="207" cy="130" r="5" fill="#DB2777"/><text x="207" y="170" text-anchor="middle" font-size="9" fill="#DB2777">09:24 5xx start</text>
+          <circle cx="276" cy="130" r="5" fill="#D97757" class="anim-pulse"/><text x="276" y="186" text-anchor="middle" font-size="9" fill="#6E6B64">09:34 page</text>
+          <circle cx="297" cy="130" r="5" fill="#D97757"/><text x="297" y="80" text-anchor="middle" font-size="9" fill="#6E6B64">09:37 ack</text>
+          <circle cx="325" cy="130" r="5" fill="#6d5acd"/><text x="325" y="170" text-anchor="middle" font-size="9" fill="#6E6B64">09:41 SEV2</text>
+          <circle cx="374" cy="130" r="5" fill="#37474F"/><text x="374" y="80" text-anchor="middle" font-size="9" fill="#6E6B64">09:48 "too many clients"</text>
+          <circle cx="401" cy="130" r="5" fill="#2563EB" class="anim-pulse d1"/><text x="401" y="186" text-anchor="middle" font-size="9" fill="#2563EB">09:52 rollback</text>
+          <circle cx="464" cy="130" r="5" fill="#0D9488"/><text x="464" y="170" text-anchor="middle" font-size="9" fill="#0D9488">10:01 mitigated</text>
+          <circle cx="666" cy="130" r="5" fill="#0D9488"/><text x="666" y="170" text-anchor="middle" font-size="9" fill="#0D9488">10:30 resolved</text>
+          <text x="360" y="218" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">12 min passed between deploy and the first error: "it can't be the deploy" was the trap</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/postmortems/2026-10-14-booking-api-5xx.md</span>
+        <pre class="code"># Postmortem: booking-api 5xx after connection pool change (SEV2)
+Status: final · Authors: Minh, Linh · Review: 2026-10-17 · Blameless
+
+## Summary
+From 09:24 to 10:01 ICT, ~9% of booking requests (≈2,000) failed with 503.
+Error budget spent: 19% of booking-api availability (30 d). No data loss.
+
+## Impact          TTD 10 min · TTA 3 min · TTM 37 min · TTR 66 min
+## Timeline        (see diagram; full log in #inc-20261014-booking-5xx)
+
+## What happened
+1.9.0 raised the per-task DB pool from 20 to 50. At 09:20 the morning peak scaled
+booking-api from 6 to 12 tasks: 12 × 50 = 600 connections against
+max_connections = 400. New tasks failed their first queries and returned 503.
+
+## Contributing factors
+- No check compares pool_size × autoscaling max_capacity with max_connections.
+- Staging runs 2 tasks, so the change never met the limit before prod.
+- The 1.9.0 rollback was delayed 15 min because errors began 12 min after deploy.
+- No alert on DatabaseConnections approaching the limit.
+
+## What went well
+Burn-rate page fired correctly; rollback worked first time; comms on schedule.
+
+## Action items      (owner · priority · due · issue)
+1. CI check: pool × max tasks ≤ 80% of max_connections  · Minh · P1 · 10-28 · #431
+2. Put RDS Proxy in front of booking-api (AW5)            · An   · P1 · 11-15 · #432
+3. Ticket alert: DatabaseConnections &gt; 80% of max          · Linh · P2 · 10-31 · #433
+4. Load test at 12 tasks in staging before pool changes (SR4) · Thao · P2 · 11-30 · #434</pre>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Run the review meeting, don't read the doc aloud.</strong> Circulate
+        the draft 24 hours before. In the 45-minute meeting, walk the timeline and spend most of the time on the
+        contributing factors and "what made this hard to detect or fix". Invite the clinic's technical contact for SEV1s:
+        clients trust a team that shows its working.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Action items that actually get done</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The most common postmortem failure is a list of good intentions nobody does. Limit it to three to five items,
+        each with an owner, a priority, a due date and an issue in the tracker. Prefer items that remove a whole class of
+        failure (a CI check) over items that rely on people remembering (a wiki note).
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Weak action item</th><th class="px-4 py-3">Strong action item</th><th class="px-4 py-3">Why stronger</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">"Be careful with pool sizes"</td><td class="px-4 py-3">CI fails a PR when pool × max tasks &gt; 80% of <code class="inline">max_connections</code></td><td class="px-4 py-3">Prevents the class, works for every future engineer</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Improve monitoring"</td><td class="px-4 py-3">Ticket alert on <code class="inline">DatabaseConnections</code> &gt; 320 for 10 min, with a runbook</td><td class="px-4 py-3">Specific, testable, has a threshold</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">"Investigate RDS Proxy"</td><td class="px-4 py-3">Deploy RDS Proxy for booking-api in staging by 11-08, prod by 11-15</td><td class="px-4 py-3">Has an end state and a date</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># the weekly ops sync starts with this list: open P1 postmortem items, oldest first</span>
+gh issue list -R golden-owl/clinic-infra --label postmortem,P1 --state open \
+  --json number,title,assignees,createdAt \
+  --jq '.[] | "\(.number)\t\(.createdAt[:10])\t\(.assignees[0].login)\t\(.title)"'
+<span class="out">431	2026-10-17	minh	CI check: pool x max tasks vs max_connections
+432	2026-10-17	an	RDS Proxy for booking-api</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Track one number across all postmortems: the share of P1 items closed within 30 days. Below 80%, the team is
+        writing postmortems for the record rather than for change, and the same incident will come back.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Toil: turn the on-call log into a backlog</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Toil is manual, repetitive, automatable work that grows with the system (defined in
+        <a href="./fn1.html" class="text-viol underline decoration-viol/40">FN1</a>). The on-call log and handoff notes
+        already record it. Once a month, add up the hours per kind of task and automate the biggest one. The clinic team
+        did this for one quarter:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Toil item</th><th class="px-4 py-3">Hours / month</th><th class="px-4 py-3">Fix</th><th class="px-4 py-3">After</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Acknowledging noisy alarms</td><td class="px-4 py-3">4</td><td class="px-4 py-3">Deleted cause-based pages per SR1 review</td><td class="px-4 py-3">0.5</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Re-driving the SQS DLQ by hand</td><td class="px-4 py-3">3</td><td class="px-4 py-3">Runbook automation with <code class="inline">aws sqs start-message-move-task</code> after the fix ships (<a href="./aw6.html" class="text-viol underline decoration-viol/40">AW6</a>)</td><td class="px-4 py-3">0.5</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Granting temporary prod DB access</td><td class="px-4 py-3">3</td><td class="px-4 py-3">Time-boxed Identity Center permission set (<a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a>)</td><td class="px-4 py-3">1</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Restarting a stuck worker</td><td class="px-4 py-3">4</td><td class="px-4 py-3">Liveness check on queue heartbeat so the platform restarts it</td><td class="px-4 py-3">2</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Total</td><td class="px-4 py-3">14</td><td class="px-4 py-3">About 6 engineer-days of work</td><td class="px-4 py-3">4</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Ten hours a month saved for six days of work pays back in under five months, and every on-call week gets quieter.
+        That is the argument you make in planning, with the table attached.
+      </p>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are good at the paperwork around incidents: turning a noisy Slack channel into a timeline, drafting status
+        updates in a consistent voice, and checking runbook commands still work. Use them with read-only credentials and
+        never let one take a production action during an incident without the IC approving it in the channel. AI-assisted
+        triage in depth is <a href="./ar6.html" class="text-viol underline decoration-viol/40">AR6</a>.
+      </p>
+      <pre class="code mt-3">Here is the export of #inc-20261014-booking-5xx and the ECS deployment history.
+Build a timeline table (time ICT, event, source) and compute TTD, TTA, TTM and TTR.
+Flag any gap over 5 minutes where nothing was decided. Do not guess root cause.</pre>
+      <pre class="code mt-3">Draft the postmortem from this timeline using postmortems/TEMPLATE.md. Write
+contributing factors in blameless language (systems and conditions, no names as
+subjects). Propose at most 4 action items, each with a testable end state.</pre>
+      <pre class="code mt-3">For every runbook in runbooks/, run each read-only command against the staging
+account (profile gol-staging-readonly) and report which ones fail or return output
+different from the "expected" block. Do not run anything that changes state.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Build timelines and incident metrics from chat exports and deploy logs</li>
+            <li>Draft status updates from the IC's notes, in the template voice</li>
+            <li>Rewrite blameful drafts into blameless language</li>
+            <li>Test runbook commands against staging with a read-only role</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every timestamp against the source, including the timezone</li>
+            <li>Impact numbers (failed requests, budget spent) against the SLO dashboard</li>
+            <li>That external updates promise nothing the IC has not approved</li>
+            <li>Action items are owned by a person and tracked as issues</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written incident material:</strong> a confident root
+        cause in a timeline that should only contain facts; a status update that blames AWS or a vendor; "human error" or
+        an engineer's name as a contributing factor; ten action items with no owners; runbook commands that write
+        (<code class="inline">update-service</code>, <code class="inline">kubectl delete</code>) presented as diagnosis;
+        and timestamps silently converted from UTC to ICT, or not converted at all.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has never been on call; treats an outage as "everyone jump in".</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows the severity levels and roles by name and has read a postmortem, but has not run any part of an incident.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Takes primary on-call with a coach, follows runbooks, acts as scribe or ops lead under an experienced IC.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Runs a SEV2 as IC: declares, assigns roles, chooses mitigation over investigation, keeps the comms cadence. Writes a blameless postmortem with tracked action items and maintains runbooks for their services.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Designs the rotation and escalation policy, coaches new ICs, runs postmortem reviews with clients present, and uses toil and incident data to set the team's reliability roadmap.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> in a tabletop exercise where a
+        mentor feeds you symptoms every two minutes, declare the incident, assign roles, post the opening message and the
+        first status page update within 10 minutes, and decide on a mitigation before you know the root cause. Then write
+        the postmortem within two working days.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ The IC who debugs</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The most senior person becomes IC and then opens a terminal. Coordination stops, comms slip, and two changes collide. If you are the best debugger, hand IC to someone else.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Waiting for proof before rolling back</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">"The deploy was 12 minutes before the errors, so it can't be that" cost 15 minutes in the October incident. If a change is recent, roll back first and prove later.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Postmortems as punishment</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">If writing one feels like a trial, people stop declaring incidents and you lose the data. Managers must visibly thank the people whose change triggered an incident for a good write-up.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Practise on boring days</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A 30-minute tabletop each month, rotating the IC role, makes the first real SEV1 feel familiar. Pair it with the game days in <a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a>.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write SEV4 near misses too</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A one-paragraph review of "RDS failed over and nobody noticed" is cheap and tells you which defences work. Near misses are free lessons.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="severity"> <span>I can classify an incident by severity from user impact and state the response and comms cadence for each level.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="roles"> <span>I have acted as scribe or ops lead in a real incident or tabletop, and can explain what the IC must not do.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="oncall"> <span>I have defined a schedule and escalation policy in Terraform and verified a test page reaches the phone.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="runbook"> <span>I wrote a runbook for one alert with copy-paste commands and expected output, and tested it in staging.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tabletop"> <span class="font-semibold">Ran a 45-minute tabletop as IC for a mentor-designed booking-api scenario, then delivered the Slack timeline, three status page updates and a blameless postmortem with TTD/TTA/TTM/TTR and at least three tracked action items as a PR to clinic-infra/postmortems (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://sre.google/sre-book/managing-incidents/" target="_blank" rel="noopener">Google SRE Book — Managing Incidents</a> — the incident command roles in Part II, with a worked bad and good incident.</li>
+        <li><a class="text-coral underline" href="https://sre.google/sre-book/postmortem-culture/" target="_blank" rel="noopener">Google SRE Book — Postmortem Culture</a> — why blameless works and how to make it stick.</li>
+        <li><a class="text-coral underline" href="https://sre.google/workbook/on-call/" target="_blank" rel="noopener">Google SRE Workbook — On-Call</a> — rotation sizing, page load and the two-incidents-per-shift guideline.</li>
+        <li><a class="text-coral underline" href="https://sre.google/sre-book/eliminating-toil/" target="_blank" rel="noopener">Google SRE Book — Eliminating Toil</a> — the definition and the 50% cap behind Part IV.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/providers/PagerDuty/pagerduty/latest/docs" target="_blank" rel="noopener">Terraform Registry — PagerDuty provider</a> — schedules, escalation policies and services as code.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/health/latest/ug/health-api.html" target="_blank" rel="noopener">AWS — Health API</a> — account-specific events during an incident, and the support plan it needs.</li>
+      </ul>

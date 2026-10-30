@@ -1,0 +1,709 @@
+<!-- meta: days=3 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Route 53, ACM &amp; DNS Operations</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Every request to the clinic platform starts with a DNS lookup and a TLS handshake. This module covers the AWS
+          services behind both: Route 53 hosted zones, records and routing policies, health checks and DNS failover, and
+          ACM certificates with DNS validation. You will lay out <code class="inline">clinic.example.com</code> across the
+          AWS accounts, issue certificates in the right Region for CloudFront and the ALB, and run a domain cutover from a
+          client's old hosting to AWS without a single failed booking.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> DNS mistakes have the worst ratio of effort to damage in
+          infrastructure. A one-line change with the wrong value takes the whole site down, and a 24-hour TTL keeps it down
+          for a day after you fix it, because resolvers you do not control keep serving the old answer. Expired
+          certificates are the other classic: nothing changed, yet every browser shows a red warning. Both are entirely
+          preventable with a few habits, and both happen to teams that skip them.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Zones and delegation</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A hosted zone is borrowed authority: get the delegation chain right first</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        You learned the resolution chain (root → <code class="inline">.com</code> → your name servers) and
+        <code class="inline">dig</code> in <a href="./fn3.html" class="text-viol underline decoration-viol/40">FN3</a>.
+        Route 53 is the last link: an authoritative DNS service that answers for the zones you host. A zone only works if
+        the link above it (the registrar, or the parent zone) points at the right four Route 53 name servers. Most "DNS is
+        broken" tickets turn out to be a broken link in that chain.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Public and private hosted zones</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>public</strong> hosted zone answers anyone on the internet. A <strong>private</strong> hosted zone answers
+        only from VPCs associated with it, which is how internal names such as
+        <code class="inline">db.clinic.internal</code> resolve without exposing them. The same name can exist in both
+        ("split-horizon"); a VPC then sees the private answer.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Zone</th><th class="px-4 py-3">Answers</th><th class="px-4 py-3">Clinic example</th><th class="px-4 py-3">Cost</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Public</td><td class="px-4 py-3">Everyone, via the registrar's NS delegation</td><td class="px-4 py-3"><code class="inline">clinic.example.com</code> in gol-shared</td><td class="px-4 py-3">USD 0.50/zone/month + USD 0.40 per million standard queries</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Public, delegated subdomain</td><td class="px-4 py-3">Everyone, via NS records in the parent zone</td><td class="px-4 py-3"><code class="inline">dev.clinic.example.com</code> in gol-dev</td><td class="px-4 py-3">Same</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Private</td><td class="px-4 py-3">Only associated VPCs (the VPC's <code class="inline">.2</code> resolver)</td><td class="px-4 py-3"><code class="inline">clinic.internal</code> in each env VPC</td><td class="px-4 py-3">Same; queries from associated VPCs are not charged per query</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Private zones, Route 53 Resolver endpoints for hybrid DNS and VPC DNS settings belong with the VPC design in
+        <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>. This module concentrates on public DNS,
+        where mistakes are visible to patients.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The clinic's zone layout across accounts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Keep the apex zone in <code class="inline">gol-shared</code>, where few people have write access, and delegate one
+        subdomain per non-prod environment to that environment's account. Developers and ExternalDNS
+        (<a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>) can then create records in dev freely
+        without any permission on the zone that serves patients.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 270" class="w-full min-w-[640px]" role="img" aria-label="Delegation: registrar points to clinic.example.com zone in gol-shared, which delegates dev and staging subdomains to zones in gol-dev and gol-staging using NS records">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">DELEGATION CHAIN · who answers for which name</text>
+          <g class="anim-pulse"><rect x="20" y="40" width="150" height="50" rx="9" fill="#37474F"/>
+            <text x="95" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Registrar</text>
+            <text x="95" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">NS → 4 Route 53 servers</text></g>
+          <g class="anim-pulse d1"><rect x="240" y="40" width="220" height="50" rx="9" fill="#2563EB"/>
+            <text x="350" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">clinic.example.com · gol-shared</text>
+            <text x="350" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">api · app · CAA · MX · NS for dev/staging</text></g>
+          <g class="anim-pulse d2"><rect x="150" y="170" width="200" height="50" rx="9" fill="#0D9488"/>
+            <text x="250" y="191" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">dev.clinic.example.com</text>
+            <text x="250" y="206" text-anchor="middle" fill="#ffffffbb" font-size="9">zone in gol-dev · ExternalDNS writes</text></g>
+          <g class="anim-pulse d3"><rect x="380" y="170" width="200" height="50" rx="9" fill="#6d5acd"/>
+            <text x="480" y="191" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">staging.clinic.example.com</text>
+            <text x="480" y="206" text-anchor="middle" fill="#ffffffbb" font-size="9">zone in gol-staging</text></g>
+          <g class="anim-pulse d4"><rect x="530" y="40" width="170" height="50" rx="9" fill="#D97757"/>
+            <text x="615" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB in gol-prod</text>
+            <text x="615" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">alias target, cross-account</text></g>
+          <line x1="170" y1="65" x2="240" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="320" y1="90" x2="250" y2="170" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="380" y1="90" x2="480" y2="170" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="460" y1="65" x2="530" y2="65" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="282" y="135" font-size="9" fill="#6E6B64">NS</text>
+          <text x="440" y="135" font-size="9" fill="#6E6B64">NS</text>
+          <text x="360" y="255" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">prod records stay in the apex zone; only non-prod is delegated</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The prod stack in <code class="inline">clinic-infra</code> writes <code class="inline">api</code> and
+        <code class="inline">app</code> into the apex zone through a role in gol-shared whose policy uses the
+        <code class="inline">route53:ChangeResourceRecordSetsNormalizedRecordNames</code> condition key, so that role can
+        change those two names and nothing else.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Delegating a subdomain, step by step</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Delegation is two resources in two accounts: the child zone, and an NS record in the parent that copies the child's
+        four name servers. Terraform handles both in one apply with a second provider alias.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/dns.tf</span>
+        <pre class="code"><span class="kw">provider</span> <span class="st">"aws"</span> {
+  alias  = <span class="st">"shared"</span>
+  region = <span class="st">"ap-southeast-1"</span>
+  assume_role { role_arn = <span class="st">"arn:aws:iam::111122223333:role/dns-delegation"</span> }
+}
+
+<span class="kw">data</span> <span class="st">"aws_route53_zone"</span> <span class="st">"apex"</span> {
+  provider = aws.shared
+  name     = <span class="st">"clinic.example.com"</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_route53_zone"</span> <span class="st">"dev"</span> {
+  name = <span class="st">"dev.clinic.example.com"</span>          <span class="cm"># created in gol-dev (default provider)</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_route53_record"</span> <span class="st">"dev_ns"</span> {
+  provider = aws.shared                      <span class="cm"># written into the parent zone in gol-shared</span>
+  zone_id  = <span class="kw">data</span>.aws_route53_zone.apex.zone_id
+  name     = <span class="st">"dev.clinic.example.com"</span>
+  type     = <span class="st">"NS"</span>
+  ttl      = 172800                          <span class="cm"># 2 days: NS sets rarely change</span>
+  records  = aws_route53_zone.dev.name_servers
+}</pre>
+      </div>
+      <pre class="code mt-3">dig +trace +nodnssec app.dev.clinic.example.com | grep -E 'NS|A\s'
+<span class="out">com.                    172800  IN  NS  a.gtld-servers.net.
+example.com.            172800  IN  NS  ns-1203.awsdns-22.org.
+clinic.example.com.     172800  IN  NS  ns-412.awsdns-51.com.
+dev.clinic.example.com. 172800  IN  NS  ns-1789.awsdns-31.co.uk.
+app.dev.clinic.example.com. 60  IN  A   13.229.41.17</span>
+<span class="cm"># each line is one hop of authority; a hop that returns SERVFAIL or the wrong NS is your bug</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Deleting and recreating a zone changes its name servers.</strong>
+        Route 53 assigns four new name servers to every new zone. If Terraform replaces
+        <code class="inline">aws_route53_zone.dev</code>, the parent's NS record updates in the same apply, but a registrar
+        delegation (the apex) does not: the domain resolves to nothing until someone edits the registrar. Put
+        <code class="inline">prevent_destroy</code> on apex zones, and consider a reusable delegation set when you manage
+        many client domains.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Reading a zone from the CLI</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        During an incident you need answers in seconds: which zone serves this name, what is in it, and did someone just
+        change it. The console hides record sets behind pagination; the CLI and <code class="inline">jq</code> do not.
+        Every change to a zone returns a change ID, and <code class="inline">INSYNC</code> means all Route 53 name servers
+        are serving it, usually within 60 seconds.
+      </p>
+      <pre class="code mt-3">aws route53 list-hosted-zones-by-name --dns-name clinic.example.com \
+  --query 'HostedZones[].[Name,Id,Config.PrivateZone,ResourceRecordSetCount]' --output text
+<span class="out">clinic.example.com.        /hostedzone/Z0123456789ABC   False   23
+dev.clinic.example.com.    /hostedzone/Z0DEV987654321   False   41</span>
+aws route53 list-resource-record-sets --hosted-zone-id Z0123456789ABC \
+  | jq -r '.ResourceRecordSets[] | [.Name, .Type, (.TTL // "alias"), (.SetIdentifier // "-")] | @tsv' | head -6
+<span class="out">clinic.example.com.        MX      3600    -
+clinic.example.com.        NS      172800  -
+clinic.example.com.        TXT     3600    -
+api.clinic.example.com.    A       alias   -
+app.clinic.example.com.    A       alias   primary
+app.clinic.example.com.    A       alias   maintenance</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        "Did someone just change it?" is answered by CloudTrail: every <code class="inline">ChangeResourceRecordSets</code>
+        call is logged with the caller, in <code class="inline">us-east-1</code> because Route 53 is a global service. If a
+        record changed and no Terraform apply ran, someone used the console, and that is the finding for the postmortem.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Records and routing policies</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Alias records and TTLs decide how fast you can change your mind</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A record is a name, a type, a value and a TTL. Route 53 adds two things on top of standard DNS:
+        <strong>alias records</strong>, which point at AWS resources and follow their IP changes, and <strong>routing
+        policies</strong>, which return different answers depending on weight, latency or health. Together they turn DNS
+        from a static phone book into a traffic control tool.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The record types you will actually write</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Type</th><th class="px-4 py-3">Holds</th><th class="px-4 py-3">Clinic example</th><th class="px-4 py-3">Watch out for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A / AAAA (alias)</td><td class="px-4 py-3">IPv4 / IPv6 of an AWS resource</td><td class="px-4 py-3"><code class="inline">api</code> → ALB, <code class="inline">app</code> → CloudFront</td><td class="px-4 py-3">Create the AAAA alias too when the target is dual-stack</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CNAME</td><td class="px-4 py-3">Another name</td><td class="px-4 py-3"><code class="inline">status</code> → the status-page vendor</td><td class="px-4 py-3">Not allowed at the apex, nor next to other records with the same name</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">TXT</td><td class="px-4 py-3">Free text</td><td class="px-4 py-3">SPF, DMARC, domain verification for Google Workspace</td><td class="px-4 py-3">Each string max 255 chars: split long DKIM keys into several quoted strings</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">MX</td><td class="px-4 py-3">Mail servers with priority</td><td class="px-4 py-3">Client's mail provider</td><td class="px-4 py-3">Forgetting to copy it during a cutover breaks the client's email</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CAA</td><td class="px-4 py-3">Which CAs may issue certificates</td><td class="px-4 py-3"><code class="inline">0 issue "amazon.com"</code></td><td class="px-4 py-3">A CAA without Amazon makes ACM issuance and renewal fail</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">NS / SOA</td><td class="px-4 py-3">Authority for the zone</td><td class="px-4 py-3">Created with the zone; NS also for delegation</td><td class="px-4 py-3">Never edit the zone's own NS/SOA unless you know exactly why</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Alias records versus CNAMEs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An <strong>alias</strong> is a Route 53 extension: you create an A record whose value is "whatever IPs this ALB has
+        right now". Route 53 resolves it internally, so the client gets an A answer directly. It works at the zone apex
+        (<code class="inline">clinic.example.com</code> itself), queries to alias targets on AWS are free, and it can
+        inherit the target's health. Use an alias whenever the target is an ALB, NLB, CloudFront distribution, API Gateway
+        custom domain, S3 website endpoint or another record in the same zone.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/dns.tf — api record</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_route53_record"</span> <span class="st">"api"</span> {
+  provider = aws.shared                         <span class="cm"># apex zone lives in gol-shared</span>
+  zone_id  = <span class="kw">data</span>.aws_route53_zone.apex.zone_id
+  name     = <span class="st">"api.clinic.example.com"</span>
+  type     = <span class="st">"A"</span>
+  alias {
+    name                   = aws_lb.public.dns_name    <span class="cm"># ALB in gol-prod</span>
+    zone_id                = aws_lb.public.zone_id     <span class="cm"># the ALB's canonical zone, not yours</span>
+    evaluate_target_health = <span class="kw">true</span>                    <span class="cm"># unhealthy ALB = record treated as unhealthy</span>
+  }
+}</pre>
+      </div>
+      <pre class="code mt-3">dig +noall +answer api.clinic.example.com
+<span class="out">api.clinic.example.com. 60  IN  A  13.229.41.17
+api.clinic.example.com. 60  IN  A  52.77.180.9
+api.clinic.example.com. 60  IN  A  18.139.66.204</span>
+<span class="cm"># an A answer, not a CNAME chain; the 60 s TTL comes from the ALB, you cannot set it on an alias</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">TTLs: the delay you choose in advance</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The TTL is how long resolvers may cache an answer. It is a promise you make to the whole internet <em>before</em>
+        you know you need to change something. With a TTL of 86,400 (one day) a wrong record, once fixed, keeps hurting
+        some users for up to a day. A short TTL costs a few more queries, which at USD 0.40 per million is nothing for the
+        clinic's traffic.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Record kind</th><th class="px-4 py-3">TTL we use</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Alias to ALB / CloudFront</td><td class="px-4 py-3">Fixed by AWS (60 s)</td><td class="px-4 py-3">Follows the target's IP changes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Records you may need to move (CNAMEs, A to IPs)</td><td class="px-4 py-3">300 s</td><td class="px-4 py-3">Five minutes of pain at most</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">During a planned cutover</td><td class="px-4 py-3">60 s, lowered 48 h before</td><td class="px-4 py-3">The old long TTL must expire first</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">MX, TXT verification, NS</td><td class="px-4 py-3">3,600 s to 172,800 s</td><td class="px-4 py-3">Rarely change; long TTLs reduce dependency on Route 53 availability</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Also mind <strong>negative caching</strong>: when a name does not exist, resolvers cache the NXDOMAIN for the SOA
+        record's minimum TTL (900 s by default in Route 53). Querying a name before you create it means some users will not
+        see it for up to 15 minutes afterwards.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Routing policies</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A routing policy lets several records share one name and decides which one each query gets. Three matter most for
+        us: <strong>weighted</strong> for gradual migrations, <strong>failover</strong> for a maintenance or DR site, and
+        <strong>latency</strong> when a client runs in more than one Region.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Policy</th><th class="px-4 py-3">Answers with</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Simple</td><td class="px-4 py-3">The one record set</td><td class="px-4 py-3">Most records</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Weighted</td><td class="px-4 py-3">Records in proportion to weights (e.g. 90/10)</td><td class="px-4 py-3">Moving traffic from old hosting to AWS, or between two ALBs, in steps</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Failover</td><td class="px-4 py-3">Primary while healthy, else secondary</td><td class="px-4 py-3">Static maintenance page; warm-standby DR Region (<a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Latency</td><td class="px-4 py-3">The Region with the lowest measured latency for the resolver</td><td class="px-4 py-3">Active-active in Singapore and Sydney</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Geolocation / geoproximity</td><td class="px-4 py-3">By the user's country or distance</td><td class="px-4 py-3">Data-residency rules ("Vietnamese users must hit the Vietnam stack")</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Multivalue / IP-based</td><td class="px-4 py-3">Up to 8 healthy IPs / by client CIDR</td><td class="px-4 py-3">Rare for us; simple client-side load spreading, ISP-specific routing</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>DNS routing is coarse.</strong> Resolvers and clients cache answers,
+        some ignore TTLs, and a weight of 10% means roughly 10% of <em>resolvers</em>, not of requests. For precise canaries
+        use ALB weighted target groups or a service mesh
+        (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>). Use DNS weights for migrations
+        between whole platforms, where coarse is fine.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Weighted records for a gradual platform move</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When the clinic moved <code class="inline">api</code> from an old Elastic Beanstalk environment to the new ECS
+        service, nobody wanted a big-bang switch. Two weighted records with the same name, shifted in steps over three
+        days while watching error rates, made the move reversible at every step: setting the new weight to 0 sent everyone
+        back within a TTL.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    Q["Resolver asks for<br/>api.clinic.example.com"] --> R53{"Route 53<br/>weighted set"}
+    R53 -->|"weight 90"| OLD["old-eb<br/>Beanstalk ALB"]
+    R53 -->|"weight 10"| NEW["ecs-v2<br/>clinic-prod ALB"]
+    NEW -.->|"day 1: 10 → day 2: 50 → day 3: 100"| DONE(["remove old record<br/>after 7 quiet days"])
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/dns_weighted.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_route53_record"</span> <span class="st">"api_new"</span> {
+  provider       = aws.shared
+  zone_id        = <span class="kw">data</span>.aws_route53_zone.apex.zone_id
+  name           = <span class="st">"api.clinic.example.com"</span>
+  type           = <span class="st">"A"</span>
+  set_identifier = <span class="st">"ecs-v2"</span>                  <span class="cm"># unique per record in the set</span>
+  weighted_routing_policy { weight = var.api_new_weight }   <span class="cm"># 10 → 50 → 100, one PR each</span>
+  alias {
+    name                   = aws_lb.public.dns_name
+    zone_id                = aws_lb.public.zone_id
+    evaluate_target_health = <span class="kw">true</span>            <span class="cm"># unhealthy side gets 0 traffic automatically</span>
+  }
+}
+<span class="cm"># api_old: same name and type, set_identifier "old-eb", weight 100 - var.api_new_weight</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        One subtlety: you cannot mix a simple record and weighted records with the same name and type. Converting an
+        existing simple record means deleting it and creating the weighted pair in the same change, which Terraform plans
+        as a destroy plus two creates. Apply it at a quiet hour, because there is a moment with no record at all.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Health checks and DNS failover</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Failover only works if the health check tests what patients use</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        DNS failover is simple in principle: Route 53 stops returning an unhealthy record. In practice it fails in two
+        ways. The health check tests something that stays green while the site is broken (a TCP port), or it flaps and
+        moves traffic back and forth. This Part builds a failover for <code class="inline">app.clinic.example.com</code>
+        to a static "we'll be right back" page, which every client should have.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">How Route 53 health checks work</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Health checkers in several AWS Regions probe your endpoint every 30 seconds (or 10 seconds, at extra cost). An
+        endpoint is <strong>unhealthy</strong> after a configurable number of consecutive failures (default 3), as judged
+        by each checker, and Route 53 treats it as healthy only if more than 18% of checkers agree it is. With the defaults,
+        detection takes about 90 seconds; add the record TTL for clients to move.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Check type</th><th class="px-4 py-3">Probes</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Endpoint (HTTPS + string match)</td><td class="px-4 py-3">A URL from the internet; healthy when it connects within 4 s and returns 2xx/3xx within 2 s, optionally containing a string</td><td class="px-4 py-3">Public endpoints: <code class="inline">https://api.clinic.example.com/healthz</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Calculated</td><td class="px-4 py-3">The status of other health checks (e.g. 2 of 3 healthy)</td><td class="px-4 py-3">"The site is up only if API and web are both up"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CloudWatch alarm</td><td class="px-4 py-3">An alarm's state</td><td class="px-4 py-3">Private resources the checkers cannot reach; SLO-based failover on 5xx rate</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Alias <code class="inline">evaluate_target_health</code></td><td class="px-4 py-3">The ALB's own target health; no separate check, no cost</td><td class="px-4 py-3">Failing over when all targets behind the ALB are unhealthy</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Your security group must let the checkers in.</strong> Endpoint
+        health checks come from published Route 53 IP ranges on the internet. If the ALB only allows CloudFront's prefix list,
+        or WAF blocks unknown user agents, every check fails and Route 53 fails over a perfectly healthy site. Allow the
+        <code class="inline">ROUTE53_HEALTHCHECKS</code> ranges from <code class="inline">ip-ranges.json</code>, or check
+        through CloudFront.</div>
+
+      <h3 class="font-semibold text-lg mt-8">A failover pair in Terraform</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Two records with the same name and type, one <code class="inline">PRIMARY</code> with a health check, one
+        <code class="inline">SECONDARY</code>. The secondary is a CloudFront distribution serving a static maintenance
+        page from S3 (<a href="./aw4.html" class="text-viol underline decoration-viol/40">AW4</a>), which has nothing in
+        common with the primary that could fail at the same time.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/dns_failover.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_route53_health_check"</span> <span class="st">"app"</span> {
+  fqdn              = <span class="st">"app.clinic.example.com"</span>
+  type              = <span class="st">"HTTPS_STR_MATCH"</span>
+  resource_path     = <span class="st">"/api/healthz/deep"</span>       <span class="cm"># checks DB + cache, not just the process</span>
+  search_string     = <span class="st">"\"status\":\"ok\""</span>
+  failure_threshold = 3
+  request_interval  = 30
+  regions           = [<span class="st">"ap-southeast-1"</span>, <span class="st">"ap-northeast-1"</span>, <span class="st">"us-west-2"</span>]
+  tags = { Name = <span class="st">"clinic-prod-app"</span> }             <span class="cm"># the console shows this name</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_route53_record"</span> <span class="st">"app_primary"</span> {
+  provider        = aws.shared
+  zone_id         = <span class="kw">data</span>.aws_route53_zone.apex.zone_id
+  name            = <span class="st">"app.clinic.example.com"</span>
+  type            = <span class="st">"A"</span>
+  set_identifier  = <span class="st">"primary"</span>
+  health_check_id = aws_route53_health_check.app.id
+  failover_routing_policy { type = <span class="st">"PRIMARY"</span> }
+  alias {
+    name                   = aws_cloudfront_distribution.app.domain_name
+    zone_id                = aws_cloudfront_distribution.app.hosted_zone_id
+    evaluate_target_health = <span class="kw">false</span>             <span class="cm"># CloudFront: rely on the health check</span>
+  }
+}
+<span class="cm"># app_secondary: same name/type, set_identifier "maintenance", type "SECONDARY",
+# alias to the maintenance-page distribution, no health check</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The health check must live in the same account as the record that uses it (gol-shared here), which is why both are
+        created through the <code class="inline">aws.shared</code> provider in the real file. A <code class="inline">/healthz/deep</code>
+        endpoint that fails when the database is down is the right signal for a maintenance page; it would be the wrong
+        signal for liveness probes, which should never depend on the database
+        (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Failing over on what patients feel: alarm-based checks</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An HTTP probe every 30 seconds misses partial failures: the health endpoint answers while 30% of bookings fail.
+        A health check backed by a <strong>CloudWatch alarm</strong> lets you fail over on the ALB's 5xx rate instead, and
+        it also works for endpoints the public checkers cannot reach. Combine it with the endpoint check in a
+        <strong>calculated</strong> check so either signal can trigger the maintenance page.
+      </p>
+      <pre class="code mt-3">aws route53 create-health-check --caller-reference app-5xx-$(date +%s) \
+  --health-check-config '{"Type":"CLOUDWATCH_METRIC",
+    "AlarmIdentifier":{"Region":"ap-southeast-1","Name":"clinic-prod-alb-5xx-rate"},
+    "InsufficientDataHealthStatus":"LastKnownStatus"}'
+<span class="out">{ "HealthCheck": { "Id": "9a7c51d2-...", "HealthCheckConfig": { "Type": "CLOUDWATCH_METRIC", ... } } }</span>
+aws route53 create-health-check --caller-reference app-combined-$(date +%s) \
+  --health-check-config '{"Type":"CALCULATED","HealthThreshold":2,
+    "ChildHealthChecks":["4b1e2f90-...","9a7c51d2-..."]}'
+<span class="cm"># HealthThreshold 2 of 2: the app is healthy only if the probe AND the 5xx alarm are fine</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">LastKnownStatus</code> matters: when the alarm has no data (no traffic at 3 a.m.), Route 53
+        keeps the previous state instead of failing over a quiet but healthy site. Alarm design itself (thresholds,
+        periods, missing data) is <a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Testing failover before you need it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A failover you have not triggered is a guess. Test it in staging by inverting the health check, which flips its
+        status without touching the app, then watch what DNS returns.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant HC as Route 53 health checkers
+    participant APP as app (primary)
+    participant R53 as Route 53 resolver answer
+    participant U as Patient browser
+    HC->>APP: GET /api/healthz/deep every 30 s
+    APP-->>HC: 503, three times (database down)
+    Note over HC: fewer than 18 percent of checkers report healthy<br/>≈ 90 s after the first failure
+    R53->>U: next lookup returns the maintenance CloudFront IPs
+    Note over U: users still holding the old answer<br/>move when the 60 s TTL expires
+    HC->>APP: probes continue, 3 successes → primary healthy again
+        </pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># staging drill: invert the check, then ask Route 53 what it would answer</span>
+aws route53 update-health-check --health-check-id 4b1e2f90-... --inverted
+aws route53 get-health-check-status --health-check-id 4b1e2f90-... \
+  --query 'HealthCheckObservations[].[Region,StatusReport.Status]' --output text | head -3
+<span class="out">ap-southeast-1   Failure: Inverted health check ...
+ap-northeast-1   Failure: Inverted health check ...
+us-west-2        Failure: Inverted health check ...</span>
+aws route53 test-dns-answer --hosted-zone-id Z0123456789ABC \
+  --record-name app.staging.clinic.example.com --record-type A --query 'RecordData'
+<span class="out">[ "18.155.68.21", "18.155.68.74", "18.155.68.90", "18.155.68.102" ]</span>
+<span class="cm"># CloudFront maintenance IPs: failover works. Now --no-inverted and confirm it fails back</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> create a CloudWatch alarm on the health
+        check's <code class="inline">HealthCheckStatus</code> metric (published in us-east-1) and route it to on-call.
+        Route 53 failing over silently is good for patients and bad for you: the first sign should not be a clinic asking
+        why the site says "maintenance".</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Certificates and cutovers</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Certificates should renew themselves; cutovers should be boring</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        ACM issues public TLS certificates for free and renews them automatically, as long as two conditions hold: the
+        certificate is DNS-validated and the validation record still exists, and the certificate is attached to an AWS
+        service. Most expired-certificate incidents on AWS involve an imported certificate or an email-validated one. The
+        last skill in this module, the domain cutover, puts DNS and certificates together under time pressure.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">ACM certificates with DNS validation</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You request a certificate, ACM gives you a CNAME per domain name to prove control, you create it in Route 53, and
+        ACM issues the certificate, usually within minutes. Keep the CNAME forever: ACM checks it again at renewal, which
+        it starts 60 days before expiry. The industry is shortening certificate lifetimes (200 days maximum from March
+        2026, heading to 47 days by 2029), which makes automatic renewal non-negotiable and manual or imported
+        certificates a liability.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/certs.tf — ALB certificate</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_acm_certificate"</span> <span class="st">"api"</span> {
+  domain_name               = <span class="st">"api.clinic.example.com"</span>
+  subject_alternative_names = [<span class="st">"partners.clinic.example.com"</span>]
+  validation_method         = <span class="st">"DNS"</span>              <span class="cm"># never EMAIL: it cannot auto-renew unattended</span>
+  key_algorithm             = <span class="st">"EC_prime256v1"</span>    <span class="cm"># smaller, faster handshakes than RSA 2048</span>
+  lifecycle { create_before_destroy = <span class="kw">true</span> }   <span class="cm"># the ALB listener never sits without a cert</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_route53_record"</span> <span class="st">"api_validation"</span> {
+  provider = aws.shared
+  for_each = { <span class="kw">for</span> o <span class="kw">in</span> aws_acm_certificate.api.domain_validation_options : o.domain_name =&gt; o }
+  zone_id  = <span class="kw">data</span>.aws_route53_zone.apex.zone_id
+  name     = each.value.resource_record_name
+  type     = each.value.resource_record_type
+  records  = [each.value.resource_record_value]
+  ttl      = 300
+  allow_overwrite = <span class="kw">true</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_acm_certificate_validation"</span> <span class="st">"api"</span> {
+  certificate_arn         = aws_acm_certificate.api.arn
+  validation_record_fqdns = [<span class="kw">for</span> r <span class="kw">in</span> aws_route53_record.api_validation : r.fqdn]
+}  <span class="cm"># the listener references this resource's certificate_arn, so it waits for ISSUED</span></pre>
+      </div>
+      <pre class="code mt-3">aws acm describe-certificate --certificate-arn "$CERT_ARN" \
+  --query 'Certificate.[Status,NotAfter,RenewalEligibility,InUseBy[0]]' --output text
+<span class="out">ISSUED   2027-05-14T23:59:59+00:00   ELIGIBLE   arn:aws:elasticloadbalancing:ap-southeast-1:444455556666:loadbalancer/app/clinic-prod-public/9f2c...</span>
+<span class="cm"># RenewalEligibility INELIGIBLE = not in use or not DNS-validated: it WILL expire</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">The Region rules for certificates</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An ACM certificate exists in one Region and can only be attached to resources in that Region, with one famous
+        exception: CloudFront is a global service that only reads certificates from <code class="inline">us-east-1</code>.
+        Getting this wrong is not dangerous, just confusing: the certificate simply does not appear in the drop-down.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Where TLS terminates for the clinic: CloudFront with a us-east-1 certificate for app, ALB with an ap-southeast-1 certificate for api">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">WHERE EACH CERTIFICATE LIVES · same client, two Regions</text>
+          <g class="anim-pulse"><rect x="15" y="85" width="120" height="50" rx="9" fill="#37474F"/>
+            <text x="75" y="106" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Patient browser</text>
+            <text x="75" y="121" text-anchor="middle" fill="#ffffffbb" font-size="9">TLS 1.3</text></g>
+          <g class="anim-pulse d1"><rect x="200" y="40" width="190" height="56" rx="9" fill="#6d5acd"/>
+            <text x="295" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">CloudFront · app.clinic…</text>
+            <text x="295" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">ACM cert in us-east-1</text></g>
+          <g class="anim-pulse d2"><rect x="200" y="135" width="190" height="56" rx="9" fill="#2563EB"/>
+            <text x="295" y="157" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB · api.clinic…</text>
+            <text x="295" y="173" text-anchor="middle" fill="#ffffffbb" font-size="9">ACM cert in ap-southeast-1</text></g>
+          <g class="anim-pulse d3"><rect x="460" y="40" width="110" height="56" rx="9" fill="#0D9488"/>
+            <text x="515" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">S3 / Next.js</text>
+            <text x="515" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">origin</text></g>
+          <g class="anim-pulse d4"><rect x="460" y="135" width="110" height="56" rx="9" fill="#D97757"/>
+            <text x="515" y="157" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api</text>
+            <text x="515" y="173" text-anchor="middle" fill="#ffffffbb" font-size="9">:8080 in VPC</text></g>
+          <line x1="135" y1="100" x2="200" y2="70" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="135" y1="120" x2="200" y2="160" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="390" y1="68" x2="460" y2="68" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="390" y1="163" x2="460" y2="163" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="600" y="72" font-size="9" fill="#6E6B64">OAC / HTTPS</text>
+          <text x="600" y="167" font-size="9" fill="#6E6B64">HTTP in VPC</text>
+          <text x="360" y="218" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">TLS ends at the edge you attach the certificate to; the Region follows that edge</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Attached to</th><th class="px-4 py-3">Certificate Region</th><th class="px-4 py-3">Clinic example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">CloudFront distribution</td><td class="px-4 py-3"><code class="inline">us-east-1</code> always</td><td class="px-4 py-3"><code class="inline">app.clinic.example.com</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ALB / NLB TLS listener</td><td class="px-4 py-3">Same Region as the load balancer</td><td class="px-4 py-3"><code class="inline">api.clinic.example.com</code> in ap-southeast-1</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">API Gateway, edge-optimised domain</td><td class="px-4 py-3"><code class="inline">us-east-1</code></td><td class="px-4 py-3">Avoid: use regional + CloudFront if you need edge</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">API Gateway, regional domain</td><td class="px-4 py-3">Same Region as the API</td><td class="px-4 py-3"><code class="inline">partners.clinic.example.com</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EC2 / containers terminating TLS themselves</td><td class="px-4 py-3">ACM private keys are not exportable by default</td><td class="px-4 py-3">Terminate at the ALB instead; exportable public certs exist (paid) for the rare exception</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="kw">provider</span> <span class="st">"aws"</span> {
+  alias  = <span class="st">"us_east_1"</span>
+  region = <span class="st">"us-east-1"</span>                      <span class="cm"># only for CloudFront certificates (and WAF for CloudFront)</span>
+}
+<span class="kw">resource</span> <span class="st">"aws_acm_certificate"</span> <span class="st">"app_cf"</span> {
+  provider          = aws.us_east_1
+  domain_name       = <span class="st">"app.clinic.example.com"</span>
+  validation_method = <span class="st">"DNS"</span>
+}</pre>
+
+      <h3 class="font-semibold text-lg mt-8">Guardrails: CAA records and expiry monitoring</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>CAA</strong> record lists the certificate authorities allowed to issue for your domain. It blocks a
+        whole class of mis-issuance and costs one record, but it must include Amazon or ACM renewals fail. Pair it with
+        monitoring: ACM publishes a <code class="inline">DaysToExpiry</code> metric per certificate and sends an
+        EventBridge event from 45 days before expiry, so an imported or ineligible certificate cannot surprise you.
+      </p>
+      <pre class="code mt-3">dig +short CAA clinic.example.com
+<span class="out">0 issue "amazon.com"
+0 issue "letsencrypt.org"
+0 iodef "mailto:security@clinic.example.com"</span>
+<span class="cm"># letsencrypt.org only because cert-manager issues internal certs on EKS (KS6)</span>
+aws cloudwatch put-metric-alarm --region ap-southeast-1 --alarm-name acm-api-expiry \
+  --namespace AWS/CertificateManager --metric-name DaysToExpiry \
+  --dimensions Name=CertificateArn,Value="$CERT_ARN" \
+  --statistic Minimum --period 86400 --evaluation-periods 1 \
+  --comparison-operator LessThanThreshold --threshold 30 --alarm-actions "$ONCALL_SNS"
+<span class="cm"># 30 days left means automatic renewal (which starts at 60) has already failed</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">The domain cutover runbook</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The typical job: a client's clinic site runs on an old VPS with DNS at the registrar, and it must move to AWS. The
+        work is mostly preparation, so that the cutover itself is one record change you can reverse in a minute. This is
+        the runbook we use; paste it into the change ticket and tick each line.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">When</th><th class="px-4 py-3">Step</th><th class="px-4 py-3">Verify with</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">T−7 days</td><td class="px-4 py-3">Export every record from the old DNS (MX, TXT, DKIM, verification records included) and import into a new Route 53 zone; do not change NS yet</td><td class="px-4 py-3"><code class="inline">dig @ns-412.awsdns-51.com</code> for each record matches <code class="inline">dig @old-ns</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">T−3 days</td><td class="px-4 py-3">Issue ACM certificates via DNS validation in the new zone; stand up and test AWS with a hosts-file override</td><td class="px-4 py-3">Status <code class="inline">ISSUED</code>; smoke test passes against the ALB</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">T−48 h</td><td class="px-4 py-3">Lower the TTL of records that will change to 60 s, and the NS TTL at the registrar if allowed</td><td class="px-4 py-3">Public resolvers show the new TTL counting down from 60</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">T−0</td><td class="px-4 py-3">Change NS at the registrar to Route 53 (or switch the record to the alias), in the agreed low-traffic window</td><td class="px-4 py-3"><code class="inline">dig +trace</code> shows Route 53; error rate and booking count on the dashboard</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">T+1 h</td><td class="px-4 py-3">Keep the old site running and watch its access log drain</td><td class="px-4 py-3">Old server requests trend to near zero</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">T+7 days</td><td class="px-4 py-3">Raise TTLs back, enable DNSSEC if required, decommission the old host</td><td class="px-4 py-3">No traffic to the old host for 72 h</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># check what the world sees, not what your laptop cached</span>
+for r in 1.1.1.1 8.8.8.8 9.9.9.9 203.162.4.191; do
+  printf "%-15s " "$r"; dig +short @"$r" app.clinic.example.com | head -1
+done
+<span class="out">1.1.1.1         18.155.68.21
+8.8.8.8         18.155.68.21
+9.9.9.9         18.155.68.21
+203.162.4.191   103.97.125.18</span>
+<span class="cm"># the last resolver (a Vietnamese ISP) still has the old IP: wait out the TTL before calling it done</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>The cutover that breaks email.</strong> Moving NS to Route 53
+        moves <em>every</em> record, not just the website. If the MX, SPF and DKIM records were not copied, the client's
+        email stops arriving the moment resolvers pick up the new NS, and nobody notices until a patient's message bounces.
+        Diff the full record sets between old and new name servers before T−0, every time.</div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        DNS work is mostly careful bookkeeping, which agents do well: exporting zones, diffing record sets, generating
+        Terraform for dozens of records. Keep the agent read-only against Route 53 in prod; a change to a public zone should
+        always go through a reviewed plan.
+      </p>
+      <pre class="code mt-3">Here is a BIND zone export from the client's old DNS provider. Convert it to Terraform
+aws_route53_record resources for zone clinic.example.com. Keep TTLs as they are, split TXT
+values over 255 characters, and list any record you could not convert and why.</pre>
+      <pre class="code mt-3">Compare the answers of the old name servers (ns1.oldhost.vn) and the new Route 53 name
+servers for every name in records.txt, for types A, AAAA, CNAME, MX, TXT and CAA. Use dig
+only. Output a table of mismatches. Do not modify any DNS.</pre>
+      <pre class="code mt-3">Write Terraform for an ACM certificate for app.clinic.example.com used by CloudFront,
+with DNS validation records in the apex zone in gol-shared. Explain which provider alias
+each resource uses and why.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Convert zone files and console exports into Terraform</li>
+            <li>Diff old and new name servers record by record</li>
+            <li>Draft the cutover runbook and the change ticket</li>
+            <li>Explain <code class="inline">dig +trace</code> output hop by hop</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>MX, SPF, DKIM, DMARC and verification TXT records all survived the conversion</li>
+            <li>CloudFront certificates use the <code class="inline">us-east-1</code> provider; ALB certificates do not</li>
+            <li>No plan replaces an <code class="inline">aws_route53_zone</code> that a registrar points at</li>
+            <li>TTLs were lowered early enough before any planned change</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written DNS and certificate infra:</strong>
+        <code class="inline">validation_method = "EMAIL"</code>; a CNAME at the zone apex; a CNAME to an ALB's DNS name
+        where an alias belongs; an alias <code class="inline">zone_id</code> set to your hosted zone instead of the target's
+        canonical zone; TTLs of 86,400 on records that point at things you may move; a CAA record without
+        <code class="inline">amazon.com</code>; a health check on <code class="inline">TCP:443</code> used for failover; a
+        CloudFront certificate created with the default ap-southeast-1 provider; and
+        <code class="inline">allow_overwrite = true</code> on records other than ACM validation records, which silently
+        takes over records someone else created.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has bought a domain but never managed its DNS or certificates.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can add an A or CNAME record in the console and knows certificates expire, but cannot explain an alias record or a TTL's effect on a change.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Creates records and ACM certificates in Terraform from examples; needs help with delegation across accounts and with the Region rules.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Lays out zones and delegations across accounts, writes alias, failover and weighted records with health checks, issues DNS-validated certificates in the correct Region, and runs a domain cutover from a runbook with zero lost records.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns DNS standards for all client domains (zone ownership, IAM scoping by record name, CAA, expiry alarms, DNSSEC policy) and leads cutovers and DNS incidents for others.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> from a blank sheet, draw how
+        <code class="inline">app.dev.clinic.example.com</code> resolves, naming the account that holds each zone, then prove
+        it with <code class="inline">dig +trace</code>. Then explain, without notes, why the CloudFront certificate and the
+        ALB certificate for the same client live in different Regions, and what makes ACM renewal fail.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Lowering the TTL at cutover time</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Resolvers already cached the old record with the old TTL. Lowering it now changes nothing for them. Lower it at least one old-TTL period before the change, usually 48 hours.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Deleting "unused" ACM validation CNAMEs</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">They look like junk in a zone review. They are what ACM checks at renewal. Delete them and the certificate quietly becomes ineligible and expires months later.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Trusting your own resolver</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Your laptop, office router and browser each cache DNS. "It works for me" after a change proves little. Query authoritative servers directly and several public resolvers.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Manage every public record in Terraform</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Console-created records are invisible to review and easy to lose in a cutover. Import existing ones with <code class="inline">import</code> blocks (<a href="./ia1.html" class="text-viol underline decoration-viol/40">IA1</a>) and make the zone's Terraform the single list of what exists.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Turn on registrar lock and auto-renew</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An expired or hijacked domain beats any multi-AZ design. Enable transfer lock and auto-renew on every client domain, and record who owns the registrar account.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="delegation"> <span>I delegated a subdomain to another account with Terraform and proved it with <code class="inline">dig +trace</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="records"> <span>I can choose between alias and CNAME, set sensible TTLs, and explain negative caching.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="failover"> <span>I built a failover record pair with an HTTPS health check and tested it by inverting the check.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="acm"> <span>I issued DNS-validated ACM certificates for an ALB and a CloudFront distribution in the correct Regions, with an expiry alarm.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cutover"> <span class="font-semibold">Ran a rehearsal cutover of a test domain (or <code class="inline">staging.clinic.example.com</code>) from an external DNS provider to Route 53 using the runbook, and shared the filled-in runbook with the record diff, the resolver checks and the timings (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-choosing-alias-non-alias.html" target="_blank" rel="noopener">AWS — Choosing between alias and non-alias records</a> — the full list of alias targets and their behaviour.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy.html" target="_blank" rel="noopener">AWS — Route 53 routing policies</a> — every policy from Part II, with examples.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover-determining-health-of-endpoints.html" target="_blank" rel="noopener">AWS — How Route 53 determines health check status</a> — thresholds, the 18% rule and checker Regions.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/CreatingNewSubdomain.html" target="_blank" rel="noopener">AWS — Routing traffic for subdomains</a> — the delegation procedure behind Part I.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/acm/latest/userguide/dns-validation.html" target="_blank" rel="noopener">AWS — ACM DNS validation</a> — how validation and managed renewal work.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/acm/latest/userguide/acm-regions.html" target="_blank" rel="noopener">AWS — Supported Regions for ACM</a> — the us-east-1 rule for CloudFront, stated by AWS.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/acm_certificate_validation" target="_blank" rel="noopener">Terraform Registry — aws_acm_certificate_validation</a> — the validation pattern used in Part IV.</li>
+      </ul>

@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KS6 · EKS Networking: VPC CNI &amp; Load Balancer Controller — DevOps Engineer Career Track</title>
+<script>(function(){if(localStorage.getItem('fde-theme')==='dark')document.documentElement.classList.add('dark');if(localStorage.getItem('fde-nav')==='collapsed')document.documentElement.classList.add('nav-collapsed');})();</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: { extend: {
+    colors: {
+      cream:'#FAF9F5', creamdark:'#0A0A0A', card:'#FFFFFF', carddark:'#161618',
+      sand:'#F0EEE6', sanddark:'#222225', ink:'#141413', inkdark:'#F0EEE9',
+      mute:'#6E6B64', mutedark:'#A8A49B', line:'#E6E3DA', linedark:'#2A2A2E',
+      coral:{ DEFAULT:'#D97757', deep:'#B4532E', soft:'#F7E9E2', softdark:'#4A352C' },
+      viol:{ DEFAULT:'#6d5acd', soft:'#efecfb', softdark:'#332e4d' },
+    },
+    fontFamily: {
+      display:['"Space Grotesk"','Inter','ui-sans-serif','sans-serif'],
+      body:['Inter','ui-sans-serif','-apple-system','sans-serif'],
+      mono:['"JetBrains Mono"','ui-monospace','monospace'],
+    },
+  }}
+};
+</script>
+<link rel="stylesheet" href="../../assets/site.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script defer src="../../assets/site.js"></script>
+</head>
+<body class="bg-cream dark:bg-creamdark text-ink dark:text-inkdark font-body antialiased">
+
+<div class="min-h-screen lg:flex">
+  <div id="overlay" class="hidden fixed inset-0 bg-black/40 z-30 lg:hidden"></div>
+  <aside id="sidebar" class="fixed z-40 inset-y-0 left-0 w-72 -translate-x-full lg:translate-x-0 transition-transform bg-card dark:bg-carddark border-r border-line dark:border-linedark flex flex-col">
+    <div class="px-5 py-5 border-b border-line dark:border-linedark">
+      <a href="../index.html" class="block">
+        <div class="font-display text-lg font-bold leading-tight">DevOps Engineer</div>
+        <div class="text-xs text-mute dark:text-mutedark mt-0.5">AWS Career Track · L0 → Senior</div>
+      </a>
+    </div>
+    <nav id="module-nav" class="flex-1 overflow-y-auto px-2 py-3"></nav>
+  </aside>
+
+  <main class="flex-1 lg:ml-72 min-w-0">
+    <!-- floating controls (no header bar) -->
+    <button id="menu-btn" aria-label="Toggle menu" class="fixed top-3 left-3 z-20 w-10 h-10 rounded-full border border-line dark:border-linedark bg-card/80 dark:bg-carddark/80 backdrop-blur flex items-center justify-center text-sm hover:border-coral hover:bg-sand dark:hover:bg-sanddark transition-colors"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16"/><path d="M4 12h16"/><path d="M4 19h16"/></svg></button>
+    <button data-theme-toggle class="fixed top-3 right-3 z-20 w-10 h-10 rounded-full border border-line dark:border-linedark bg-card/80 dark:bg-carddark/80 backdrop-blur flex items-center justify-center hover:border-coral hover:bg-sand dark:hover:bg-sanddark transition-colors" aria-label="Toggle theme">
+      <span data-theme-icon class="inline-flex align-middle"></span>
+    </button>
+
+    <div>
+      <article class="max-w-[52rem] mx-auto px-6 pt-20 lg:pt-12 pb-2 prose-fde">
+        <div class="flex flex-wrap items-center gap-1.5">
+          <span data-group-chip class="badge"></span>
+          <span class="badge badge-critical">Core</span>
+          <span class="badge badge-neutral">Target score: 3 / 4</span>
+          <span class="badge badge-neutral">L2 · Mid-level</span>
+          <span class="badge badge-accent">~4 days · hands-on</span>
+        </div>
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">EKS Networking: VPC CNI &amp; Load Balancer Controller</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          On EKS, a Pod is not hidden behind an overlay network. It gets a real IP address from your VPC subnet, and an
+          ALB can send traffic straight to it. This module covers the two controllers that make that work: the Amazon
+          VPC CNI, which hands out VPC addresses to Pods, and the AWS Load Balancer Controller, which turns Ingress and
+          Service objects into ALBs and NLBs. It finishes with the controllers that complete the public path for
+          <code class="inline">booking-api</code>: ExternalDNS for Route 53 records, certificates from ACM or
+          cert-manager, and Gateway API on EKS.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> the classic EKS outage is not a crash. It is a Friday scale-out
+          where new Pods sit in <code class="inline">ContainerCreating</code> because the subnet ran out of IP addresses,
+          or a deploy that returns 502s for thirty seconds because the ALB still sends traffic to Pods that are shutting
+          down. Both are configuration you can get right up front: subnet sizing, prefix delegation, readiness gates and
+          deregistration timing. An agent will write an Ingress that works in a demo. You need to know which annotations
+          decide whether it survives a rollout at peak booking hours.
+        </div>
+      </article>
+    </div>
+
+    <article class="max-w-[52rem] mx-auto px-6 pb-12 prose-fde">
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Pod networking on AWS</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every Pod gets a real VPC address, so IPs are a capacity limit</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <a href="./ks3.html" class="text-viol underline decoration-viol/40">KS3</a> described the CNI as a plug-in that
+        gives each Pod an IP and connects it to the network. On EKS that plug-in is the <strong>Amazon VPC CNI</strong>,
+        installed as the <code class="inline">vpc-cni</code> add-on in
+        <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>. Its design choice is simple and has big
+        consequences: Pod IPs come from the same subnets as your EC2 instances. No encapsulation, no NAT between Pods,
+        and security groups, Flow Logs and route tables all see Pod IPs directly. The cost is that every Pod uses up a
+        subnet address, and every instance type can hold only a fixed number of them.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">How the VPC CNI hands out addresses</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The CNI runs as the <code class="inline">aws-node</code> DaemonSet. Inside it, a long-running daemon called
+        <strong>ipamd</strong> attaches extra <strong>Elastic Network Interfaces</strong> (ENIs) to the node and assigns
+        <strong>secondary private IPs</strong> to each ENI. It keeps a warm pool of unused addresses ready. When the kubelet
+        starts a Pod, the CNI binary takes one address from the pool, creates a veth pair and adds a host route. Because the
+        address was already attached, Pod start-up does not wait for an EC2 API call.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 280" class="w-full min-w-[640px]" role="img" aria-label="VPC CNI on one node: ipamd attaches ENIs with secondary IPs from the subnet and assigns them to Pods">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ONE NODE · m6i.large in subnet 10.20.32.0/19 (ap-southeast-1a)</text>
+          <rect x="10" y="34" width="470" height="230" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <g class="anim-pulse"><rect x="25" y="50" width="130" height="50" rx="9" fill="#37474F"/>
+            <text x="90" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">aws-node / ipamd</text>
+            <text x="90" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">keeps the warm pool</text></g>
+          <g class="anim-pulse d1"><rect x="190" y="50" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="255" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ENI 0 (primary)</text>
+            <text x="255" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">node IP + 9 secondary</text></g>
+          <g class="anim-pulse d2"><rect x="190" y="120" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="255" y="141" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ENI 1</text>
+            <text x="255" y="156" text-anchor="middle" fill="#ffffffbb" font-size="9">1 primary + 9 secondary</text></g>
+          <g class="anim-pulse d3"><rect x="190" y="190" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="255" y="211" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ENI 2</text>
+            <text x="255" y="226" text-anchor="middle" fill="#ffffffbb" font-size="9">1 primary + 9 secondary</text></g>
+          <g class="anim-pulse d1"><rect x="350" y="60" width="115" height="40" rx="9" fill="#0D9488"/>
+            <text x="407" y="78" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api</text>
+            <text x="407" y="91" text-anchor="middle" fill="#ffffffbb" font-size="9">10.20.41.17</text></g>
+          <g class="anim-pulse d2"><rect x="350" y="125" width="115" height="40" rx="9" fill="#0D9488"/>
+            <text x="407" y="143" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-worker</text>
+            <text x="407" y="156" text-anchor="middle" fill="#ffffffbb" font-size="9">10.20.44.203</text></g>
+          <g class="anim-pulse d3"><rect x="350" y="190" width="115" height="40" rx="9" fill="#A8A49B"/>
+            <text x="407" y="208" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">warm IPs</text>
+            <text x="407" y="221" text-anchor="middle" fill="#ffffffbb" font-size="9">attached, unused</text></g>
+          <line x1="155" y1="75" x2="190" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="155" y1="85" x2="190" y2="145" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="320" y1="75" x2="350" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="320" y1="145" x2="350" y2="145" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="320" y1="215" x2="350" y2="210" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <g class="anim-pulse d4"><rect x="530" y="100" width="170" height="60" rx="9" fill="#6d5acd"/>
+            <text x="615" y="123" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">EC2 API</text>
+            <text x="615" y="139" text-anchor="middle" fill="#ffffffbb" font-size="9">AttachNetworkInterface</text>
+            <text x="615" y="151" text-anchor="middle" fill="#ffffffbb" font-size="9">AssignPrivateIpAddresses</text></g>
+          <line x1="480" y1="130" x2="530" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="600" y="200" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">max Pods = 3 ENIs × (10 − 1) + 2 = 29</text>
+        </svg>
+      </div>
+      <pre class="code mt-3"><span class="cm"># see the pool from the node's point of view (ipamd introspection endpoint, port 61679)</span>
+kubectl -n kube-system exec ds/aws-node -c aws-node -- curl -s localhost:61679/v1/enis | jq '.TotalIPs, .AssignedIPs'
+<span class="out">28
+11</span>
+<span class="cm"># 28 secondary IPs attached across ENIs, 11 handed to Pods: 17 are idle but still taken from the subnet</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Max Pods per node is ENI maths</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every instance type has a hard limit on ENIs and on IPv4 addresses per ENI. Each ENI's primary address cannot be
+        used by Pods, and two host-network Pods (<code class="inline">aws-node</code> and
+        <code class="inline">kube-proxy</code>) need no Pod IP. That gives the formula EKS uses to set the kubelet's
+        <code class="inline">--max-pods</code>:
+      </p>
+      <pre class="code mt-3">max_pods = ENIs × (IPv4_per_ENI − 1) + 2
+<span class="cm"># m6i.large: 3 × (10 − 1) + 2 = 29   ← an "8 GiB node" fits 29 Pods, whatever their size</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Instance</th><th class="px-4 py-3">vCPU / GiB</th><th class="px-4 py-3">ENIs × IPs</th><th class="px-4 py-3">Max Pods (default)</th><th class="px-4 py-3">With prefix delegation</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">t3.medium</td><td class="px-4 py-3">2 / 4</td><td class="px-4 py-3">3 × 6</td><td class="px-4 py-3">17</td><td class="px-4 py-3">3 × 5 × 16 + 2 = 242 → capped at 110</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">m6i.large / m7g.large</td><td class="px-4 py-3">2 / 8</td><td class="px-4 py-3">3 × 10</td><td class="px-4 py-3">29</td><td class="px-4 py-3">434 → capped at 110</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">m6i.xlarge / m7g.xlarge</td><td class="px-4 py-3">4 / 16</td><td class="px-4 py-3">4 × 15</td><td class="px-4 py-3">58</td><td class="px-4 py-3">898 → capped at 110</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">c6i.2xlarge</td><td class="px-4 py-3">8 / 16</td><td class="px-4 py-3">4 × 15</td><td class="px-4 py-3">58</td><td class="px-4 py-3">capped at 110</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">m6i.8xlarge</td><td class="px-4 py-3">32 / 128</td><td class="px-4 py-3">8 × 30</td><td class="px-4 py-3">234</td><td class="px-4 py-3">capped at 250</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The caps come from the EKS recommendation: 110 Pods for instances with fewer than 30 vCPUs, 250 above that,
+        because the kubelet and container runtime slow down beyond those numbers. Read the table as a sizing rule. Our
+        <code class="inline">booking</code> namespace runs many small Pods (each requesting 250m CPU and 256 MiB), so on
+        an m6i.large without prefix delegation the scheduler stops at 29 Pods while half the memory is still free. You pay
+        for RAM you cannot use. Check the real number on a node rather than trusting a calculator:
+      </p>
+      <pre class="code mt-3">kubectl get nodes -o custom-columns=NODE:.metadata.name,TYPE:.metadata.labels.node\\.kubernetes\\.io/instance-type,PODS:.status.allocatable.pods
+<span class="out">NODE                                             TYPE         PODS
+ip-10-20-41-12.ap-southeast-1.compute.internal   m6i.large    29
+ip-10-20-77-90.ap-southeast-1.compute.internal   m7g.xlarge   110</span>
+<span class="cm"># the second node was launched with prefix delegation and max-pods=110</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Warm pools: why an idle node holds 30 addresses</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        ipamd pre-allocates addresses so Pods start fast. The default is <code class="inline">WARM_ENI_TARGET=1</code>:
+        always keep one whole spare ENI's worth of free IPs. On an m6i.xlarge running five Pods, that means the primary
+        ENI (14 usable IPs, 5 used) plus a second, fully free ENI (14 more), so <strong>30 subnet addresses held for 5
+        Pods</strong>. On a 60-node cluster that is the difference between using 900 and 1,800 addresses. You can tune it
+        with three variables, and they trade start-up speed against EC2 API calls.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Variable</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">When to set it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">WARM_ENI_TARGET</td><td class="px-4 py-3">Spare whole ENIs to keep attached (default 1)</td><td class="px-4 py-3">Leave at 1 if subnets are large and Pod churn is high</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">WARM_IP_TARGET</td><td class="px-4 py-3">Spare individual IPs to keep (overrides ENI target)</td><td class="px-4 py-3">Small subnets; set 2–5. Too low and ipamd calls EC2 constantly and gets throttled</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">MINIMUM_IP_TARGET</td><td class="px-4 py-3">Floor of IPs per node, used with WARM_IP_TARGET</td><td class="px-4 py-3">Set to your typical Pods per node (for us, 10) so a new node is ready in one call</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">WARM_PREFIX_TARGET</td><td class="px-4 py-3">Spare /28 prefixes when prefix delegation is on</td><td class="px-4 py-3">Default 1 is right for almost everyone</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Do not set these with <code class="inline">kubectl set env</code>.</strong>
+        The <code class="inline">vpc-cni</code> add-on is managed by EKS, and the next add-on update overwrites any manual
+        change to the DaemonSet. Configure it through the add-on's <code class="inline">configuration_values</code> in
+        Terraform (Part II shows the block), so the setting is reviewed, versioned and survives upgrades.</div>
+
+      <h3 class="font-semibold text-lg mt-8">IP exhaustion: the failure you plan out at VPC design time</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When a subnet has no free addresses left, ipamd cannot grow its pool, and new Pods stick in
+        <code class="inline">ContainerCreating</code>. The Pod events give it away. Subnet layout belongs to
+        <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>. Our prod VPC
+        <code class="inline">10.20.0.0/16</code> uses three private <strong>/19</strong> subnets for nodes and Pods (8,187
+        usable addresses each), three public /24s for load balancers and three isolated /24s for RDS. A /24 node subnet,
+        which an agent will happily generate, holds 251 addresses: about eight m6i.xlarge nodes under default warm-pool
+        settings.
+      </p>
+      <pre class="code mt-3">kubectl -n booking describe pod booking-api-7c9f8d6b5-k2v9d | tail -3
+<span class="out">  Warning  FailedCreatePodSandBox  11s  kubelet  Failed to create pod sandbox: ... plugin type="aws-cni"
+           name="aws-cni" failed (add): add cmd: failed to assign an IP address to container</span>
+aws ec2 describe-subnets --filters Name=tag:karpenter.sh/discovery,Values=clinic-prod-eks \
+  --query 'Subnets[].[SubnetId,AvailabilityZone,CidrBlock,AvailableIpAddressCount]' --output table
+<span class="out">|  subnet-0a1b2c3d  |  ap-southeast-1a |  10.20.32.0/19  |  6912 |
+|  subnet-0e4f5a6b  |  ap-southeast-1b |  10.20.64.0/19  |  7020 |
+|  subnet-0c7d8e9f  |  ap-southeast-1c |  10.20.96.0/19  |    14 |</span>
+<span class="cm"># one AZ nearly full: usually a shared subnet another team filled, or a stuck warm pool</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Put a CloudWatch alarm on free addresses per subnet before you need it. Alert when any node subnet drops below
+        20% free. That gives you days, not minutes, to add a secondary CIDR (Part II) or turn on prefix delegation.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Beyond the defaults</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Turn on prefix delegation first; reach for custom networking only when you must</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The defaults work for a small cluster. As soon as you run more than a handful of nodes, three settings decide
+        how many Pods fit and how many addresses they burn: prefix delegation, custom networking with a secondary CIDR,
+        and security groups for Pods. All three are set in the same place, the <code class="inline">vpc-cni</code> add-on
+        configuration in <code class="inline">clinic-infra</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Prefix delegation: 16 addresses per slot</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        With <code class="inline">ENABLE_PREFIX_DELEGATION=true</code>, ipamd assigns a <strong>/28 prefix</strong> (16
+        addresses) to each ENI slot instead of a single secondary IP. The ENI limits stay the same, but each slot is now
+        worth 16 Pods, so the ENI limit stops being the bottleneck and the 110/250 cap takes over. It needs Nitro
+        instances (every current family is Nitro), and the kubelet's max-pods must be raised to match, or the node keeps
+        advertising 29.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/main.tf — vpc-cni add-on</span>
+        <pre class="code">module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~&gt; 21.0"
+  # ... cluster settings from KS5 ...
+  addons = {
+    vpc-cni = {
+      before_compute = true          <span class="cm"># CNI config must exist before the first node joins</span>
+      most_recent    = false
+      addon_version  = "v1.20.4-eksbuild.1"
+      configuration_values = jsonencode({
+        env = {
+          ENABLE_PREFIX_DELEGATION = "true"   <span class="cm"># /28 per slot</span>
+          WARM_PREFIX_TARGET       = "1"
+        }
+        enableNetworkPolicy = "true"          <span class="cm"># native NetworkPolicy enforcement (KS3)</span>
+      })
+    }
+  }
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">karpenter/ec2nodeclass-default.yaml — raise max Pods to match</span>
+        <pre class="code">apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  kubelet:
+    maxPods: 110                     <span class="cm"># without this, prefix delegation buys you nothing</span>
+  # ... amiSelectorTerms, subnets, security groups: see KS8 ...</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The catch is fragmentation. A /28 prefix needs 16 <em>contiguous</em> free addresses aligned on a /28 boundary. In a
+        subnet where nodes and old Pods have left single IPs scattered everywhere, ipamd can fail with
+        <code class="inline">InsufficientCidrBlocks</code> even though <code class="inline">AvailableIpAddressCount</code>
+        shows thousands free. The fix is to reserve a block for prefixes only, ideally before the subnet is in use:
+      </p>
+      <pre class="code mt-3"><span class="cm"># reserve the upper half of the 1a node subnet for /28 Pod prefixes</span>
+aws ec2 create-subnet-cidr-reservation --subnet-id subnet-0a1b2c3d \
+  --cidr 10.20.48.0/20 --reservation-type prefix --description "eks pod prefixes"
+<span class="out">{ "SubnetCidrReservation": { "ReservationType": "prefix", "Cidr": "10.20.48.0/20", ... } }</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Our default:</strong> prefix delegation on, for every new cluster,
+        from day one. Turning it on later works, but only for newly launched nodes, and existing subnets may already be
+        too fragmented. On <code class="inline">clinic-prod-eks</code> it cut the node count for the same workload from
+        14 m6i.large to 6 m6i.xlarge, because nodes now fill on CPU and memory instead of on IP count.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Custom networking: Pods in a secondary CIDR</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Sometimes the VPC itself is too small. A client's VPC is a /22 peered to their data centre, and there are no
+        routable addresses left to give. <strong>Custom networking</strong> lets nodes keep their primary ENI in the
+        normal subnet while Pods get addresses from a different subnet, usually carved from a secondary CIDR in the
+        <code class="inline">100.64.0.0/10</code> range (CG-NAT space that is rarely used on premises). Pods then reach
+        the outside world through the node's primary IP via SNAT. You describe one subnet per AZ in an
+        <code class="inline">ENIConfig</code>:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">eniconfig-ap-southeast-1a.yaml</span>
+        <pre class="code">apiVersion: crd.k8s.amazonaws.com/v1alpha1
+kind: ENIConfig
+metadata:
+  name: ap-southeast-1a              <span class="cm"># name = AZ, matched via ENI_CONFIG_LABEL_DEF</span>
+spec:
+  subnet: subnet-0pod1a00000000000   <span class="cm"># 100.64.0.0/18 in the secondary CIDR</span>
+  securityGroups:
+    - sg-0eksnodes0000000000         <span class="cm"># Pod ENIs need the node SG or traffic is dropped</span></pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># add-on env for custom networking (set in configuration_values, not by hand)</span>
+AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG = "true"
+ENI_CONFIG_LABEL_DEF               = "topology.kubernetes.io/zone"
+<span class="cm"># max Pods drops: the primary ENI no longer hosts Pods</span>
+<span class="cm"># m6i.large: (3 − 1) × (10 − 1) + 2 = 20 instead of 29  → pair it with prefix delegation</span></pre>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    A["New Pods failing:<br/>failed to assign an IP"] --> B{"Subnet free IPs<br/>below 20%?"}
+    B -->|no| C["Warm pool too greedy<br/>tune WARM_IP_TARGET"]
+    B -->|yes| D{"Prefix delegation on?"}
+    D -->|no| E["Enable prefix delegation<br/>+ maxPods 110"]
+    D -->|yes| F{"Can the VPC get more<br/>routable CIDR?"}
+    F -->|yes| G["Add a secondary CIDR<br/>+ new /19 node subnets"]
+    F -->|no| H["Custom networking<br/>100.64.0.0/16 for Pods"]
+    H --> I["Or IPv6 cluster<br/>(new clusters only)"]
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        IPv6 clusters remove the problem entirely (every Pod gets an address from a /80 per node), but the IP family is
+        chosen at cluster creation and every dependency must speak IPv6. We use it only when a client already runs
+        dual-stack. For everyone else the order is: prefix delegation, then a bigger or secondary routable CIDR, then
+        custom networking.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Security groups for Pods</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        By default every Pod on a node shares the node's security group. That is a problem when the RDS security group
+        should admit <code class="inline">booking-api</code> but not the twenty other Pods on the same node.
+        <strong>Security groups for Pods</strong> give selected Pods their own <em>branch ENI</em> (hung off a trunk ENI
+        on the node) with their own security groups. NetworkPolicy (<a href="./ks3.html" class="text-viol underline decoration-viol/40">KS3</a>)
+        controls Pod-to-Pod traffic inside the cluster. Security groups for Pods are the tool when the
+        <strong>other side is an AWS resource</strong> whose rules reference security groups.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking/securitygrouppolicy.yaml</span>
+        <pre class="code">apiVersion: vpcresources.k8s.aws/v1beta1
+kind: SecurityGroupPolicy
+metadata:
+  name: booking-api-db-access
+  namespace: booking
+spec:
+  podSelector:
+    matchLabels: { app: booking-api }
+  securityGroups:
+    groupIds:
+      - sg-0bookingapi000000         <span class="cm"># allowed by the RDS SG on 5432</span>
+      - sg-0eksnodes0000000000       <span class="cm"># keep the node SG so DNS and kubelet probes still work</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        It needs <code class="inline">ENABLE_POD_ENI=true</code> on the add-on and the
+        <code class="inline">AmazonEKSVPCResourceController</code> policy on the cluster role. Each instance type has a
+        branch-ENI limit, separate from max Pods: an m6i.large supports 9 branch ENIs, an m6i.xlarge 18. The VPC resource
+        controller advertises this as an extended resource, so the scheduler places these Pods only where a branch ENI is
+        free:
+      </p>
+      <pre class="code mt-3">kubectl get node ip-10-20-41-12.ap-southeast-1.compute.internal -o jsonpath='{.status.allocatable.vpc\.amazonaws\.com/pod-eni}{"\n"}'
+<span class="out">9</span>
+<span class="cm"># the 10th booking-api Pod on this node would stay Pending with "Insufficient vpc.amazonaws.com/pod-eni"</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Setting</th><th class="px-4 py-3">Solves</th><th class="px-4 py-3">Costs</th><th class="px-4 py-3">Our default</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Prefix delegation</td><td class="px-4 py-3">Low max Pods on small and medium nodes</td><td class="px-4 py-3">Needs contiguous /28s; reserve CIDR blocks</td><td class="px-4 py-3">On for every cluster</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Custom networking</td><td class="px-4 py-3">No routable IPs left in the VPC</td><td class="px-4 py-3">ENIConfig per AZ, fewer Pods per ENI, SNAT for egress</td><td class="px-4 py-3">Only in constrained client VPCs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Security groups for Pods</td><td class="px-4 py-3">Per-workload access to RDS, ElastiCache, partner VPCs</td><td class="px-4 py-3">Branch-ENI limits, slower Pod start (~1–2 s), more moving parts</td><td class="px-4 py-3">Only for Pods that reach SG-guarded AWS resources</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Network policy (VPC CNI)</td><td class="px-4 py-3">Pod-to-Pod isolation inside the cluster</td><td class="px-4 py-3">An eBPF agent per node</td><td class="px-4 py-3">On, default-deny per namespace (KS3)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · AWS Load Balancer Controller</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The ALB is now a Kubernetes object, so review its annotations like Terraform</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        In <a href="./ks3.html" class="text-viol underline decoration-viol/40">KS3</a> an Ingress was a routing rule that an
+        ingress controller read. On EKS, the <strong>AWS Load Balancer Controller</strong> (LBC) is that controller, and it
+        does not run a proxy at all. It watches Ingress, Service and Gateway API objects and creates real ALBs, NLBs,
+        target groups, listeners and security group rules through the ELB API. That means a one-line annotation change
+        can create, replace or delete a production load balancer. Treat these manifests with the care you give a
+        <code class="inline">terraform plan</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Install it with Pod Identity, pinned, on every cluster</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The controller needs IAM permissions to manage ELB, EC2 security groups and ACM lookups. It gets them through EKS
+        Pod Identity (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a> explains the mechanism),
+        never through the node role. The upstream project publishes the exact IAM policy, and the
+        <code class="inline">eks-pod-identity</code> registry module bundles it:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/lbc.tf</span>
+        <pre class="code">module "lbc_pod_identity" {
+  source  = "terraform-aws-modules/eks-pod-identity/aws"
+  version = "~&gt; 2.0"
+  name    = "aws-load-balancer-controller"
+
+  attach_aws_lb_controller_policy = true     <span class="cm"># the upstream policy, kept current by the module</span>
+  associations = {
+    this = {
+      cluster_name    = module.eks.cluster_name
+      namespace       = "kube-system"
+      service_account = "aws-load-balancer-controller"
+    }
+  }
+}</pre>
+      </div>
+      <pre class="code mt-3">helm repo add eks https://aws.github.io/eks-charts
+helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system --version 1.13.0 \
+  --set clusterName=clinic-prod-eks \
+  --set region=ap-southeast-1 --set vpcId=vpc-0clinicprod000000 \
+  --set replicaCount=2 --set enableServiceMutatorWebhook=false   <span class="cm"># see the warning below</span>
+kubectl -n kube-system get deploy aws-load-balancer-controller
+<span class="out">NAME                           READY   UP-TO-DATE   AVAILABLE   AGE
+aws-load-balancer-controller   2/2     2            2           41s</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        In practice Argo CD installs it from the platform repo (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>),
+        but the values are the same. The controller finds subnets by tag: <code class="inline">kubernetes.io/role/elb=1</code>
+        on public subnets and <code class="inline">kubernetes.io/role/internal-elb=1</code> on private ones. Missing tags
+        are the most common reason a new Ingress never gets an address.
+      </p>
+      <div class="mt-4 callout callout-warn"><strong>The Service mutator webhook surprises people.</strong> When it is
+        enabled, the LBC takes over <em>every</em> <code class="inline">type: LoadBalancer</code> Service, including Helm
+        charts that expected the legacy in-tree Classic LB. We disable it and require an explicit
+        <code class="inline">loadBalancerClass: service.k8s.aws/nlb</code>, so nobody gets a new NLB by accident.</div>
+
+      <h3 class="font-semibold text-lg mt-8">An ALB Ingress for booking-api, annotation by annotation</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Use <strong>target type <code class="inline">ip</code></strong>. The ALB registers Pod IPs directly in the target
+        group, which works because VPC CNI Pod IPs are real VPC addresses. The older <code class="inline">instance</code>
+        mode sends traffic to a NodePort on every node and lets kube-proxy forward it, adding a hop, breaking ALB health
+        checks per Pod, and sometimes crossing an AZ twice.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 250" class="w-full min-w-[640px]" role="img" aria-label="Target type ip sends ALB traffic directly to Pod IPs; target type instance goes through NodePort and kube-proxy">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">TARGET TYPE IP · our default</text>
+          <g class="anim-pulse"><rect x="15" y="40" width="120" height="46" rx="9" fill="#37474F"/>
+            <text x="75" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Client</text>
+            <text x="75" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">api.clinic.example.com</text></g>
+          <g class="anim-pulse d1"><rect x="185" y="40" width="130" height="46" rx="9" fill="#D97757"/>
+            <text x="250" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB :443</text>
+            <text x="250" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">ACM cert · public subnets</text></g>
+          <g class="anim-pulse d2"><rect x="365" y="40" width="140" height="46" rx="9" fill="#6d5acd"/>
+            <text x="435" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Target group</text>
+            <text x="435" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">10.20.41.17:8080 · …</text></g>
+          <g class="anim-pulse d3"><rect x="555" y="40" width="150" height="46" rx="9" fill="#0D9488"/>
+            <text x="630" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api Pod</text>
+            <text x="630" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">health check /healthz</text></g>
+          <line x1="135" y1="63" x2="185" y2="63" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="315" y1="63" x2="365" y2="63" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="505" y1="63" x2="555" y2="63" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="12" y="132" font-size="11" font-weight="700" fill="#6E6B64">TARGET TYPE INSTANCE · legacy</text>
+          <g class="anim-pulse d1"><rect x="185" y="150" width="130" height="46" rx="9" fill="#A8A49B"/>
+            <text x="250" y="170" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB :443</text>
+            <text x="250" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">targets = every node</text></g>
+          <g class="anim-pulse d2"><rect x="365" y="150" width="140" height="46" rx="9" fill="#A8A49B"/>
+            <text x="435" y="170" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">NodePort 31847</text>
+            <text x="435" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">kube-proxy iptables</text></g>
+          <g class="anim-pulse d3"><rect x="555" y="150" width="150" height="46" rx="9" fill="#A8A49B"/>
+            <text x="630" y="170" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Pod on any node</text>
+            <text x="630" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">maybe another AZ</text></g>
+          <line x1="315" y1="173" x2="365" y2="173" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <line x1="505" y1="173" x2="555" y2="173" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="360" y="232" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">ip mode: one hop, per-Pod health checks, readiness gates possible</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-api/ingress.yaml</span>
+        <pre class="code">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: booking-api
+  namespace: booking
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/group.name: clinic-public       <span class="cm"># share one ALB (next section)</span>
+    alb.ingress.kubernetes.io/group.order: "20"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:ap-southeast-1:444455556666:regional/webacl/clinic-prod/a1b2
+spec:
+  ingressClassName: alb
+  tls:
+    - hosts: [api.clinic.example.com]   <span class="cm"># LBC discovers the matching ACM cert by host name</span>
+  rules:
+    - host: api.clinic.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: booking-api, port: { name: http } } }</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Annotation</th><th class="px-4 py-3">Default if omitted</th><th class="px-4 py-3">Why we set it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">scheme</td><td class="px-4 py-3"><code class="inline">internal</code></td><td class="px-4 py-3">Be explicit: an accidental <code class="inline">internet-facing</code> on an admin API is a security incident</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">target-type</td><td class="px-4 py-3"><code class="inline">instance</code></td><td class="px-4 py-3">ip mode for direct, per-Pod health checks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ssl-policy</td><td class="px-4 py-3">An older TLS 1.2 policy</td><td class="px-4 py-3">TLS 1.3 with a TLS 1.2 floor, which our security baseline requires</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">healthcheck-path</td><td class="px-4 py-3"><code class="inline">/</code></td><td class="px-4 py-3"><code class="inline">/</code> may redirect or need auth, so targets flap</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">deregistration_delay</td><td class="px-4 py-3">300 s</td><td class="px-4 py-3">Five-minute rollouts per Pod otherwise; 30 s fits our request times</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">wafv2-acl-arn</td><td class="px-4 py-3">No WAF</td><td class="px-4 py-3">Public endpoints get the managed rule sets (<a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">IngressGroups: one ALB for many Ingresses</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Without a group, every Ingress gets its own ALB. An ALB in ap-southeast-1 costs about USD 18 a month before
+        traffic (LCU) charges, so 12 services with their own Ingresses come to roughly USD 220 a month in idle load
+        balancers, plus 12 DNS targets and 12 WAF associations. With <code class="inline">group.name</code>, the LBC merges
+        all Ingresses in the group into one ALB, with listener rules ordered by <code class="inline">group.order</code>.
+        <code class="inline">booking-web</code> (order 10) and <code class="inline">booking-api</code> (order 20) share
+        <code class="inline">clinic-public</code>.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The risk is that <strong>any namespace can join a group by name</strong> and add a rule to your public ALB, including
+        a catch-all path that steals traffic. Lock groups down with an <code class="inline">IngressClassParams</code> that
+        fixes the group and the namespaces allowed to use the class:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/lbc/ingressclass-alb-public.yaml</span>
+        <pre class="code">apiVersion: elbv2.k8s.aws/v1beta1
+kind: IngressClassParams
+metadata:
+  name: alb-public
+spec:
+  scheme: internet-facing                <span class="cm"># the class decides, not each Ingress</span>
+  group: { name: clinic-public }
+  namespaceSelector:
+    matchLabels: { ingress.clinic.example.com/public: "true" }   <span class="cm"># only labelled namespaces</span>
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: alb-public
+spec:
+  controller: ingress.k8s.aws/alb
+  parameters: { apiGroup: elbv2.k8s.aws, kind: IngressClassParams, name: alb-public }</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">NLB Services for TCP and internal traffic</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Use an NLB when the protocol is not HTTP (gRPC with end-to-end TLS, MQTT, a partner's TCP feed), when you need
+        static IPs per AZ, or for a private endpoint exposed to another VPC over PrivateLink. The LBC creates it from a
+        <code class="inline">type: LoadBalancer</code> Service when you set the class:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking/service-booking-api-internal.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: Service
+metadata:
+  name: booking-api-internal
+  namespace: booking
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+spec:
+  type: LoadBalancer
+  loadBalancerClass: service.k8s.aws/nlb      <span class="cm"># explicit: the LBC, not the legacy cloud provider</span>
+  selector: { app: booking-api }
+  ports:
+    - { name: http, port: 80, targetPort: http }</pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking get svc booking-api-internal
+<span class="out">NAME                   TYPE           CLUSTER-IP     EXTERNAL-IP                                                          PORT(S)
+booking-api-internal   LoadBalancer   172.20.88.14   k8s-booking-bookinga-3f9c1e7a2b-0d4e5f.elb.ap-southeast-1.amazonaws.com   80:30412/TCP</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Zero-downtime rollouts: readiness gates and deregistration</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Here is the race that causes 502s on every deploy. Kubernetes marks a terminating Pod as not ready and sends
+        SIGTERM at the same moment. The LBC then has to notice, call the ELB API and deregister the target, and the ALB
+        takes a few more seconds to stop sending new requests. If the app exits on SIGTERM straight away, the ALB still
+        sends requests to an IP that is gone. Two settings close both ends of the race:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Pod readiness gates</strong> on start-up: label the namespace
+          <code class="inline">elbv2.k8s.aws/pod-readiness-gate-inject=enabled</code>. A new Pod is only Ready once the ALB
+          reports its target as healthy, so a rollout cannot remove old Pods before the new ones get traffic.</li>
+        <li><strong>A preStop delay</strong> on shutdown: keep serving for 15 s after termination starts, so deregistration
+          finishes first. The grace period must cover preStop, the drain and app shutdown.</li>
+      </ul>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant K as kubelet
+    participant P as booking-api Pod
+    participant L as LB Controller
+    participant A as ALB
+    K->>P: run preStop: sleep 15
+    K-->>L: EndpointSlice: Pod not ready
+    L->>A: DeregisterTargets(10.20.41.17)
+    A-->>A: draining, no new requests (30 s max)
+    Note over P: still serving in-flight requests
+    K->>P: SIGTERM after preStop (t = 15 s)
+    P-->>K: graceful exit (≤ 20 s)
+    Note over K,A: terminationGracePeriodSeconds 45 ≥ 15 + 20 + margin
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">booking-api/deployment.yaml — shutdown fields (KS2 owns the rest)</span>
+        <pre class="code">    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: api
+          lifecycle:
+            preStop:
+              sleep: { seconds: 15 }     <span class="cm"># native sleep action (on by default since 1.30): no shell needed in the image</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · DNS, certificates &amp; Gateway API</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Let controllers own the records, and let ACM own the public certificates</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An ALB with a random <code class="inline">k8s-…elb.amazonaws.com</code> name is not yet a product. Users need
+        <code class="inline">api.clinic.example.com</code> pointing at it, with a valid certificate, and the record must
+        follow the ALB if it is ever recreated. Route 53 and ACM basics are in
+        <a href="./aw7.html" class="text-viol underline decoration-viol/40">AW7</a>. Here we automate them from inside the
+        cluster, then look at where Gateway API fits on EKS.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">ExternalDNS: records that follow the load balancer</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        ExternalDNS watches Ingresses, Services and HTTPRoutes, reads their host names and load balancer addresses, and
+        writes Route 53 alias records to match. It also writes a TXT <strong>ownership record</strong> next to each one, so it
+        never touches records it did not create. Two settings make it safe for production: a domain filter that limits it to
+        one zone, and the <code class="inline">upsert-only</code> policy, so deleting an Ingress never deletes a live DNS
+        record.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/external-dns/values.yaml</span>
+        <pre class="code">provider:
+  name: aws
+env:
+  - { name: AWS_DEFAULT_REGION, value: ap-southeast-1 }
+serviceAccount:
+  name: external-dns                   <span class="cm"># Pod Identity association → route53 role (KS7)</span>
+domainFilters: [clinic.example.com]    <span class="cm"># never the whole account</span>
+policy: upsert-only                    <span class="cm"># "sync" deletes records when objects go away</span>
+registry: txt
+txtOwnerId: clinic-prod-eks            <span class="cm"># unique per cluster, or two clusters fight over records</span>
+txtPrefix: "edns-"
+sources: [ingress, service, gateway-httproute]
+interval: 1m</pre>
+      </div>
+      <pre class="code mt-3">kubectl -n external-dns logs deploy/external-dns --tail=3
+<span class="out">level=info msg="Desired change: CREATE api.clinic.example.com A" profile=default zoneID=/hostedzone/Z04517273CLINIC zoneName=clinic.example.com.
+level=info msg="Desired change: CREATE edns-a-api.clinic.example.com TXT" zoneID=/hostedzone/Z04517273CLINIC
+level=info msg="2 record(s) were successfully updated" zoneID=/hostedzone/Z04517273CLINIC</span>
+dig +short api.clinic.example.com
+<span class="out">13.250.41.88
+54.169.12.203</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>Two clusters, one <code class="inline">txtOwnerId</code>.</strong> During a
+        blue/green cluster migration, an agent copied the ExternalDNS values from the old cluster unchanged. Both clusters
+        now believed they owned <code class="inline">api.clinic.example.com</code> and overwrote each other's record every
+        minute, so traffic flipped between clusters. Set the owner ID from the cluster name in Terraform or the
+        ApplicationSet, never as a literal in a copied file.</div>
+
+      <h3 class="font-semibold text-lg mt-8">ACM or cert-manager: pick by where TLS terminates</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The question is not which tool is better. It is where the TLS connection ends. If it ends at an ALB or a TLS
+        listener on an NLB, the certificate must be in <strong>ACM</strong>, because that is the only place an AWS load
+        balancer reads certificates from. If it ends inside the cluster, at a Pod, a sidecar or a webhook, you need a
+        Kubernetes Secret, and <strong>cert-manager</strong> issues and renews those.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Need</th><th class="px-4 py-3">Use</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Public HTTPS on an ALB (<code class="inline">api.</code>, <code class="inline">app.</code>)</td><td class="px-4 py-3">ACM, DNS-validated, created in Terraform</td><td class="px-4 py-3">Free, auto-renewing, private key never leaves AWS; LBC finds it by host name</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">NLB with TLS passthrough to Pods</td><td class="px-4 py-3">cert-manager + Let's Encrypt (DNS-01 via Route 53)</td><td class="px-4 py-3">The Pod terminates TLS, so the cert must be a Secret</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Admission webhooks, internal mTLS</td><td class="px-4 py-3">cert-manager with a private CA issuer</td><td class="px-4 py-3">Short-lived internal certs, rotated automatically (mesh mTLS: <a href="./ks13.html" class="text-viol underline decoration-viol/40">KS13</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Wildcard for many preview environments</td><td class="px-4 py-3">ACM <code class="inline">*.preview.clinic.example.com</code></td><td class="px-4 py-3">One cert, one validation record, shared by the IngressGroup</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/edge/acm.tf</span>
+        <pre class="code">resource "aws_acm_certificate" "api" {
+  domain_name       = "api.clinic.example.com"
+  validation_method = "DNS"
+  lifecycle { create_before_destroy = true }   <span class="cm"># the ALB never points at a deleted cert</span>
+}
+<span class="cm"># + aws_route53_record for the validation CNAME and aws_acm_certificate_validation (AW7)</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Gateway API on EKS</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <a href="./ks3.html" class="text-viol underline decoration-viol/40">KS3</a> taught Gateway API v1 as the successor
+        to Ingress: a platform-owned <code class="inline">Gateway</code> and team-owned <code class="inline">HTTPRoute</code>s.
+        On EKS there are two AWS implementations. The <strong>AWS Load Balancer Controller</strong> (v2.13 and later)
+        implements Gateway API on ALBs (<code class="inline">HTTPRoute</code>, <code class="inline">GRPCRoute</code>) and
+        NLBs (<code class="inline">TCPRoute</code>, <code class="inline">UDPRoute</code>, <code class="inline">TLSRoute</code>),
+        enabled with the <code class="inline">ALBGatewayAPI</code> and <code class="inline">NLBGatewayAPI</code> feature
+        gates. The separate <strong>AWS Gateway API Controller</strong> maps Gateways to <strong>VPC Lattice</strong>
+        service networks for service-to-service traffic across VPCs and accounts. That is a different problem, and we use it
+        only when a client already runs Lattice.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/gateway/clinic-public.yaml — platform team owns this</span>
+        <pre class="code">apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: aws-alb
+spec:
+  controllerName: gateway.k8s.aws/alb        <span class="cm"># handled by the LBC</span>
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: clinic-public
+  namespace: gateway
+spec:
+  gatewayClassName: aws-alb
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.clinic.example.com"
+      allowedRoutes:
+        namespaces:
+          from: Selector                       <span class="cm"># the Gateway equivalent of IngressClassParams</span>
+          selector: { matchLabels: { ingress.clinic.example.com/public: "true" } }</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-api/httproute.yaml — app team owns this</span>
+        <pre class="code">apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: booking-api
+  namespace: booking
+spec:
+  parentRefs: [{ name: clinic-public, namespace: gateway, sectionName: https }]
+  hostnames: [api.clinic.example.com]
+  rules:
+    - backendRefs: [{ name: booking-api, port: 80 }]</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Our position for late 2026: <strong>new clusters start on Gateway API</strong> through the LBC, because the role
+        split between platform and app teams is built in rather than bolted on with IngressGroups. Existing clusters keep
+        their ALB Ingresses until there is a reason to touch them. Migrating means a new ALB and a DNS cutover, not an
+        in-place change. Install the Gateway API CRDs (standard channel) through GitOps and pin their version alongside the
+        LBC, because the controller supports specific CRD versions.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Debugging the path from DNS to Pod</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When <code class="inline">api.clinic.example.com</code> misbehaves, walk the path in order: DNS, load balancer,
+        target group, Pod. Each layer has one command that tells you whether the fault is there. Full troubleshooting
+        playbooks are in <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a>. This table covers the
+        networking layer:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Symptom</th><th class="px-4 py-3">Usual cause</th><th class="px-4 py-3">Check</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Ingress has no ADDRESS</td><td class="px-4 py-3">Subnet tags missing, IAM denied, invalid annotation</td><td class="px-4 py-3"><code class="inline">kubectl describe ingress</code> events; LBC logs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">NXDOMAIN</td><td class="px-4 py-3">ExternalDNS filtered the host, or owner ID conflict</td><td class="px-4 py-3">ExternalDNS logs; <code class="inline">dig</code> the TXT record</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">503 from the ALB</td><td class="px-4 py-3">Target group empty: Service selector or readiness wrong</td><td class="px-4 py-3"><code class="inline">get endpointslices</code>; target health</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">502 during deploys</td><td class="px-4 py-3">Pods exit before deregistration finishes</td><td class="px-4 py-3">preStop, grace period, readiness gate label</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">504 after 60 s</td><td class="px-4 py-3">ALB idle timeout shorter than the request</td><td class="px-4 py-3"><code class="inline">load-balancer-attributes: idle_timeout.timeout_seconds</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Targets unhealthy, Pods fine</td><td class="px-4 py-3">Health check path or port wrong; node SG blocks ALB SG</td><td class="px-4 py-3"><code class="inline">describe-target-health</code> reason code</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">kubectl -n booking get targetgroupbindings
+<span class="out">NAME                    SERVICE-NAME   SERVICE-PORT   TARGET-TYPE   AGE
+k8s-booking-bookinga-9e1d2c3b4a   booking-api    http           ip            12d</span>
+aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
+  --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason]' --output text
+<span class="out">10.20.41.17    healthy     None
+10.20.70.4     healthy     None
+10.20.101.33   unhealthy   Target.ResponseCodeMismatch</span>
+<span class="cm"># ResponseCodeMismatch: /healthz returned 3xx/5xx; the Pod is up but the check is wrong or the app is sick</span></pre>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Networking config is where agents are most confidently wrong, because a manifest with outdated annotations still
+        applies cleanly. Give the agent the instance types, subnet sizes and controller versions you actually run, and ask
+        for the maths as well as the YAML.
+      </p>
+      <pre class="code mt-3">Our clinic-prod-eks node subnets are three /19s. Nodes are m6i.xlarge and m7g.xlarge with
+VPC CNI prefix delegation on. Calculate max Pods per node, the subnet addresses held per node
+with WARM_PREFIX_TARGET=1, and how many nodes each subnet can hold. Show the formula for each.</pre>
+      <pre class="code mt-3">Write an ALB Ingress for booking-web (port 3000, host app.clinic.example.com) that joins the
+clinic-public IngressGroup at order 10, uses target-type ip, TLS 1.3 policy, /api/health as
+the health check and a 30 s deregistration delay. List every annotation you used and what the
+controller does if each one is omitted.</pre>
+      <pre class="code mt-3">Here is `kubectl describe ingress booking-api` and the last 50 lines of the
+aws-load-balancer-controller logs. The Ingress has no address. Rank the likely causes and give
+me read-only commands (kubectl and aws CLI) to confirm each. Do not modify anything.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Max-Pods and subnet-capacity calculations for a list of instance types</li>
+            <li>Drafting Ingress, Service and HTTPRoute manifests from a short spec</li>
+            <li>Translating Ingress annotations into the Gateway API equivalent</li>
+            <li>Reading LBC and ExternalDNS logs and ranking causes</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><code class="inline">scheme</code> is what you meant; internet-facing only behind WAF</li>
+            <li>CNI settings go through the add-on config in Terraform, not <code class="inline">kubectl set env</code></li>
+            <li><code class="inline">txtOwnerId</code> is unique per cluster and the domain filter is a single zone</li>
+            <li>Grace period ≥ preStop + app shutdown, and the readiness-gate label is on the namespace</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written EKS networking:</strong>
+        <code class="inline">kubernetes.io/ingress.class: alb</code> annotations instead of
+        <code class="inline">ingressClassName</code>; <code class="inline">target-type: instance</code> for a new service;
+        no <code class="inline">group.name</code>, so every Ingress gets its own ALB; ExternalDNS with
+        <code class="inline">policy: sync</code> and no domain filter; the LBC with node-role IAM permissions or a static
+        access key; a /24 node subnet; <code class="inline">WARM_IP_TARGET=1</code> on a busy cluster (EC2 API
+        throttling); and a <code class="inline">type: LoadBalancer</code> Service with no
+        <code class="inline">loadBalancerClass</code>.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Assumes Pods use an overlay network as in a local cluster; has never seen an ALB created from an Ingress.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows Pods get VPC IPs and that the LBC creates ALBs, but cannot explain why a node stops accepting Pods with free CPU.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Copies a working Ingress for a new service and gets it online; needs help with 502s during deploys or a missing address.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Calculates max Pods and subnet usage for any instance type, configures prefix delegation through Terraform, ships an ALB Ingress or HTTPRoute with ExternalDNS and ACM that has zero failed requests during a rolling deploy, and debugs the DNS-to-Pod path layer by layer.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Designs the VPC and subnet plan for a new client cluster, sets the IngressGroup / Gateway policy for all teams, and leads the migration from Ingress to Gateway API with a DNS cutover plan.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, work out max Pods
+        for an m6i.large with and without prefix delegation and with custom networking. Then run a rolling deploy of
+        <code class="inline">booking-api</code> while a load generator sends 50 requests per second, and show an ALB
+        5xx count of zero in CloudWatch for the deploy window.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Sizing node subnets for nodes</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Node subnets hold Pod IPs and warm pools too. A subnet sized for "maybe 20 nodes" fills at 8. Plan /19s per AZ for EKS and alarm on free addresses.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ One ALB per Ingress</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">It works and it is expensive: idle ALBs, extra WAF associations and many DNS targets. Use an IngressGroup or one shared Gateway per exposure level (public, internal).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Accepting "a few 502s per deploy"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">They are not normal. They are a race between SIGTERM and deregistration, fixed with a preStop delay, a sized grace period and readiness gates.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Prefix delegation from day one</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Turn it on in the add-on config before the first node joins, set maxPods 110, and reserve CIDR space for prefixes. Retrofitting it onto a fragmented subnet is much harder.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Lock exposure at the class level</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Put scheme, group and allowed namespaces in IngressClassParams or the Gateway's <code class="inline">allowedRoutes</code>. Then an app team cannot make something public by editing one annotation.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="max-pods"> <span>I can calculate max Pods and subnet usage per node for any instance type, with and without prefix delegation and custom networking.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cni-config"> <span>I configured the <code class="inline">vpc-cni</code> add-on (prefix delegation, network policy) through Terraform and verified max Pods on a new node.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="lbc-ingress"> <span>I installed the AWS Load Balancer Controller with Pod Identity and exposed a service through an ALB in an IngressGroup with target type ip.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dns-tls"> <span>I set up ExternalDNS (upsert-only, single zone, unique owner ID) and an ACM certificate, and can explain when I would use cert-manager instead.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="zero-502"> <span class="font-semibold">On a dev EKS cluster, exposed booking-api at a real hostname through the LBC (Ingress or Gateway API), ExternalDNS and ACM, then ran a rolling deploy under a 50 rps k6 load and showed zero ALB 5xx. Shared the PR, the k6 summary and the CloudWatch graph (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html" target="_blank" rel="noopener">AWS — Amazon VPC CNI</a>: add-on management, configuration values and versions.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/best-practices/vpc-cni.html" target="_blank" rel="noopener">AWS — EKS Best Practices: VPC CNI</a> · <a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/best-practices/ip-opt.html" target="_blank" rel="noopener">IP address optimisation</a>: warm pools, prefix delegation, custom networking and subnet planning.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/security-groups-for-pods.html" target="_blank" rel="noopener">AWS — Security groups for Pods</a>: SecurityGroupPolicy, branch ENI limits and caveats.</li>
+        <li><a class="text-coral underline" href="https://github.com/kubernetes-sigs/aws-load-balancer-controller" target="_blank" rel="noopener">AWS Load Balancer Controller — README and docs</a>: the full annotation reference, IngressClassParams and Gateway API support.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html" target="_blank" rel="noopener">AWS — Route internet traffic with the AWS Load Balancer Controller</a>: install, IAM and subnet tagging.</li>
+        <li><a class="text-coral underline" href="https://github.com/kubernetes-sigs/external-dns" target="_blank" rel="noopener">ExternalDNS — README</a>: the AWS provider tutorial, policies and the TXT registry.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/concepts/services-networking/gateway/" target="_blank" rel="noopener">Kubernetes — Gateway API</a>: the resource model behind the EKS implementations in Part IV.</li>
+      </ul>
+
+      <nav id="page-nav" class="mt-14 flex gap-4"></nav>
+    </article>
+
+    <footer class="px-6 py-8 text-center text-xs text-mute dark:text-mutedark">
+      DevOps Engineer Career Track · KS6 EKS Networking: VPC CNI &amp; Load Balancer Controller
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>

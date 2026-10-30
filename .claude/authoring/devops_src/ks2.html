@@ -1,0 +1,903 @@
+<!-- meta: days=5 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Workloads, Configuration &amp; Resource Management</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          KS1 gave you a Deployment that runs. This module makes it survive production. You will choose the right controller
+          for each piece of the clinic booking platform, feed it configuration without baking that configuration into the
+          image, tell Kubernetes honestly when a Pod is healthy, and tell the scheduler how much CPU and memory it needs.
+          Then you will place replicas across three Availability Zones and shut them down without dropping a single booking
+          request. By the end, the <code class="inline">booking-api</code> manifest from KS1 has grown into one you would
+          approve in a production pull request.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> the outages this module prevents are the boring, common ones. A
+          liveness probe checks the database, so a 20-second RDS failover restarts every API Pod at once. A Pod without a
+          memory limit eats a node and gets its neighbours evicted. All three replicas land in one AZ, and that AZ has a bad
+          hour. A node drain during an upgrade kills in-flight requests because nobody set a <code class="inline">preStop</code>
+          delay. None of these show up on a kind cluster with no traffic. All of them show up in the first month on
+          <code class="inline">clinic-prod-eks</code>.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Workload controllers</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pick the controller by what the Pod must remember</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        In KS1 you met one controller, the Deployment, and the control loop behind it
+        (<a href="./ks1.html" class="text-viol underline decoration-viol/40">KS1</a>). Kubernetes ships four more workload
+        controllers. Each makes a different promise about identity, placement and completion. Choosing the wrong one is
+        rarely a syntax error. It is a design error that shows up later, as a lost volume, a duplicated batch run or a log
+        agent missing from half the nodes.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Five controllers, five contracts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Ask two questions. Does each Pod need a stable identity (a fixed name and its own disk)? Does the work ever finish?
+        The answers pick the controller. On the booking platform, every component maps to exactly one row of this table.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Controller</th><th class="px-4 py-3">Promise</th><th class="px-4 py-3">Booking platform example</th><th class="px-4 py-3">Wrong when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Deployment</td><td class="px-4 py-3">N interchangeable Pods, rolling updates</td><td class="px-4 py-3"><code class="inline">booking-api</code>, <code class="inline">booking-web</code>, <code class="inline">booking-worker</code></td><td class="px-4 py-3">Each replica needs its own persistent disk</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">StatefulSet</td><td class="px-4 py-3">Stable names (<code class="inline">-0</code>, <code class="inline">-1</code>), ordered start, one PVC per Pod</td><td class="px-4 py-3">A self-hosted search index in staging (storage in <a href="./ks4.html" class="text-viol underline decoration-viol/40">KS4</a>)</td><td class="px-4 py-3">Replicas are identical: you pay ordering cost for nothing</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">DaemonSet</td><td class="px-4 py-3">Exactly one Pod on every matching node</td><td class="px-4 py-3">Log shipper, node exporter, the Datadog agent</td><td class="px-4 py-3">You want "about 3 copies": use a Deployment</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Job</td><td class="px-4 py-3">Run until N completions succeed, retry on failure</td><td class="px-4 py-3"><code class="inline">booking-db-migrate</code> before a release</td><td class="px-4 py-3">The process is meant to run for ever</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CronJob</td><td class="px-4 py-3">Create a Job on a schedule</td><td class="px-4 py-3"><code class="inline">booking-reminders</code> SMS run every morning</td><td class="px-4 py-3">You need sub-minute timing or exactly-once delivery</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    Q1{"Does the work<br/>finish?"} -->|yes, once| J["Job<br/>booking-db-migrate"]
+    Q1 -->|yes, on a schedule| CJ["CronJob<br/>booking-reminders"]
+    Q1 -->|no, long-running| Q2{"One per node?"}
+    Q2 -->|yes| DS["DaemonSet<br/>fluent-bit, node-exporter"]
+    Q2 -->|no| Q3{"Stable name +<br/>own disk per Pod?"}
+    Q3 -->|yes| SS["StatefulSet<br/>search-0, search-1"]
+    Q3 -->|no| D["Deployment<br/>booking-api, -web, -worker"]
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice that <code class="inline">booking-worker</code> is a Deployment, not a Job. It consumes an SQS queue for ever,
+        and the queue already remembers the work. Pods that hold no state of their own are Deployments, even when they do
+        "background" work. Scaling it on queue depth is <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Rollout fields decide how much capacity you lose</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <code class="inline">RollingUpdate</code> has two dials. <code class="inline">maxSurge</code> is how many extra
+        Pods may exist above <code class="inline">replicas</code> during the rollout. <code class="inline">maxUnavailable</code>
+        is how many may be missing. Percentages are rounded: surge rounds <em>up</em>, unavailable rounds <em>down</em>. The
+        defaults (25% / 25%) behave very differently at 3 replicas and at 10, so always work out the numbers.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Setting</th><th class="px-4 py-3">replicas: 3</th><th class="px-4 py-3">replicas: 10</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Default 25% / 25%</td><td class="px-4 py-3">+1 surge, 0 unavailable</td><td class="px-4 py-3">+3 surge, 2 unavailable (8 Ready minimum)</td><td class="px-4 py-3">Rarely what you meant at 10+: you lose 20%</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">maxSurge 1, maxUnavailable 0</td><td class="px-4 py-3">One at a time, never below 3</td><td class="px-4 py-3">Slow: 10 sequential steps</td><td class="px-4 py-3"><code class="inline">booking-api</code> today: safe, small</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">maxSurge 25%, maxUnavailable 0</td><td class="px-4 py-3">+1, never below 3</td><td class="px-4 py-3">+3 per step, never below 10</td><td class="px-4 py-3">Our default at scale: fast, no capacity loss, needs headroom</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Recreate</td><td class="px-4 py-3">All 3 down, then 3 up</td><td class="px-4 py-3">Full outage</td><td class="px-4 py-3">Only when two versions must never run together</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two more fields stop a bad release from rolling all the way through. <code class="inline">minReadySeconds</code>
+        makes a new Pod stay Ready for a while before it counts as available, which catches apps that crash 15 seconds
+        after start. <code class="inline">progressDeadlineSeconds</code> marks the rollout as failed when it stops making
+        progress, so the pipeline (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>) can fail
+        and roll back instead of waiting for ever.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api/deployment.yaml — rollout section</span>
+        <pre class="code">spec:
+  replicas: 3
+  minReadySeconds: 10                  <span class="cm"># must stay Ready 10 s before it counts</span>
+  progressDeadlineSeconds: 300         <span class="cm"># no progress for 5 min = Progressing=False</span>
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%                    <span class="cm"># rounds UP: at least 1 extra Pod</span>
+      maxUnavailable: 0                <span class="cm"># never fewer Ready Pods than replicas</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking rollout status deploy/booking-api --timeout=6m
+<span class="out">Waiting for deployment "booking-api" rollout to finish: 1 out of 3 new replicas have been updated...
+error: deployment "booking-api" exceeded its progress deadline</span>
+kubectl -n booking get deploy booking-api -o jsonpath='{.status.conditions[?(@.type=="Progressing")].reason}{"\n"}'
+<span class="out">ProgressDeadlineExceeded</span>
+<span class="cm"># the old ReplicaSet still serves all traffic: maxUnavailable 0 protected you. Now roll back.</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">DaemonSets: one Pod per node, including the nodes you forgot</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A DaemonSet runs a copy on every node that matches its node selector and tolerations. It is the right shape for
+        anything that reads from the node itself: container logs under <code class="inline">/var/log/pods</code>, node
+        metrics, a security agent. The usual failure is a DaemonSet that silently skips nodes, because system nodes carry a
+        taint the DaemonSet does not tolerate. Taints are covered in Part IV; here is the shape of a log shipper.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/fluent-bit/daemonset.yaml — the parts that matter</span>
+        <pre class="code">apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: fluent-bit, namespace: logging }
+spec:
+  selector: { matchLabels: { app: fluent-bit } }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 10% }   <span class="cm"># on 40 nodes, 4 at a time lose logs briefly</span>
+  template:
+    metadata: { labels: { app: fluent-bit } }
+    spec:
+      priorityClassName: system-node-critical <span class="cm"># evicted last under node pressure</span>
+      tolerations:
+        - operator: Exists                    <span class="cm"># tolerate EVERY taint: run on all nodes</span>
+      containers:
+        - name: fluent-bit
+          image: cr.fluentbit.io/fluent/fluent-bit:4.0.3
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { memory: 128Mi }
+          volumeMounts: [{ name: varlog, mountPath: /var/log, readOnly: true }]
+      volumes:
+        - { name: varlog, hostPath: { path: /var/log } }</pre>
+      </div>
+      <pre class="code mt-3">kubectl -n logging get ds fluent-bit
+<span class="out">NAME         DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+fluent-bit   12        12        12      12           12          &lt;none&gt;          9d</span>
+kubectl get nodes --no-headers | wc -l
+<span class="out">12</span>
+<span class="cm"># DESIRED must equal the node count. 9 of 12 means three nodes have a taint you don't tolerate.</span></pre>
+      <div class="mt-4 callout callout-info"><strong>Sidecars are now first class.</strong> Since Kubernetes 1.33 a
+        <em>native sidecar</em> is an init container with <code class="inline">restartPolicy: Always</code>. It starts
+        before the app containers, keeps running beside them, and stops after them. Use this form, not a second entry in
+        <code class="inline">containers:</code>, for log or proxy sidecars. Otherwise a Job never completes, because the
+        sidecar never exits.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Jobs and CronJobs: retries, deadlines and clean-up</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A Job runs Pods until enough of them succeed. The defaults are risky for real work. Six retries with exponential
+        backoff (<code class="inline">backoffLimit: 6</code>) can turn a failing migration into ten minutes of hammering
+        the database. There is no time limit, and finished Jobs pile up for ever. Set all three dials yourself. The
+        schema migration that runs before each <code class="inline">booking-api</code> release looks like this:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api/migrate-job.yaml</span>
+        <pre class="code">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: booking-db-migrate-1-8-3        <span class="cm"># one Job per release: Job templates are immutable</span>
+  namespace: booking
+spec:
+  backoffLimit: 1                      <span class="cm"># one retry, then fail the release loudly</span>
+  activeDeadlineSeconds: 600           <span class="cm"># kill it after 10 min whatever the state</span>
+  ttlSecondsAfterFinished: 86400       <span class="cm"># garbage-collect a day later (logs gone too)</span>
+  podFailurePolicy:
+    rules:
+      - action: FailJob                <span class="cm"># exit 2 = "schema conflict": retrying won't help</span>
+        onExitCodes: { containerName: migrate, operator: In, values: [2] }
+  template:
+    spec:
+      restartPolicy: Never             <span class="cm"># required for podFailurePolicy</span>
+      containers:
+        - name: migrate
+          image: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-api:1.8.3
+          args: ["dist/migrate.js", "up"]  <span class="cm"># distroless nodejs22: the entrypoint is node</span>
+          envFrom: [{ secretRef: { name: booking-db } }]</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A CronJob adds a schedule, and three fields that matter more than the schedule. <code class="inline">timeZone</code>
+        stops "8 a.m." meaning 8 a.m. UTC, which is 3 p.m. for the clinic's patients in Vietnam.
+        <code class="inline">concurrencyPolicy: Forbid</code> stops a slow run overlapping the next one.
+        <code class="inline">startingDeadlineSeconds</code> skips a run that was missed for too long, instead of firing it
+        hours late after a control plane hiccup.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-worker/reminders-cronjob.yaml</span>
+        <pre class="code">apiVersion: batch/v1
+kind: CronJob
+metadata: { name: booking-reminders, namespace: booking }
+spec:
+  schedule: "0 8 * * *"
+  timeZone: Asia/Ho_Chi_Minh           <span class="cm"># 08:00 local time, not 08:00 UTC</span>
+  concurrencyPolicy: Forbid            <span class="cm"># never two runs at once: no double SMS</span>
+  startingDeadlineSeconds: 1800        <span class="cm"># missed by 30+ min? skip it, don't send at noon</span>
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5            <span class="cm"># keep failures around long enough to debug</span>
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1200
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: reminders
+              image: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-worker:2.4.0
+              args: ["send-reminders", "--window=24h"]</pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking create job reminders-manual --from=cronjob/booking-reminders   <span class="cm"># test it now</span>
+<span class="out">job.batch/reminders-manual created</span>
+kubectl -n booking get jobs
+<span class="out">NAME                         STATUS     COMPLETIONS   DURATION   AGE
+booking-reminders-29360160   Complete   1/1           47s        6h
+reminders-manual             Running    0/1           12s        12s</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>A CronJob can run twice.</strong> Kubernetes documents CronJobs as
+        "approximately once": a controller restart can create two Jobs for one schedule, and a retry re-runs work that
+        partly succeeded. <code class="inline">Forbid</code> narrows the window but does not close it. The reminder sender
+        must be idempotent, for example by recording <code class="inline">reminder_sent_at</code> per appointment and
+        skipping rows that already have it. That is an application pattern
+        (<a href="../../intern/modules/sd8.html" class="text-viol underline decoration-viol/40">intern SD8</a>), and the
+        manifest cannot fix it for you.</div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Configuration</div>
+      <h2 class="font-display text-2xl font-bold mt-2">One image, many environments: config lives outside it</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The same <code class="inline">booking-api:1.8.3</code> image runs in dev, staging and prod. What changes is
+        configuration: the database host, the log level, feature flags, credentials. Kubernetes holds this in two object
+        kinds, ConfigMaps and Secrets, and hands them to Pods as environment variables or files. The way you hand them over
+        decides what happens when the value changes, and that is where most config incidents start.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">ConfigMaps: env vars or mounted files</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A ConfigMap is a map of string keys to string values, up to 1 MiB in total. Keep it for non-sensitive settings. The
+        booking API reads a few settings from the environment and a larger rate-limit policy from a file, so its ConfigMap
+        carries both.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api/configmap.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: booking-api-config
+  namespace: booking
+data:
+  LOG_LEVEL: info
+  DB_HOST: clinic-prod.cluster-c8xk2v0e1abc.ap-southeast-1.rds.amazonaws.com
+  CACHE_URL: rediss://clinic-prod.x7ykq1.ng.0001.apse1.cache.amazonaws.com:6379  <span class="cm"># ElastiCache Valkey 8, TLS</span>
+  FEATURE_WAITLIST: "true"             <span class="cm"># quote it: YAML would read true as a boolean</span>
+  ratelimit.yaml: |                    <span class="cm"># a whole file as one key</span>
+    default: { rps: 20, burst: 40 }
+    routes:
+      - { path: /v1/slots, rps: 100, burst: 200 }</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">booking-api/deployment.yaml — container config section</span>
+        <pre class="code">      containers:
+        - name: api
+          envFrom:
+            - configMapRef: { name: booking-api-config }  <span class="cm"># every key becomes an env var</span>
+          env:
+            - name: POD_NAME                              <span class="cm"># Downward API: facts about the Pod</span>
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NODE_OPTIONS                          <span class="cm"># V8 heap = ~75% of the 384Mi limit</span>
+              value: "--max-old-space-size=288"
+          volumeMounts:
+            - name: ratelimit
+              mountPath: /etc/booking            <span class="cm"># whole directory: updates propagate</span>
+              readOnly: true
+      volumes:
+        - name: ratelimit
+          configMap:
+            name: booking-api-config
+            items: [{ key: ratelimit.yaml, path: ratelimit.yaml }]</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Delivery</th><th class="px-4 py-3">When the ConfigMap changes</th><th class="px-4 py-3">Use for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">env</code> / <code class="inline">envFrom</code></td><td class="px-4 py-3">Nothing happens. The Pod keeps the old value until it restarts</td><td class="px-4 py-3">Values read once at start-up (most settings)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Volume (directory)</td><td class="px-4 py-3">The kubelet swaps the file in, usually within 60–90 s. The app must re-read it</td><td class="px-4 py-3">Files the app watches and hot-reloads</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Volume with <code class="inline">subPath</code></td><td class="px-4 py-3">Never updates. A subPath mount is a one-time copy</td><td class="px-4 py-3">Dropping one file into a directory that already exists, accepting the staleness</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">immutable: true</code></td><td class="px-4 py-3">The API rejects edits. You create a new ConfigMap instead</td><td class="px-4 py-3">Prod: fewer watches on the API server, no accidental edits</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The first row is the one that surprises people. You change <code class="inline">LOG_LEVEL</code> to
+        <code class="inline">debug</code>, apply it, and nothing happens, because environment variables are fixed when
+        the container starts. The next heading shows how to make a config change roll out like an image change.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Make a config change trigger a rollout</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A Deployment rolls out only when its Pod <em>template</em> changes. A ConfigMap is a separate object, so editing it
+        does not touch the template. The fix is to put the config's identity into the template. Our standard is a
+        content-hashed name, generated by Kustomize (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>).
+        Each change produces a new ConfigMap name, the Deployment reference changes, and that change triggers a normal,
+        safe rolling update with a rollback path. Helm charts do the same thing with a checksum annotation.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api/kustomization.yaml</span>
+        <pre class="code">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: booking
+resources: [deployment.yaml, service.yaml]
+configMapGenerator:
+  - name: booking-api-config
+    envs: [config.env]                 <span class="cm"># LOG_LEVEL=info, DB_HOST=…</span>
+    files: [ratelimit.yaml]
+    options:
+      immutable: true                  <span class="cm"># every version is a new object, never edited</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl kustomize booking-api/ | grep -n 'booking-api-config'
+<span class="out">14:  name: booking-api-config-6t2mf8hd94
+71:            name: booking-api-config-6t2mf8hd94</span>
+<span class="cm"># change LOG_LEVEL → new suffix → the Deployment reference changes → a rollout</span>
+kubectl diff -k booking-api/ | grep configMapRef -A1
+<span class="out">-                name: booking-api-config-6t2mf8hd94
++                name: booking-api-config-b7k4c9m2gt</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> treat a config change as a release. With
+        hashed names, the previous ConfigMap still exists, so <code class="inline">kubectl rollout undo</code> restores the
+        old config <em>and</em> the old Pods together. Teams that edit ConfigMaps in place lose that ability. A bad setting
+        then has no rollback, only a hurried second edit.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Secrets are a separate kind, not a safe</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A Secret looks like a ConfigMap whose values are base64-encoded. <strong>Base64 is an encoding, not
+        encryption.</strong> Anyone who can <code class="inline">get</code> the Secret can read it. What makes a Secret
+        different is how the platform treats it. RBAC can grant ConfigMap read access without Secret read access. The
+        kubelet keeps mounted Secrets in tmpfs (memory) rather than on disk. On EKS, Secrets are envelope-encrypted with KMS
+        in etcd. Those properties only help if you use them.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-db Secret — created by External Secrets, shown for reading only</span>
+        <pre class="code">apiVersion: v1
+kind: Secret
+metadata: { name: booking-db, namespace: booking }
+type: Opaque
+data:
+  DB_USER: Ym9va2luZ19hcHA=             <span class="cm"># "booking_app"</span>
+  DB_PASSWORD: dDNtcC1ub3QtcmVhbA==     <span class="cm"># readable by anyone with get secrets</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking get secret booking-db -o jsonpath='{.data.DB_USER}' | base64 -d; echo
+<span class="out">booking_app</span>
+kubectl auth can-i get secrets -n booking --as=system:serviceaccount:booking:booking-web
+<span class="out">no</span>
+<span class="cm"># good: the frontend's identity cannot read DB credentials, even in the same namespace</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Question</th><th class="px-4 py-3">Answer on the booking platform</th><th class="px-4 py-3">Owner</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Where does the real value live?</td><td class="px-4 py-3">AWS Secrets Manager, rotated there</td><td class="px-4 py-3"><a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">How does it reach the cluster?</td><td class="px-4 py-3">External Secrets Operator syncs it into the <code class="inline">booking-db</code> Secret</td><td class="px-4 py-3"><a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Is it in Git?</td><td class="px-4 py-3">Never. Git holds only the <code class="inline">ExternalSecret</code> reference</td><td class="px-4 py-3"><a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Env var or file?</td><td class="px-4 py-3">File, where the app supports it: env vars leak into crash dumps and <code class="inline">/proc</code></td><td class="px-4 py-3">This module</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>Never commit a Secret manifest.</strong> A
+        <code class="inline">kind: Secret</code> with real <code class="inline">data:</code> in a Git repo is a leaked
+        credential, even in a private repo and even if you delete it in the next commit. It stays in history and in every
+        clone. Treat it as an incident: rotate first, then clean up
+        (<a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a> has the response runbook).</div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Health and resources</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Probes tell Kubernetes the truth; requests tell the scheduler</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Kubernetes knows two things about your container unless you tell it more: whether the process is running, and how
+        much CPU and memory it is using right now. Probes add "is it able to serve?" Requests and limits add "how much does
+        it need, and how much may it take?" Get either wrong and Kubernetes makes confident, automated decisions on false
+        information, across every replica at once.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Three probes, three different questions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each probe has a different consequence when it fails, and mixing them up is the most common probe bug.
+        <strong>Readiness</strong> failing removes the Pod from Service endpoints but leaves it running.
+        <strong>Liveness</strong> failing kills and restarts the container. <strong>Startup</strong> holds the other two
+        off until the app has finished booting.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 240" class="w-full min-w-[640px]" role="img" aria-label="Probe timeline: startup probe runs first, then readiness and liveness run in parallel for the life of the container">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">PROBE TIMELINE · one booking-api container</text>
+          <g class="anim-pulse"><rect x="20" y="40" width="200" height="44" rx="9" fill="#6d5acd"/>
+            <text x="120" y="59" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">startupProbe</text>
+            <text x="120" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">every 2 s, up to 30 tries = 60 s budget</text></g>
+          <g class="anim-pulse d1"><rect x="240" y="40" width="460" height="44" rx="9" fill="#0D9488"/>
+            <text x="470" y="59" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">readinessProbe · GET /readyz every 5 s</text>
+            <text x="470" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">2 failures → out of Service endpoints · 1 success → back in</text></g>
+          <g class="anim-pulse d2"><rect x="240" y="100" width="460" height="44" rx="9" fill="#D97757"/>
+            <text x="470" y="119" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">livenessProbe · GET /healthz every 10 s</text>
+            <text x="470" y="134" text-anchor="middle" fill="#ffffffbb" font-size="9">3 failures (~30 s hung) → kubelet restarts the container</text></g>
+          <line x1="220" y1="62" x2="240" y2="62" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="220" y1="62" x2="240" y2="122" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="20" y1="180" x2="700" y2="180" stroke="#A8A49B" stroke-width="1.5"/>
+          <text x="20" y="196" font-size="9" fill="#6E6B64">t=0 container starts</text>
+          <text x="232" y="196" font-size="9" fill="#6E6B64">t≈18 s startup passes</text>
+          <text x="440" y="196" font-size="9" fill="#6E6B64">RDS failover: readiness flaps, liveness stays green</text>
+          <rect x="430" y="40" width="60" height="44" rx="9" fill="#37474F" opacity="0.55"/>
+          <text x="460" y="166" text-anchor="middle" font-size="9" fill="#A8A49B">← not Ready, not restarted</text>
+          <text x="360" y="225" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">readiness = "send me traffic?" · liveness = "am I stuck for good?"</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Probe</th><th class="px-4 py-3">Question</th><th class="px-4 py-3">On failure</th><th class="px-4 py-3">Should check</th><th class="px-4 py-3">Must not check</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">startup</td><td class="px-4 py-3">Has it finished booting?</td><td class="px-4 py-3">Restart after the budget runs out</td><td class="px-4 py-3">The same endpoint as liveness</td><td class="px-4 py-3">Anything slower than a boot</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">readiness</td><td class="px-4 py-3">Can it serve a request right now?</td><td class="px-4 py-3">Removed from endpoints, keeps running</td><td class="px-4 py-3">Its own critical dependencies: DB pool has a connection, warm-up done</td><td class="px-4 py-3">Other services' health (cascades)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">liveness</td><td class="px-4 py-3">Is the process wedged beyond recovery?</td><td class="px-4 py-3">Container killed and restarted</td><td class="px-4 py-3">In-process only: event loop answers, no deadlock</td><td class="px-4 py-3"><strong>Any external dependency</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The probe block for booking-api</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The booking API exposes two endpoints. <code class="inline">/healthz</code> returns 200 if the HTTP server
+        answers at all. <code class="inline">/readyz</code> also checks it can take a connection from its Postgres pool.
+        The numbers are deliberate. Startup gets a 60-second budget, because a cold start takes about 18 seconds and
+        migrations-at-boot are banned. Readiness reacts within 10 seconds. Liveness waits 30 seconds of total silence,
+        because restarting a slow but healthy process makes an overload worse.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api/deployment.yaml — probes</span>
+        <pre class="code">          ports: [{ name: http, containerPort: 8080 }]
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30        <span class="cm"># 30 × 2 s = 60 s to boot before a restart</span>
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2         <span class="cm"># out of rotation within ~10 s</span>
+            successThreshold: 1
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }   <span class="cm"># in-process only, never the DB</span>
+            periodSeconds: 10
+            failureThreshold: 3         <span class="cm"># ~30 s fully stuck before a restart</span>
+            timeoutSeconds: 3           <span class="cm"># default is 1 s: too tight under load</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking describe pod booking-api-7c9f8d6b5-x2lqp | sed -n '/Events:/,$p'
+<span class="out">Events:
+  Type     Reason     Age                From     Message
+  Warning  Unhealthy  41s (x4 over 56s)  kubelet  Readiness probe failed: HTTP probe failed with statuscode: 503
+  Normal   Started    12m                kubelet  Started container api</span>
+<span class="cm"># readiness failing, zero restarts: the probe design is working. Look at why /readyz says 503.</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>The liveness probe that took down the platform.</strong> An agent
+        "improves" <code class="inline">/healthz</code> to include a <code class="inline">SELECT 1</code>. RDS fails over
+        to the standby, which takes about 30 seconds. Every API Pod fails liveness together, the kubelet restarts all of
+        them, and they all reconnect at the same moment. A 30-second database blip becomes a five-minute outage and a
+        connection storm. Liveness checks the process. Dependencies belong in readiness, or nowhere.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Requests, limits and what the kernel actually does</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>request</strong> is a reservation: the scheduler places the Pod only on a node with that much
+        unreserved capacity, and the kernel guarantees it under contention. A <strong>limit</strong> is a ceiling enforced
+        by cgroups. CPU and memory behave completely differently at the ceiling, because CPU can be slowed down and memory
+        cannot be taken back.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Resource</th><th class="px-4 py-3">Request means</th><th class="px-4 py-3">Hitting the limit</th><th class="px-4 py-3">Our rule</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">CPU</td><td class="px-4 py-3">Guaranteed share; also used for bin-packing</td><td class="px-4 py-3"><strong>Throttled</strong>: the process is paused for the rest of each 100 ms period. Latency jumps, nothing restarts</td><td class="px-4 py-3">Set a request near the p90 of real usage. <strong>No CPU limit</strong> on latency-sensitive services</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Memory</td><td class="px-4 py-3">Reserved bytes; the scheduler won't overcommit them</td><td class="px-4 py-3"><strong>OOMKilled</strong>: the kernel kills the process, exit code 137, restart</td><td class="px-4 py-3">Always set a limit. <strong>Limit = request</strong> for services, so a node is never overcommitted on memory</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ephemeral storage</td><td class="px-4 py-3">Disk for logs, emptyDir, writable layer</td><td class="px-4 py-3">Pod evicted by the kubelet</td><td class="px-4 py-3">Set a limit on anything that writes temp files</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">booking-api/deployment.yaml — resources</span>
+        <pre class="code">          resources:
+            requests:
+              cpu: 250m                 <span class="cm"># 0.25 vCPU: p90 under normal load was 180m</span>
+              memory: 384Mi
+            limits:
+              memory: 384Mi             <span class="cm"># = request: no memory overcommit</span>
+              <span class="cm"># no cpu limit: spare CPU on the node is used, not wasted</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking top pods -l app=booking-api
+<span class="out">NAME                          CPU(cores)   MEMORY(bytes)
+booking-api-7c9f8d6b5-m8tzr   174m         298Mi
+booking-api-7c9f8d6b5-q7wnd   191m         305Mi
+booking-api-7c9f8d6b5-x2lqp   168m         291Mi</span>
+kubectl -n booking get pod booking-api-7c9f8d6b5-x2lqp \
+  -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}{"\n"}'
+<span class="out">OOMKilled</span>   <span class="cm"># last restart was memory: raise the limit or fix the leak, check usage trend first</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Setting these numbers from real data rather than guesses (VPA recommendations, Prometheus usage percentiles) and
+        tuning them for node cost is <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>. From
+        Kubernetes 1.33, in-place Pod resize is on by default (beta), so a resource change no longer has to restart the
+        container. Our Deployments still change resources through Git, which rolls new Pods.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">QoS classes decide who is evicted first</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When a node runs short of memory, the kubelet evicts Pods to protect itself. It picks victims by
+        <strong>Quality of Service class</strong>, which Kubernetes derives from your requests and limits. You never set
+        the class directly. You get it as a side effect, so check it.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">QoS class</th><th class="px-4 py-3">You get it when</th><th class="px-4 py-3">Eviction order</th><th class="px-4 py-3">Booking platform</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Guaranteed</td><td class="px-4 py-3">Every container sets CPU and memory, with limit = request</td><td class="px-4 py-3">Last</td><td class="px-4 py-3">Rare: requires a CPU limit, which we avoid</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Burstable</td><td class="px-4 py-3">At least one request or limit, but not Guaranteed</td><td class="px-4 py-3">Middle, by how far usage exceeds request</td><td class="px-4 py-3"><code class="inline">booking-api</code>, <code class="inline">-web</code>, <code class="inline">-worker</code> (memory limit = request, no CPU limit)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">BestEffort</td><td class="px-4 py-3">No requests or limits at all</td><td class="px-4 py-3">First</td><td class="px-4 py-3">Never in prod: our LimitRange makes it impossible</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">kubectl -n booking get pods -o custom-columns=POD:.metadata.name,QOS:.status.qosClass
+<span class="out">POD                               QOS
+booking-api-7c9f8d6b5-m8tzr       Burstable
+booking-web-5b8c7d9f4-2kqtl       Burstable
+debug-shell                       BestEffort</span>   <span class="cm"># someone's forgotten Pod: first to go, and a LimitRange gap</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A Burstable Pod with memory limit equal to request behaves almost like Guaranteed for memory: it never uses more
+        than it reserved, so it is never the Pod pushing a node into pressure. That is the trade-off we choose. Strong
+        memory isolation, and CPU that can burst into idle capacity.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">LimitRange and ResourceQuota: guardrails per namespace</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Individual manifests forget things. Namespace guardrails catch them. A <strong>LimitRange</strong> fills in default
+        requests and limits for containers that have none, and rejects values outside a range. A
+        <strong>ResourceQuota</strong> caps the namespace's total, so one runaway HPA or a copy-paste of
+        <code class="inline">replicas: 300</code> cannot take the whole cluster. The platform team applies both to every
+        app namespace.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/namespaces/booking/guardrails.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: LimitRange
+metadata: { name: defaults, namespace: booking }
+spec:
+  limits:
+    - type: Container
+      defaultRequest: { cpu: 100m, memory: 128Mi }   <span class="cm"># applied when a container sets none</span>
+      default:        { memory: 128Mi }              <span class="cm"># default LIMIT: memory only</span>
+      max:            { memory: 4Gi }                <span class="cm"># reject a 64Gi typo at admission</span>
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: { name: booking-quota, namespace: booking }
+spec:
+  hard:
+    requests.cpu: "12"
+    requests.memory: 24Gi
+    limits.memory: 24Gi
+    pods: "60"
+    services.loadbalancers: "0"        <span class="cm"># public entry goes through the shared ALB only</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking describe resourcequota booking-quota
+<span class="out">Name:                   booking-quota
+Namespace:              booking
+Resource                Used   Hard
+--------                ----   ----
+limits.memory           9Gi    24Gi
+pods                    17     60
+requests.cpu            3850m  12
+requests.memory         9Gi    24Gi
+services.loadbalancers  0      0</span>
+<span class="cm"># a rollout that would cross a Hard value fails with "exceeded quota" in the ReplicaSet events, not the Deployment's</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Quota blocks rollouts silently.</strong> With
+        <code class="inline">maxSurge</code>, a rollout briefly needs <em>more</em> than steady-state capacity. If the
+        namespace sits at 95% of quota, the surge Pods are rejected, the Deployment shows no error, and the rollout stalls
+        until <code class="inline">progressDeadlineSeconds</code>. Look for <code class="inline">FailedCreate</code> in
+        <code class="inline">kubectl describe rs</code>, and keep quota at least one surge's worth above normal usage.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Placement and disruption</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Spread for failure, budget for maintenance, drain gracefully</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Three replicas protect you only if they fail independently. By default the scheduler optimises for packing, not
+        for resilience, and it may place all three on one node in one AZ. Then nodes go away on purpose: Karpenter
+        consolidates them, upgrades rotate them, Spot reclaims them. This Part covers the fields that control where Pods
+        land and how they leave.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Taints repel, affinity attracts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        These two mechanisms are easy to confuse because both affect placement. A <strong>taint</strong> is on a node and
+        keeps every Pod away unless that Pod <em>tolerates</em> it. An <strong>affinity</strong> rule is on a Pod and
+        pulls it towards nodes, or towards or away from other Pods. On <code class="inline">clinic-prod-eks</code>, the
+        small managed node group for system add-ons is tainted so app Pods stay off it
+        (<a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>).
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Mechanism</th><th class="px-4 py-3">Set on</th><th class="px-4 py-3">Does</th><th class="px-4 py-3">Booking platform use</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Taint + toleration</td><td class="px-4 py-3">Node + Pod</td><td class="px-4 py-3">Keeps Pods off unless they opt in. A toleration permits, it does not attract</td><td class="px-4 py-3"><code class="inline">CriticalAddonsOnly=true:NoSchedule</code> on system nodes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">nodeSelector</td><td class="px-4 py-3">Pod</td><td class="px-4 py-3">Hard "only nodes with this label"</td><td class="px-4 py-3"><code class="inline">kubernetes.io/arch: arm64</code> for Graviton images</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Node affinity</td><td class="px-4 py-3">Pod</td><td class="px-4 py-3">Like nodeSelector, with operators and a "preferred" soft form</td><td class="px-4 py-3">Prefer on-demand capacity for the API, allow Spot for the worker</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Pod anti-affinity</td><td class="px-4 py-3">Pod</td><td class="px-4 py-3">Keep away from Pods matching a label</td><td class="px-4 py-3">Superseded for spreading by topology spread (next)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">booking-worker/deployment.yaml — placement</span>
+        <pre class="code">    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64          <span class="cm"># multi-arch image (FN6): run on Graviton</span>
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 80
+              preference:
+                matchExpressions:
+                  - key: karpenter.sh/capacity-type
+                    operator: In
+                    values: ["spot"]       <span class="cm"># prefer Spot: the queue tolerates restarts</span>
+      tolerations:
+        - key: workload-type
+          operator: Equal
+          value: batch
+          effect: NoSchedule               <span class="cm"># may also use the tainted batch pool</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read <code class="inline">IgnoredDuringExecution</code> literally. Affinity is checked only when the Pod is
+        scheduled. If a node's labels change afterwards, running Pods stay where they are. Nodes and node pools themselves
+        (the labels, taints and Spot settings on them) are Karpenter's job in
+        <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Topology spread: one bad AZ must not take the service</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">topologySpreadConstraints</code> says how evenly Pods matching a selector must be spread over
+        a topology key such as the zone or the node. <code class="inline">maxSkew: 1</code> means no zone may have more
+        than one Pod more than the emptiest zone. For <code class="inline">booking-api</code> we make zone spread hard
+        (<code class="inline">DoNotSchedule</code>) and node spread soft (<code class="inline">ScheduleAnyway</code>), so a
+        shortage of nodes slows scheduling down rather than blocking it.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Six booking-api replicas spread two per Availability Zone across ap-southeast-1a, 1b and 1c">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">TOPOLOGY SPREAD · booking-api, 6 replicas, maxSkew 1 on zone</text>
+          <rect x="15" y="36" width="220" height="150" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="27" y="56" font-size="11" font-weight="700" fill="#6E6B64">ap-southeast-1a</text>
+          <rect x="250" y="36" width="220" height="150" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="262" y="56" font-size="11" font-weight="700" fill="#6E6B64">ap-southeast-1b</text>
+          <rect x="485" y="36" width="220" height="150" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="497" y="56" font-size="11" font-weight="700" fill="#6E6B64">ap-southeast-1c · outage</text>
+          <g class="anim-pulse"><rect x="30" y="70" width="90" height="42" rx="9" fill="#2563EB"/>
+            <text x="75" y="88" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">api-1</text>
+            <text x="75" y="102" text-anchor="middle" fill="#ffffffbb" font-size="9">node a-1</text></g>
+          <g class="anim-pulse d1"><rect x="130" y="70" width="90" height="42" rx="9" fill="#2563EB"/>
+            <text x="175" y="88" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">api-2</text>
+            <text x="175" y="102" text-anchor="middle" fill="#ffffffbb" font-size="9">node a-2</text></g>
+          <g class="anim-pulse d2"><rect x="265" y="70" width="90" height="42" rx="9" fill="#0D9488"/>
+            <text x="310" y="88" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">api-3</text>
+            <text x="310" y="102" text-anchor="middle" fill="#ffffffbb" font-size="9">node b-1</text></g>
+          <g class="anim-pulse d3"><rect x="365" y="70" width="90" height="42" rx="9" fill="#0D9488"/>
+            <text x="410" y="88" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">api-4</text>
+            <text x="410" y="102" text-anchor="middle" fill="#ffffffbb" font-size="9">node b-2</text></g>
+          <rect x="500" y="70" width="90" height="42" rx="9" fill="#37474F" opacity="0.45"/>
+          <text x="545" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">api-5 ✗</text>
+          <rect x="600" y="70" width="90" height="42" rx="9" fill="#37474F" opacity="0.45"/>
+          <text x="645" y="95" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">api-6 ✗</text>
+          <text x="125" y="140" text-anchor="middle" font-size="10" fill="#6E6B64">2 Ready</text>
+          <text x="360" y="140" text-anchor="middle" font-size="10" fill="#6E6B64">2 Ready</text>
+          <text x="595" y="140" text-anchor="middle" font-size="10" fill="#6E6B64">0 Ready</text>
+          <line x1="595" y1="160" x2="360" y2="160" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="478" y="176" text-anchor="middle" font-size="9" fill="#6E6B64">replacements go to 1a and 1b</text>
+          <text x="360" y="215" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">lose one AZ, keep 4 of 6 = 67% capacity, with no human involved</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">booking-api/deployment.yaml — spread</span>
+        <pre class="code">      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule      <span class="cm"># hard: never 3 in one AZ</span>
+          labelSelector: { matchLabels: { app: booking-api } }
+          matchLabelKeys: [pod-template-hash]   <span class="cm"># count only THIS revision's Pods mid-rollout</span>
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway     <span class="cm"># soft: prefer different nodes</span>
+          labelSelector: { matchLabels: { app: booking-api } }</pre>
+      </div>
+      <pre class="code mt-3">for n in $(kubectl -n booking get pods -l app=booking-api -o jsonpath='{.items[*].spec.nodeName}'); do
+  kubectl get node "$n" -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}'
+done | sort | uniq -c
+<span class="out">      2 ap-southeast-1a
+      2 ap-southeast-1b
+      2 ap-southeast-1c</span></pre>
+      <div class="mt-4 callout callout-info"><strong>Why 3 replicas is the floor for a 3-AZ service.</strong> With 2
+        replicas, one AZ has none, and losing either occupied AZ halves capacity. With 3 spread replicas, an AZ loss costs
+        33%. Size the request so that 2 of 3 replicas can carry peak traffic. Otherwise spreading only spreads the
+        overload.</div>
+
+      <h3 class="font-semibold text-lg mt-8">PodDisruptionBudgets: how many may leave at once</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Disruptions come in two kinds. <em>Involuntary</em> ones (a node crashes, an AZ fails) are handled by spread and
+        replicas. <em>Voluntary</em> ones (a drain for an upgrade, Karpenter consolidation) go through the Eviction API, and
+        that API honours a <strong>PodDisruptionBudget</strong>. A PDB says how many matching Pods must stay available,
+        and an eviction that would break it is refused and retried later.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api/pdb.yaml</span>
+        <pre class="code">apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: booking-api, namespace: booking }
+spec:
+  maxUnavailable: 1                    <span class="cm"># scales with replicas; minAvailable: 3 would block at 3</span>
+  selector: { matchLabels: { app: booking-api } }
+  unhealthyPodEvictionPolicy: AlwaysAllow  <span class="cm"># a crash-looping Pod must not block a drain</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl drain ip-10-20-34-117.ap-southeast-1.compute.internal --ignore-daemonsets --delete-emptydir-data
+<span class="out">evicting pod booking/booking-api-7c9f8d6b5-x2lqp
+evicting pod booking/booking-api-7c9f8d6b5-m8tzr
+error when evicting pods/"booking-api-7c9f8d6b5-m8tzr" -n "booking" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/booking-api-7c9f8d6b5-x2lqp evicted
+evicting pod booking/booking-api-7c9f8d6b5-m8tzr
+pod/booking-api-7c9f8d6b5-m8tzr evicted
+node/ip-10-20-34-117.ap-southeast-1.compute.internal drained</span>
+<span class="cm"># the second eviction waited until the first replacement was Ready: exactly what the PDB is for</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>A PDB that can never be satisfied blocks every upgrade.</strong>
+        <code class="inline">minAvailable: 1</code> on a single-replica Deployment, or <code class="inline">maxUnavailable: 0</code>
+        anywhere, means no eviction is ever allowed. The node drain hangs, the managed node group upgrade fails after its
+        timeout, and someone forces it with <code class="inline">--disable-eviction</code> at 2 a.m. Every PDB must allow
+        at least one disruption at normal replica count. KS11 checks this before every upgrade
+        (<a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a>).</div>
+
+      <h3 class="font-semibold text-lg mt-8">Graceful shutdown: the race you have to design for</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When a Pod is deleted, two things start <strong>at the same time</strong>. The kubelet begins stopping the
+        container, and the endpoint controllers begin removing the Pod from Services and the ALB target group. Removal takes
+        a few seconds to reach every kube-proxy and the load balancer. If the app exits on SIGTERM straight away, requests
+        that are still being routed to it fail with 502s. On every rollout and every node drain, users see errors.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant A as API server
+    participant E as EndpointSlice ctrl
+    participant L as kube-proxy / ALB
+    participant K as kubelet
+    participant P as booking-api
+    A->>E: Pod marked Terminating
+    A->>K: Pod marked Terminating
+    par traffic drains
+        E->>L: remove Pod IP (takes 1–10 s to apply everywhere)
+    and container stops
+        K->>P: run preStop: sleep 10 s (still serving)
+    end
+    K->>P: SIGTERM: stop accepting, finish in-flight
+    P-->>K: exit 0 after ~5 s
+    Note over K,P: SIGKILL only if still running at<br/>terminationGracePeriodSeconds (45 s)
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">booking-api/deployment.yaml — shutdown</span>
+        <pre class="code">    spec:
+      terminationGracePeriodSeconds: 45  <span class="cm"># total budget: preStop + SIGTERM handling</span>
+      containers:
+        - name: api
+          lifecycle:
+            preStop:
+              sleep: { seconds: 10 }     <span class="cm"># built-in sleep action: works in distroless images</span>
+          <span class="cm"># the app on SIGTERM: stop the listener, drain in-flight (max 25 s), close the DB pool, exit 0</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The budget adds up: 10 s preStop, up to 25 s draining in the app, and 10 s spare before SIGKILL, which makes 45 s.
+        The ALB's own deregistration delay must fit inside this window too (set in
+        <a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>). The check is a load test during a
+        rollout: run <code class="inline">k6</code> (<a href="./sr4.html" class="text-viol underline decoration-viol/40">SR4</a>)
+        at a steady rate, roll the Deployment, and count non-2xx responses. The target is <strong>zero</strong>.
+      </p>
+      <pre class="code mt-3">k6 run --vus 20 --duration 3m slots-smoke.js &amp; kubectl -n booking rollout restart deploy/booking-api
+<span class="out">     http_req_failed................: 0.00%  ✓ 0       ✗ 21480
+     http_req_duration..............: avg=38ms p(95)=91ms</span>
+<span class="cm"># before the preStop sleep, the same test showed 0.61% failed (131 × 502) per rollout</span></pre>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents produce complete-looking workload manifests quickly, and they copy probe and resource blocks from
+        examples without asking what your app does. Give the agent the facts it cannot know (boot time, real usage, what
+        each health endpoint checks), and ask it to justify every number.
+      </p>
+      <pre class="code mt-3">Harden booking-api/deployment.yaml for production. Facts: cold start ~18 s, /healthz is
+in-process only, /readyz checks the DB pool, p90 CPU 180m, peak memory 310Mi, 3 AZs.
+Add probes, resources (no CPU limit, memory limit = request), zone topology spread,
+a PDB, and graceful shutdown. For each number, add a comment showing the arithmetic.</pre>
+      <pre class="code mt-3">Review every Deployment, StatefulSet and CronJob under k8s/ and output a table: workload,
+QoS class it will get, probes present, liveness checks an external dependency (y/n),
+PDB present and satisfiable at current replicas (y/n), CronJob concurrencyPolicy and timeZone.</pre>
+      <pre class="code mt-3">Using `kubectl get pods -A -o json` from my kind cluster (context kind-ks2 ONLY), list
+every Pod whose container has no memory limit, and propose a LimitRange that would have
+caught it. Read-only commands only.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Expand a short spec into probes, resources, spread and PDB blocks</li>
+            <li>Audit a directory of manifests for missing limits, risky probes or impossible PDBs</li>
+            <li>Convert a ConfigMap edited in place into a Kustomize generator with hashed names</li>
+            <li>Write the k6 smoke test and the rollout loop that proves zero-error shutdown</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The liveness probe touches no database, cache or downstream service</li>
+            <li>Resource numbers come from measured usage, not from the example it copied</li>
+            <li>Every PDB allows at least one eviction at the normal replica count</li>
+            <li>The grace period is longer than preStop plus the app's drain time</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written workloads:</strong> identical
+        <code class="inline">/healthz</code> paths for liveness and readiness that both hit the DB;
+        <code class="inline">initialDelaySeconds: 60</code> used instead of a startup probe;
+        <code class="inline">cpu: 1</code> / <code class="inline">memory: 1Gi</code> on everything; a CPU limit lower than
+        the request's realistic burst; <code class="inline">minAvailable: 100%</code> or <code class="inline">maxUnavailable: 0</code>
+        in a PDB; a <code class="inline">kind: Secret</code> with real values; a CronJob with no
+        <code class="inline">timeZone</code> or <code class="inline">concurrencyPolicy</code>; and
+        <code class="inline">preStop: exec: ["sleep","10"]</code> in a distroless image that has no
+        <code class="inline">sleep</code> binary.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has only deployed the KS1 manifest. Has not met probes, requests or any controller besides Deployment.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows probes and limits exist and can name the workload kinds, but copies blocks from examples without knowing what each number does.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds probes, resources and a PDB when asked, and diagnoses OOMKilled with help. Still edits ConfigMaps in place and sets liveness to check the database.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses the right controller, writes probes that match what each endpoint checks, sets requests from measured usage, spreads across AZs, writes satisfiable PDBs, and proves zero-error rollouts with a load test.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the namespace guardrails (LimitRange, quota, policy) for all teams, writes the team's workload standard, and catches the liveness-on-DB pattern in other people's reviews before it ships.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> given a Deployment with
+        <code class="inline">replicas: 10</code> and default strategy, state how many Pods may be unavailable mid-rollout.
+        Explain, without notes, which QoS class our standard resources give and why. Then, on kind, show a ConfigMap change
+        rolling out through a hashed name, and a drain that a PDB slows down but does not block.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Liveness probes that check dependencies</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A dependency outage then restarts every replica together. That turns a degraded service into a dead one and adds a reconnect storm. Readiness is the probe for dependencies.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ CPU limits on latency-sensitive services</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">CFS throttling pauses the process for the rest of each 100 ms period. p99 latency doubles while average CPU looks fine. Check <code class="inline">container_cpu_cfs_throttled_periods_total</code> before you blame the code.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Expecting env vars to update</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Applying a new ConfigMap does nothing to running Pods that read it through <code class="inline">env</code>. Then the next unrelated deploy picks up the change, and nobody connects the incident to the config edit.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write down the arithmetic</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Comment every probe and budget with its maths (<code class="inline">30 × 2 s = 60 s</code>, <code class="inline">10 + 25 + 10 = 45 s</code>). Reviewers can check it, and the next person knows what to change when boot time grows.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Test shutdown under load, once per service</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A 3-minute k6 run during <code class="inline">rollout restart</code> is the only proof that preStop, grace period and deregistration line up. Keep the script in the repo and rerun it whenever the ingress path changes.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="controllers"> <span>I can pick Deployment, StatefulSet, DaemonSet, Job or CronJob for a workload and explain the promise each makes.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="config"> <span>I rolled out a ConfigMap change through a hashed name and rolled it back with <code class="inline">rollout undo</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="probes"> <span>I wrote startup, readiness and liveness probes for <code class="inline">booking-api</code> and can justify each threshold.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="resources"> <span>I set requests and limits from measured usage, predicted the QoS class, and applied a LimitRange and ResourceQuota to a namespace.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="placement"> <span>I spread replicas across zones with a hard constraint and wrote a PDB that a drain respects but cannot be blocked by.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="hardened-pr"> <span class="font-semibold">Opened a PR that turns the KS1 booking-api manifest into a production-ready one (probes, resources, spread, PDB, graceful shutdown, hashed ConfigMap, reminder CronJob), with a k6 run during a rollout on a 3-node kind cluster showing 0% failed requests (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/concepts/workloads/controllers/" target="_blank" rel="noopener">Kubernetes — Workload management</a> — Deployments, StatefulSets, DaemonSets, Jobs and CronJobs in one place.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/" target="_blank" rel="noopener">Kubernetes — Configure liveness, readiness and startup probes</a> — every probe field and its default.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Kubernetes — Resource management for Pods and containers</a> — requests, limits and how the kubelet enforces them.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/" target="_blank" rel="noopener">Kubernetes — Pod Quality of Service classes</a> · <a class="text-coral underline" href="https://kubernetes.io/docs/concepts/policy/resource-quotas/" target="_blank" rel="noopener">Resource quotas</a> — eviction order and namespace guardrails.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/" target="_blank" rel="noopener">Kubernetes — Pod topology spread constraints</a> — maxSkew, matchLabelKeys and the zone examples.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/concepts/workloads/pods/disruptions/" target="_blank" rel="noopener">Kubernetes — Disruptions</a> — voluntary vs involuntary disruption and how PDBs work.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/best-practices/application.html" target="_blank" rel="noopener">AWS — EKS Best Practices: running highly available applications</a> — the EKS view of probes, spread and graceful shutdown.</li>
+      </ul>

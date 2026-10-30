@@ -139,6 +139,78 @@ const INTERN_MODULES = [
   { code: "PP3", name: "Communication & Collaboration", critical: true },
 ];
 
+/* ---------- DevOps Engineer Career Track ---------- */
+const DEVOPS_GROUPS = [
+  { key: "FN", name: "Foundations", color: "#2563EB" },
+  { key: "AW", name: "AWS Core Services", color: "#EA580C" },
+  { key: "IA", name: "Infrastructure as Code", color: "#7C3AED" },
+  { key: "CI", name: "CI/CD & Supply Chain", color: "#0D9488" },
+  { key: "CN", name: "Containers on ECS", color: "#0891B2" },
+  { key: "KS", name: "Kubernetes & EKS", color: "#4F46E5" },
+  { key: "OB", name: "Observability", color: "#DB2777" },
+  { key: "SR", name: "SRE & Reliability", color: "#DC2626" },
+  { key: "SE", name: "Security & Compliance", color: "#16A34A" },
+  { key: "AR", name: "Architecture & Leadership", color: "#475569" },
+];
+
+/* Order = recommended path from L0 to L3. level = career level the module belongs to
+   (0 Foundation · 1 Junior · 2 Mid · 3 Senior). critical = Core, else Elective.
+   soon = page not written yet: listed but not linked. Remove the flag when the page ships. */
+const DEVOPS_MODULES = [
+  { code: "FN1", name: "DevOps Culture, SDLC & DORA Metrics", critical: true, level: 0 },
+  { code: "FN2", name: "Linux for Operators", critical: true, level: 0 },
+  { code: "FN3", name: "Networking for DevOps", critical: true, level: 0 },
+  { code: "FN4", name: "Git Workflows for Infrastructure Teams", critical: true, level: 0 },
+  { code: "FN5", name: "Bash & Python Automation", critical: true, level: 0 },
+  { code: "FN6", name: "Containers in Depth with Docker", critical: true, level: 0 },
+  { code: "AW1", name: "AWS Accounts, IAM & Identity Center", critical: true, level: 1 },
+  { code: "AW2", name: "VPC Networking", critical: true, level: 1 },
+  { code: "AW3", name: "EC2, Auto Scaling & Load Balancers", critical: true, level: 1 },
+  { code: "AW4", name: "S3, EBS, EFS & CloudFront", critical: true, level: 1 },
+  { code: "AW5", name: "Managed Databases: RDS, Aurora, DynamoDB & ElastiCache", critical: true, level: 1 },
+  { code: "AW6", name: "Serverless & Messaging: Lambda, SQS, SNS & EventBridge", critical: true, level: 1 },
+  { code: "AW7", name: "Route 53, ACM & DNS Operations", critical: true, level: 1 },
+  { code: "IA1", name: "Terraform Fundamentals", critical: true, level: 1 },
+  { code: "CI1", name: "CI Pipelines with GitHub Actions", critical: true, level: 1 },
+  { code: "IA2", name: "Terraform at Scale: Modules, Environments & Testing", critical: true, level: 2 },
+  { code: "CI2", name: "Continuous Delivery & Release Strategies", critical: true, level: 2 },
+  { code: "CI3", name: "Secrets & Configuration: Secrets Manager, SSM & KMS", critical: true, level: 2 },
+  { code: "CI4", name: "Software Supply Chain: ECR, Scanning, SBOM & Signing", critical: true, level: 2 },
+  { code: "CN1", name: "ECS & Fargate Fundamentals", critical: true, level: 2 },
+  { code: "CN2", name: "ECS in Production: Deployments, Scaling & Service Connect", critical: true, level: 2 },
+  { code: "KS1", name: "Kubernetes Architecture & Core Objects", critical: true, level: 2 },
+  { code: "KS2", name: "Workloads, Configuration & Resource Management", critical: true, level: 2 },
+  { code: "KS3", name: "Kubernetes Networking: Services, Ingress & Gateway API", critical: true, level: 2 },
+  { code: "KS4", name: "Storage & Stateful Workloads", critical: true, level: 2 },
+  { code: "KS5", name: "EKS Cluster Design & Provisioning", critical: true, level: 2 },
+  { code: "KS6", name: "EKS Networking: VPC CNI & Load Balancer Controller", critical: true, level: 2 },
+  { code: "KS7", name: "EKS Security: Access, Pod Identity & Policy", critical: true, level: 2 },
+  { code: "KS8", name: "Autoscaling & Cost: HPA, KEDA & Karpenter", critical: true, level: 2 },
+  { code: "KS9", name: "Packaging with Helm & Kustomize", critical: true, level: 2 },
+  { code: "KS10", name: "GitOps & Progressive Delivery with Argo CD", critical: true, level: 2 },
+  { code: "KS11", name: "EKS Day-2 Operations: Upgrades & Troubleshooting", critical: true, level: 2 },
+  { code: "OB1", name: "Monitoring on AWS with CloudWatch", critical: true, level: 2 },
+  { code: "OB2", name: "Prometheus, Grafana & Loki", critical: true, level: 2 },
+  { code: "OB3", name: "Datadog: Infrastructure, APM & Logs", critical: true, level: 2 },
+  { code: "OB4", name: "OpenTelemetry & Distributed Tracing", critical: true, level: 2 },
+  { code: "SR1", name: "SLIs, SLOs, Error Budgets & Alerting", critical: true, level: 2 },
+  { code: "SR2", name: "Incident Management, On-call & Postmortems", critical: true, level: 2 },
+  { code: "SE1", name: "AWS Security Baseline & Threat Detection", critical: true, level: 2 },
+  { code: "SE2", name: "DevSecOps: Security in the Pipeline", critical: true, level: 2 },
+  { code: "IA3", name: "Configuration Management: Ansible & SSM", critical: false, level: 2 },
+  { code: "SR3", name: "Resilience & Disaster Recovery", critical: true, level: 3 },
+  { code: "SR4", name: "Load Testing & Capacity Planning", critical: false, level: 3 },
+  { code: "KS12", name: "Extending Kubernetes: CRDs, Operators & Controllers", critical: false, level: 3 },
+  { code: "KS13", name: "Service Mesh & Multi-cluster EKS", critical: false, level: 3 },
+  { code: "SE3", name: "Compliance & Audit Readiness", critical: false, level: 3 },
+  { code: "AR1", name: "Well-Architected Design & Multi-account Landing Zones", critical: true, level: 3 },
+  { code: "AR2", name: "FinOps: Cost Visibility & Optimisation", critical: true, level: 3 },
+  { code: "AR3", name: "Platform Engineering & Internal Developer Platforms", critical: false, level: 3 },
+  { code: "AR4", name: "Migration & Modernisation", critical: false, level: 3 },
+  { code: "AR5", name: "Technical Leadership for Senior DevOps", critical: true, level: 3 },
+  { code: "AR6", name: "AI-native DevOps: Agents for Infra & Operations", critical: false, level: 3 },
+];
+
 /* ---------- program registry ---------- */
 /* One entry per program folder (<slug>/index.html + <slug>/modules/*.html). */
 const PROGRAMS = {
@@ -148,6 +220,10 @@ const PROGRAMS = {
   },
   intern: {
     groups: INTERN_GROUPS, modules: INTERN_MODULES, checkPrefix: "intern-check",
+    labels: { on: "Core", off: "Elective", onTarget: "3 — works independently", offTarget: "2 — works with support" },
+  },
+  devops: {
+    groups: DEVOPS_GROUPS, modules: DEVOPS_MODULES, checkPrefix: "devops-check",
     labels: { on: "Core", off: "Elective", onTarget: "3 — works independently", offTarget: "2 — works with support" },
   },
 };
@@ -178,6 +254,19 @@ const TOPICS = [
     meta: `${INTERN_MODULES.length} modules`,
     tags: INTERN_GROUPS.map((g) => g.name),
     accent: "#2563EB",
+    status: "live",
+  },
+  {
+    slug: "devops",
+    name: "DevOps Engineer Career Track",
+    tagline: "AWS · zero to senior",
+    blurb:
+      "A level-by-level path from someone who has never run a server to a senior DevOps engineer on AWS: " +
+      "Linux and networking, core AWS, Terraform, GitHub Actions, ECS and a deep Kubernetes/EKS track, " +
+      "observability with CloudWatch, Prometheus and Datadog, SRE, security and architecture leadership.",
+    meta: `${DEVOPS_MODULES.length} modules`,
+    tags: DEVOPS_GROUPS.map((g) => g.name),
+    accent: "#EA580C",
     status: "live",
   },
 ];

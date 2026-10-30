@@ -1,0 +1,712 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">ECS in Production: Deployments, Scaling &amp; Service Connect</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a> got <code class="inline">booking-api</code>
+          running on Fargate behind an ALB. This module makes it survive real life: deployments that roll themselves back,
+          scaling that follows the clinic's Monday-morning booking rush, Fargate Spot where interruptions are harmless,
+          service-to-service traffic through Service Connect, and an honest answer to the question every client eventually
+          asks: should this be on EKS instead?
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> the riskiest thing you do to a healthy service is deploy it, and the
+          second riskiest is let it scale on the wrong signal. A rolling deploy without a circuit breaker keeps replacing
+          healthy tasks with crashing ones until nothing serves traffic. A CPU-based scaling policy on a queue worker sits at
+          2 tasks while 40,000 reminder messages pile up. These are configuration choices that take an afternoon to get
+          right and a postmortem to discover were wrong.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Deployments</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every deploy is a controlled replacement; choose how much risk each step takes</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The release strategies themselves (rolling, blue/green, canary, and when to use each) are taught in
+        <a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>. Here you implement them on ECS. Since
+        2025 ECS has four built-in deployment strategies, so the question is no longer "can ECS do blue/green?" but "which
+        strategy fits this service's risk?".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Rolling updates with the circuit breaker and alarms</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A rolling deployment starts new tasks on the new revision and stops old ones, within two bounds:
+        <code class="inline">minimumHealthyPercent</code> (how low the healthy count may drop) and
+        <code class="inline">maximumPercent</code> (how many extra tasks may run during the switch). For
+        <code class="inline">booking-api</code> at 3 tasks we use 100 / 200: never below 3 healthy, up to 6 during the
+        deploy. The <strong>circuit breaker</strong> watches for tasks that fail to start or fail health checks and rolls
+        back to the last good revision. <strong>Alarm-based rollback</strong> also rolls back if a CloudWatch alarm fires,
+        such as a 5xx rate, which catches a new version that starts fine but returns errors.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Rolling deployment at 100/200 percent: three old tasks, three new tasks start, old tasks drain, circuit breaker and alarm roll back on failure">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ROLLING · minimumHealthyPercent 100 · maximumPercent 200 · desired 3</text>
+          <text x="20" y="55" font-size="10" font-weight="700" fill="#6E6B64">t0</text>
+          <g class="anim-pulse"><rect x="50" y="38" width="70" height="30" rx="9" fill="#2563EB"/><text x="85" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v41</text></g>
+          <g class="anim-pulse"><rect x="125" y="38" width="70" height="30" rx="9" fill="#2563EB"/><text x="160" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v41</text></g>
+          <g class="anim-pulse"><rect x="200" y="38" width="70" height="30" rx="9" fill="#2563EB"/><text x="235" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v41</text></g>
+          <text x="20" y="105" font-size="10" font-weight="700" fill="#6E6B64">t1</text>
+          <g class="anim-pulse d1"><rect x="50" y="88" width="70" height="30" rx="9" fill="#2563EB"/><text x="85" y="108" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v41</text></g>
+          <g class="anim-pulse d1"><rect x="125" y="88" width="70" height="30" rx="9" fill="#2563EB"/><text x="160" y="108" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v41</text></g>
+          <g class="anim-pulse d1"><rect x="200" y="88" width="70" height="30" rx="9" fill="#2563EB"/><text x="235" y="108" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v41</text></g>
+          <g class="anim-pulse d2"><rect x="290" y="88" width="70" height="30" rx="9" fill="#0D9488"/><text x="325" y="108" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v42</text></g>
+          <g class="anim-pulse d2"><rect x="365" y="88" width="70" height="30" rx="9" fill="#0D9488"/><text x="400" y="108" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v42</text></g>
+          <g class="anim-pulse d2"><rect x="440" y="88" width="70" height="30" rx="9" fill="#0D9488"/><text x="475" y="108" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v42</text></g>
+          <text x="540" y="108" font-size="9" fill="#6E6B64">6 running: new ones pass /healthz</text>
+          <text x="20" y="155" font-size="10" font-weight="700" fill="#6E6B64">t2</text>
+          <g class="anim-pulse d3"><rect x="50" y="138" width="70" height="30" rx="9" fill="#37474F"/><text x="85" y="158" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">drain</text></g>
+          <g class="anim-pulse d3"><rect x="125" y="138" width="70" height="30" rx="9" fill="#37474F"/><text x="160" y="158" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">drain</text></g>
+          <g class="anim-pulse d3"><rect x="200" y="138" width="70" height="30" rx="9" fill="#37474F"/><text x="235" y="158" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">drain</text></g>
+          <g class="anim-pulse d4"><rect x="290" y="138" width="70" height="30" rx="9" fill="#0D9488"/><text x="325" y="158" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v42</text></g>
+          <g class="anim-pulse d4"><rect x="365" y="138" width="70" height="30" rx="9" fill="#0D9488"/><text x="400" y="158" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v42</text></g>
+          <g class="anim-pulse d4"><rect x="440" y="138" width="70" height="30" rx="9" fill="#0D9488"/><text x="475" y="158" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">v42</text></g>
+          <text x="540" y="158" font-size="9" fill="#6E6B64">deregister, 30 s delay, SIGTERM</text>
+          <g class="anim-pulse d2"><rect x="560" y="38" width="145" height="40" rx="9" fill="#DB2777"/>
+            <text x="632" y="56" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Circuit breaker</text>
+            <text x="632" y="70" text-anchor="middle" fill="#ffffffbb" font-size="9">or 5xx alarm → v41</text></g>
+          <line x1="510" y1="100" x2="560" y2="66" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="360" y="210" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">capacity never drops below 3 healthy; the cost is up to 2× tasks for a few minutes</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/ecs-service/service.tf — rolling settings</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_ecs_service"</span> <span class="st">"this"</span> {
+  <span class="cm"># ... CN1 settings ...</span>
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true        <span class="cm"># threshold: 50% of desired count, min 3, max 200 failed tasks</span>
+  }
+  alarms {
+    enable      = true
+    rollback    = true
+    alarm_names = [aws_cloudwatch_metric_alarm.api_5xx_rate.alarm_name]   <span class="cm"># 5xx &gt; 2% for 3 min</span>
+  }
+}</pre>
+      </div>
+      <pre class="code mt-3">aws ecs describe-services --cluster clinic-prod --services booking-api --profile gol-prod \
+  --query 'services[0].deployments[].[status,taskDefinition,rolloutState,rolloutStateReason]' --output text
+<span class="out">PRIMARY  …:task-definition/booking-api:41  COMPLETED  ECS deployment circuit breaker: rolling back to deploymentId ecs-svc/7312…
+ACTIVE   …:task-definition/booking-api:42  FAILED     ECS deployment circuit breaker: tasks failed to start.</span>
+<span class="cm"># revision 42 never took traffic for long; 41 is serving again. The deploy job must fail the pipeline here.</span></pre>
+      <div class="mt-4">
+        <span class="code-label">golden-owl/gha-platform/scripts/ecs-wait-rollout.sh — used by the deploy job</span>
+        <pre class="code">set -euo pipefail
+<span class="cm"># poll the newest deployment until ECS decides; fail the job if it rolled back</span>
+for i in $(seq 1 60); do
+  STATE=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+    --query "services[0].deployments[?taskDefinition=='$TASKDEF_ARN'].rolloutState | [0]" --output text)
+  echo "attempt $i: rolloutState=$STATE"
+  case "$STATE" in
+    COMPLETED) exit 0 ;;
+    FAILED)    echo "::error::ECS rolled back $SERVICE"; exit 1 ;;
+  esac
+  sleep 20                                      <span class="cm"># up to 20 minutes: longer than the 15-min bake</span>
+done
+echo "::error::timed out waiting for $SERVICE"; exit 1</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>The circuit breaker is slow at low desired counts.</strong> With 3
+        tasks the threshold is 3 failed launches, which with image pull and health check grace can take 5–8 minutes. That is
+        why the 5xx alarm matters: it catches the release that starts cleanly but breaks the booking flow, which the circuit
+        breaker never sees. Make your deploy job wait for <code class="inline">rolloutState</code>, not just for
+        <code class="inline">update-service</code> to return.</div>
+
+      <h3 class="font-semibold text-lg mt-8">ECS native blue/green: two target groups and a bake time</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In <strong>blue/green</strong>, ECS starts a full copy of the service on the new revision (green) behind a second
+        target group, optionally sends test traffic to it through a test listener rule, then moves all production traffic
+        at once by rewriting the listener rule. Blue stays running for the <strong>bake time</strong>; rolling back during the
+        bake is just switching the rule back, in seconds, with no new tasks to start. Lifecycle hooks call a Lambda at
+        chosen stages, for example to run smoke tests against green before production traffic moves.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant E as ECS (BLUE_GREEN)
+    participant G as Green tasks v42
+    participant L as ALB listener rules
+    participant H as Smoke-test Lambda
+    participant B as Blue tasks v41
+    E->>G: PRE_SCALE_UP → scale green to 3 tasks
+    G-->>E: POST_SCALE_UP: all healthy in tg-booking-api-green
+    E->>L: TEST_TRAFFIC_SHIFT: test rule (header x-clinic-canary) → green
+    E->>H: POST_TEST_TRAFFIC_SHIFT hook
+    H-->>E: SUCCEEDED (booking flow OK)
+    E->>L: PRODUCTION_TRAFFIC_SHIFT: prod rule → green 100%
+    Note over E,B: bake time 15 min: blue still running<br/>alarm fires → rule flips back to blue in seconds
+    E->>B: after bake: scale blue to 0
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/ecs-service/bluegreen.tf — AWS provider 6.x</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_ecs_service"</span> <span class="st">"this"</span> {
+  <span class="cm"># ... CN1 settings, alarms block as above ...</span>
+  deployment_configuration {
+    strategy             = <span class="st">"BLUE_GREEN"</span>
+    bake_time_in_minutes = 15                         <span class="cm"># blue kept alive for instant rollback</span>
+    lifecycle_hook {
+      hook_target_arn  = aws_lambda_function.smoke_test.arn
+      role_arn         = aws_iam_role.ecs_hooks.arn
+      lifecycle_stages = [<span class="st">"POST_TEST_TRAFFIC_SHIFT"</span>]
+    }
+  }
+  load_balancer {
+    target_group_arn = aws_lb_target_group.blue.arn
+    container_name   = <span class="st">"api"</span>
+    container_port   = 8080
+    advanced_configuration {
+      alternate_target_group_arn = aws_lb_target_group.green.arn
+      production_listener_rule   = aws_lb_listener_rule.api.arn
+      test_listener_rule         = aws_lb_listener_rule.api_test.arn    <span class="cm"># matches header x-clinic-canary</span>
+      role_arn                   = aws_iam_role.ecs_lb.arn               <span class="cm"># lets ECS edit the rules</span>
+    }
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The price is capacity: during a blue/green deploy plus bake you run 2× tasks for about 20 minutes, roughly USD 0.05
+        extra per deploy for <code class="inline">booking-api</code>. That is cheap insurance for the service that takes
+        payments. Blue/green also gives the cleanest answer to database migrations: both versions must work against the same
+        schema, which forces the expand/contract discipline from CI2.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Choosing a strategy, and what to do with CodeDeploy</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Before July 2025, blue/green on ECS meant <code class="inline">deployment_controller { type = "CODE_DEPLOY" }</code>
+        and an AWS CodeDeploy application, deployment group and AppSpec file. ECS now does blue/green natively, and
+        linear and canary traffic shifting as well, with the same two-target-group setup. For new services, use the native
+        strategies. Existing CodeDeploy services keep working; migrate them when you next touch the service, because the
+        native version removes a whole service from the deploy path and works with the same
+        <code class="inline">update-service</code> call as rolling.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Strategy</th><th class="px-4 py-3">Rollback time</th><th class="px-4 py-3">Extra capacity</th><th class="px-4 py-3">Clinic services</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">ROLLING + circuit breaker + alarms</td><td class="px-4 py-3">Minutes: old tasks must start again</td><td class="px-4 py-3">Up to <code class="inline">maximumPercent</code> briefly</td><td class="px-4 py-3"><code class="inline">booking-worker</code>, <code class="inline">booking-web</code>, all of dev and staging</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">BLUE_GREEN</td><td class="px-4 py-3">Seconds during bake</td><td class="px-4 py-3">2× for deploy + bake</td><td class="px-4 py-3"><code class="inline">booking-api</code> in prod (payments)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CANARY (e.g. 10% for 10 min, then 100%)</td><td class="px-4 py-3">Seconds</td><td class="px-4 py-3">2× during the shift</td><td class="px-4 py-3">Risky changes with enough traffic for 10% to be measurable</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">LINEAR (e.g. 20% every 5 min)</td><td class="px-4 py-3">Seconds</td><td class="px-4 py-3">2× during the shift</td><td class="px-4 py-3">Large traffic where cache warm-up matters</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CodeDeploy (legacy)</td><td class="px-4 py-3">Seconds</td><td class="px-4 py-3">2×</td><td class="px-4 py-3">Existing services only; migrate on next change</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>Canary needs traffic to mean anything.</strong> At 3 requests a second,
+        10% for 10 minutes is about 180 requests: one error is a 0.5% rate and statistically meaningless. Clinic traffic
+        outside the morning peak is often that low. Blue/green with a scripted smoke test usually gives more confidence than a
+        canary nobody can read.</div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Service Auto Scaling</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Scale on the signal that predicts pain, not the one that is easy to measure</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        ECS services scale through <strong>Application Auto Scaling</strong>, which changes the service's
+        <code class="inline">desiredCount</code> between a minimum and a maximum. That is why CN1's service ignores
+        <code class="inline">desired_count</code> in Terraform: the autoscaler owns it. The real design work is picking the
+        metric. For an API, request rate per task tracks load directly; for a worker, it is the queue backlog; CPU is a
+        fallback when you have nothing better.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Target tracking for <code class="inline">booking-api</code></h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Target tracking</strong> works like a thermostat: you set a target value and it adds or removes tasks to stay
+        near it. The SR4 load test showed one 1-vCPU task serves about 250 requests a second before p95 latency climbs past
+        300 ms. Target 150 per task leaves headroom for the 60–90 s a new Fargate task needs to become healthy. Add a CPU
+        policy as a safety net; when several policies are attached, ECS scales out if any of them asks and scales in only
+        when all of them agree.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/ecs-service/autoscaling.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_appautoscaling_target"</span> <span class="st">"svc"</span> {
+  service_namespace  = <span class="st">"ecs"</span>
+  scalable_dimension = <span class="st">"ecs:service:DesiredCount"</span>
+  resource_id        = <span class="st">"service/clinic-prod/booking-api"</span>
+  min_capacity       = 3                        <span class="cm"># one per AZ, always</span>
+  max_capacity       = 12                       <span class="cm"># cap the bill and protect RDS connections</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_appautoscaling_policy"</span> <span class="st">"requests"</span> {
+  name               = <span class="st">"booking-api-req-per-target"</span>
+  policy_type        = <span class="st">"TargetTrackingScaling"</span>
+  service_namespace  = aws_appautoscaling_target.svc.service_namespace
+  scalable_dimension = aws_appautoscaling_target.svc.scalable_dimension
+  resource_id        = aws_appautoscaling_target.svc.resource_id
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = <span class="st">"ALBRequestCountPerTarget"</span>
+      resource_label         = <span class="st">"${var.alb_arn_suffix}/${aws_lb_target_group.this.arn_suffix}"</span>
+    }
+    target_value       = 9000                   <span class="cm"># per minute = 150 req/s per task</span>
+    scale_out_cooldown = 60
+    scale_in_cooldown  = 300                    <span class="cm"># come down slowly; going up fast is what matters</span>
+  }
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong><code class="inline">max_capacity</code> is a database decision.</strong>
+        Each <code class="inline">booking-api</code> task opens a pool of 10 Postgres connections. At 12 tasks that is 120,
+        plus workers and migrations, against an RDS instance whose <code class="inline">max_connections</code> might be 400.
+        Raising the maximum to 40 "to be safe" moves the outage from the API to the database. RDS Proxy
+        (<a href="./aw5.html" class="text-viol underline decoration-viol/40">AW5</a>) is the fix if you genuinely need more
+        tasks.</div>
+
+      <h3 class="font-semibold text-lg mt-8"><code class="inline">booking-worker</code>: scale on backlog per task</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A queue consumer's CPU says little about whether it is keeping up. The right signal is <strong>backlog per
+        task</strong>: visible messages divided by running tasks. If one worker processes 10 reminder messages a second and
+        you accept 30 seconds of delay, the target is 300 messages per task. Target tracking can follow that ratio directly
+        with metric math, so no Lambda is needed to publish a custom metric.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/worker-scaling.tf</span>
+        <pre class="code">target_tracking_scaling_policy_configuration {
+  target_value = 300                                        <span class="cm"># messages per task = 30 s of work</span>
+  customized_metric_specification {
+    metrics {
+      id = <span class="st">"visible"</span>, return_data = false
+      metric_stat {
+        stat = <span class="st">"Sum"</span>
+        metric {
+          namespace   = <span class="st">"AWS/SQS"</span>
+          metric_name = <span class="st">"ApproximateNumberOfMessagesVisible"</span>
+          dimensions { name = <span class="st">"QueueName"</span>, value = <span class="st">"clinic-prod-reminders"</span> }
+        }
+      }
+    }
+    metrics {
+      id = <span class="st">"tasks"</span>, return_data = false
+      metric_stat {
+        stat = <span class="st">"Average"</span>
+        metric {
+          namespace   = <span class="st">"ECS/ContainerInsights"</span>
+          metric_name = <span class="st">"RunningTaskCount"</span>
+          dimensions { name = <span class="st">"ClusterName"</span>, value = <span class="st">"clinic-prod"</span> }
+          dimensions { name = <span class="st">"ServiceName"</span>, value = <span class="st">"booking-worker"</span> }
+        }
+      }
+    }
+    metrics { id = <span class="st">"backlog_per_task"</span>, expression = <span class="st">"visible / tasks"</span>, return_data = true }
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Set the worker's <code class="inline">min_capacity</code> to 1, not 0: target tracking cannot divide by zero
+        running tasks, and the first reminder of the day should not wait for a cold start. KEDA does the same job on EKS
+        (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>), including scale to zero.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Scheduled and predictive scaling for a known daily shape</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Clinic bookings spike when clinics open: 07:30–09:30 Vietnam time, Monday to Saturday, with Monday the busiest.
+        Reactive scaling always lags such a spike by a couple of minutes. A <strong>scheduled action</strong> raises the
+        floor before the rush; <strong>predictive scaling</strong> learns the weekly pattern from history and does the same
+        automatically once it has enough data (it needs at least a day, and is much better with two weeks).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/schedule.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_appautoscaling_scheduled_action"</span> <span class="st">"morning_rush"</span> {
+  name               = <span class="st">"booking-api-morning-rush"</span>
+  service_namespace  = <span class="st">"ecs"</span>
+  scalable_dimension = <span class="st">"ecs:service:DesiredCount"</span>
+  resource_id        = <span class="st">"service/clinic-prod/booking-api"</span>
+  schedule           = <span class="st">"cron(15 7 ? * MON-SAT *)"</span>
+  timezone           = <span class="st">"Asia/Ho_Chi_Minh"</span>     <span class="cm"># not UTC: DST-free, but still say it explicitly</span>
+  scalable_target_action { min_capacity = 6, max_capacity = 12 }
+}
+<span class="cm"># and a second action at 10:00 that sets min_capacity back to 3</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Policy type</th><th class="px-4 py-3">Reacts to</th><th class="px-4 py-3">Good for</th><th class="px-4 py-3">Watch out for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Target tracking</td><td class="px-4 py-3">A metric staying near a target</td><td class="px-4 py-3">Default for APIs and workers</td><td class="px-4 py-3">Metric must scale with task count (per-task or ratio)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Step scaling</td><td class="px-4 py-3">A CloudWatch alarm, with step sizes per breach</td><td class="px-4 py-3">Sharp jumps where you want +4 tasks at once</td><td class="px-4 py-3">You maintain the alarms and steps by hand</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scheduled</td><td class="px-4 py-3">The clock</td><td class="px-4 py-3">Known peaks, nights and weekends in dev</td><td class="px-4 py-3">Time zone and the "scale back down" action</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Predictive</td><td class="px-4 py-3">Forecast from 14 days of history</td><td class="px-4 py-3">Repeating daily or weekly shapes</td><td class="px-4 py-3">Run in forecast-only mode first and compare</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">aws application-autoscaling describe-scaling-activities --service-namespace ecs \
+  --resource-id service/clinic-prod/booking-api --max-items 3 --profile gol-prod \
+  --query 'ScalingActivities[].[StartTime,Description,StatusCode]' --output text
+<span class="out">2026-10-26T09:41:12+07:00  Setting desired count to 4.  Successful
+2026-10-26T08:02:47+07:00  Setting desired count to 9.  Successful
+2026-10-26T07:15:00+07:00  Setting desired count to 6.  Successful</span>
+<span class="cm"># 07:15 scheduled floor, 08:02 target tracking for the Monday spike, 09:41 slow scale-in</span></pre>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Capacity &amp; compute</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Fargate on-demand for the baseline, Spot for the interruptible, EC2 only with a reason</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A <strong>capacity provider</strong> tells ECS where tasks may run: <code class="inline">FARGATE</code>,
+        <code class="inline">FARGATE_SPOT</code>, or an EC2 Auto Scaling group you own. A service's
+        <strong>capacity provider strategy</strong> splits its tasks between them. This is the main cost lever on ECS after
+        right-sizing, and it is where the "should we use EC2?" conversation belongs.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7"><code class="inline">base</code> and <code class="inline">weight</code></h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">base</code> is the number of tasks placed on a provider first; <code class="inline">weight</code>
+        splits everything above the base. Fargate Spot runs on spare AWS capacity at up to 70% off and can be reclaimed with
+        a two-minute warning. For <code class="inline">booking-worker</code>, whose messages simply return to the queue if a
+        task disappears, a base of 1 on-demand and 3:1 Spot above it is safe. For <code class="inline">booking-api</code> in
+        prod we keep 100% on-demand: a reclaim during the morning rush is a real risk for a small fleet.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 210" class="w-full min-w-[640px]" role="img" aria-label="booking-worker capacity provider strategy: base 1 on FARGATE, then weight 1 FARGATE to 3 FARGATE_SPOT for 9 tasks">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">booking-worker · desired 9 · FARGATE base 1 weight 1 · FARGATE_SPOT weight 3</text>
+          <g class="anim-pulse"><rect x="20" y="50" width="80" height="40" rx="9" fill="#2563EB"/>
+            <text x="60" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">base</text>
+            <text x="60" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">on-demand</text></g>
+          <g class="anim-pulse d1"><rect x="120" y="50" width="80" height="40" rx="9" fill="#2563EB"/>
+            <text x="160" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1</text>
+            <text x="160" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">on-demand</text></g>
+          <g class="anim-pulse d2"><rect x="210" y="50" width="70" height="40" rx="9" fill="#D97757"/><text x="245" y="74" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">spot</text></g>
+          <g class="anim-pulse d2"><rect x="285" y="50" width="70" height="40" rx="9" fill="#D97757"/><text x="320" y="74" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">spot</text></g>
+          <g class="anim-pulse d2"><rect x="360" y="50" width="70" height="40" rx="9" fill="#D97757"/><text x="395" y="74" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">spot</text></g>
+          <g class="anim-pulse d3"><rect x="450" y="50" width="80" height="40" rx="9" fill="#2563EB"/>
+            <text x="490" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1</text>
+            <text x="490" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">on-demand</text></g>
+          <g class="anim-pulse d4"><rect x="540" y="50" width="50" height="40" rx="9" fill="#D97757"/><text x="565" y="74" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">spot</text></g>
+          <g class="anim-pulse d4"><rect x="595" y="50" width="50" height="40" rx="9" fill="#D97757"/><text x="620" y="74" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">spot</text></g>
+          <g class="anim-pulse d4"><rect x="650" y="50" width="50" height="40" rx="9" fill="#D97757"/><text x="675" y="74" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">spot</text></g>
+          <line x1="100" y1="110" x2="700" y2="110" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="60" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">placed first</text>
+          <text x="400" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">the remaining 8 split 1 : 3 → 2 on-demand, 6 Spot</text>
+          <g class="anim-pulse d1"><rect x="200" y="148" width="320" height="40" rx="9" fill="#37474F"/>
+            <text x="360" y="166" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Spot reclaim: SIGTERM + 2 min</text>
+            <text x="360" y="180" text-anchor="middle" fill="#ffffffbb" font-size="9">stop polling, finish or release the message, exit</text></g>
+          <line x1="395" y1="90" x2="395" y2="148" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="610" y="175" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">~50% cheaper overall</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/capacity.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_ecs_cluster_capacity_providers"</span> <span class="st">"this"</span> {
+  cluster_name       = aws_ecs_cluster.this.name
+  capacity_providers = [<span class="st">"FARGATE"</span>, <span class="st">"FARGATE_SPOT"</span>]
+  default_capacity_provider_strategy { capacity_provider = <span class="st">"FARGATE"</span>, base = 0, weight = 1 }
+}
+
+<span class="cm"># in the booking-worker service (instead of launch_type, which must be removed)</span>
+capacity_provider_strategy { capacity_provider = <span class="st">"FARGATE"</span>,      base = 1, weight = 1 }
+capacity_provider_strategy { capacity_provider = <span class="st">"FARGATE_SPOT"</span>, base = 0, weight = 3 }</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        At 9 worker tasks of 0.5 vCPU / 1 GB, that strategy cuts the worker bill from about USD 160 to about USD 85 a month.
+        In dev and staging, where an interruption costs nothing, run every service 100% on Fargate Spot.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Designing for a Spot interruption</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When AWS reclaims a Spot task, ECS sends <code class="inline">SIGTERM</code> to the containers and emits a task state
+        change event with stop code <code class="inline">SpotInterruption</code>. Two minutes later the task is gone. The
+        service starts a replacement, on Spot again if capacity allows, otherwise wherever the strategy permits. Your code
+        has one job: stop taking new work and finish or release what it holds. Make SQS processing idempotent
+        (<a href="../../intern/modules/sd8.html" class="text-viol underline decoration-viol/40">intern SD8</a>) so a message
+        processed twice is harmless.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-worker/src/shutdown.ts</span>
+        <pre class="code"><span class="kw">let</span> stopping = <span class="kw">false</span>;
+process.on(<span class="st">"SIGTERM"</span>, <span class="kw">async</span> () =&gt; {
+  stopping = <span class="kw">true</span>;                          <span class="cm">// the poll loop checks this before ReceiveMessage</span>
+  logger.info({ event: <span class="st">"sigterm"</span> }, <span class="st">"draining in-flight messages"</span>);
+  <span class="kw">await</span> inFlight.drain({ timeoutMs: 90_000 }); <span class="cm">// well inside 120 s; unfinished messages reappear</span>
+  <span class="kw">await</span> db.end();                            <span class="cm">//   after their visibility timeout</span>
+  process.exit(0);
+});</pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># how often were we interrupted this week? (EventBridge → CloudWatch Logs, Logs Insights)</span>
+fields @timestamp, detail.taskArn
+| filter detail.stopCode = "SpotInterruption" and detail.group = "service:booking-worker"
+| stats count() as interruptions by bin(1d)
+<span class="out">bin(1d)      interruptions
+2026-10-24   2
+2026-10-25   0
+2026-10-26   5</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Remember to set the worker's <code class="inline">stopTimeout</code> to 120 seconds, the Fargate maximum. The CN1
+        value of 30 is right for the API but would kill a worker mid-message long before Spot's two minutes are up.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">ECS on EC2, and Managed Instances in between</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Fargate does not offer GPUs, does not let you pick instance types, and costs more per vCPU than a well-packed EC2
+        fleet. When one of those matters, ECS can run tasks on EC2 through an <strong>Auto Scaling group capacity
+        provider</strong> with managed scaling, where you own the AMI, patching and bin-packing. Since late 2025 there is
+        also <strong>ECS Managed Instances</strong>: EC2 instances that AWS provisions, patches and replaces for you, while
+        you choose instance attributes such as GPU or memory-optimised families. For most new EC2 needs, try Managed
+        Instances first.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Need</th><th class="px-4 py-3">Fargate</th><th class="px-4 py-3">ECS Managed Instances</th><th class="px-4 py-3">EC2 ASG capacity provider</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Zero host operations</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">Mostly: AWS patches and replaces hosts</td><td class="px-4 py-3">No: AMIs, agent, draining are yours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">GPU (e.g. OCR on scanned referral letters)</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">Yes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lowest cost at steady 50+ vCPU</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Often</td><td class="px-4 py-3">Yes, with Savings Plans and good packing (AR2)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Daemon tasks, privileged containers, host volumes</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Check the current limits</td><td class="px-4 py-3">Yes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>EC2 capacity providers need managed termination protection and
+        draining.</strong> Without them, an ASG scale-in terminates an instance with running tasks, and every task on it
+        dies at once without <code class="inline">SIGTERM</code> handling. Turn on <code class="inline">managed_termination_protection</code>
+        and managed draining, and give the ASG instance-refresh settings that respect them before any AMI update.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Service Connect &amp; platform choice</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Service Connect for east-west traffic, and a straight answer on ECS vs EKS</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        So far traffic has come in through the ALB. Services also call each other: <code class="inline">booking-web</code>'s
+        server-side rendering calls <code class="inline">booking-api</code>, and <code class="inline">booking-worker</code>
+        calls it to confirm appointments. Sending that internal traffic out through the public ALB and back is slow, costs
+        money and needs extra security rules. ECS has a built-in answer.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">How Service Connect works</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Service Connect</strong> adds an ECS-managed proxy (based on Envoy) to every task in a Cloud Map namespace.
+        A client calls <code class="inline">http://booking-api:8080</code>; its local proxy resolves the name, load-balances
+        across healthy <code class="inline">booking-api</code> tasks directly, retries on connection failures, ejects tasks
+        that keep failing (outlier detection), and publishes per-service request metrics to CloudWatch. You never manage the
+        proxy container; ECS injects and upgrades it. It replaced App Mesh, which AWS retired in September 2026.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Service Connect: booking-web and booking-worker tasks call booking-api through their local proxies, which load balance directly to booking-api tasks">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">SERVICE CONNECT · namespace clinic.internal</text>
+          <rect x="15" y="40" width="200" height="70" rx="10" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <g class="anim-pulse"><rect x="25" y="55" width="90" height="44" rx="9" fill="#2563EB"/>
+            <text x="70" y="74" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-web</text>
+            <text x="70" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">Next.js SSR</text></g>
+          <g class="anim-pulse d1"><rect x="125" y="55" width="80" height="44" rx="9" fill="#37474F"/>
+            <text x="165" y="74" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">proxy</text>
+            <text x="165" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">ECS-managed</text></g>
+          <rect x="15" y="130" width="200" height="70" rx="10" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <g class="anim-pulse d2"><rect x="25" y="145" width="90" height="44" rx="9" fill="#6d5acd"/>
+            <text x="70" y="164" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-worker</text>
+            <text x="70" y="178" text-anchor="middle" fill="#ffffffbb" font-size="9">SQS consumer</text></g>
+          <g class="anim-pulse d3"><rect x="125" y="145" width="80" height="44" rx="9" fill="#37474F"/>
+            <text x="165" y="164" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">proxy</text>
+            <text x="165" y="178" text-anchor="middle" fill="#ffffffbb" font-size="9">ECS-managed</text></g>
+          <g class="anim-pulse d2"><rect x="470" y="40" width="230" height="44" rx="9" fill="#0D9488"/>
+            <text x="585" y="59" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api task 1a</text>
+            <text x="585" y="73" text-anchor="middle" fill="#ffffffbb" font-size="9">proxy → :8080</text></g>
+          <g class="anim-pulse d3"><rect x="470" y="98" width="230" height="44" rx="9" fill="#0D9488"/>
+            <text x="585" y="117" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api task 1b</text>
+            <text x="585" y="131" text-anchor="middle" fill="#ffffffbb" font-size="9">proxy → :8080</text></g>
+          <g class="anim-pulse d4"><rect x="470" y="156" width="230" height="44" rx="9" fill="#0D9488"/>
+            <text x="585" y="175" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api task 1c</text>
+            <text x="585" y="189" text-anchor="middle" fill="#ffffffbb" font-size="9">proxy → :8080</text></g>
+          <line x1="205" y1="77" x2="470" y2="62" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="205" y1="77" x2="470" y2="120" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="205" y1="167" x2="470" y2="178" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="205" y1="167" x2="470" y2="120" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="340" y="222" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">http://booking-api:8080 · no ALB hop · retries, outlier detection, per-service metrics</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/ecs-service/service-connect.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_service_discovery_http_namespace"</span> <span class="st">"clinic"</span> {
+  name = <span class="st">"clinic.internal"</span>                     <span class="cm"># once per environment</span>
+}
+
+<span class="cm"># inside aws_ecs_service.booking_api (the server side)</span>
+service_connect_configuration {
+  enabled   = true
+  namespace = aws_service_discovery_http_namespace.clinic.arn
+  service {
+    port_name      = <span class="st">"http"</span>                   <span class="cm"># must match portMappings[].name in the task definition</span>
+    discovery_name = <span class="st">"booking-api"</span>
+    client_alias { port = 8080, dns_name = <span class="st">"booking-api"</span> }
+    timeout { per_request_timeout_seconds = 15 }
+  }
+  log_configuration {
+    log_driver = <span class="st">"awslogs"</span>
+    options = { <span class="st">"awslogs-group"</span> = <span class="st">"/ecs/clinic-prod/service-connect"</span>, <span class="st">"awslogs-region"</span> = <span class="st">"ap-southeast-1"</span>,
+                <span class="st">"awslogs-stream-prefix"</span> = <span class="st">"booking-api"</span> }
+  }
+}
+<span class="cm"># booking-web and booking-worker: service_connect_configuration { enabled = true, namespace = ... } (client only)</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two details catch everyone. The task definition's port mapping needs a <code class="inline">name</code>
+        (<code class="inline">"name": "http", "appProtocol": "http"</code>), which CN1's minimal version did not have. And
+        Service Connect configuration only reaches tasks started after the change, so existing clients cannot resolve
+        <code class="inline">booking-api</code> until they are redeployed. Roll out servers first, then clients.
+      </p>
+
+      <pre class="code mt-3"><span class="cm"># after redeploying the clients: is traffic flowing through Service Connect?</span>
+aws cloudwatch get-metric-statistics --namespace AWS/ECS --metric-name RequestCount \
+  --dimensions Name=ClusterName,Value=clinic-prod Name=ServiceName,Value=booking-api Name=DiscoveryName,Value=booking-api \
+  --start-time 2026-10-29T08:00:00+07:00 --end-time 2026-10-29T08:05:00+07:00 \
+  --period 300 --statistics Sum --profile gol-prod --query 'Datapoints[0].Sum'
+<span class="out">48213.0</span>
+<span class="cm"># ~160 req/s of internal traffic that no longer crosses the public ALB</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Service Connect vs the alternatives</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        There are four ways for one ECS service to reach another. For services inside one cluster and namespace, Service
+        Connect is the default. The others have their place when the caller is outside ECS or in another VPC or account.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">How clients find tasks</th><th class="px-4 py-3">Retries / metrics</th><th class="px-4 py-3">Use when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Service Connect</td><td class="px-4 py-3">Local proxy, short names</td><td class="px-4 py-3">Yes, built in</td><td class="px-4 py-3">ECS-to-ECS in one namespace (our default)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cloud Map DNS service discovery</td><td class="px-4 py-3">DNS A records per task</td><td class="px-4 py-3">No: client-side, DNS caching issues</td><td class="px-4 py-3">Non-ECS clients in the VPC, legacy setups</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Internal ALB</td><td class="px-4 py-3">ALB DNS name</td><td class="px-4 py-3">ALB metrics only</td><td class="px-4 py-3">Callers on EC2 or Lambda, path routing, WAF needed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">VPC Lattice</td><td class="px-4 py-3">Lattice service network</td><td class="px-4 py-3">Yes, plus IAM auth policies</td><td class="px-4 py-3">Cross-VPC or cross-account, mixed ECS/EKS/Lambda</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The ECS vs EKS decision table</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Golden Owl runs both, and clients ask which one they should have. The honest default for a new product with a small
+        team is <strong>ECS on Fargate</strong>: it is cheaper to run, easier to staff, and covers everything the clinic
+        platform needs. EKS (<a href="./ks1.html" class="text-viol underline decoration-viol/40">KS1</a> onwards) earns its
+        cost when the number of services, the need for its ecosystem, or portability requirements outweigh the operational
+        load. Score each row for the client; three or more rows in the EKS column is a real case for EKS.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Question to ask the client</th><th class="px-4 py-3">Points to ECS (Fargate)</th><th class="px-4 py-3">Points to EKS</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">How many services in two years?</td><td class="px-4 py-3">Under ~15</td><td class="px-4 py-3">Dozens, several teams deploying independently</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Who operates it after handover?</td><td class="px-4 py-3">Developers with part-time ops help</td><td class="px-4 py-3">A platform team with Kubernetes skills</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Must it run outside AWS (on-prem, another cloud)?</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Yes, or likely: Kubernetes is the portable layer</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Need Argo CD, operators, KEDA, service mesh, Helm charts for vendors?</td><td class="px-4 py-3">No, or AWS-native equivalents are enough</td><td class="px-4 py-3">Yes: the ecosystem is the reason</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Baseline cost tolerance</td><td class="px-4 py-3">Tight: USD 0 control plane</td><td class="px-4 py-3">About USD 73/month per cluster, plus add-ons and system nodes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Upgrade appetite</td><td class="px-4 py-3">None: Fargate platform updates are transparent</td><td class="px-4 py-3">Accepts a version upgrade roughly every year (KS11)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Workload shapes</td><td class="px-4 py-3">HTTP services, queue workers, scheduled tasks</td><td class="px-4 py-3">Stateful sets, custom schedulers, heavy batch/ML, multi-tenant clusters</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    A["New client platform"] --> B{"Must run outside AWS<br/>or already on Kubernetes?"}
+    B -->|yes| K["EKS"]
+    B -->|no| C{"Platform team with<br/>K8s skills after handover?"}
+    C -->|no| E["ECS on Fargate"]
+    C -->|yes| D{"Needs K8s ecosystem<br/>or 15+ services?"}
+    D -->|yes| K
+    D -->|no| E
+    E -.->|revisit at 15+ services<br/>or when a K8s-only need appears| D
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Write the result as an architecture decision record (<a href="./ar1.html" class="text-viol underline decoration-viol/40">AR1</a>)
+        with the scores, so the next team knows why. Moving from ECS to EKS later is a well-trodden path, because the images,
+        IAM roles, ALB and observability carry over; only the orchestration layer changes.
+      </p>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The features in this module are recent (native blue/green, linear and canary, Managed Instances), so an agent's
+        training data may predate them. Ask it to check the AWS provider documentation for the argument names before
+        writing Terraform, and verify against <code class="inline">terraform validate</code> rather than trusting memory.
+      </p>
+      <pre class="code mt-3">Convert booking-api's ECS service from rolling to native BLUE_GREEN: second target group,
+test listener rule matching header x-clinic-canary, IAM role for ECS to modify listener
+rules, a POST_TEST_TRAFFIC_SHIFT hook calling the smoke-test Lambda, bake time 15 min.
+Check the aws provider 6.x docs for exact argument names, then run terraform validate.</pre>
+      <pre class="code mt-3">Here are 14 days of ALBRequestCountPerTarget and p95 latency for booking-api, and the SR4
+load test results. Propose min, max and target value for target tracking, plus scheduled
+actions for the morning rush. Show the arithmetic and the RDS connection count at max.</pre>
+      <pre class="code mt-3">Score the attached client brief against the ECS vs EKS decision table in this module.
+For each row, quote the line of the brief that supports your score. Draft an ADR.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Write scaling policies and metric-math expressions from your numbers</li>
+            <li>Convert services between deployment strategies</li>
+            <li>Add Service Connect to a set of services and their task definitions</li>
+            <li>Draft the ECS vs EKS ADR from a client brief</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Circuit breaker and alarm rollback are both on for prod</li>
+            <li><code class="inline">max_capacity</code> × pool size fits the database</li>
+            <li>No API in prod placed on Fargate Spot without a decision</li>
+            <li>The plan does not replace the service when switching strategy or capacity providers</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written ECS production config:</strong>
+        <code class="inline">deployment_minimum_healthy_percent = 0</code> on a prod API; circuit breaker without
+        <code class="inline">rollback = true</code>; CPU target tracking on a queue worker; <code class="inline">min_capacity = 1</code>
+        for a three-AZ API; <code class="inline">max_capacity = 100</code> with no thought for the database; scheduled
+        actions in UTC with times meant for Vietnam; a new service built on CodeDeploy or App Mesh; and Service Connect
+        enabled without a named port mapping.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Deploys by clicking "update service" and has never configured scaling.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows rolling and blue/green exist and that services can scale, but cannot say what triggers a rollback.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adjusts an existing scaling policy or deployment setting and reads a failed deployment's events with help.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses and implements rolling or blue/green with automatic rollback, sets scaling from load-test data with a justified maximum, uses Fargate Spot where safe, wires Service Connect, and can argue ECS vs EKS for a client using the decision table.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the deployment and scaling standards across client projects, runs migrations off CodeDeploy and App Mesh, and leads the platform choice conversation with clients.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> deploy a deliberately broken
+        revision to staging twice, once that crashes on start and once that returns 500 on booking, and show each one rolled
+        back automatically, naming which mechanism caught it. Then explain, with numbers, why your
+        <code class="inline">max_capacity</code> is what it is.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ A deploy job that returns after <code class="inline">update-service</code></div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The pipeline goes green while the circuit breaker is rolling back. Wait for <code class="inline">rolloutState</code> to be COMPLETED or FAILED, and fail the job on FAILED.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Fighting the autoscaler from Terraform</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Without <code class="inline">ignore_changes = [desired_count]</code>, every apply resets a scaled-out service to 3 tasks, often during the morning peak.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Short stop timeouts on Spot workers</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A 30-second <code class="inline">stopTimeout</code> throws away most of Spot's two-minute warning. Set 120 and drain in-flight work.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Spot everything in dev and staging</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Non-prod environments on 100% Fargate Spot plus a scheduled scale to zero at night cut their compute bill by roughly 80%, and exercise your interruption handling for free.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Read Service Connect metrics before adding tracing</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Per-service request count, latency and 5xx between <code class="inline">booking-worker</code> and <code class="inline">booking-api</code> are already in CloudWatch, free. Full tracing comes with OB4.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="rollback"> <span>I configured rolling deploys with circuit breaker and alarm rollback and demonstrated both rollbacks on a broken revision.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="bluegreen"> <span>I set up ECS native blue/green with a test listener rule, a smoke-test hook and a bake time, and rolled back during the bake.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="scaling"> <span>I set target tracking for an API and backlog-per-task scaling for a worker, with a maximum justified against the database.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="spot-sc"> <span>I ran a worker on a FARGATE / FARGATE_SPOT strategy with SIGTERM draining, and connected services with Service Connect.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="prod-ready"> <span class="font-semibold">In gol-staging, took the CN1 booking-api and booking-worker services to production readiness in one Terraform PR: blue/green for the API, rolling with rollback for the worker, scaling policies and a morning-rush schedule, Spot for the worker, and Service Connect between them. Ran a k6 spike and a bad deploy, and shared the PR, the scaling activity log and the rollback events (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-types.html" target="_blank" rel="noopener">AWS — ECS deployment types</a> — rolling, blue/green, linear, canary and external, with the lifecycle stages.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html" target="_blank" rel="noopener">AWS — Deployment circuit breaker</a> — thresholds and how rollback is decided.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-auto-scaling.html" target="_blank" rel="noopener">AWS — Service Auto Scaling</a> — target tracking, step, scheduled and predictive policies for ECS.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-capacity-providers.html" target="_blank" rel="noopener">AWS — Fargate capacity providers</a> — base, weight and Fargate Spot interruption behaviour.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect.html" target="_blank" rel="noopener">AWS — ECS Service Connect</a> — namespaces, port names, metrics and migration from App Mesh.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/decision-guides/latest/containers-on-aws-how-to-choose/choosing-aws-container-service.html" target="_blank" rel="noopener">AWS — Choosing a container service</a> — AWS's own ECS vs EKS guidance, to compare with the table above.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/intro.html" target="_blank" rel="noopener">AWS — ECS Best Practices Guide</a> — deployment, scaling and capacity guidance in depth.</li>
+      </ul>

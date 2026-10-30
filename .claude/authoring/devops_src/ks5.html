@@ -1,0 +1,779 @@
+<!-- meta: days=5 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">EKS Cluster Design &amp; Provisioning</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Until now you have used clusters someone else built: kind on your laptop, and a cluster on EKS that was already
+          there. This module builds <code class="inline">clinic-prod-eks</code> from an empty VPC. You will learn what AWS
+          runs for you and what it doesn't, choose between managed node groups, Fargate and EKS Auto Mode, write the cluster
+          in Terraform with <code class="inline">terraform-aws-modules/eks</code>, install and pin the core add-ons, give
+          people access through access entries, and hand the cluster over to GitOps. When you finish, you can delete the
+          cluster and recreate it from code in under an hour.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> decisions made on the day a cluster is created are the expensive
+          ones to change later. A Service CIDR that overlaps a peered VPC. A public API endpoint open to
+          <code class="inline">0.0.0.0/0</code>. Cluster admin tied to whichever IAM user happened to run
+          <code class="inline">terraform apply</code>, who has since left the company. Add-ons that were never pinned and
+          upgrade themselves into an incompatible version. A cluster nobody can recreate, because half of it was clicked
+          together in the console. Each of these turns up months later, during an incident or an audit, and is costly to
+          fix by then.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · EKS architecture</div>
+      <h2 class="font-display text-2xl font-bold mt-2">AWS runs the control plane; the data plane is your call</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <a href="./ks1.html" class="text-viol underline decoration-viol/40">KS1</a> showed that on EKS you never see an
+        etcd or API server Pod. This Part explains where those components actually run, how they reach your nodes, and
+        how the split of responsibility changes with each compute option. The rest of the module is a series of design
+        decisions, and they only make sense once you can see this boundary.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">What EKS runs, and where</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The control plane (at least two API server instances and three etcd members, spread across three AZs) runs in a
+        VPC owned by AWS. It reaches into <em>your</em> VPC through <strong>cross-account ENIs</strong> that EKS places in
+        the subnets you give it. Those ENIs are how the API server talks to kubelets for <code class="inline">logs</code>,
+        <code class="inline">exec</code> and webhooks. Nodes reach the API server through its endpoint, either privately
+        through those ENIs or over the public endpoint.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 270" class="w-full min-w-[640px]" role="img" aria-label="EKS architecture: the control plane in an AWS-owned VPC across three AZs connects to worker nodes in the customer VPC through cross-account ENIs in private subnets">
+          <rect x="10" y="30" width="250" height="210" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="22" y="50" font-size="11" font-weight="700" fill="#6E6B64">AWS-OWNED VPC · managed by EKS</text>
+          <g class="anim-pulse"><rect x="30" y="65" width="210" height="46" rx="9" fill="#2563EB"/>
+            <text x="135" y="85" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">API servers ×2+ (autoscaled)</text>
+            <text x="135" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">behind an NLB · 3 AZs</text></g>
+          <g class="anim-pulse d1"><rect x="30" y="125" width="210" height="46" rx="9" fill="#37474F"/>
+            <text x="135" y="145" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">etcd ×3</text>
+            <text x="135" y="160" text-anchor="middle" fill="#ffffffbb" font-size="9">KMS envelope encryption</text></g>
+          <g class="anim-pulse d2"><rect x="30" y="185" width="210" height="40" rx="9" fill="#6d5acd"/>
+            <text x="135" y="210" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">scheduler · controllers</text></g>
+          <rect x="300" y="30" width="410" height="210" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="312" y="50" font-size="11" font-weight="700" fill="#6E6B64">YOUR VPC 10.20.0.0/16 · gol-prod account</text>
+          <g class="anim-pulse d1"><rect x="315" y="65" width="120" height="46" rx="9" fill="#D97757"/>
+            <text x="375" y="85" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">EKS ENIs</text>
+            <text x="375" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">private subnets</text></g>
+          <g class="anim-pulse d2"><rect x="455" y="65" width="115" height="46" rx="9" fill="#0D9488"/>
+            <text x="512" y="85" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">node 1a</text>
+            <text x="512" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">kubelet · Pods</text></g>
+          <g class="anim-pulse d3"><rect x="585" y="65" width="115" height="46" rx="9" fill="#0D9488"/>
+            <text x="642" y="85" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">node 1b</text>
+            <text x="642" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">kubelet · Pods</text></g>
+          <g class="anim-pulse d4"><rect x="455" y="130" width="245" height="46" rx="9" fill="#0D9488"/>
+            <text x="577" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">node 1c</text>
+            <text x="577" y="165" text-anchor="middle" fill="#ffffffbb" font-size="9">Karpenter-launched (KS8)</text></g>
+          <g class="anim-pulse d3"><rect x="315" y="130" width="120" height="46" rx="9" fill="#DB2777"/>
+            <text x="375" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">private endpoint</text>
+            <text x="375" y="165" text-anchor="middle" fill="#ffffffbb" font-size="9">Route 53 private</text></g>
+          <line x1="240" y1="88" x2="315" y2="88" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="435" y1="88" x2="455" y2="88" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="455" y1="153" x2="435" y2="153" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="505" y="215" text-anchor="middle" font-size="9" fill="#6E6B64">kubelet → API: private endpoint · API → kubelet: via the EKS ENIs</text>
+          <text x="360" y="262" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">you choose the subnets, endpoint access and version; AWS runs everything on the left</text>
+        </svg>
+      </div>
+      <pre class="code mt-3">aws eks describe-cluster --name clinic-prod-eks --region ap-southeast-1 \
+  --query 'cluster.{version:version,platform:platformVersion,endpointPublic:resourcesVpcConfig.endpointPublicAccess,svcCidr:kubernetesNetworkConfig.serviceIpv4Cidr,auth:accessConfig.authenticationMode}'
+<span class="out">{
+    "version": "1.33",
+    "platform": "eks.14",
+    "endpointPublic": false,
+    "svcCidr": "172.20.0.0/16",
+    "auth": "API"
+}</span>
+<span class="cm"># platformVersion: AWS patches the control plane under you within a minor version (eks.N)</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Shared responsibility, layer by layer</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Managed Kubernetes" covers very different amounts of work depending on how you run nodes. Read across a row to
+        see who patches what. The further right you go, the less you run and the less you control. The compute options
+        themselves are compared in Part II.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Layer</th><th class="px-4 py-3">Managed node groups + Karpenter</th><th class="px-4 py-3">EKS Auto Mode</th><th class="px-4 py-3">Fargate</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Control plane, etcd</td><td class="px-4 py-3">AWS</td><td class="px-4 py-3">AWS</td><td class="px-4 py-3">AWS</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Kubernetes version upgrade</td><td class="px-4 py-3">You trigger and test (<a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a>)</td><td class="px-4 py-3">You trigger; nodes follow automatically</td><td class="px-4 py-3">You trigger; Pods pick it up on restart</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Node OS and AMI patching</td><td class="px-4 py-3">You: roll AMIs regularly</td><td class="px-4 py-3">AWS: nodes replaced at most every 21 days</td><td class="px-4 py-3">AWS</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">VPC CNI, CoreDNS, kube-proxy, EBS CSI</td><td class="px-4 py-3">You: EKS add-ons, pinned in Terraform</td><td class="px-4 py-3">AWS: built in</td><td class="px-4 py-3">Mostly AWS; CoreDNS is yours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Autoscaling nodes</td><td class="px-4 py-3">You run Karpenter (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>)</td><td class="px-4 py-3">AWS runs Karpenter for you</td><td class="px-4 py-3">No nodes to scale</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Workloads, RBAC, policies, data</td><td class="px-4 py-3">You</td><td class="px-4 py-3">You</td><td class="px-4 py-3">You</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Control plane choices: version, support tier, logs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You don't size the EKS control plane. AWS scales it. What you choose is the Kubernetes version, what happens when
+        that version leaves standard support, and which control plane logs to keep. Each minor version gets 14 months of
+        standard support and then 12 months of <strong>extended support</strong>, at six times the price. Extended support
+        is a safety net, not a plan. The upgrade cadence that keeps you out of it is
+        <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Setting</th><th class="px-4 py-3">Options</th><th class="px-4 py-3">Our choice for clinic-prod-eks</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Version</td><td class="px-4 py-3">Any version in standard support</td><td class="px-4 py-3"><code class="inline">1.33</code>, the same in dev, staging and prod</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Support tier</td><td class="px-4 py-3">Standard: USD 0.10/h (≈ 73/month). Extended: USD 0.60/h (≈ 438/month)</td><td class="px-4 py-3"><code class="inline">upgrade_policy.support_type = "STANDARD"</code>: AWS auto-upgrades at end of support rather than billing extended</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Control plane logs</td><td class="px-4 py-3">api, audit, authenticator, controllerManager, scheduler</td><td class="px-4 py-3"><code class="inline">audit</code> + <code class="inline">authenticator</code> + <code class="inline">api</code>, 90-day retention (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Secrets encryption</td><td class="px-4 py-3">AWS-owned key (default) or your KMS key</td><td class="px-4 py-3">Customer-managed KMS key, for audit evidence (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Audit logs are the expensive line.</strong> On a busy cluster the
+        <code class="inline">audit</code> log stream can reach tens of GB a day, because every controller's watch and
+        every Argo CD sync is logged. Keep it, since it answers "who deleted that?", but set a retention period, watch
+        CloudWatch ingestion in Cost Explorer for the first week, and leave <code class="inline">controllerManager</code>
+        and <code class="inline">scheduler</code> off until you are debugging something specific.</div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Compute options</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pick the compute model by who should own the nodes</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        EKS gives you four ways to run Pods, and one cluster can mix them. The choice is less about technology and more
+        about ownership. Who patches the AMI? Who picks instance types? Who is paged when nodes don't scale? Make that
+        choice on purpose for each client, and write it down.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Four options, compared</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Self-managed nodes are a legacy option that you will still find on older client clusters. Fargate suits a narrow
+        set of cases. The real choice for new clusters is between managed node groups plus Karpenter, and Auto Mode.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">What it is</th><th class="px-4 py-3">Strengths</th><th class="px-4 py-3">Limits</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Managed node groups</td><td class="px-4 py-3">EKS-managed Auto Scaling groups with EKS AMIs and drain-aware updates</td><td class="px-4 py-3">Simple, predictable, in-place AMI rollouts</td><td class="px-4 py-3">One instance shape per group; slow, coarse scaling</td><td class="px-4 py-3">A small, stable <strong>system</strong> pool</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Karpenter on top</td><td class="px-4 py-3">You run Karpenter; it launches right-sized EC2 per pending Pod</td><td class="px-4 py-3">Fast, Spot and Graviton aware, consolidation</td><td class="px-4 py-3">Another controller to run and upgrade</td><td class="px-4 py-3">All app workloads (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EKS Auto Mode</td><td class="px-4 py-3">AWS runs Karpenter, the AMI, VPC CNI, EBS CSI and the LB controller</td><td class="px-4 py-3">Least to operate; nodes patched for you</td><td class="px-4 py-3">Fee on top of EC2; less control over AMI and add-on versions</td><td class="px-4 py-3">Small teams, clients with no platform engineer</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Fargate</td><td class="px-4 py-3">Each Pod in its own micro-VM, no nodes</td><td class="px-4 py-3">Strong isolation, nothing to patch</td><td class="px-4 py-3">No DaemonSets, no EBS volumes, no GPUs, slower start, higher per-vCPU price</td><td class="px-4 py-3">A few isolated jobs; rarely a whole cluster</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Self-managed nodes</td><td class="px-4 py-3">Your own ASGs and bootstrap</td><td class="px-4 py-3">Total control</td><td class="px-4 py-3">You own drains, AMIs and the join process</td><td class="px-4 py-3">Inherited clusters: migrate away</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    Q1{"Does the client have<br/>a platform engineer on call?"} -->|no| AM["EKS Auto Mode<br/>general-purpose + system pools"]
+    Q1 -->|yes| Q2{"Need custom AMI, specific<br/>add-on versions, or fine Spot control?"}
+    Q2 -->|no| AM
+    Q2 -->|yes| MNG["Managed node group: system pool<br/>+ Karpenter for workloads"]
+    MNG --> F{"A few Pods that need<br/>VM-level isolation?"}
+    F -->|yes| FG["add a Fargate profile<br/>for that namespace only"]
+    F -->|no| DONE["clinic-prod-eks today"]
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">EKS Auto Mode: what you give up for less work</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Auto Mode turns compute, block storage, load balancing and core networking into parts of the cluster that AWS
+        operates. You declare node pools (Karpenter <code class="inline">NodePool</code> objects, with two built in), and
+        AWS launches, patches and replaces instances. Nodes run a locked-down Bottlerocket-based image, you cannot SSH
+        into them, and they are replaced at least every 21 days. The price is a management fee per instance, roughly 12%
+        on top of the EC2 price, and less control.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/eks.tf — the dev cluster runs Auto Mode</span>
+        <pre class="code"><span class="kw">module</span> <span class="st">"eks"</span> {
+  source  = <span class="st">"terraform-aws-modules/eks/aws"</span>
+  version = <span class="st">"~&gt; 21.0"</span>
+
+  name               = <span class="st">"clinic-dev-eks"</span>
+  kubernetes_version = <span class="st">"1.33"</span>
+  vpc_id             = module.vpc.vpc_id
+  subnet_ids         = module.vpc.private_subnets
+
+  compute_config = {
+    enabled    = <span class="kw">true</span>
+    node_pools = [<span class="st">"general-purpose"</span>, <span class="st">"system"</span>]  <span class="cm"># built-in pools; add your own via GitOps</span>
+  }
+  <span class="cm"># no addons block for vpc-cni / ebs-csi / LB controller: Auto Mode runs them for you</span>
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Concern</th><th class="px-4 py-3">Auto Mode</th><th class="px-4 py-3">MNG + Karpenter (prod)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Monthly cost, 12 × m7g.large on-demand</td><td class="px-4 py-3">EC2 ≈ USD 900 + fee ≈ 110</td><td class="px-4 py-3">EC2 ≈ USD 900 + your engineering time</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AMI patching</td><td class="px-4 py-3">Automatic, nodes replaced within 21 days</td><td class="px-4 py-3">Karpenter drift + a monthly AMI bump PR</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Storage class provisioner</td><td class="px-4 py-3"><code class="inline">ebs.csi.eks.amazonaws.com</code></td><td class="px-4 py-3"><code class="inline">ebs.csi.aws.com</code> (<a href="./ks4.html" class="text-viol underline decoration-viol/40">KS4</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Node debugging</td><td class="px-4 py-3"><code class="inline">kubectl debug node</code>, no shell</td><td class="px-4 py-3">SSM Session Manager into the node</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Why we chose it</td><td class="px-4 py-3">dev: nobody should spend time on dev nodes</td><td class="px-4 py-3">prod: pinned add-on versions, Spot policy, custom EC2NodeClass</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>Dev on Auto Mode, prod on Karpenter: is that drift?</strong> Partly,
+        and it is a deliberate trade-off. Workload manifests are identical. What differs is node and storage plumbing,
+        which staging tests because staging matches prod. If a client needs all three environments the same, pick one
+        model for all of them. Don't let the decision happen by accident, one cluster at a time.</div>
+
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Fargate fits narrow cases, and it is added per namespace through a <strong>Fargate profile</strong>. On the clinic
+        platform, one partner integration runs a vendor-supplied image that we do not trust on shared nodes, so its
+        namespace gets Fargate. Each Pod there gets its own micro-VM, and the vendor's code never shares a kernel with
+        <code class="inline">booking-api</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/cluster.tf (continued) — one Fargate profile</span>
+        <pre class="code"><span class="kw">module</span> <span class="st">"eks"</span> {   <span class="cm"># same module block</span>
+  fargate_profiles = {
+    partner = {
+      selectors = [{ namespace = <span class="st">"partner-hl7"</span> }]   <span class="cm"># every Pod in this ns runs on Fargate</span>
+      subnet_ids = local.private_subnet_ids         <span class="cm"># Fargate needs private subnets</span>
+    }
+  }
+}
+<span class="cm"># consequences: no DaemonSets there (log shipping needs a sidecar), no EBS PVCs, and</span>
+<span class="cm"># each Pod is billed by its requests rounded up to a Fargate size: set requests honestly</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The prod design: a small system pool plus Karpenter</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Karpenter cannot launch the nodes it runs on, so something else has to. On <code class="inline">clinic-prod-eks</code>
+        that is a managed node group named <code class="inline">system</code> with two Graviton nodes (m7g.large), tainted <code class="inline">CriticalAddonsOnly</code>
+        so app Pods stay off it (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>). It runs
+        Karpenter, CoreDNS, Argo CD and the other controllers. Everything else lands on Karpenter nodes. Nodes run
+        Amazon Linux 2023 or Bottlerocket. EKS does not publish Amazon Linux 2 AMIs for 1.33 and later, so any template
+        that still says <code class="inline">AL2_x86_64</code> is out of date.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Pool</th><th class="px-4 py-3">Managed by</th><th class="px-4 py-3">Shape</th><th class="px-4 py-3">Runs</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">system</td><td class="px-4 py-3">Managed node group (Terraform)</td><td class="px-4 py-3">2 × m7g.large (max 3), AL2023 arm64, on-demand, different AZs</td><td class="px-4 py-3">Karpenter, CoreDNS, Argo CD, LB controller, ExternalDNS, External Secrets</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">general</td><td class="px-4 py-3">Karpenter NodePool (GitOps)</td><td class="px-4 py-3">c/m/r 7th gen, arm64 first, on-demand + Spot</td><td class="px-4 py-3"><code class="inline">booking-api</code>, <code class="inline">booking-web</code>, <code class="inline">booking-worker</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">batch</td><td class="px-4 py-3">Karpenter NodePool (GitOps)</td><td class="px-4 py-3">Spot only, tainted <code class="inline">workload-type=batch</code></td><td class="px-4 py-3">Reminder CronJobs, report exports</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">kubectl get nodes -L eks.amazonaws.com/nodegroup,karpenter.sh/nodepool,karpenter.sh/capacity-type,topology.kubernetes.io/zone
+<span class="out">NAME                                              STATUS  VERSION              NODEGROUP     NODEPOOL  CAPACITY-TYPE  ZONE
+ip-10-20-33-14.ap-southeast-1.compute.internal    Ready   v1.33.4-eks-a1b2c3d  system-2025…                            ap-southeast-1a
+ip-10-20-66-201.ap-southeast-1.compute.internal   Ready   v1.33.4-eks-a1b2c3d  system-2025…                            ap-southeast-1b
+ip-10-20-41-87.ap-southeast-1.compute.internal    Ready   v1.33.4-eks-a1b2c3d                general   on-demand      ap-southeast-1a
+ip-10-20-109-12.ap-southeast-1.compute.internal   Ready   v1.33.4-eks-a1b2c3d                general   spot           ap-southeast-1c</span></pre>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Provisioning with Terraform</div>
+      <h2 class="font-display text-2xl font-bold mt-2">One Terraform state per cluster, and nothing clicked</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The cluster is infrastructure, so it lives in <code class="inline">clinic-infra</code> and follows the plan-on-PR,
+        apply-on-merge workflow from <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>. We use
+        the community <code class="inline">terraform-aws-modules/eks</code> module (v21, built for AWS provider 6) rather
+        than raw resources. It encodes a few hundred lines of IAM, security groups and launch templates that you would
+        otherwise get subtly wrong.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">State layout and VPC prerequisites</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The VPC and the cluster are separate Terraform states. A mistake in the cluster code cannot then plan a change to
+        a NAT gateway, and the network can outlive any one cluster, which matters during blue/green cluster upgrades in
+        <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a>. The network state publishes its IDs
+        to SSM Parameter Store, and the cluster state reads them from there. EKS and the controllers you install later
+        discover subnets by <strong>tags</strong>, so the tags are part of the contract.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Subnets (prod)</th><th class="px-4 py-3">Tag</th><th class="px-4 py-3">Read by</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Public 10.20.0.0/24–10.20.2.0/24</td><td class="px-4 py-3"><code class="inline">kubernetes.io/role/elb = 1</code></td><td class="px-4 py-3">AWS LB Controller: internet-facing ALBs (<a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Private 10.20.32.0/19, 10.20.64.0/19, 10.20.96.0/19</td><td class="px-4 py-3"><code class="inline">kubernetes.io/role/internal-elb = 1</code>, <code class="inline">karpenter.sh/discovery = clinic-prod-eks</code></td><td class="px-4 py-3">Internal LBs, Karpenter node placement, EKS ENIs, Pod IPs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Isolated 10.20.200.0/24–10.20.202.0/24</td><td class="px-4 py-3">none</td><td class="px-4 py-3">RDS and ElastiCache only: no cluster resources here</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/main.tf — inputs from the network state</span>
+        <pre class="code">terraform {
+  required_version = <span class="st">"&gt;= 1.10"</span>
+  backend <span class="st">"s3"</span> {
+    bucket       = <span class="st">"gol-prod-terraform-state"</span>
+    key          = <span class="st">"clinic/eks/terraform.tfstate"</span>  <span class="cm"># its own state, not the VPC's</span>
+    region       = <span class="st">"ap-southeast-1"</span>
+    use_lockfile = <span class="kw">true</span>
+  }
+  required_providers { aws = { source = <span class="st">"hashicorp/aws"</span>, version = <span class="st">"~&gt; 6.0"</span> } }
+}
+<span class="kw">data</span> <span class="st">"aws_ssm_parameter"</span> <span class="st">"vpc_id"</span> { name = <span class="st">"/clinic/prod/network/vpc_id"</span> }
+<span class="kw">data</span> <span class="st">"aws_ssm_parameter"</span> <span class="st">"private_subnets"</span> { name = <span class="st">"/clinic/prod/network/private_subnet_ids"</span> }
+<span class="kw">locals</span> {
+  private_subnet_ids = split(<span class="st">","</span>, nonsensitive(data.aws_ssm_parameter.private_subnets.value))
+  tags = { Environment = <span class="st">"prod"</span>, Project = <span class="st">"clinic"</span>, ManagedBy = <span class="st">"terraform"</span> }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The cluster module</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every input below is a decision from Part I or Part IV, made explicitly. Two of them cannot be changed after
+        creation without replacing the cluster: the Service CIDR, and a few encryption settings. Choose
+        <code class="inline">172.20.0.0/16</code> on purpose, rather than accepting whatever EKS picks, because it must not
+        overlap any VPC you will ever peer or route to (<a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/cluster.tf</span>
+        <pre class="code"><span class="kw">module</span> <span class="st">"eks"</span> {
+  source  = <span class="st">"terraform-aws-modules/eks/aws"</span>
+  version = <span class="st">"~&gt; 21.0"</span>                      <span class="cm"># pin the major: v20 → v21 renamed most inputs</span>
+
+  name               = <span class="st">"clinic-prod-eks"</span>
+  kubernetes_version = <span class="st">"1.33"</span>
+  upgrade_policy     = { support_type = <span class="st">"STANDARD"</span> }
+
+  vpc_id            = nonsensitive(data.aws_ssm_parameter.vpc_id.value)
+  subnet_ids        = local.private_subnet_ids     <span class="cm"># nodes + control plane ENIs, 3 AZs</span>
+  service_ipv4_cidr = <span class="st">"172.20.0.0/16"</span>          <span class="cm"># FORCES REPLACEMENT if changed later</span>
+
+  endpoint_private_access = <span class="kw">true</span>
+  endpoint_public_access  = <span class="kw">false</span>             <span class="cm"># Part IV: prod API is private only</span>
+
+  authentication_mode                      = <span class="st">"API"</span>   <span class="cm"># access entries only, no aws-auth</span>
+  enable_cluster_creator_admin_permissions = <span class="kw">false</span>   <span class="cm"># admins come from access_entries</span>
+  enable_irsa                              = <span class="kw">false</span>   <span class="cm"># Pod Identity only (KS7)</span>
+
+  enabled_log_types = [<span class="st">"api"</span>, <span class="st">"audit"</span>, <span class="st">"authenticator"</span>]
+  encryption_config = { resources = [<span class="st">"secrets"</span>], provider_key_arn = aws_kms_key.eks.arn }
+
+  node_security_group_tags = { <span class="st">"karpenter.sh/discovery"</span> = <span class="st">"clinic-prod-eks"</span> }
+  tags = local.tags
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/cluster.tf (continued) — the system pool</span>
+        <pre class="code"><span class="kw">module</span> <span class="st">"eks"</span> {   <span class="cm"># same module block as above, split here for reading</span>
+  eks_managed_node_groups = {
+    system = {
+      ami_type       = <span class="st">"AL2023_ARM_64_STANDARD"</span>   <span class="cm"># no AL2 AMIs for 1.33+</span>
+      instance_types = [<span class="st">"m7g.large"</span>]
+      min_size       = 2
+      max_size       = 3
+      desired_size   = 2                          <span class="cm"># hosts Karpenter; Karpenter hosts the rest</span>
+      labels = { <span class="st">"node.clinic/pool"</span> = <span class="st">"system"</span> }
+      taints = {
+        critical = { key = <span class="st">"CriticalAddonsOnly"</span>, value = <span class="st">"true"</span>, effect = <span class="st">"NO_SCHEDULE"</span> }
+      }
+      update_config = { max_unavailable = 1 }     <span class="cm"># AMI rollouts one node at a time</span>
+      metadata_options = { http_put_response_hop_limit = 1 }  <span class="cm"># Pods can't reach IMDS</span>
+    }
+  }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">EKS add-ons: install, pin, order</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        EKS add-ons are the AWS-packaged versions of the core components, installed and upgraded through the EKS API. We
+        manage five or six of them in Terraform, pinned to exact versions so an upgrade is a reviewed PR and never a
+        surprise. Two of them have to exist <em>before</em> any node joins. Without the VPC CNI, nodes stay
+        <code class="inline">NotReady</code>. Without the Pod Identity agent, the first controllers start with no AWS
+        credentials.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/cluster.tf (continued) — add-ons</span>
+        <pre class="code"><span class="kw">module</span> <span class="st">"eks"</span> {   <span class="cm"># continued</span>
+  addons = {
+    vpc-cni                = { addon_version = <span class="st">"v1.20.1-eksbuild.1"</span>, before_compute = <span class="kw">true</span> }
+    eks-pod-identity-agent = { addon_version = <span class="st">"v1.3.8-eksbuild.2"</span>,  before_compute = <span class="kw">true</span> }
+    kube-proxy             = { addon_version = <span class="st">"v1.33.3-eksbuild.4"</span> }  <span class="cm"># tracks the K8s minor</span>
+    coredns                = { addon_version = <span class="st">"v1.12.2-eksbuild.4"</span> }
+    aws-ebs-csi-driver     = { addon_version = <span class="st">"v1.48.0-eksbuild.1"</span> }  <span class="cm"># Pod Identity role: KS4</span>
+    snapshot-controller    = { addon_version = <span class="st">"v8.3.0-eksbuild.1"</span> }
+  }
+}</pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># the versions above came from here, never from memory or an old README</span>
+aws eks describe-addon-versions --kubernetes-version 1.33 --addon-name coredns \
+  --query 'addons[0].addonVersions[?compatibilities[0].defaultVersion==`true`].addonVersion' --output text
+<span class="out">v1.12.2-eksbuild.4</span>
+aws eks list-addons --cluster-name clinic-prod-eks --output text
+<span class="out">ADDONS  aws-ebs-csi-driver
+ADDONS  coredns
+ADDONS  eks-pod-identity-agent
+ADDONS  kube-proxy
+ADDONS  snapshot-controller
+ADDONS  vpc-cni</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Add-on</th><th class="px-4 py-3">Job</th><th class="px-4 py-3">Tuned in</th><th class="px-4 py-3">If missing or broken</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">vpc-cni</td><td class="px-4 py-3">Pod IPs from the VPC</td><td class="px-4 py-3"><a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a></td><td class="px-4 py-3">Nodes NotReady; Pods stuck ContainerCreating</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">eks-pod-identity-agent</td><td class="px-4 py-3">Hands Pods their IAM role credentials</td><td class="px-4 py-3"><a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a></td><td class="px-4 py-3">Controllers get AccessDenied, or quietly fall back to the node role</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">coredns</td><td class="px-4 py-3">Cluster DNS</td><td class="px-4 py-3"><a href="./ks3.html" class="text-viol underline decoration-viol/40">KS3</a></td><td class="px-4 py-3">Every service-to-service call fails</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">kube-proxy</td><td class="px-4 py-3">Service IP rules on nodes</td><td class="px-4 py-3"><a href="./ks3.html" class="text-viol underline decoration-viol/40">KS3</a></td><td class="px-4 py-3">ClusterIPs unreachable from new nodes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">aws-ebs-csi-driver, snapshot-controller</td><td class="px-4 py-3">EBS volumes and snapshots</td><td class="px-4 py-3"><a href="./ks4.html" class="text-viol underline decoration-viol/40">KS4</a></td><td class="px-4 py-3">PVCs Pending; Velero backups skip volumes</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Karpenter's AWS side is created with the cluster</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Karpenter itself is installed by Argo CD, but it needs AWS resources that belong in Terraform. These are a
+        controller role (through Pod Identity), a node role that its EC2 instances use, an access entry so those
+        instances can join, and an SQS queue with EventBridge rules for Spot interruption warnings. The EKS module ships a
+        submodule that creates all of them. Node pools and tuning are covered in
+        <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>. This is only the foundation.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/karpenter.tf</span>
+        <pre class="code"><span class="kw">module</span> <span class="st">"karpenter"</span> {
+  source  = <span class="st">"terraform-aws-modules/eks/aws//modules/karpenter"</span>
+  version = <span class="st">"~&gt; 21.0"</span>
+
+  cluster_name = module.eks.cluster_name
+
+  node_iam_role_use_name_prefix = <span class="kw">false</span>
+  node_iam_role_name            = <span class="st">"KarpenterNode-clinic-prod-eks"</span>  <span class="cm"># EC2NodeClass refers to it (KS8)</span>
+  node_iam_role_additional_policies = {
+    ssm = <span class="st">"arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"</span>     <span class="cm"># SSM sessions, no SSH</span>
+  }
+  create_pod_identity_association = <span class="kw">true</span>   <span class="cm"># controller creds via Pod Identity, not IRSA</span>
+  tags = local.tags
+}
+<span class="kw">resource</span> <span class="st">"aws_ssm_parameter"</span> <span class="st">"karpenter_queue"</span> {      <span class="cm"># GitOps reads it for the Helm values</span>
+  name  = <span class="st">"/clinic/prod/eks/karpenter_interruption_queue"</span>
+  type  = <span class="st">"String"</span>
+  value = module.karpenter.queue_name
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Security group</th><th class="px-4 py-3">Created by</th><th class="px-4 py-3">Allows</th><th class="px-4 py-3">Review for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Cluster SG (module)</td><td class="px-4 py-3">The EKS module</td><td class="px-4 py-3">Nodes → API on 443</td><td class="px-4 py-3">No extra ingress from 0.0.0.0/0</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Node SG</td><td class="px-4 py-3">The EKS module, tagged for Karpenter</td><td class="px-4 py-3">Node ↔ node, API → kubelet 10250, webhooks</td><td class="px-4 py-3">Webhook ports for controllers you add later (LB controller 9443, Karpenter 8443)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EKS-managed cluster SG</td><td class="px-4 py-3">EKS itself</td><td class="px-4 py-3">Control plane ENIs ↔ managed nodes</td><td class="px-4 py-3">Don't manage it in Terraform; just don't delete it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">RDS / Valkey SGs</td><td class="px-4 py-3">The data stack (<a href="./aw5.html" class="text-viol underline decoration-viol/40">AW5</a>)</td><td class="px-4 py-3">5432 / 6379 from the node SG</td><td class="px-4 py-3">Source is the node SG, never the whole VPC CIDR</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Reading the plan before the first apply</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The first plan for a new cluster adds 60 to 70 resources, and nobody reads all of them. Read the ones that
+        matter: the cluster itself, IAM roles and policies, security group rules, and access entries. On later plans, one
+        line matters more than everything else: <code class="inline">must be replaced</code> on the cluster resource.
+        Replacing a cluster deletes it, with every workload, PVC and load balancer in it.
+      </p>
+      <pre class="code mt-3">terraform plan -out=tfplan | grep -E 'must be replaced|forces replacement|Plan:'
+<span class="out">  # module.eks.aws_eks_cluster.this[0] must be replaced
+      ~ service_ipv4_cidr = "172.20.0.0/16" -&gt; "10.100.0.0/16" # forces replacement
+Plan: 1 to add, 3 to change, 1 to destroy.</span>
+<span class="cm"># STOP. An agent "aligned" the CIDR with an old README. Never apply a plan that replaces the cluster.</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>Protect the cluster from its own code.</strong> Add a
+        <code class="inline">lifecycle { prevent_destroy = true }</code> guard through a wrapper module, or a policy check
+        in the pipeline that fails any plan that deletes or replaces <code class="inline">aws_eks_cluster</code>
+        (<a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>). The apply role for
+        <code class="inline">clinic-infra</code> (<code class="inline">gha-clinic-infra-apply</code>) should also need a
+        human approval on the prod environment. A replaced cluster takes at least an hour to rebuild, plus every restore
+        in <a href="./ks4.html" class="text-viol underline decoration-viol/40">KS4</a>.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Access and bootstrap</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Access entries for people, a private API, GitOps for the rest</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A cluster that exists is not yet usable. People need a way in that is tied to their SSO identity and not to
+        whoever created the cluster. The API endpoint needs a network boundary. Then the platform components need to arrive
+        in a repeatable way. This Part covers the last three decisions on cluster day, and the handover to Argo CD.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Access entries: IAM principals in, aws-auth out</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An <strong>access entry</strong> maps an IAM principal (in our case an Identity Center permission-set role,
+        <a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a>) to the cluster. An
+        <strong>access policy</strong> attached to it grants Kubernetes permissions, either cluster-wide or for named
+        namespaces. They are EKS API objects, managed in Terraform and visible in CloudTrail. The old
+        <code class="inline">aws-auth</code> ConfigMap was a YAML file inside the cluster, where one bad edit locked
+        everybody out. With <code class="inline">authentication_mode = "API"</code> it is ignored entirely. Finer-grained
+        RBAC on top of access policies is <a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 200" class="w-full min-w-[640px]" role="img" aria-label="Access path: an engineer signs in with Identity Center, assumes an SSO role, kubectl sends an EKS token, EKS matches an access entry and applies its access policy">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">FROM LAPTOP TO kubectl get pods · clinic-prod-eks</text>
+          <g class="anim-pulse"><rect x="10" y="50" width="120" height="56" rx="9" fill="#2563EB"/>
+            <text x="70" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">aws sso login</text>
+            <text x="70" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">Identity Center + MFA</text></g>
+          <g class="anim-pulse d1"><rect x="150" y="50" width="130" height="56" rx="9" fill="#6d5acd"/>
+            <text x="215" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SSO role</text>
+            <text x="215" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">PlatformAdmin · 1 h creds</text></g>
+          <g class="anim-pulse d2"><rect x="300" y="50" width="120" height="56" rx="9" fill="#D97757"/>
+            <text x="360" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">eks get-token</text>
+            <text x="360" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">presigned STS call</text></g>
+          <g class="anim-pulse d3"><rect x="440" y="50" width="125" height="56" rx="9" fill="#0D9488"/>
+            <text x="502" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">access entry</text>
+            <text x="502" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">authn: who are you?</text></g>
+          <g class="anim-pulse d4"><rect x="585" y="50" width="125" height="56" rx="9" fill="#37474F"/>
+            <text x="647" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">access policy</text>
+            <text x="647" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">+ RBAC: may you?</text></g>
+          <line x1="130" y1="78" x2="150" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="280" y1="78" x2="300" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="420" y1="78" x2="440" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="565" y1="78" x2="585" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="215" y="130" text-anchor="middle" font-size="9" fill="#6E6B64">AWS side: IAM, CloudTrail</text>
+          <text x="575" y="130" text-anchor="middle" font-size="9" fill="#6E6B64">EKS side: no entry = 401 Unauthorized</text>
+          <text x="360" y="180" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">remove someone from the SSO group and their cluster access ends at the next token refresh</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/access.tf</span>
+        <pre class="code"><span class="kw">data</span> <span class="st">"aws_iam_roles"</span> <span class="st">"sso"</span> {
+  for_each    = toset([<span class="st">"PlatformAdmin"</span>, <span class="st">"BookingDeveloper"</span>])
+  name_regex  = <span class="st">"AWSReservedSSO_${each.key}_.*"</span>   <span class="cm"># suffix is random per account</span>
+  path_prefix = <span class="st">"/aws-reserved/sso.amazonaws.com/"</span>
+}
+<span class="kw">module</span> <span class="st">"eks"</span> {   <span class="cm"># same module block, continued</span>
+  access_entries = {
+    platform_admin = {
+      principal_arn = one(data.aws_iam_roles.sso[<span class="st">"PlatformAdmin"</span>].arns)
+      policy_associations = { admin = {
+        policy_arn   = <span class="st">"arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"</span>
+        access_scope = { type = <span class="st">"cluster"</span> } } }
+    }
+    booking_dev = {
+      principal_arn = one(data.aws_iam_roles.sso[<span class="st">"BookingDeveloper"</span>].arns)
+      policy_associations = { view = {
+        policy_arn   = <span class="st">"arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"</span>
+        access_scope = { type = <span class="st">"namespace"</span>, namespaces = [<span class="st">"booking"</span>] } } }  <span class="cm"># read-only, one ns</span>
+    }
+  }
+}</pre>
+      </div>
+      <pre class="code mt-3">aws eks list-access-entries --cluster-name clinic-prod-eks --output text
+<span class="out">ACCESSENTRIES  arn:aws:iam::444455556666:role/KarpenterNode-clinic-prod-eks
+ACCESSENTRIES  arn:aws:iam::444455556666:role/aws-reserved/sso.amazonaws.com/ap-southeast-1/AWSReservedSSO_BookingDeveloper_8e2a4c6f1b3d5a79
+ACCESSENTRIES  arn:aws:iam::444455556666:role/aws-reserved/sso.amazonaws.com/ap-southeast-1/AWSReservedSSO_PlatformAdmin_3f9c1a2b4d5e6f70
+ACCESSENTRIES  arn:aws:iam::444455556666:role/clinic-prod-eks-system-eks-node-group-2025…</span>
+<span class="cm"># the two node-role entries (type EC2_LINUX) let nodes join: system pool and Karpenter. Never delete them.</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Access policy</th><th class="px-4 py-3">Roughly equals</th><th class="px-4 py-3">Who gets it on prod</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">AmazonEKSClusterAdminPolicy</td><td class="px-4 py-3"><code class="inline">cluster-admin</code></td><td class="px-4 py-3">PlatformAdmin, used for break-glass and upgrades only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AmazonEKSAdminPolicy</td><td class="px-4 py-3"><code class="inline">admin</code>, scoped to namespaces</td><td class="px-4 py-3">Nobody on prod: changes go through Argo CD</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AmazonEKSEditPolicy</td><td class="px-4 py-3"><code class="inline">edit</code></td><td class="px-4 py-3">BookingDeveloper on <em>dev</em> only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AmazonEKSViewPolicy</td><td class="px-4 py-3"><code class="inline">view</code> (no Secrets)</td><td class="px-4 py-3">BookingDeveloper on prod, namespace <code class="inline">booking</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Verify access the way an auditor would, from both sides. On the AWS side, check which policy is attached to an
+        entry and at what scope. On the Kubernetes side, impersonate the developer role and confirm that what should be
+        denied is denied. Run both checks after every change to <code class="inline">access.tf</code>, and keep the output
+        in the PR.
+      </p>
+      <pre class="code mt-3">aws eks list-associated-access-policies --cluster-name clinic-prod-eks \
+  --principal-arn "$(aws iam list-roles --path-prefix /aws-reserved/sso.amazonaws.com/ \
+     --query "Roles[?contains(RoleName,'BookingDeveloper')].Arn" --output text)" \
+  --query 'associatedAccessPolicies[].[policyArn,accessScope.type,join(`,`,accessScope.namespaces)]' --output text
+<span class="out">arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy   namespace   booking</span>
+<span class="cm"># then, signed in as a BookingDeveloper:</span>
+kubectl --context clinic-prod -n booking get pods --no-headers | wc -l       <span class="out">9</span>
+kubectl --context clinic-prod -n booking auth can-i get secrets              <span class="out">no</span>
+kubectl --context clinic-prod -n kube-system auth can-i list pods            <span class="out">no</span>
+kubectl --context clinic-prod -n booking auth can-i delete deployment        <span class="out">no</span></pre>
+      <div class="mt-4 callout callout-info"><strong>Keep one break-glass path, and alarm on it.</strong> If Identity
+        Center is unavailable, nobody can reach the cluster. Keep one IAM role in <code class="inline">gol-prod</code>
+        with an access entry for cluster admin, assumable only from <code class="inline">gol-security</code> with MFA, and
+        send its CloudTrail <code class="inline">AssumeRole</code> events to a high-priority alert
+        (<a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>). Rehearse using it once a year.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Endpoint access: who can reach the API at all</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The Kubernetes API is the most powerful endpoint in the account. Authentication protects it, but there is no
+        reason to expose it to the internet as well. Three settings are possible. We choose based on who has to call the
+        API from outside the VPC, and in prod the answer is nobody, because Argo CD runs <em>inside</em> the cluster and
+        pulls from Git.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Mode</th><th class="px-4 py-3">Reachable from</th><th class="px-4 py-3">Use for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Public only (default)</td><td class="px-4 py-3">The internet; node traffic leaves the VPC too</td><td class="px-4 py-3">Never: it is the module's old default, which you will find on inherited clusters</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Public + private, CIDR allowlist</td><td class="px-4 py-3">Listed IPs, plus everything inside the VPC</td><td class="px-4 py-3">dev and staging: office and Client VPN egress IPs only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Private only</td><td class="px-4 py-3">Inside the VPC and connected networks</td><td class="px-4 py-3">prod: engineers come in through Client VPN (<a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">aws sso login --profile gol-prod-platform
+aws eks update-kubeconfig --name clinic-prod-eks --region ap-southeast-1 \
+  --alias clinic-prod --profile gol-prod-platform
+<span class="out">Added new context clinic-prod to /Users/vu/.kube/config</span>
+kubectl --context clinic-prod auth whoami
+<span class="out">ATTRIBUTE   VALUE
+Username    arn:aws:sts::444455556666:assumed-role/AWSReservedSSO_PlatformAdmin_3f9c1a2b4d5e6f70/vu.tran
+Groups      [system:authenticated]</span>
+kubectl --context clinic-prod get ns booking   <span class="cm"># off the VPN: "dial tcp 10.20.3x.x:443: i/o timeout"</span>
+<span class="out">NAME      STATUS   AGE
+booking   Active   212d</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> name every context after its cluster and
+        environment (<code class="inline">--alias clinic-prod</code>, not the default ARN), and give prod a read-only
+        default. Keep a separate profile for the PlatformAdmin role that you sign in to only for planned changes.
+        Combined with a shell prompt that shows the context (KS1), this prevents most "I ran it against prod" incidents.</div>
+
+      <h3 class="font-semibold text-lg mt-8">The bootstrap baseline: Terraform stops where GitOps starts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Draw a hard line. Terraform creates what must exist before the cluster can manage itself: the cluster, the system
+        node group, core add-ons, access entries, and the IAM roles and Pod Identity associations for controllers.
+        Terraform also installs exactly one Helm release, Argo CD, and one root Application. From then on, Argo CD
+        installs everything else from <code class="inline">clinic-gitops</code>
+        (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>). Helm releases managed by Terraform
+        drift, time out during applies, and couple app upgrades to infrastructure plans.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant T as terraform apply<br/>(gha-clinic-infra-apply)
+    participant E as EKS API
+    participant K as clinic-prod-eks
+    participant A as Argo CD
+    participant G as clinic-gitops
+    T->>E: cluster, access entries, Pod Identity roles
+    T->>E: add-ons vpc-cni + pod-identity-agent (before compute)
+    T->>E: system node group, then coredns, kube-proxy, ebs-csi
+    T->>K: helm_release argocd + root Application
+    A->>G: sync platform/ (app-of-apps)
+    A->>K: Karpenter, LB controller, ExternalDNS, External Secrets,<br/>gp3 StorageClass, Gateway, monitoring, policies
+    A->>K: apps/booking (once the platform is Healthy)
+        </pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Component</th><th class="px-4 py-3">Lives in</th><th class="px-4 py-3">Why there</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Cluster, node group, add-ons, access entries</td><td class="px-4 py-3">Terraform (<code class="inline">clinic-infra</code>)</td><td class="px-4 py-3">AWS resources, needed before anything else can run</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">IAM roles + Pod Identity associations for controllers, <code class="inline">KarpenterNode-clinic-prod-eks</code>, interruption queue</td><td class="px-4 py-3">Terraform</td><td class="px-4 py-3">IAM belongs with the infrastructure and its review</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Argo CD + root Application</td><td class="px-4 py-3">Terraform, once</td><td class="px-4 py-3">Something has to install the installer</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Karpenter, LB controller, ExternalDNS, ESO, monitoring</td><td class="px-4 py-3">GitOps (<code class="inline">clinic-gitops/platform</code>)</td><td class="px-4 py-3">Upgraded often; Argo CD shows drift and health</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Namespaces, quotas, NetworkPolicies, StorageClasses</td><td class="px-4 py-3">GitOps</td><td class="px-4 py-3">Kubernetes objects, reviewed like app manifests (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>, <a href="./ks3.html" class="text-viol underline decoration-viol/40">KS3</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># the cluster is "done" when this is all green, about 15 min after terraform apply finishes</span>
+kubectl --context clinic-prod -n argocd get applications
+<span class="out">NAME                 SYNC STATUS   HEALTH STATUS
+root                 Synced        Healthy
+karpenter            Synced        Healthy
+aws-lb-controller    Synced        Healthy
+external-dns         Synced        Healthy
+external-secrets     Synced        Healthy
+platform-baseline    Synced        Healthy
+booking              Synced        Healthy</span></pre>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Cluster Terraform is where agents are most confidently out of date. The EKS module renamed most inputs in v21,
+        <code class="inline">aws-auth</code> examples are everywhere online, and AL2 AMI types still appear in many
+        answers. Give the agent the version baseline, and let it plan with read-only credentials only.
+      </p>
+      <pre class="code mt-3">Using terraform-aws-modules/eks ~&gt; 21.0 and AWS provider ~&gt; 6.0, write clinic-infra/envs/
+staging/eks for clinic-staging-eks (1.33): private endpoint + public with CIDR allowlist,
+authentication_mode API, no cluster creator admin, AL2023 arm64 system node group with
+CriticalAddonsOnly taint, pinned add-ons. Read VPC IDs from SSM. Do not use aws-auth.</pre>
+      <pre class="code mt-3">Here is `terraform plan` output for clinic-prod-eks. List every resource that is replaced
+or destroyed, every IAM policy change, every security group rule opened to 0.0.0.0/0, and
+every access entry added or removed. Then say whether this plan is safe to apply.</pre>
+      <pre class="code mt-3">For each EKS add-on in addons.tf, run `aws eks describe-addon-versions` for Kubernetes 1.33
+(read-only profile gol-prod-readonly) and report current vs latest compatible version and
+whether the default version differs. Change nothing.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Scaffold a new environment's cluster from the prod root, with the differences listed</li>
+            <li>Summarise a large plan into replacements, IAM changes and network exposure</li>
+            <li>Look up compatible add-on versions and draft the bump PR</li>
+            <li>Translate an inherited <code class="inline">aws-auth</code> ConfigMap into access entries</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>No plan replaces <code class="inline">aws_eks_cluster</code> or changes the Service CIDR</li>
+            <li>Input names match module v21 (<code class="inline">name</code>, <code class="inline">kubernetes_version</code>, <code class="inline">addons</code>)</li>
+            <li><code class="inline">endpoint_public_access</code> is false in prod, or has a tight CIDR list elsewhere</li>
+            <li>Cluster-admin is granted to an SSO role, never to a CI role or an IAM user</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written EKS Terraform:</strong> v20 input names
+        (<code class="inline">cluster_name</code>, <code class="inline">cluster_version</code>, <code class="inline">cluster_addons</code>)
+        with a <code class="inline">~&gt; 21.0</code> pin; <code class="inline">manage_aws_auth_configmap</code> or a
+        <code class="inline">kubernetes_config_map</code> named <code class="inline">aws-auth</code>;
+        <code class="inline">ami_type = "AL2_x86_64"</code>; <code class="inline">endpoint_public_access_cidrs = ["0.0.0.0/0"]</code>;
+        <code class="inline">enable_cluster_creator_admin_permissions = true</code> in prod; add-ons with
+        <code class="inline">most_recent = true</code>; dozens of <code class="inline">helm_release</code> resources for
+        platform components; and <code class="inline">terraform_remote_state</code> instead of SSM parameters for VPC IDs.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has used an EKS cluster through a kubeconfig someone else provided, and has never seen how it was built.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows EKS manages the control plane and that node groups exist, but cannot say what AWS patches and what we patch.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Creates a dev cluster from the module with an example, and gets kubeconfig working. Still relies on cluster-creator admin and default add-on versions.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Writes a cluster root with module v21: private endpoint, access entries for SSO roles, a tainted system node group, pinned add-ons in the right order. Reads the plan for replacements, and hands the cluster to Argo CD with a clean Terraform/GitOps boundary.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Chooses Auto Mode or Karpenter per client and defends the choice in an ADR, owns the cluster blueprint for every new client, and can recreate a cluster from code against a timed target.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> on a whiteboard, draw where the
+        API servers, etcd, EKS ENIs and nodes live, and explain how <code class="inline">kubectl exec</code> reaches a
+        Pod. Name the two inputs that force a cluster replacement. Then destroy your sandbox cluster and recreate it from
+        code, with access working for your SSO role and Argo CD green, in under an hour.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Cluster admin tied to the creator</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">If <code class="inline">enable_cluster_creator_admin_permissions</code> is the only admin path, the cluster belongs to whichever CI role or person ran the first apply. Grant admin to an SSO role in code, and turn the creator path off.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Unpinned add-ons</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">most_recent = true</code> turns an unrelated Terraform apply into a CoreDNS or VPC CNI upgrade. Pin versions and bump them in their own PRs, tested in staging first.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Everything in Terraform</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Thirty <code class="inline">helm_release</code> resources make every infra plan slow and fragile, and app-level upgrades block on infra reviews. Install Argo CD, then let Git do the rest.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Rebuild a cluster on purpose</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Once a quarter, destroy and recreate the sandbox or dev cluster from code and time it. Anything that needed a manual step is a gap to fix before the day you need it in prod.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Separate states for network and cluster</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A cluster state that cannot touch the VPC is a smaller blast radius, and it lets you build a second cluster next to the first for a blue/green upgrade (KS11).</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="architecture"> <span>I can draw the EKS control plane, the cross-account ENIs and the nodes, and explain who patches each layer for each compute option.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="compute"> <span>I can argue managed node groups + Karpenter versus Auto Mode versus Fargate for a given client, including cost.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="terraform"> <span>I wrote a cluster root with <code class="inline">terraform-aws-modules/eks</code> v21, pinned add-ons and a tainted system node group, and read its plan for replacements.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="access"> <span>I granted cluster access through access entries for SSO roles, reached a private endpoint through the VPN, and verified identity with <code class="inline">kubectl auth whoami</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cluster-pr"> <span class="font-semibold">In the gol-sandbox account, opened a PR with a full cluster root (separate network and cluster states, access entries, pinned add-ons, Argo CD bootstrap), applied it, destroyed it, and recreated it from code, then shared the plan summary, the timed rebuild and a screenshot of all Argo CD applications Healthy (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/what-is-eks.html" target="_blank" rel="noopener">AWS — What is Amazon EKS?</a> — architecture, versions and the support calendar.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/automode.html" target="_blank" rel="noopener">AWS — EKS Auto Mode</a> — what it manages, built-in node pools and pricing.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest" target="_blank" rel="noopener">Terraform Registry — terraform-aws-modules/eks</a> — inputs, examples and the v21 upgrade guide.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/access-entries.html" target="_blank" rel="noopener">AWS — Grant IAM users access to Kubernetes with access entries</a> — access entries and access policies.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html" target="_blank" rel="noopener">AWS — Amazon EKS add-ons</a> · <a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/cluster-endpoint.html" target="_blank" rel="noopener">Cluster API endpoint access</a> — add-on management and the endpoint modes.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/best-practices/introduction.html" target="_blank" rel="noopener">AWS — EKS Best Practices Guide</a> — cluster design, security and reliability guidance.</li>
+      </ul>

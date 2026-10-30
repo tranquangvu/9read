@@ -1,0 +1,776 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Linux for Operators</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Almost everything you will run in this track runs on Linux. That includes the EC2 instances, the Fargate tasks,
+          the EKS nodes, the GitHub Actions runners and the containers themselves. This module teaches Linux the way an
+          operator uses it: where files live, who is allowed to touch them, how programs run as processes and services,
+          how to read CPU, memory, disk and sockets, and how to get onto a box safely and work out what is wrong with it.
+          The examples use a staging EC2 instance running <code class="inline">booking-api</code> as a systemd service on
+          Amazon Linux 2023, which is how many client systems still run before they move to containers.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> containers and managed services hide Linux until something goes
+          wrong, and then Linux is the only thing you can see. A full disk stops Postgres from writing. A file owned by
+          <code class="inline">root</code> makes a service fail at start. A process ignores SIGTERM and every deploy waits
+          30 seconds before it is killed. The OOM killer quietly removes your worker at 03:00. Each of these is a
+          five-minute diagnosis with the commands in this module, and a long night without them.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Files, users &amp; permissions</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Everything is a file, and every file has an owner</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Linux is an <strong>operating system</strong>: the software that shares a machine's CPU, memory, disk and network
+        between programs. The <strong>kernel</strong> is its core, and everything else (the shell, systemd, your app) is a
+        program asking the kernel for things. You talk to the machine through a <strong>shell</strong> (usually
+        <code class="inline">bash</code>), a program that reads the commands you type. Two ideas carry most of the weight:
+        configuration, logs, devices and even running processes appear as <em>files</em>, and every file belongs to a
+        <em>user</em> and a <em>group</em> that decide who may read or change it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The filesystem hierarchy: where things live</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A Linux filesystem is one tree that starts at <code class="inline">/</code> (called "root", not to be confused with
+        the root <em>user</em>). Disks are attached, or <strong>mounted</strong>, somewhere in that tree. The layout follows
+        a standard (the Filesystem Hierarchy Standard), so the same directories mean the same thing on Amazon Linux,
+        Ubuntu or inside a container. Learn the eight in this diagram and you can find almost anything.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 250" class="w-full min-w-[640px]" role="img" aria-label="Linux filesystem tree: root with etc, var, opt, home, usr, tmp, proc and dev">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ONE TREE · every disk is mounted somewhere under /</text>
+          <g class="anim-pulse"><rect x="300" y="36" width="120" height="40" rx="9" fill="#37474F"/>
+            <text x="360" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/</text>
+            <text x="360" y="68" text-anchor="middle" fill="#ffffffbb" font-size="9">the root of the tree</text></g>
+          <g class="anim-pulse d1"><rect x="10" y="130" width="80" height="46" rx="9" fill="#2563EB"/>
+            <text x="50" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/etc</text>
+            <text x="50" y="164" text-anchor="middle" fill="#ffffffbb" font-size="9">configuration</text></g>
+          <g class="anim-pulse d2"><rect x="98" y="130" width="80" height="46" rx="9" fill="#D97757"/>
+            <text x="138" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/var</text>
+            <text x="138" y="164" text-anchor="middle" fill="#ffffffbb" font-size="9">logs, data, spool</text></g>
+          <g class="anim-pulse d3"><rect x="186" y="130" width="80" height="46" rx="9" fill="#0D9488"/>
+            <text x="226" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/opt</text>
+            <text x="226" y="164" text-anchor="middle" fill="#ffffffbb" font-size="9">our apps</text></g>
+          <g class="anim-pulse d4"><rect x="274" y="130" width="80" height="46" rx="9" fill="#6d5acd"/>
+            <text x="314" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/home</text>
+            <text x="314" y="164" text-anchor="middle" fill="#ffffffbb" font-size="9">users' files</text></g>
+          <g class="anim-pulse d1"><rect x="362" y="130" width="80" height="46" rx="9" fill="#37474F"/>
+            <text x="402" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/usr</text>
+            <text x="402" y="164" text-anchor="middle" fill="#ffffffbb" font-size="9">installed software</text></g>
+          <g class="anim-pulse d2"><rect x="450" y="130" width="80" height="46" rx="9" fill="#DB2777"/>
+            <text x="490" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/tmp</text>
+            <text x="490" y="164" text-anchor="middle" fill="#ffffffbb" font-size="9">scratch, wiped</text></g>
+          <g class="anim-pulse d3"><rect x="538" y="130" width="80" height="46" rx="9" fill="#2563EB"/>
+            <text x="578" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/proc</text>
+            <text x="578" y="164" text-anchor="middle" fill="#ffffffbb" font-size="9">live kernel view</text></g>
+          <g class="anim-pulse d4"><rect x="626" y="130" width="80" height="46" rx="9" fill="#6d5acd"/>
+            <text x="666" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/dev</text>
+            <text x="666" y="164" text-anchor="middle" fill="#ffffffbb" font-size="9">disks, devices</text></g>
+          <line x1="360" y1="76" x2="50" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="76" x2="138" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="76" x2="226" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="76" x2="314" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="76" x2="402" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="76" x2="490" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="76" x2="578" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="76" x2="666" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="138" y="200" text-anchor="middle" font-size="9" fill="#6E6B64">/var/log/… fills disks</text>
+          <text x="226" y="200" text-anchor="middle" font-size="9" fill="#6E6B64">/opt/booking-api</text>
+          <text x="578" y="200" text-anchor="middle" font-size="9" fill="#6E6B64">not on disk at all</text>
+          <text x="360" y="235" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">when a disk is full, the answer is almost always under /var</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Path</th><th class="px-4 py-3">What you find there</th><th class="px-4 py-3">Operator rule</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">/etc</td><td class="px-4 py-3">Config: <code class="inline">/etc/ssh/sshd_config</code>, <code class="inline">/etc/systemd/system/</code>, <code class="inline">/etc/booking-api/env</code></td><td class="px-4 py-3">Small text files. Back up before editing; manage with code (<a href="./ia3.html" class="text-viol underline decoration-viol/40">IA3</a>) rather than by hand</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/var</td><td class="px-4 py-3">Data that grows: <code class="inline">/var/log</code>, <code class="inline">/var/lib/docker</code>, <code class="inline">/var/lib/pgsql</code></td><td class="px-4 py-3">First place to look when a disk fills. Often worth its own EBS volume</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/opt</td><td class="px-4 py-3">Third-party and our own apps: <code class="inline">/opt/booking-api/</code></td><td class="px-4 py-3">One directory per app, owned by the app's user, not root</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/usr</td><td class="px-4 py-3">Software installed by the package manager: <code class="inline">/usr/bin</code>, <code class="inline">/usr/lib</code></td><td class="px-4 py-3">Never edit by hand; the next package update overwrites it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/home, /root</td><td class="px-4 py-3">Personal files, including <code class="inline">~/.ssh/authorized_keys</code></td><td class="px-4 py-3">Nothing an app needs to run should live here</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/tmp</td><td class="px-4 py-3">Scratch files, often cleared at reboot</td><td class="px-4 py-3">Assume it disappears. Anyone can write here, so never trust its contents</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/proc, /sys</td><td class="px-4 py-3">Virtual files the kernel generates: <code class="inline">/proc/meminfo</code>, <code class="inline">/proc/&lt;pid&gt;/</code></td><td class="px-4 py-3">Read-only truth about the running system. Every tool in Part III reads these</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/dev</td><td class="px-4 py-3">Devices: <code class="inline">/dev/nvme0n1</code> (an EBS disk), <code class="inline">/dev/null</code></td><td class="px-4 py-3">You touch it mainly when attaching and formatting volumes (<a href="./aw4.html" class="text-viol underline decoration-viol/40">AW4</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Five commands get you around the tree. Run them on any box you inherit, in this order, before you change anything:
+      </p>
+      <pre class="code mt-3">pwd                              <span class="cm"># where am I?</span>
+<span class="out">/home/ec2-user</span>
+cat /etc/os-release | head -2     <span class="cm"># which distribution? decides dnf vs apt, paths, defaults</span>
+<span class="out">NAME="Amazon Linux"
+VERSION="2023"</span>
+ls -la /opt/booking-api           <span class="cm"># -l long format, -a include hidden dot-files</span>
+<span class="out">drwxr-x---. 4 booking booking   60 Oct 28 09:12 .
+drwxr-xr-x. 3 root    root      25 Oct 28 09:10 ..
+drwxr-xr-x. 2 booking booking   26 Oct 28 09:12 bin
+drwxr-x---. 2 booking booking   17 Oct 28 09:12 config</span>
+find /etc -name '*.service' -newer /etc/hostname   <span class="cm"># config changed since the box was built</span>
+cd -                              <span class="cm"># jump back to the previous directory</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Users, groups and the root problem</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every process runs <em>as</em> a user, identified by a number (UID). <strong>root</strong> is UID 0 and can do
+        anything: read every file, kill every process, delete the operating system. A <strong>group</strong> is a named set
+        of users that can share access. The rule we enforce on every client system: <strong>humans log in as themselves,
+        services run as their own unprivileged user, and nobody runs anything as root by default.</strong> If
+        <code class="inline">booking-api</code> runs as root and has a file-upload bug, the attacker owns the whole machine.
+        If it runs as <code class="inline">booking</code>, they own one directory.
+      </p>
+      <pre class="code mt-3">id                                         <span class="cm"># who am I, and which groups am I in?</span>
+<span class="out">uid=1000(ec2-user) gid=1000(ec2-user) groups=1000(ec2-user),4(adm),10(wheel)</span>
+<span class="cm"># create a system user for the service: no home login, no shell</span>
+sudo useradd --system --no-create-home --shell /sbin/nologin booking
+getent passwd booking                      <span class="cm"># name:x:UID:GID:comment:home:shell</span>
+<span class="out">booking:x:992:990::/home/booking:/sbin/nologin</span>
+sudo usermod -aG adm vu.tran               <span class="cm"># -a APPEND; without -a you wipe their other groups</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>sudo</strong> ("superuser do") lets an allowed user run one command as root, and logs that it happened. It
+        is configured in <code class="inline">/etc/sudoers</code> and drop-in files under
+        <code class="inline">/etc/sudoers.d/</code>. Give the narrowest rule that does the job, and always edit with
+        <code class="inline">visudo</code>, which refuses to save a file with a syntax error. A broken sudoers file can lock
+        every admin out of the box.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">/etc/sudoers.d/booking-ops — edit with: sudo visudo -f /etc/sudoers.d/booking-ops</span>
+        <pre class="code"><span class="cm"># members of group booking-ops may restart and inspect ONE service, nothing else</span>
+%booking-ops ALL=(root) NOPASSWD: /usr/bin/systemctl restart booking-api, \
+                                  /usr/bin/systemctl status booking-api, \
+                                  /usr/bin/journalctl -u booking-api *
+<span class="cm"># NEVER: %booking-ops ALL=(ALL) NOPASSWD: ALL   ← that is just root with extra steps</span></pre>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>On AWS you rarely manage human users on boxes at all.</strong> We log
+        in through SSM Session Manager with IAM identity (<a href="./aw3.html" class="text-viol underline decoration-viol/40">AW3</a>,
+        <a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a>), so access is granted and revoked in one
+        place and every session is recorded. Local users still matter for <em>services</em>, and for understanding what
+        <code class="inline">ec2-user</code> and <code class="inline">ssm-user</code> can do.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Permissions: read, write, execute, for three audiences</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each file has an owner user, an owner group, and nine permission bits: read (<code class="inline">r</code>), write
+        (<code class="inline">w</code>) and execute (<code class="inline">x</code>) for the <strong>u</strong>ser who owns
+        it, the <strong>g</strong>roup, and <strong>o</strong>thers (everyone else). On a directory, <code class="inline">x</code>
+        means "may enter", and <code class="inline">w</code> means "may create and delete files inside". The octal form adds
+        r=4, w=2, x=1 per audience, so <code class="inline">640</code> means owner read+write, group read, others nothing.
+      </p>
+      <pre class="code mt-3">ls -l /opt/booking-api/config/env
+<span class="out">-rw-r-----. 1 booking booking 412 Oct 28 09:12 /opt/booking-api/config/env</span>
+<span class="cm">#  │└┬┘└┬┘└┬┘   owner   group</span>
+<span class="cm">#  │ u  g  o    type: - file, d directory, l symlink</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Mode</th><th class="px-4 py-3">Symbolic</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">600</td><td class="px-4 py-3"><code class="inline">rw-------</code></td><td class="px-4 py-3">Private keys, <code class="inline">~/.ssh/authorized_keys</code>, files with secrets</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">640</td><td class="px-4 py-3"><code class="inline">rw-r-----</code></td><td class="px-4 py-3">App config the service group must read: <code class="inline">/opt/booking-api/config/env</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">644</td><td class="px-4 py-3"><code class="inline">rw-r--r--</code></td><td class="px-4 py-3">Ordinary non-secret files, unit files in <code class="inline">/etc/systemd/system</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">700</td><td class="px-4 py-3"><code class="inline">rwx------</code></td><td class="px-4 py-3"><code class="inline">~/.ssh</code> directory, private scripts</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">755</td><td class="px-4 py-3"><code class="inline">rwxr-xr-x</code></td><td class="px-4 py-3">Program binaries and public directories</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">777</td><td class="px-4 py-3"><code class="inline">rwxrwxrwx</code></td><td class="px-4 py-3">Never. It is the "fix" that turns a permissions error into a security hole</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">sudo chown -R booking:booking /opt/booking-api   <span class="cm"># owner:group, -R recursive</span>
+sudo chmod 640 /opt/booking-api/config/env
+sudo -u booking cat /opt/booking-api/config/env &gt;/dev/null &amp;&amp; echo ok   <span class="cm"># test AS the service user</span>
+<span class="out">ok</span>
+namei -l /opt/booking-api/config/env             <span class="cm"># permissions of every directory on the path</span>
+<span class="out">f: /opt/booking-api/config/env
+dr-xr-xr-x root    root    /
+drwxr-xr-x root    root    opt
+drwxr-x--- booking booking booking-api
+drwxr-x--- booking booking config
+-rw-r----- booking booking env</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>"Permission denied" is usually a directory, not the file.</strong> To
+        open <code class="inline">/opt/booking-api/config/env</code>, the user needs <code class="inline">x</code> on
+        <em>every</em> directory in the path. <code class="inline">namei -l</code> shows the one that blocks. Testing with
+        <code class="inline">sudo -u booking</code> proves it from the service's point of view; testing as yourself or as
+        root proves nothing.</div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Processes &amp; services</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Programs run as processes; systemd keeps the ones you care about alive</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A <strong>process</strong> is a running program: code plus memory, open files and a user identity, tracked by the
+        kernel under a number called a <strong>PID</strong>. A <strong>service</strong> (or daemon) is a process meant to
+        run for ever in the background, like <code class="inline">sshd</code> or <code class="inline">booking-api</code>.
+        On every modern distribution, <strong>systemd</strong> is PID 1: the first process the kernel starts, and the
+        parent that starts, watches, restarts and logs every service. You will meet the same ideas again in containers
+        (<a href="./fn6.html" class="text-viol underline decoration-viol/40">FN6</a>) and in Kubernetes, where the kubelet
+        plays systemd's role.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Processes, PIDs and signals</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every process has a parent (PPID) and a state. You control processes by sending <strong>signals</strong>: small
+        numbered messages the kernel delivers. A well-behaved service catches <code class="inline">SIGTERM</code>, stops
+        accepting work, finishes in-flight requests and exits. <code class="inline">SIGKILL</code> cannot be caught: the
+        kernel removes the process immediately, with no cleanup. Every orchestrator you will use (systemd, ECS, Kubernetes)
+        follows the same sequence: SIGTERM, wait a grace period, then SIGKILL.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 200" class="w-full min-w-[640px]" role="img" aria-label="Graceful shutdown: SIGTERM, drain during the grace period, exit or SIGKILL">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">GRACEFUL STOP · systemd, ECS and Kubernetes all do this</text>
+          <g class="anim-pulse"><rect x="15" y="60" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="80" y="81" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Running</text>
+            <text x="80" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">serving requests</text></g>
+          <g class="anim-pulse d1"><rect x="195" y="60" width="130" height="50" rx="9" fill="#D97757"/>
+            <text x="260" y="81" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SIGTERM (15)</text>
+            <text x="260" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">"please stop"</text></g>
+          <g class="anim-pulse d2"><rect x="375" y="60" width="140" height="50" rx="9" fill="#0D9488"/>
+            <text x="445" y="81" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Draining</text>
+            <text x="445" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">finish in-flight work</text></g>
+          <g class="anim-pulse d3"><rect x="570" y="30" width="135" height="46" rx="9" fill="#0D9488"/>
+            <text x="637" y="50" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">exit 0</text>
+            <text x="637" y="64" text-anchor="middle" fill="#ffffffbb" font-size="9">clean, within grace</text></g>
+          <g class="anim-pulse d4"><rect x="570" y="100" width="135" height="46" rx="9" fill="#DB2777"/>
+            <text x="637" y="120" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SIGKILL (9)</text>
+            <text x="637" y="134" text-anchor="middle" fill="#ffffffbb" font-size="9">grace expired, no cleanup</text></g>
+          <line x1="145" y1="85" x2="195" y2="85" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="325" y1="85" x2="375" y2="85" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="515" y1="78" x2="570" y2="55" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="515" y1="92" x2="570" y2="122" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="445" y="135" text-anchor="middle" font-size="9" fill="#6E6B64">systemd 90 s · ECS 30 s · K8s 30 s default</text>
+          <text x="360" y="182" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">an app that ignores SIGTERM drops requests on every deploy</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Signal</th><th class="px-4 py-3">Number</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">When you send it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">SIGTERM</td><td class="px-4 py-3">15</td><td class="px-4 py-3">Ask the process to shut down cleanly. Default for <code class="inline">kill</code></td><td class="px-4 py-3">Always first</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SIGINT</td><td class="px-4 py-3">2</td><td class="px-4 py-3">Interrupt, what Ctrl+C sends</td><td class="px-4 py-3">Stopping something in your terminal</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SIGHUP</td><td class="px-4 py-3">1</td><td class="px-4 py-3">Many daemons (nginx, sshd) reload config on it</td><td class="px-4 py-3">Reload without a restart, if the app documents it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SIGKILL</td><td class="px-4 py-3">9</td><td class="px-4 py-3">Kernel kills it instantly. Cannot be caught or ignored</td><td class="px-4 py-3">Last resort after SIGTERM failed. Expect lost work</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">(OOM kill)</td><td class="px-4 py-3">9</td><td class="px-4 py-3">The kernel's out-of-memory killer sends SIGKILL itself</td><td class="px-4 py-3">You don't; you find out from <code class="inline">dmesg</code> (Part III)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">ps -eo pid,ppid,user,stat,%cpu,%mem,etime,cmd --sort=-%cpu | head -5
+<span class="out">    PID    PPID USER     STAT %CPU %MEM     ELAPSED CMD
+   2841       1 booking  Ssl  38.2 12.4    02:11:47 /opt/booking-api/bin/booking-api
+   1203       1 root     Ss    0.3  0.4  3-04:10:22 /usr/sbin/sshd -D
+    917       1 root     Ssl   0.2  1.1  3-04:10:25 /usr/bin/amazon-ssm-agent</span>
+pgrep -a booking-api          <span class="cm"># find PIDs by name</span>
+<span class="out">2841 /opt/booking-api/bin/booking-api</span>
+kill 2841                     <span class="cm"># SIGTERM. wait, then check: pgrep booking-api</span>
+kill -9 2841                  <span class="cm"># only if it is still there after the grace period</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">STAT</code> column is worth reading: <code class="inline">S</code> sleeping (normal for an
+        idle server), <code class="inline">R</code> running, <code class="inline">D</code> uninterruptible wait, usually on
+        disk or network storage, and <code class="inline">Z</code> zombie, a dead child whose parent never collected it. A
+        few <code class="inline">D</code> processes that never go away point at a stuck disk or NFS/EFS mount, and
+        <code class="inline">kill -9</code> will not remove them.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">systemd units: a service in twelve lines</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        systemd manages <strong>units</strong>, described in small INI-style text files. A <code class="inline">.service</code>
+        unit says what to run, as which user, what it depends on and what to do when it dies. Your own units go in
+        <code class="inline">/etc/systemd/system/</code>; the package manager's go in <code class="inline">/usr/lib/systemd/system/</code>
+        and should not be edited. This is the unit that runs <code class="inline">booking-api</code> on our staging box:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">/etc/systemd/system/booking-api.service</span>
+        <pre class="code">[Unit]
+Description=Clinic booking API
+After=network-online.target                 <span class="cm"># start once the network is actually up</span>
+Wants=network-online.target
+
+[Service]
+User=booking                                <span class="cm"># never run the app as root</span>
+Group=booking
+EnvironmentFile=/opt/booking-api/config/env <span class="cm"># DATABASE_URL, REDIS_URL… (mode 640)</span>
+ExecStart=/opt/booking-api/bin/booking-api --port 8080
+Restart=on-failure                          <span class="cm"># restart on crash, not on a clean stop</span>
+RestartSec=5
+TimeoutStopSec=30                           <span class="cm"># SIGTERM, wait 30 s, then SIGKILL</span>
+LimitNOFILE=65536                           <span class="cm"># max open files/sockets (default 1024 is too low)</span>
+NoNewPrivileges=yes                         <span class="cm"># cheap hardening: no setuid escalation</span>
+ProtectSystem=strict                        <span class="cm"># /usr, /etc read-only for this service</span>
+ReadWritePaths=/var/lib/booking-api
+
+[Install]
+WantedBy=multi-user.target                  <span class="cm"># start at boot</span></pre>
+      </div>
+      <pre class="code mt-3">sudo systemctl daemon-reload                 <span class="cm"># re-read unit files after ANY edit</span>
+sudo systemctl enable --now booking-api      <span class="cm"># start now AND at every boot</span>
+systemctl status booking-api
+<span class="out">● booking-api.service - Clinic booking API
+     Loaded: loaded (/etc/systemd/system/booking-api.service; enabled; preset: disabled)
+     Active: active (running) since Wed 2026-10-28 09:14:02 UTC; 2h 11min ago
+   Main PID: 2841 (booking-api)
+      Tasks: 14 (limit: 4568)
+     Memory: 241.3M
+        CPU: 49min 12.031s</span>
+systemctl --failed                           <span class="cm"># every unit that is currently broken</span>
+<span class="out">  UNIT              LOAD   ACTIVE SUB    DESCRIPTION
+● booking-worker.service loaded failed failed Clinic booking worker</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read <code class="inline">status</code> top to bottom: <em>Loaded</em> tells you which file systemd actually used
+        and whether it starts at boot (<code class="inline">enabled</code>); <em>Active</em> tells you the state and since
+        when. A service that shows <code class="inline">activating (auto-restart)</code> and a Main PID that changes every
+        few seconds is crash-looping: the systemd version of Kubernetes' CrashLoopBackOff.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> inactive
+    inactive --> activating: systemctl start
+    activating --> active: ExecStart running
+    active --> deactivating: systemctl stop (SIGTERM)
+    deactivating --> inactive: exited within TimeoutStopSec
+    active --> failed: crashed (non-zero exit / signal)
+    failed --> activating: Restart=on-failure<br/>after RestartSec=5
+    failed --> failed: start limit hit<br/>(5 restarts in 10 s by default)
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The last arrow is the one that surprises people: after five failed starts within ten seconds, systemd gives up and
+        leaves the unit <code class="inline">failed</code> until someone runs <code class="inline">systemctl reset-failed</code>.
+        With <code class="inline">RestartSec=5</code> you stay under that limit, so a crash-looping service keeps retrying
+        every five seconds and keeps writing the error to the journal, which is what you want while you investigate.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">journald: one log stream for every service</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Anything a service writes to stdout or stderr is captured by <strong>journald</strong>, systemd's logging
+        component, and tagged with the unit name, PID and timestamp. You query it with <code class="inline">journalctl</code>.
+        Four flags cover nearly every investigation. On a real fleet, the CloudWatch agent or Fluent Bit ships these logs
+        off the box (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>), because logs that live
+        only on an instance die with it.
+      </p>
+      <pre class="code mt-3">journalctl -u booking-api --since "30 min ago"          <span class="cm"># -u one unit, --since a window</span>
+journalctl -u booking-api -p err -n 20 --no-pager       <span class="cm"># -p priority err and worse, last 20</span>
+<span class="out">Oct 28 11:02:41 ip-10-15-34-17 booking-api[2841]: ERROR pg: connection refused 10.15.52.8:5432
+Oct 28 11:02:46 ip-10-15-34-17 booking-api[2841]: ERROR pg: connection refused 10.15.52.8:5432</span>
+journalctl -u booking-worker -b -o cat | tail          <span class="cm"># -b this boot only, -o cat message text only</span>
+journalctl -f -u booking-api                           <span class="cm"># follow live, like tail -f</span>
+journalctl --disk-usage
+<span class="out">Archived and active journals take up 1.2G in the file system.</span></pre>
+      <div class="mt-4">
+        <span class="code-label">/etc/systemd/journald.conf.d/size.conf — cap the journal so it can't fill the disk</span>
+        <pre class="code">[Journal]
+SystemMaxUse=500M          <span class="cm"># total cap on disk</span>
+MaxRetentionSec=14day      <span class="cm"># older entries removed; CloudWatch keeps the long history</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Package management: installing software the repeatable way</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>package manager</strong> installs software from signed repositories, tracks every file it put on disk, and
+        resolves dependencies. Never install by downloading random binaries or running a <code class="inline">curl | bash</code>
+        script on a server. Our default AMI is <strong>Amazon Linux 2023</strong>, which uses <code class="inline">dnf</code>;
+        Ubuntu and Debian (common in CI runners and container base images) use <code class="inline">apt</code>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Task</th><th class="px-4 py-3">Amazon Linux 2023 (dnf)</th><th class="px-4 py-3">Ubuntu / Debian (apt)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Refresh index</td><td class="px-4 py-3"><code class="inline">dnf makecache</code></td><td class="px-4 py-3"><code class="inline">apt-get update</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Install</td><td class="px-4 py-3"><code class="inline">dnf install -y sysstat</code></td><td class="px-4 py-3"><code class="inline">apt-get install -y sysstat</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Which package owns a file?</td><td class="px-4 py-3"><code class="inline">rpm -qf /usr/bin/iostat</code></td><td class="px-4 py-3"><code class="inline">dpkg -S /usr/bin/iostat</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Security updates</td><td class="px-4 py-3"><code class="inline">dnf upgrade --security</code></td><td class="px-4 py-3"><code class="inline">unattended-upgrades</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Pinning versions</td><td class="px-4 py-3">AL2023 pins a dated repo release; move with <code class="inline">dnf upgrade --releasever=…</code></td><td class="px-4 py-3"><code class="inline">apt-mark hold</code> or <code class="inline">pkg=1.2.3</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">sudo dnf install -y sysstat lsof tmux      <span class="cm"># the tools Part III assumes</span>
+<span class="out">Installed:
+  lsof-4.94.0-1.amzn2023.0.2.x86_64   sysstat-12.5.6-1.amzn2023.0.3.x86_64   tmux-3.2a-3.amzn2023.0.2.x86_64
+Complete!</span>
+dnf check-release-update                   <span class="cm"># AL2023: is a newer dated repo release available?</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Patching a fleet is not a manual job.</strong> Running
+        <code class="inline">dnf upgrade</code> by hand on one box teaches you what happens. On real systems we bake patched
+        images and replace instances, or use SSM Patch Manager on a schedule
+        (<a href="./ia3.html" class="text-viol underline decoration-viol/40">IA3</a>). A server someone patched by hand is
+        a server nobody can rebuild identically.</div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · CPU, memory, disk &amp; sockets</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Measure the four resources before you guess</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A machine has four resources that can run out: <strong>CPU</strong> (time to run code), <strong>memory</strong>
+        (RAM), <strong>disk</strong> (space and speed) and <strong>network</strong> (connections and bandwidth). For each one
+        ask three questions, a method Brendan Gregg calls USE: how busy is it (<em>utilisation</em>), is work queueing
+        (<em>saturation</em>), and are there <em>errors</em>? The tools below answer those questions in a few seconds each.
+        They all read <code class="inline">/proc</code>, which is why they work on a VM, an EKS node or inside a container.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Resource</th><th class="px-4 py-3">Utilisation</th><th class="px-4 py-3">Saturation</th><th class="px-4 py-3">Errors</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">CPU</td><td class="px-4 py-3"><code class="inline">top</code> %us + %sy</td><td class="px-4 py-3">Load average above CPU count; <code class="inline">vmstat 1</code> column <code class="inline">r</code></td><td class="px-4 py-3">%st (steal) on burstable T-class instances out of credits</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Memory</td><td class="px-4 py-3"><code class="inline">free -h</code> "available"</td><td class="px-4 py-3">Swap in use, <code class="inline">vmstat</code> si/so non-zero</td><td class="px-4 py-3">OOM kills in <code class="inline">dmesg</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Disk</td><td class="px-4 py-3"><code class="inline">df -h</code>, <code class="inline">df -i</code>, <code class="inline">iostat -x</code> %util</td><td class="px-4 py-3"><code class="inline">iostat</code> aqu-sz, r_await/w_await</td><td class="px-4 py-3">"No space left on device", I/O errors in <code class="inline">dmesg</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Network</td><td class="px-4 py-3"><code class="inline">sar -n DEV 1</code></td><td class="px-4 py-3">Many sockets in SYN-SENT / CLOSE-WAIT (<code class="inline">ss -s</code>)</td><td class="px-4 py-3">"Too many open files", retransmits (<a href="./fn3.html" class="text-viol underline decoration-viol/40">FN3</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">CPU and load average</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <strong>load average</strong> is the average number of processes running or waiting to run (plus those stuck in
+        disk wait), over 1, 5 and 15 minutes. Compare it with the number of vCPUs: on a 2-vCPU <code class="inline">t3.medium</code>,
+        a load of 2.0 means fully busy and 6.0 means each process waits about two thirds of the time. The three numbers also
+        show the trend: <code class="inline">6.1, 3.2, 1.0</code> is getting worse right now.
+      </p>
+      <pre class="code mt-3">nproc
+<span class="out">2</span>
+uptime
+<span class="out"> 11:25:09 up 3 days,  4:11,  1 user,  load average: 6.12, 3.20, 1.04</span>
+top -b -n 1 | head -12        <span class="cm"># -b batch mode: printable snapshot, good for pasting into tickets</span>
+<span class="out">top - 11:25:10 up 3 days,  4:11,  1 user,  load average: 6.12, 3.20, 1.04
+Tasks: 118 total,   3 running, 115 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 71.4 us, 21.0 sy,  0.0 ni,  0.0 id,  1.2 wa,  0.0 hi,  0.4 si,  6.0 st
+MiB Mem :   3889.4 total,    212.6 free,   3071.9 used,    605.0 buff/cache
+MiB Swap:      0.0 total,      0.0 free,      0.0 used.    598.3 avail Mem
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   2841 booking   20   0 2214.1m   2.6g  21.4m S 182.0  68.4  51:03.21 booking-api</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read the <code class="inline">%Cpu</code> line left to right: <code class="inline">us</code> is your code,
+        <code class="inline">sy</code> the kernel working for it, <code class="inline">id</code> idle, <code class="inline">wa</code>
+        waiting on disk, <code class="inline">st</code> "stolen" by the hypervisor. Here <code class="inline">id</code> is 0
+        and one process uses 182% (almost both cores), so this box is CPU-bound and <code class="inline">booking-api</code>
+        is the cause. A high <code class="inline">wa</code> with low <code class="inline">us</code> would point at disk
+        instead. Instance families and sizing are in <a href="./aw3.html" class="text-viol underline decoration-viol/40">AW3</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Memory: "free" is the wrong column</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Linux uses spare RAM as a <strong>page cache</strong> for files, so "free" memory is always low on a healthy box and
+        that is good. The number that matters is <strong>available</strong>: memory the kernel can hand to programs right
+        now, including cache it can drop. When available reaches zero and there is no swap (our default on EC2), the kernel's
+        <strong>OOM killer</strong> picks the biggest process and sends it SIGKILL. The process does not log anything,
+        because it gets no chance to. The kernel does.
+      </p>
+      <pre class="code mt-3">free -h
+<span class="out">               total        used        free      shared  buff/cache   available
+Mem:           3.8Gi       3.0Gi       207Mi       1.0Mi       605Mi       598Mi
+Swap:             0B          0B          0B</span>
+<span class="cm"># 598Mi available of 3.8Gi: 15% headroom. Below ~10% you are one traffic spike from an OOM kill</span>
+sudo dmesg -T | grep -i -E 'out of memory|oom-kill' | tail -2
+<span class="out">[Wed Oct 28 03:02:17 2026] oom-kill:constraint=CONSTRAINT_NONE,…,task=booking-worker,pid=3120,uid=992
+[Wed Oct 28 03:02:17 2026] Out of memory: Killed process 3120 (booking-worker) total-vm:2811204kB, anon-rss:2398812kB</span>
+journalctl -k --since today | grep -i oom    <span class="cm"># same kernel messages, via the journal</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>An OOM kill looks like a silent crash.</strong> The app's own logs
+        just stop; systemd reports <code class="inline">status=9/KILL</code> and restarts it, and the cycle repeats under
+        load. Always check <code class="inline">dmesg</code> when a process dies without an error. In containers the same
+        thing appears as <code class="inline">OOMKilled</code> with exit code 137 (128 + signal 9), covered in
+        <a href="./fn6.html" class="text-viol underline decoration-viol/40">FN6</a> and
+        <a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Disk: space, inodes and speed</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Disks fail in three different ways, and each needs a different command. <strong>Space</strong> runs out
+        (<code class="inline">df -h</code>). <strong>Inodes</strong>, the kernel's per-file records, run out even with space
+        left, usually because something wrote millions of tiny files (<code class="inline">df -i</code>). Or the disk is
+        <strong>too slow</strong> for the load: a gp3 EBS volume gives 3,000 IOPS and 125 MB/s by default, and
+        <code class="inline">iostat</code> shows when you hit that ceiling.
+      </p>
+      <pre class="code mt-3">df -h -x tmpfs -x devtmpfs      <span class="cm"># -x hide in-memory filesystems</span>
+<span class="out">Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p1   20G   19G  1.0G  95% /
+/dev/nvme1n1    100G   41G   60G  41% /var/lib/pgsql</span>
+sudo du -xh --max-depth=1 /var | sort -rh | head -4   <span class="cm"># -x stay on this filesystem</span>
+<span class="out">12G	/var
+9.8G	/var/log
+1.4G	/var/lib
+480M	/var/cache</span>
+sudo du -xh --max-depth=1 /var/log | sort -rh | head -3
+<span class="out">9.8G	/var/log
+8.9G	/var/log/booking-api
+612M	/var/log/journal</span>
+df -i /                          <span class="cm"># inodes: 100% IUse means "disk full" even with GBs free</span>
+<span class="out">Filesystem     Inodes IUsed IFree IUse% Mounted on
+/dev/nvme0n1p1  10M   412K  9.6M    5% /</span></pre>
+      <pre class="code mt-3">iostat -xz 1 3                  <span class="cm"># extended stats, skip idle devices, 1 s × 3 (needs sysstat)</span>
+<span class="out">Device   r/s     w/s   rkB/s    wkB/s  r_await w_await aqu-sz  %util
+nvme1n1  12.0  2981.0  192.0 118420.0     0.6    14.8  44.10  100.0</span>
+<span class="cm"># ~3,000 writes/s and ~118 MB/s = gp3 baseline ceiling; w_await 14.8 ms and a deep queue = saturated</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Deleting a log file that is still open does not free the space.</strong>
+        The process keeps writing to the deleted file, <code class="inline">du</code> no longer sees it, but
+        <code class="inline">df</code> still shows the disk full. Find these with
+        <code class="inline">sudo lsof +L1</code> and either restart the process or truncate the file in place with
+        <code class="inline">: &gt; /var/log/booking-api/app.log</code>. The real fix is log rotation (Part IV) and shipping
+        logs off the box.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Sockets and open files: who is listening, who is connected</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        To the kernel, a network connection is just another open file (a <strong>socket</strong>). Two tools answer most
+        questions. <code class="inline">ss</code> lists sockets: which process is listening on which port, and how many
+        connections are in each TCP state. <code class="inline">lsof</code> ("list open files") shows every file and socket
+        a process holds. Ports and TCP states themselves are explained in
+        <a href="./fn3.html" class="text-viol underline decoration-viol/40">FN3</a>.
+      </p>
+      <pre class="code mt-3">sudo ss -tlnp                   <span class="cm"># -t TCP, -l listening, -n numeric, -p show process</span>
+<span class="out">State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process
+LISTEN  0       128           0.0.0.0:22         0.0.0.0:*      users:(("sshd",pid=1203,fd=3))
+LISTEN  0       4096        127.0.0.1:8080       0.0.0.0:*      users:(("booking-api",pid=2841,fd=7))</span>
+<span class="cm"># 127.0.0.1:8080 = only reachable from this box. The load balancer will never reach it: bind 0.0.0.0</span>
+ss -s                           <span class="cm"># summary by state</span>
+<span class="out">TCP:   1842 (estab 212, closed 1580, orphaned 0, timewait 1574)</span>
+sudo lsof -p 2841 | wc -l       <span class="cm"># open files for one PID; compare with LimitNOFILE</span>
+<span class="out">1019</span>
+sudo lsof -i :5432              <span class="cm"># who is talking to Postgres?</span>
+<span class="out">COMMAND      PID    USER   FD   TYPE  NODE NAME
+booking-a   2841 booking   21u  IPv4   TCP ip-10-15-34-17:41822-&gt;10.15.52.8:postgresql (ESTABLISHED)</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Those 1,019 open files are five short of the old default limit of 1,024. One more burst of connections and the
+        service starts failing with <code class="inline">EMFILE: too many open files</code>. That is why the unit file in
+        Part II sets <code class="inline">LimitNOFILE=65536</code>.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Access &amp; troubleshooting</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Get in safely, then follow a method instead of a hunch</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Most of your time on a Linux box will be spent on one that is misbehaving. The skill is not knowing a hundred
+        commands. It is getting access without weakening security, reading what the box is already telling you, and checking
+        causes in an order that finds the common ones first. Part IV puts the previous three Parts together.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">SSH and keys, and why we prefer SSM</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>SSH</strong> (Secure Shell) gives you an encrypted terminal on a remote machine. Instead of passwords it uses
+        a <strong>key pair</strong>: a private key that never leaves your laptop, and a public key you copy into
+        <code class="inline">~/.ssh/authorized_keys</code> on the server. Use <code class="inline">ed25519</code> keys and
+        protect the private key with a passphrase. On AWS our default is <strong>SSM Session Manager</strong> instead: no
+        open port 22, no keys to rotate, access controlled by IAM, and every session logged
+        (<a href="./aw3.html" class="text-viol underline decoration-viol/40">AW3</a>). SSH still matters for CI runners,
+        Git, client systems outside AWS, and SSH tunnelled over SSM.
+      </p>
+      <pre class="code mt-3">ssh-keygen -t ed25519 -C "vu.tran@goldenowl" -f ~/.ssh/id_ed25519
+<span class="out">Generating public/private ed25519 key pair.
+Enter passphrase (empty for no passphrase):
+Your public key has been saved in /home/vu/.ssh/id_ed25519.pub
+The key fingerprint is:
+SHA256:q3H8m2xY0fV7c1sT9kLwPz4aR6nB5eD8gJ2uK0iO1Ms vu.tran@goldenowl</span>
+chmod 700 ~/.ssh &amp;&amp; chmod 600 ~/.ssh/id_ed25519     <span class="cm"># ssh refuses keys with loose permissions</span>
+aws ssm start-session --target i-0a1b2c3d4e5f67890 --region ap-southeast-1   <span class="cm"># our default: no port 22</span>
+<span class="out">Starting session with SessionId: vu.tran-0f3c9a1d2b7e45a61
+sh-5.2$</span></pre>
+      <div class="mt-4">
+        <span class="code-label">~/.ssh/config — SSH over SSM, so port 22 stays closed in the security group</span>
+        <pre class="code">Host i-* mi-*
+    User ec2-user
+    IdentityFile ~/.ssh/id_ed25519
+    ProxyCommand sh -c "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+
+Host bastion-legacy-client
+    HostName 203.0.113.40
+    User ops
+    IdentitiesOnly yes          <span class="cm"># offer only this key, not every key in your agent</span>
+    IdentityFile ~/.ssh/client_x_ed25519</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">/etc/ssh/sshd_config.d/10-hardening.conf — when a box must accept SSH</span>
+        <pre class="code">PermitRootLogin no              <span class="cm"># log in as yourself, then sudo</span>
+PasswordAuthentication no       <span class="cm"># keys only: kills password brute-forcing</span>
+KbdInteractiveAuthentication no
+AllowGroups ssh-users           <span class="cm"># an explicit allow-list</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        After editing, run <code class="inline">sudo sshd -t</code> (syntax check, silent when fine), then
+        <code class="inline">sudo systemctl reload sshd</code>, and test a <em>new</em> session before you close the one you
+        have. Locking yourself out of the only access path is a classic first-week mistake.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Reading logs: journald, /var/log and rotation</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        There are two places to look. Services managed by systemd log to the journal (Part II). Older software, and apps
+        that write their own files, log under <code class="inline">/var/log</code>. Either way, the method is the same:
+        narrow by time first, then by severity, then by keyword. A log file you cannot narrow is a log file you will scroll
+        through for twenty minutes.
+      </p>
+      <pre class="code mt-3">sudo tail -n 100 -f /var/log/booking-api/app.log        <span class="cm"># follow a file live</span>
+grep -c ' 500 ' /var/log/booking-api/access.log         <span class="cm"># how many? count before you read</span>
+<span class="out">1847</span>
+grep ' 500 ' access.log | awk '{print $7}' | sort | uniq -c | sort -rn | head -3   <span class="cm"># which paths?</span>
+<span class="out">   1790 /v1/appointments
+     41 /v1/slots
+     16 /healthz</span>
+sudo grep -i 'failed password\|invalid user' /var/log/secure | tail -3   <span class="cm"># auth log (Ubuntu: /var/log/auth.log)</span>
+zgrep 'ERROR' /var/log/booking-api/app.log.2.gz | head    <span class="cm"># search rotated, compressed logs</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The pipeline in the third command (count, extract a column, group) is the single most useful log trick on a box.
+        <a href="./fn5.html" class="text-viol underline decoration-viol/40">FN5</a> teaches <code class="inline">grep</code>,
+        <code class="inline">awk</code> and <code class="inline">jq</code> properly. Files that grow for ever need
+        <strong>logrotate</strong>, which renames, compresses and deletes old files on a schedule:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">/etc/logrotate.d/booking-api</span>
+        <pre class="code">/var/log/booking-api/*.log {
+    daily
+    rotate 7                 <span class="cm"># keep 7 old files; older ones are deleted</span>
+    maxsize 500M             <span class="cm"># rotate early if a file passes 500 MB in a day</span>
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate             <span class="cm"># app keeps its file handle; avoids the "deleted but open" trap</span>
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The sick-box method: the first five minutes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When an alert says a box is unhealthy, follow the same order every time. Start with the cheapest checks that rule
+        out the most causes, and write down what you find as you go. This order catches the big four on our systems (full
+        disk, OOM, a crashed or crash-looping service, a dependency that is unreachable) within the first few commands.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    A["Alert: booking-api unhealthy<br/>on i-0a1b2c3d4e5f67890"] --> B{"Can you get in?<br/>ssm start-session"}
+    B -->|no| B1["Check EC2 status checks,<br/>console output, SG / SSM agent"]
+    B -->|yes| C["uptime · df -h · free -h<br/>load, disk, memory in 10 s"]
+    C -->|disk 100%| D1["du under /var · lsof +L1<br/>free space, then fix rotation"]
+    C -->|available ~0| D2["dmesg OOM lines<br/>who grew? limits?"]
+    C -->|load high| D3["top: which process,<br/>us vs wa vs st"]
+    C -->|all normal| E["systemctl status · --failed<br/>journalctl -u -p err"]
+    E -->|service fine| F["ss -tlnp · curl localhost:8080/healthz<br/>dependencies reachable? (FN3)"]
+    D1 --> G["Write timeline + fix<br/>in the incident channel"]
+    D2 --> G
+    D3 --> G
+    F --> G
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">first-five-minutes.sh — paste into the session, read top to bottom</span>
+        <pre class="code">uptime                                         <span class="cm"># load vs nproc; is it getting worse?</span>
+df -h -x tmpfs -x devtmpfs; df -i /            <span class="cm"># space AND inodes</span>
+free -h                                        <span class="cm"># the "available" column</span>
+sudo dmesg -T | tail -20                       <span class="cm"># OOM kills, disk errors, network drops</span>
+systemctl --failed                             <span class="cm"># anything broken?</span>
+systemctl status booking-api --no-pager | head -8
+journalctl -u booking-api -p warning --since "1 hour ago" --no-pager | tail -20
+top -b -n 1 | head -15                         <span class="cm"># who uses CPU and memory</span>
+sudo ss -tlnp                                  <span class="cm"># is it listening, on which address?</span>
+curl -fsS -m 3 localhost:8080/healthz &amp;&amp; echo " healthy"</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Worked example.</strong> Staging <code class="inline">booking-api</code> returns 502s from the load balancer.
+        The script shows <code class="inline">/</code> at <code class="inline">100%</code>, <code class="inline">du</code>
+        finds 8.9 GB in <code class="inline">/var/log/booking-api</code>, and the journal shows
+        <code class="inline">ENOSPC: no space left on device</code> when the app tried to write an upload to a temp file.
+        Truncating the current log restores service in two minutes; adding the logrotate file above and an alarm on disk
+        usage at 80% (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>) stops it coming back. The
+        postmortem habit that turns this into a lasting fix is covered in
+        <a href="./sr2.html" class="text-viol underline decoration-viol/40">SR2</a>.
+      </p>
+      <div class="mt-4 callout callout-tip"><strong>Prefer replacing to repairing.</strong> If a box in an Auto Scaling
+        group is sick and you have captured what you need (logs, the output above), terminate it and let a fresh one
+        replace it. Fix the cause in the image or the config code, not by hand on one instance. Diagnosis on the box,
+        repair in Git.</div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code is a strong pair for Linux work: it explains unfamiliar output, writes unit files and logrotate configs,
+        and suggests the next diagnostic command. Use it on a throwaway instance or a local VM first, give it read-only
+        commands on real boxes, and paste output to it rather than letting it run commands on production.
+      </p>
+      <pre class="code mt-3">Write a systemd unit for booking-api: binary /opt/booking-api/bin/booking-api, port 8080,
+runs as user booking, env from /opt/booking-api/config/env, restart on failure, 30 s stop
+timeout, LimitNOFILE 65536, and basic hardening. Explain each directive in one line.</pre>
+      <pre class="code mt-3">Here is the output of uptime, df -h, free -h, dmesg | tail and systemctl status from a
+staging box where booking-api returns 502s. Rank the likely causes, say which line of output
+supports each, and give only read-only commands to confirm. Do not suggest rm or kill.</pre>
+      <pre class="code mt-3">Review this /etc/sudoers.d file and sshd_config drop-in. List every rule that grants more
+access than "restart and read logs for booking-api", and propose the narrowest replacement.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Explain <code class="inline">top</code>, <code class="inline">iostat</code>, <code class="inline">ss</code> and <code class="inline">dmesg</code> output line by line</li>
+            <li>Draft unit files, logrotate configs and sudoers rules from a short spec</li>
+            <li>Turn a pasted diagnostic dump into a ranked list of causes</li>
+            <li>Write the one-liners that count and group log lines</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Which host you are on (<code class="inline">hostname</code>, instance ID) before running anything it suggests</li>
+            <li>Services run as a dedicated user, never <code class="inline">User=root</code></li>
+            <li>Permission fixes are the narrowest mode that works, tested with <code class="inline">sudo -u</code></li>
+            <li>sudoers edits go through <code class="inline">visudo</code> and sshd edits through <code class="inline">sshd -t</code></li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written Linux changes:</strong>
+        <code class="inline">chmod -R 777</code> or <code class="inline">chown -R root</code> to "fix" a permission error;
+        <code class="inline">User=root</code> in a unit file; <code class="inline">ALL=(ALL) NOPASSWD: ALL</code> in sudoers;
+        <code class="inline">PasswordAuthentication yes</code> or opening port 22 to <code class="inline">0.0.0.0/0</code>;
+        <code class="inline">kill -9</code> as the first step; <code class="inline">rm -rf</code> on a path built from a
+        variable; <code class="inline">curl … | sudo bash</code> installers; and "clear disk space" advice that deletes
+        files a running process still has open.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has used a terminal to run a few commands but cannot say what a process, a permission bit or <code class="inline">/var</code> is.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Navigates the filesystem, reads files and runs <code class="inline">top</code>, but reaches for <code class="inline">sudo</code> or <code class="inline">chmod 777</code> when something is denied.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Starts and inspects services with <code class="inline">systemctl</code> and <code class="inline">journalctl</code>, reads <code class="inline">df</code> and <code class="inline">free</code>, and follows the sick-box method with a checklist in hand.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Writes a hardened unit file for a new service running as its own user, sets correct ownership and modes, explains SIGTERM vs SIGKILL and the OOM killer, and finds a full disk, an OOM kill or a crash loop in under ten minutes from a cold start.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Writes the team's sick-box runbook, reviews sudoers and SSH policy across client systems, and moves the team from hand-fixed servers to replaced-from-image ones.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> on a fresh Amazon Linux 2023
+        instance, install a small HTTP service as a systemd unit running as a non-root user with no notes. Then have a
+        mentor break it three ways (fill the disk, make the env file unreadable, cap its memory so it gets OOM-killed) and
+        find each cause using only the commands in this module.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Fixing permissions with 777 or root</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">It makes the error go away by removing the protection. Find the blocking directory with <code class="inline">namei -l</code>, fix the owner, and use the narrowest mode.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Reading "free" instead of "available"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Low free memory is normal because of the page cache. Alert on available memory, and check <code class="inline">dmesg</code> before blaming the app for a silent crash.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Editing a unit and forgetting daemon-reload</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">systemd keeps running the old definition and warns quietly. Every unit edit is followed by <code class="inline">systemctl daemon-reload</code> and a restart, then <code class="inline">status</code> to confirm.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Run the same five checks every time</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Load, disk, memory, failed units, recent errors. Discipline beats intuition at 03:00, and the output pasted into the incident channel is half of your postmortem timeline.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Put growing data on its own volume</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A separate EBS volume for <code class="inline">/var/lib/pgsql</code> or <code class="inline">/var/log</code> means a runaway log cannot fill the root disk and take down sshd and the SSM agent with it.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="fhs-perms"> <span>I can say what lives in each top-level directory, read a permission string, and fix a "Permission denied" with the narrowest change.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="signals"> <span>I can explain SIGTERM vs SIGKILL, the grace period, and how an OOM kill shows up in <code class="inline">dmesg</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="systemd"> <span>I wrote a systemd unit for a service running as its own user, enabled it, and queried its logs with <code class="inline">journalctl</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="resources"> <span>I can read <code class="inline">top</code>, <code class="inline">free</code>, <code class="inline">df</code>, <code class="inline">iostat</code> and <code class="inline">ss</code> output and say which resource is the bottleneck.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="access"> <span>I connected to an instance with SSM Session Manager and with SSH over SSM, with port 22 closed in the security group.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="sick-box"> <span class="font-semibold">On a sandbox Amazon Linux 2023 instance, ran a demo HTTP service as a hardened systemd unit, then diagnosed three faults a mentor injected (full disk, unreadable config, OOM kill). Wrote a one-page runbook with the commands, the output that pointed to each cause and the fix (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/linux/al2023/ug/what-is-amazon-linux.html" target="_blank" rel="noopener">AWS — Amazon Linux 2023 User Guide</a>: our default server OS, its release model and how it differs from older Amazon Linux.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/linux/al2023/ug/managing-repos-os-updates.html" target="_blank" rel="noopener">AWS — Managing packages and OS updates in AL2023</a>: <code class="inline">dnf</code>, versioned repositories and security updates.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html" target="_blank" rel="noopener">AWS — Systems Manager Session Manager</a>: shell access without SSH keys or open ports, and SSH over SSM.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connect-linux-inst-ssh.html" target="_blank" rel="noopener">AWS — Connect to your Linux instance using SSH</a>: key pairs, <code class="inline">authorized_keys</code> and common connection errors.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/TroubleshootingInstances.html" target="_blank" rel="noopener">AWS — Troubleshoot EC2 Linux instances</a>: status checks, console output and what to do when you cannot get in.</li>
+        <li><a class="text-coral underline" href="https://github.com/systemd/systemd" target="_blank" rel="noopener">systemd — project README and docs</a>: the authoritative reference for unit directives and <code class="inline">journalctl</code>.</li>
+        <li><a class="text-coral underline" href="https://sre.google/sre-book/effective-troubleshooting/" target="_blank" rel="noopener">Google SRE Book — Effective Troubleshooting</a>: the hypothesis-and-test method behind the sick-box flow in Part IV.</li>
+      </ul>

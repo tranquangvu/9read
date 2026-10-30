@@ -1,0 +1,727 @@
+<!-- meta: days=3 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Datadog: Infrastructure, APM &amp; Logs</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Some clients buy Datadog, and on those projects it becomes the one place where engineers look and where on-call
+          gets paged. This module covers when we use Datadog instead of the OSS stack, how to deploy the Agent on EKS, ECS
+          and EC2, the AWS integration, unified service tagging, APM and the service map, log pipelines and indexes,
+          monitors and SLO objects, dashboards as code, and the cost drivers that decide whether the client renews. Every
+          piece is defined in Terraform or GitOps, the same way as the rest of <code class="inline">clinic-infra</code>.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> Datadog makes it very easy to send data and very easy to pay for it.
+          A team that indexes every log line at 1 KB each, at 200 requests per second, adds about USD 900 a month in
+          indexing alone. Debug logs, health checks and one unbounded tag can double the bill before anyone looks at the
+          usage page. The opposite failure is just as common: services without <code class="inline">env</code>,
+          <code class="inline">service</code> and <code class="inline">version</code> tags, so traces, logs and metrics never
+          link up and the client pays for a single pane of glass that shows three disconnected views. Agents generate
+          Datadog config quickly. Whether it is tagged, sampled and indexed sensibly is your call.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Where Datadog fits</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Datadog is the client's choice; once they make it, it is the single pane</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Our routing rule (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>) gives Datadog a clear
+        role. When a client buys it, Datadog replaces Prometheus/Grafana/Loki and Tempo for application and infrastructure
+        telemetry: APM, host and container metrics, and logs all land there, and that's where people look. Two things don't
+        change. Code is still instrumented with OpenTelemetry or with Datadog's tracers configured by the same conventions
+        (<a href="./ob4.html" class="text-viol underline decoration-viol/40">OB4</a>). And alarms on AWS resources stay
+        in CloudWatch, which Datadog reads through its AWS integration.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">When Datadog, when the OSS stack</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Datadog's strength is breadth with no platform to run: one agent, hundreds of integrations, APM, logs, RUM and
+        security in one UI, with tags that link them together. The price is a per-host and per-GB bill that grows with the
+        client's success, and some lock-in to Datadog's query language and monitors. We recommend it when the client
+        values time-to-insight over cost control and doesn't want to run Grafana. We don't push it on a cost-sensitive
+        client with a small team that is happy with AWS-native tools.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Factor</th><th class="px-4 py-3">Datadog</th><th class="px-4 py-3">CloudWatch / Prometheus / Grafana / Loki</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Who decides</td><td class="px-4 py-3">The client, usually because they already use it elsewhere</td><td class="px-4 py-3">Our default when the client has no preference</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ops burden</td><td class="px-4 py-3">Agent upgrades only</td><td class="px-4 py-3">Prometheus, Loki and Grafana to run (much less with AMP/AMG)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Correlation</td><td class="px-4 py-3">Built in once tags are right: trace → logs → host in one click</td><td class="px-4 py-3">Possible, but you wire exemplars and derived fields yourself</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost shape</td><td class="px-4 py-3">Per host, per container, per GB indexed, per custom metric</td><td class="px-4 py-3">Per sample (AMP), per GB (CloudWatch), plus our time</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Typical clinic-platform bill</td><td class="px-4 py-3">USD 800–1,600 / month (Part IV)</td><td class="px-4 py-3">USD 600–1,200 / month plus about 2 engineer-days a month to run it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Exit cost</td><td class="px-4 py-3">Monitors, dashboards and DQL queries need rewriting</td><td class="px-4 py-3">Low: open formats, and OTel keeps instrumentation portable</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>Don't run both for the same signal.</strong> A Datadog client
+        sometimes asks to keep Prometheus "just in case". Paying twice for pod metrics and running two alerting paths
+        splits on-call attention. Keep exactly one owner per signal: Datadog for app, container and log telemetry, and
+        CloudWatch alarms for AWS resources, as the safety net that works even if the Datadog Agent is broken.</div>
+
+      <h3 class="font-semibold text-lg mt-8">The architecture: Agent, Cluster Agent, integrations, intake</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <strong>Datadog Agent</strong> runs once per host (a DaemonSet on EKS, a sidecar per task on Fargate, a service
+        on EC2). It collects host and container metrics, tails container logs, receives traces from tracers or OTLP, runs
+        integration checks, and sends everything to Datadog's intake for the client's <strong>site</strong>, for example
+        <code class="inline">ap1.datadoghq.com</code>. On Kubernetes, the <strong>Cluster Agent</strong> talks to the API
+        server once on behalf of all node agents, serves cluster-level checks and runs the admission controller that injects
+        tracers and tags. The <strong>AWS integration</strong> needs no agent at all: Datadog assumes an IAM role in each
+        account and reads CloudWatch.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 260" class="w-full min-w-[640px]" role="img" aria-label="Datadog architecture: node agents on EKS, sidecar agents on ECS Fargate and the AWS integration role all send to the Datadog intake; Cluster Agent coordinates node agents">
+          <rect x="10" y="30" width="300" height="140" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="22" y="48" font-size="11" font-weight="700" fill="#6E6B64">clinic-prod-eks</text>
+          <g class="anim-pulse"><rect x="22" y="60" width="130" height="46" rx="9" fill="#6d5acd"/>
+            <text x="87" y="80" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Node Agent</text>
+            <text x="87" y="94" text-anchor="middle" fill="#ffffffbb" font-size="9">DaemonSet · logs · APM :8126</text></g>
+          <g class="anim-pulse d1"><rect x="168" y="60" width="130" height="46" rx="9" fill="#37474F"/>
+            <text x="233" y="80" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Cluster Agent</text>
+            <text x="233" y="94" text-anchor="middle" fill="#ffffffbb" font-size="9">API cache · admission</text></g>
+          <g class="anim-pulse d2"><rect x="22" y="116" width="276" height="40" rx="9" fill="#2563EB"/>
+            <text x="160" y="134" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api · booking-worker pods</text>
+            <text x="160" y="148" text-anchor="middle" fill="#ffffffbb" font-size="9">tracer injected · tags.datadoghq.com/* labels</text></g>
+          <rect x="10" y="185" width="300" height="65" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="22" y="203" font-size="11" font-weight="700" fill="#6E6B64">ECS Fargate task · booking-web</text>
+          <g class="anim-pulse d3"><rect x="22" y="210" width="276" height="32" rx="9" fill="#0D9488"/>
+            <text x="160" y="231" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">app + datadog-agent sidecar + FireLens</text></g>
+          <g class="anim-pulse d4"><rect x="380" y="200" width="150" height="46" rx="9" fill="#37474F"/>
+            <text x="455" y="220" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">AWS integration</text>
+            <text x="455" y="234" text-anchor="middle" fill="#ffffffbb" font-size="9">IAM role · CloudWatch</text></g>
+          <g class="anim-pulse d2"><rect x="560" y="95" width="150" height="70" rx="9" fill="#D97757"/>
+            <text x="635" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Datadog intake</text>
+            <text x="635" y="137" text-anchor="middle" fill="#ffffffbb" font-size="9">site ap1.datadoghq.com</text>
+            <text x="635" y="151" text-anchor="middle" fill="#ffffffbb" font-size="9">metrics · traces · logs</text></g>
+          <line x1="310" y1="90" x2="560" y2="118" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="310" y1="226" x2="560" y2="145" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="530" y1="222" x2="590" y2="165" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="152" y1="83" x2="168" y2="83" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="455" y="70" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">HTTPS out only: no inbound ports</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Unified service tagging: env, service, version</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Three reserved tags link everything in Datadog: <code class="inline">env</code>, <code class="inline">service</code>
+        and <code class="inline">version</code>. When a trace, a log line and a container metric carry the same three
+        values, the service page joins them, deployment tracking compares versions, and a monitor can link to the exact
+        logs. Set them once, at the deployment level, and let the Agent propagate them. Don't hand-set them in code. They
+        line up with OTel's <code class="inline">deployment.environment.name</code>, <code class="inline">service.name</code>
+        and <code class="inline">service.version</code>, so the same values work if the project later moves to the OSS stack.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Platform</th><th class="px-4 py-3">Where you set the three tags</th><th class="px-4 py-3">Gotcha</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">EKS</td><td class="px-4 py-3">Labels <code class="inline">tags.datadoghq.com/env|service|version</code> on the Deployment <em>and</em> the Pod template</td><td class="px-4 py-3">Labels only on the Deployment are not seen by the Agent on the pod</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ECS</td><td class="px-4 py-3">Docker labels <code class="inline">com.datadoghq.tags.*</code> + <code class="inline">DD_ENV</code>/<code class="inline">DD_SERVICE</code>/<code class="inline">DD_VERSION</code> env vars</td><td class="px-4 py-3">FireLens log config needs <code class="inline">dd_service</code> too, or logs arrive untagged</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EC2</td><td class="px-4 py-3"><code class="inline">env</code> in <code class="inline">datadog.yaml</code> <code class="inline">tags</code>; service/version per integration or process</td><td class="px-4 py-3">Host tags apply to everything on the host</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AWS integration</td><td class="px-4 py-3">AWS resource tags (<code class="inline">env</code>, <code class="inline">service</code>) are imported</td><td class="px-4 py-3">Another reason for the tagging policy in <a href="./ar2.html" class="text-viol underline decoration-viol/40">AR2</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-api/deployment.yaml (labels excerpt)</span>
+        <pre class="code">metadata:
+  labels:
+    tags.datadoghq.com/env: prod
+    tags.datadoghq.com/service: booking-api
+    tags.datadoghq.com/version: "1.8.3"          <span class="cm"># the image tag; CI sets it with the image</span>
+spec:
+  template:
+    metadata:
+      labels:                                     <span class="cm"># repeat on the POD template: the Agent reads these</span>
+        tags.datadoghq.com/env: prod
+        tags.datadoghq.com/service: booking-api
+        tags.datadoghq.com/version: "1.8.3"
+        admission.datadoghq.com/enabled: "true"   <span class="cm"># Cluster Agent injects DD_* env + tracer</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Tags are also the main source of custom-metric cost. Every unique combination of tag values on a custom metric is
+        billed as a separate metric. <code class="inline">env</code>, <code class="inline">service</code>,
+        <code class="inline">version</code>, <code class="inline">clinic_tier</code> are fine.
+        <code class="inline">clinic_id</code> or <code class="inline">user_id</code> on a DogStatsD metric is the same
+        cardinality explosion as in <a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>, only billed
+        per metric.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Getting data in</div>
+      <h2 class="font-display text-2xl font-bold mt-2">One Agent per host, one integration per account, everything in code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The Datadog UI offers one-click installs for everything. Don't use them. An Agent installed by a copy-pasted
+        <code class="inline">helm install</code> drifts, carries an API key in shell history, and can't be reviewed.
+        Install the Agent through GitOps on EKS and Terraform on ECS and EC2, take the API key from Secrets Manager
+        (<a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a>), and manage the AWS integration with
+        the Datadog Terraform provider.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">EKS: the Datadog Operator and a DatadogAgent object</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        On EKS we install the <strong>Datadog Operator</strong> with Helm through Argo CD, then describe the whole agent
+        deployment as a single <code class="inline">DatadogAgent</code> custom resource. The Operator creates and upgrades
+        the node Agent DaemonSet, the Cluster Agent and the admission controller from it. The API key arrives from Secrets
+        Manager through External Secrets (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>), so
+        it is never in Git.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/platform/datadog/datadogagent.yaml</span>
+        <pre class="code">apiVersion: datadoghq.com/v2alpha1
+kind: DatadogAgent
+metadata: { name: datadog, namespace: datadog }
+spec:
+  global:
+    site: ap1.datadoghq.com                  <span class="cm"># the client's site: a wrong site = data silently goes nowhere</span>
+    clusterName: clinic-prod-eks
+    credentials:
+      apiSecret: { secretName: datadog-keys, keyName: api-key }   <span class="cm"># from External Secrets</span>
+      appSecret: { secretName: datadog-keys, keyName: app-key }
+    tags: ["team:clinic"]
+  features:
+    apm:
+      enabled: true
+      instrumentation:                       <span class="cm"># Single Step Instrumentation: tracer injected at pod start</span>
+        enabled: true
+        enabledNamespaces: [booking]
+    logCollection:
+      enabled: true
+      containerCollectAll: true
+    otlp:
+      receiver: { protocols: { grpc: { enabled: true } } }   <span class="cm"># accept OTel SDK traffic on :4317</span>
+    admissionController: { enabled: true, mutateUnlabelled: false }
+    liveProcessCollection: { enabled: false }               <span class="cm"># billed feature: opt in deliberately</span>
+  override:
+    nodeAgent:
+      containers:
+        agent: { resources: { requests: { cpu: 200m, memory: 256Mi }, limits: { memory: 512Mi } } }</pre>
+      </div>
+      <pre class="code mt-3">kubectl -n datadog exec ds/datadog-agent -c agent -- agent status | grep -A3 -E "^(APM Agent|Logs Agent)"
+<span class="out">APM Agent
+=========
+  Status: Running
+  Receiver (previous minute): 1,842 traces, 14,610 spans from booking-api
+Logs Agent
+==========
+  BytesSent: 1.2 GB   EncodedBytesSent: 96 MB   LogsProcessed: 1,104,233</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">ECS on Fargate and EC2</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Fargate has no host to install a DaemonSet on, so the Agent runs as a <strong>sidecar container in every task</strong>
+        and logs go out through <strong>FireLens</strong> (<a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>)
+        straight to Datadog's log intake. Budget roughly 0.25 vCPU and 512 MiB per task for the sidecar, which is real money
+        at 30 tasks. On EC2 (utility hosts, legacy apps), install the Agent from the golden AMI or with SSM
+        State Manager (<a href="./ia3.html" class="text-viol underline decoration-viol/40">IA3</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/ecs-service/datadog.tf — container definitions excerpt</span>
+        <pre class="code">{
+  name      = <span class="st">"datadog-agent"</span>
+  image     = <span class="st">"public.ecr.aws/datadog/agent:7"</span>    <span class="cm"># pin a minor version in prod</span>
+  essential = false                                  <span class="cm"># a broken agent must not kill the app</span>
+  environment = [
+    { name = <span class="st">"ECS_FARGATE"</span>,    value = <span class="st">"true"</span> },
+    { name = <span class="st">"DD_SITE"</span>,        value = <span class="st">"ap1.datadoghq.com"</span> },
+    { name = <span class="st">"DD_APM_ENABLED"</span>, value = <span class="st">"true"</span> },
+  ]
+  secrets = [{ name = <span class="st">"DD_API_KEY"</span>, valueFrom = var.dd_api_key_secret_arn }]
+},
+{
+  name  = <span class="st">"booking-web"</span>
+  dockerLabels = { <span class="st">"com.datadoghq.tags.env"</span> = var.env, <span class="st">"com.datadoghq.tags.service"</span> = <span class="st">"booking-web"</span>,
+                   <span class="st">"com.datadoghq.tags.version"</span> = var.image_tag }
+  logConfiguration = {
+    logDriver = <span class="st">"awsfirelens"</span>
+    options = { Name = <span class="st">"datadog"</span>, Host = <span class="st">"http-intake.logs.ap1.datadoghq.com"</span>, TLS = <span class="st">"on"</span>,
+                provider = <span class="st">"ecs"</span>, dd_service = <span class="st">"booking-web"</span>, dd_source = <span class="st">"nodejs"</span>,
+                dd_tags = <span class="st">"env:${var.env},version:${var.image_tag}"</span> }
+    secretOptions = [{ name = <span class="st">"apikey"</span>, valueFrom = var.dd_api_key_secret_arn }]
+  }
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Platform</th><th class="px-4 py-3">Agent form</th><th class="px-4 py-3">Logs path</th><th class="px-4 py-3">Billed as</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">EKS on EC2 nodes</td><td class="px-4 py-3">Operator → DaemonSet + Cluster Agent</td><td class="px-4 py-3">Agent tails <code class="inline">/var/log/pods</code></td><td class="px-4 py-3">Per node (host), with a container allotment per host</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ECS on Fargate</td><td class="px-4 py-3">Sidecar per task</td><td class="px-4 py-3">FireLens → log intake</td><td class="px-4 py-3">Per task rather than per host</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EC2</td><td class="px-4 py-3">Package from AMI / SSM</td><td class="px-4 py-3">Agent tails files or journald</td><td class="px-4 py-3">Per host</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lambda</td><td class="px-4 py-3">Datadog Lambda extension layer</td><td class="px-4 py-3">Extension</td><td class="px-4 py-3">Per invocation / function</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The sidecar also costs Fargate capacity. At 0.25 vCPU and 0.5 GB per task, 20 always-on
+        <code class="inline">booking-web</code> tasks add roughly 5 vCPU and 10 GB, which is about USD 200 a month in
+        ap-southeast-1 Fargate pricing, before any Datadog charge. Include it when you compare Datadog with CloudWatch
+        Container Insights for an ECS-only client.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The AWS integration in Terraform</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The AWS integration lets Datadog assume a read-only IAM role in each account and pull CloudWatch metrics, resource
+        tags and (optionally) logs. Two choices matter. First, <strong>restrict namespaces and regions</strong>: polling
+        every AWS namespace in every region costs the client in CloudWatch API calls and fills Datadog with metrics nobody
+        reads. Second, <strong>polling vs CloudWatch Metric Streams</strong>: polling runs about every 10 minutes, while a
+        metric stream through Firehose delivers in 2–3 minutes. That matters if a Datadog monitor on ALB 5xx is your
+        page, and the stream has its own AWS cost (about USD 0.003 per 1,000 metric updates plus Firehose).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/datadog-aws.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"datadog_integration_aws_account"</span> <span class="st">"prod"</span> {
+  aws_account_id = <span class="st">"444455556666"</span>            <span class="cm"># gol-prod</span>
+  aws_partition  = <span class="st">"aws"</span>
+  aws_regions { include_only = [<span class="st">"ap-southeast-1"</span>] }
+  auth_config {
+    aws_auth_config_role { role_name = <span class="st">"DatadogIntegrationRole"</span> }  <span class="cm"># trust policy uses Datadog's external ID</span>
+  }
+  metrics_config {
+    namespace_filters {
+      include_only = [<span class="st">"AWS/ApplicationELB"</span>, <span class="st">"AWS/RDS"</span>, <span class="st">"AWS/SQS"</span>, <span class="st">"AWS/ElastiCache"</span>, <span class="st">"AWS/ECS"</span>]
+    }
+  }
+  logs_config { lambda_forwarder {} }
+  resources_config { extended_collection = true }
+  traces_config { xray_services {} }
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>The AWS integration doesn't replace CloudWatch alarms.</strong> Keep
+        the RDS free-storage, SQS age and ALB 5xx alarms from <a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>
+        in CloudWatch, routed to the same on-call tool. A Datadog monitor on the same metric can be the richer page with
+        links to traces. Still, an expired API key, a deleted IAM role or a polling delay must not leave a full database
+        disk unalarmed.</div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · APM and logs</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Ingest broadly, keep deliberately: sampling and indexes are where the bill is decided</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Datadog separates <strong>ingesting</strong> data from <strong>keeping it searchable</strong>, for both traces and
+        logs. Ingestion is cheap per GB. Indexing (searchable spans, searchable logs) is priced per million events and is
+        where bills explode. Understanding that split is the main Datadog skill this module asks of you.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">APM: tracers, the service map, and two sampling decisions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Traces reach Datadog from either the <strong>Datadog tracer</strong> (<code class="inline">dd-trace</code>, injected
+        by Single Step Instrumentation) or the <strong>OpenTelemetry SDK</strong> sending OTLP to the Agent. Our default for
+        new code is the OTel SDK (<a href="./ob4.html" class="text-viol underline decoration-viol/40">OB4</a>), so the code
+        doesn't change if the client leaves Datadog. SSI is the fastest way to get traces from an existing service nobody
+        wants to touch. Either way, Datadog builds the <strong>service map</strong> and per-service RED metrics
+        (<code class="inline">trace.*.hits</code>, <code class="inline">.errors</code>, <code class="inline">.duration</code>)
+        from 100% of traffic <em>before</em> sampling, so dashboards and monitors stay accurate when you keep only a few
+        percent of the traces.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    S["booking-api spans<br/>200 req/s × 8 spans"] --> M["trace metrics<br/>hits · errors · latency<br/>from 100% of traffic"]
+    S --> I{"ingestion sampling<br/>(in the tracer / Agent)"}
+    I -->|"~10% + all errors"| G["ingested spans<br/>Live Search 15 min<br/>billed per GB"]
+    I -->|dropped| X["gone"]
+    G --> R{"retention filters"}
+    R -->|"errors, p99 &gt; 2 s,<br/>1% of the rest"| K["indexed spans<br/>searchable 15 days<br/>billed per million"]
+    R -->|not matched| E["expire after 15 min"]
+        </pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># ingestion sampling for booking-api: set on the workload, not in code</span>
+DD_TRACE_SAMPLING_RULES='[{"service":"booking-api","name":"http.request","resource":"GET /healthz","sample_rate":0.0},
+                          {"service":"booking-api","sample_rate":0.10}]'
+<span class="cm"># then check what you actually ingest (Datadog metric, query in a notebook):</span>
+sum:datadog.estimated_usage.apm.ingested_bytes{service:booking-api}.as_count().rollup(sum, 86400)
+<span class="out">≈ 4.1 GB/day   → about 123 GB/month: inside the per-host allotment for 8 APM hosts</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Log pipelines: parse, remap, enrich</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every log passes through <strong>pipelines</strong> before it is indexed. JSON logs are parsed automatically. The
+        processors you will actually write are: a <strong>status remapper</strong> (so <code class="inline">level:error</code>
+        becomes Datadog's status, which drives colours, facets and monitors), a <strong>trace ID remapper</strong> (so logs
+        link to traces), and a <strong>Grok parser</strong> for the one legacy component that still writes plain text. You can
+        define pipelines in Terraform like everything else.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/datadog-logs.tf — pipeline</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"datadog_logs_custom_pipeline"</span> <span class="st">"booking"</span> {
+  name       = <span class="st">"clinic booking services"</span>
+  is_enabled = true
+  filter { query = <span class="st">"service:(booking-api OR booking-worker OR booking-web)"</span> }
+
+  processor {
+    status_remapper {
+      name       = <span class="st">"level → status"</span>
+      is_enabled = true
+      sources    = [<span class="st">"level"</span>]
+    }
+  }
+  processor {
+    trace_id_remapper {
+      name       = <span class="st">"trace_id → trace"</span>
+      is_enabled = true
+      sources    = [<span class="st">"trace_id"</span>]
+    }
+  }
+  processor {
+    grok_parser {
+      name       = <span class="st">"legacy payment gateway lines"</span>
+      is_enabled = true
+      source     = <span class="st">"message"</span>
+      grok {
+        support_rules = <span class="st">""</span>
+        match_rules   = <span class="st">"payment_fail PAYMENT FAILED clinic=%{notSpace:clinic_id} code=%{word:gateway_code}"</span>
+      }
+    }
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Attributes extracted here, such as <code class="inline">clinic_id</code>, become searchable <strong>facets</strong>
+        on indexed logs at no extra cost. That's the right home for per-clinic detail. They are not tags, so they don't
+        multiply metric cardinality.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Indexes, exclusion filters, Flex and archives</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Logging without Limits" means: ingest everything (about USD 0.10 per GB), then decide per query what gets
+        <strong>indexed</strong> (about USD 1.70 per million events at 15-day retention, list price). Exclusion filters on
+        an index drop or sample matching logs from the index, but those logs still pass through pipelines,
+        <strong>generate log-based metrics</strong> and go to the <strong>archive</strong> in S3. Flex Logs keeps rarely
+        searched logs queryable for months at a much lower storage price.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    L["booking-* logs<br/>~600 GB / month"] --> I["ingest<br/>~USD 0.10 / GB"]
+    I --> P["pipelines<br/>status · trace_id · grok"]
+    P --> SDS["Sensitive Data Scanner<br/>mask PII"]
+    SDS --> M["log-based metrics<br/>from 100%"]
+    SDS --> A["S3 archive<br/>gol-log-archive · 100%"]
+    SDS --> X{"index exclusion filters"}
+    X -->|"errors 100% · info 10%"| IDX["main index · 15 d<br/>~USD 1.70 / M events"]
+    X -->|"audit events"| F["Flex tier · 12 months"]
+    X -->|"excluded"| D["not searchable<br/>(still in metrics + archive)"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/datadog-logs.tf — index and archive</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"datadog_logs_index"</span> <span class="st">"main"</span> {
+  name           = <span class="st">"main"</span>
+  retention_days = 15
+  daily_limit    = 25000000                       <span class="cm"># hard stop at 25M events/day: a runaway loop can't bankrupt the client</span>
+  filter { query = <span class="st">"*"</span> }
+  exclusion_filter {
+    name       = <span class="st">"drop health checks"</span>
+    is_enabled = true
+    filter {
+      query       = <span class="st">"@http.url_details.path:/healthz"</span>
+      sample_rate = 1.0                            <span class="cm"># exclude 100% from the index</span>
+    }
+  }
+  exclusion_filter {
+    name       = <span class="st">"sample info from booking-api"</span>
+    is_enabled = true
+    filter {
+      query       = <span class="st">"service:booking-api status:info"</span>
+      sample_rate = 0.9                            <span class="cm"># exclude 90%: keep 10%</span>
+    }
+  }
+}
+
+<span class="kw">resource</span> <span class="st">"datadog_logs_archive"</span> <span class="st">"s3"</span> {
+  name  = <span class="st">"clinic-prod-archive"</span>
+  query = <span class="st">"*"</span>                                     <span class="cm"># 100% of ingested logs, rehydratable later</span>
+  s3_archive {
+    bucket     = <span class="st">"gol-log-archive-datadog"</span>
+    path       = <span class="st">"/clinic-prod"</span>
+    account_id = <span class="st">"666677778888"</span>             <span class="cm"># gol-log-archive</span>
+    role_name  = <span class="st">"DatadogArchiveRole"</span>
+  }
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Log kind</th><th class="px-4 py-3">Ingest</th><th class="px-4 py-3">Index</th><th class="px-4 py-3">Where it ends up</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Errors and warnings</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">100%, 15 days</td><td class="px-4 py-3">Main index + archive</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Info request logs</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">10% sample</td><td class="px-4 py-3">Log-based metrics from 100%; archive</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Health checks, probe noise</td><td class="px-4 py-3">Better: drop at the source</td><td class="px-4 py-3">0%</td><td class="px-4 py-3">Nowhere</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Audit-style events</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">Flex tier, 6–12 months</td><td class="px-4 py-3">Flex + archive (retention rules in <a href="./se3.html" class="text-viol underline decoration-viol/40">SE3</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>Exclusion filters don't stop sensitive data.</strong> An excluded
+        log is still ingested, processed and archived. Patient names, phone numbers or tokens in log lines must be removed
+        in the app or with Sensitive Data Scanner rules <em>before</em> indexing and archiving. Treat a PII leak into
+        Datadog as a data incident (<a href="./se3.html" class="text-viol underline decoration-viol/40">SE3</a>), not as
+        a log-hygiene ticket.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Monitors, SLOs, dashboards and cost</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Monitors and dashboards are code, and the bill is a metric you monitor</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Monitors created by clicking can't be reviewed, copied to staging or restored after someone deletes them by
+        accident. Manage monitors, SLOs and dashboards with the Datadog Terraform provider in
+        <code class="inline">clinic-infra</code>, with the API and app keys coming from the pipeline's secrets. Then treat
+        Datadog usage as just another metric with its own monitor.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Monitors in Terraform</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A monitor is a query, thresholds and a message. The message is the page, so it carries the runbook link and the
+        <code class="inline">@</code>-handle of the on-call integration, inside <code class="inline">{{#is_alert}}</code>
+        blocks so recoveries and warnings go to the right place. Datadog has no "if traffic is above N" guard inside one
+        query, so for low-traffic services, combine the ratio monitor with a hits monitor in a composite monitor.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/datadog-monitors.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"datadog_monitor"</span> <span class="st">"booking_api_5xx"</span> {
+  name  = <span class="st">"[prod] booking-api 5xx ratio above 2%"</span>
+  type  = <span class="st">"query alert"</span>
+  query = <span class="st">"sum(last_5m):sum:trace.http.request.errors{env:prod,service:booking-api}.as_count() / sum:trace.http.request.hits{env:prod,service:booking-api}.as_count() &gt; 0.02"</span>
+  message = &lt;&lt;-EOT
+    {{#is_alert}}booking-api is failing {{value}} of requests.
+    Runbook: https://wiki/runbooks/booking-api-5xx  @pagerduty-clinic-prod{{/is_alert}}
+    {{#is_warning}}Early warning only. @slack-clinic-alerts{{/is_warning}}
+    {{#is_recovery}}Recovered. @pagerduty-clinic-prod{{/is_recovery}}
+  EOT
+  monitor_thresholds {
+    critical = 0.02
+    warning  = 0.01
+  }
+  require_full_window = false
+  notify_no_data      = false       <span class="cm"># no traffic is not an error for this ratio</span>
+  renotify_interval   = 0
+  tags = [<span class="st">"service:booking-api"</span>, <span class="st">"env:prod"</span>, <span class="st">"team:clinic"</span>]
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Monitor type</th><th class="px-4 py-3">Use it for</th><th class="px-4 py-3">clinic example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Metric / APM</td><td class="px-4 py-3">Rates, latency and saturation from trace metrics or integrations</td><td class="px-4 py-3">booking-api 5xx ratio, p99 above 1.5 s</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Log</td><td class="px-4 py-3">Counts of a specific event, including excluded logs (monitors see everything ingested)</td><td class="px-4 py-3">More than 20 <code class="inline">payment_fail</code> in 10 min</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Composite</td><td class="px-4 py-3">Combining monitors: ratio AND enough traffic; dedupe related pages</td><td class="px-4 py-3">5xx monitor AND hits &gt; 100/min</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Forecast / anomaly</td><td class="px-4 py-3">Trends that end in an outage, and seasonal traffic</td><td class="px-4 py-3">Disk on a utility host full in 7 days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SLO burn rate</td><td class="px-4 py-3">Paging on error-budget consumption</td><td class="px-4 py-3">Thresholds and windows from <a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The metric name <code class="inline">trace.http.request.*</code> follows the span's operation name, which depends
+        on the tracer and framework (for example <code class="inline">trace.express.request</code> with
+        <code class="inline">dd-trace</code> on Express). Copy it from the service page rather than guessing. A monitor on a
+        metric that doesn't exist stays green for ever.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">SLO objects and dashboards as code</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Datadog has first-class <strong>SLO objects</strong>: metric-based (good events / total events), monitor-based, or
+        time-slice. They show remaining error budget and can drive burn-rate monitors. Choosing the SLI, the target and the
+        window is <a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a>'s job. Here you encode what SR1
+        decided, so the SLO lives in Git next to the monitors that depend on it. Dashboards follow the same rule: export the
+        JSON once, review changes in PRs.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/datadog-slo.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"datadog_service_level_objective"</span> <span class="st">"booking_availability"</span> {
+  name = <span class="st">"booking-api availability"</span>
+  type = <span class="st">"metric"</span>
+  query {
+    numerator   = <span class="st">"sum:trace.http.request.hits{env:prod,service:booking-api}.as_count() - sum:trace.http.request.errors{env:prod,service:booking-api}.as_count()"</span>
+    denominator = <span class="st">"sum:trace.http.request.hits{env:prod,service:booking-api}.as_count()"</span>
+  }
+  thresholds {
+    timeframe = <span class="st">"30d"</span>
+    target    = 99.5            <span class="cm"># from the SR1 SLO doc; 0.5% of 30 days ≈ 3.6 h of budget</span>
+    warning   = 99.7
+  }
+  tags = [<span class="st">"service:booking-api"</span>, <span class="st">"env:prod"</span>, <span class="st">"team:clinic"</span>]
+}
+
+<span class="kw">resource</span> <span class="st">"datadog_dashboard_json"</span> <span class="st">"booking"</span> {
+  dashboard = file(<span class="st">"${path.module}/dashboards/booking-service.json"</span>)  <span class="cm"># exported from the UI, then reviewed</span>
+}</pre>
+      </div>
+      <pre class="code mt-3">terraform plan -target=datadog_service_level_objective.booking_availability
+<span class="out">  # datadog_service_level_objective.booking_availability will be created
+  + resource "datadog_service_level_objective" "booking_availability" {
+      + name = "booking-api availability"
+      + type = "metric"
+      ...
+Plan: 1 to add, 0 to change, 0 to destroy.</span>
+<span class="cm"># -target only for this walkthrough; normal PRs plan the whole state</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Cost drivers, with a worked bill</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Datadog bills each product on its own unit. The client's contract sets the real prices. The list prices below
+        (annual billing, late 2026) are close enough to reason with. For the clinic platform on an 8-node EKS cluster, the
+        same telemetry costs about 2.5 times more when nobody tunes indexing and tags.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Driver</th><th class="px-4 py-3">Unit (approx. list)</th><th class="px-4 py-3">Untuned</th><th class="px-4 py-3">Tuned</th><th class="px-4 py-3">What changed</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Infrastructure</td><td class="px-4 py-3">~USD 15 / host / month</td><td class="px-4 py-3">USD 120</td><td class="px-4 py-3">USD 120</td><td class="px-4 py-3">Fewer, larger nodes would lower it (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">APM</td><td class="px-4 py-3">~USD 31 / APM host / month</td><td class="px-4 py-3">USD 248</td><td class="px-4 py-3">USD 248</td><td class="px-4 py-3">Ingested spans stay inside the per-host allotment</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Log ingestion</td><td class="px-4 py-3">~USD 0.10 / GB</td><td class="px-4 py-3">USD 60</td><td class="px-4 py-3">USD 50</td><td class="px-4 py-3">Health checks dropped at the source</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Log indexing (15 d)</td><td class="px-4 py-3">~USD 1.70 / million events</td><td class="px-4 py-3">USD 1,020</td><td class="px-4 py-3">USD 153</td><td class="px-4 py-3">Errors 100%, info 10%, rest to archive/Flex</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Custom metrics</td><td class="px-4 py-3">100 per host included, then ~USD 5 per 100</td><td class="px-4 py-3">USD 135</td><td class="px-4 py-3">USD 15</td><td class="px-4 py-3"><code class="inline">clinic_id</code> removed from two DogStatsD metrics</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Total</td><td class="px-4 py-3"></td><td class="px-4 py-3"><strong>≈ USD 1,583</strong></td><td class="px-4 py-3"><strong>≈ USD 586</strong></td><td class="px-4 py-3">Same dashboards, same alerts</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Monthly Datadog bill for the clinic platform, untuned versus tuned, by driver: log indexing dominates the untuned bill">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">MONTHLY BILL BY DRIVER · untuned (coral) vs tuned (teal), USD</text>
+          <text x="12" y="52" font-size="11" font-weight="700" fill="#6E6B64">Log indexing</text>
+          <g class="anim-pulse"><rect x="150" y="40" width="440" height="12" rx="4" fill="#D97757"/></g>
+          <text x="598" y="51" font-size="10" fill="#6E6B64">1,020</text>
+          <g class="anim-pulse d1"><rect x="150" y="55" width="66" height="12" rx="4" fill="#0D9488"/></g>
+          <text x="224" y="66" font-size="10" fill="#6E6B64">153</text>
+          <text x="12" y="92" font-size="11" font-weight="700" fill="#6E6B64">APM</text>
+          <g class="anim-pulse d2"><rect x="150" y="80" width="107" height="12" rx="4" fill="#D97757"/></g>
+          <text x="265" y="91" font-size="10" fill="#6E6B64">248</text>
+          <g class="anim-pulse d3"><rect x="150" y="95" width="107" height="12" rx="4" fill="#0D9488"/></g>
+          <text x="265" y="106" font-size="10" fill="#6E6B64">248</text>
+          <text x="12" y="132" font-size="11" font-weight="700" fill="#6E6B64">Custom metrics</text>
+          <g class="anim-pulse d1"><rect x="150" y="120" width="58" height="12" rx="4" fill="#D97757"/></g>
+          <text x="216" y="131" font-size="10" fill="#6E6B64">135</text>
+          <g class="anim-pulse d2"><rect x="150" y="135" width="7" height="12" rx="3" fill="#0D9488"/></g>
+          <text x="165" y="146" font-size="10" fill="#6E6B64">15</text>
+          <text x="12" y="172" font-size="11" font-weight="700" fill="#6E6B64">Infrastructure</text>
+          <g class="anim-pulse d3"><rect x="150" y="160" width="52" height="12" rx="4" fill="#D97757"/></g>
+          <text x="210" y="171" font-size="10" fill="#6E6B64">120</text>
+          <g class="anim-pulse d4"><rect x="150" y="175" width="52" height="12" rx="4" fill="#0D9488"/></g>
+          <text x="210" y="186" font-size="10" fill="#6E6B64">120</text>
+          <text x="12" y="212" font-size="11" font-weight="700" fill="#6E6B64">Log ingestion</text>
+          <g class="anim-pulse"><rect x="150" y="200" width="26" height="12" rx="4" fill="#D97757"/></g>
+          <g class="anim-pulse d1"><rect x="150" y="214" width="22" height="10" rx="3" fill="#0D9488"/></g>
+          <text x="184" y="212" font-size="10" fill="#6E6B64">60 → 50</text>
+          <text x="560" y="140" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">indexing is 64% of the untuned bill</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Datadog publishes its own usage as metrics (<code class="inline">datadog.estimated_usage.*</code>), so you can put a
+        monitor on the bill. Do this on day one of every Datadog project and send it to the team channel, not the pager:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/datadog-cost.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"datadog_monitor"</span> <span class="st">"log_index_budget"</span> {
+  name    = <span class="st">"[cost] indexed logs above 4M events/day"</span>
+  type    = <span class="st">"query alert"</span>
+  query   = <span class="st">"sum(last_1d):sum:datadog.estimated_usage.logs.ingested_events{datadog_is_excluded:false}.as_count() &gt; 4000000"</span>
+  message = <span class="st">"Indexed logs are over budget (~USD 200/month pace). Check top services in Log Patterns. @slack-clinic-platform"</span>
+  monitor_thresholds { critical = 4000000 }
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> add a monthly line to the client report: Datadog
+        cost per 1,000 bookings, broken down by driver. When it rises faster than traffic, someone added a tag, a debug
+        log or an unsampled service. Unit cost is the language the client's finance team understands
+        (<a href="./ar2.html" class="text-viol underline decoration-viol/40">AR2</a>).</div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code writes Datadog Terraform, DatadogAgent manifests and monitor queries well, and it can read the Datadog
+        API to audit what exists. Give it a read-only app key scoped to the client's org (or the Datadog MCP server with
+        read scopes, <a href="./ar6.html" class="text-viol underline decoration-viol/40">AR6</a>), never an admin key, and
+        land every change through <code class="inline">clinic-infra</code> or <code class="inline">clinic-gitops</code>.
+      </p>
+      <pre class="code mt-3">Import the existing click-built monitors tagged service:booking-api into Terraform: generate
+import blocks and datadog_monitor resources, normalise names to "[env] service: symptom",
+and add a runbook link and an {{#is_alert}} @-handle to every message. Show the plan; apply nothing.</pre>
+      <pre class="code mt-3">Using the usage metrics datadog.estimated_usage.logs.ingested_events and .metrics.custom,
+find the five services and five metrics that drive cost this month, with the tag that drives
+each custom metric's cardinality. Propose index exclusion filters and code changes with a USD estimate.</pre>
+      <pre class="code mt-3">Write the DatadogAgent for clinic-staging-eks: site ap1.datadoghq.com, keys from the
+datadog-keys secret, SSI only in namespace booking, OTLP gRPC receiver on, process collection off.
+Explain every billed feature you enable.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Bring click-built monitors and dashboards under Terraform with import blocks</li>
+            <li>Draft pipelines, exclusion filters and monitor messages</li>
+            <li>Produce a cost-driver report from the usage metrics</li>
+            <li>Check every workload for the three unified service tags</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The <code class="inline">site</code> is the client's, and keys come from a secret, never from values or tfvars</li>
+            <li>Every enabled feature (process, NPM, profiling, RUM) is one the client pays for on purpose</li>
+            <li>No unbounded tag on custom metrics; identifiers go to log attributes or span tags</li>
+            <li>Monitor metric names exist (copy them from the service page) and messages route to the right handle</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written Datadog config:</strong> an API key in a Helm
+        values file, a task definition <code class="inline">environment</code> block or Terraform variables; the default
+        <code class="inline">datadoghq.com</code> site for a client on <code class="inline">ap1</code>;
+        <code class="inline">essential = true</code> on the Fargate agent sidecar; <code class="inline">containerCollectAll</code>
+        with no index exclusion filters; AWS integration with no namespace filter; monitors with
+        <code class="inline">notify_no_data = true</code> on sparse ratios; DogStatsD calls tagged with
+        <code class="inline">user_id</code> or <code class="inline">clinic_id</code>; and deleting the CloudWatch alarms
+        "because Datadog has them now".</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has seen a Datadog dashboard but doesn't know what the Agent collects or how the product is billed.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can search logs and open a trace in the UI, and knows Datadog is chosen by the client, but installs things with copy-pasted commands.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Deploys the Agent from a provided DatadogAgent or task definition and writes simple monitors; needs review on tags, sampling and indexes.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Deploys the Agent on EKS and Fargate through GitOps/Terraform with unified tagging, configures the AWS integration with filters, sets trace sampling and log indexes deliberately, manages monitors, SLOs and dashboards in Terraform, and explains the client's bill by driver.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Advises clients on whether to buy Datadog at all, negotiates commitments with real usage data, and maintains the shared Terraform modules other Datadog projects reuse.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, explain the
+        difference between ingested and indexed logs and spans, and where log-based metrics and archives sit in that flow.
+        Then take a service with no tags and get its traces, logs and container metrics joined on the service page within
+        one hour, using only GitOps or Terraform changes.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Indexing everything "for now"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">"For now" lasts until the invoice. Set exclusion filters and a <code class="inline">daily_limit</code> on the index on day one; log-based metrics and the archive still see 100%.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Tags only on the Deployment object</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The Agent reads pod labels. Without the <code class="inline">tags.datadoghq.com/*</code> labels on the Pod template, traces and logs arrive with <code class="inline">service:unknown</code> and nothing links up.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Locking code to dd-trace APIs</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Custom spans written against Datadog-only APIs must be rewritten if the client leaves. Use the OTel API for manual spans; the Datadog Agent accepts OTLP.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Deployment tracking for free</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">With <code class="inline">version</code> set from the image tag, the service page compares error rate and latency per version. That is the fastest canary check there is (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Archive to the log-archive account</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An S3 archive in <code class="inline">gol-log-archive</code> keeps 100% of logs cheaply under our control, lets you rehydrate for an investigation, and keeps the data if the client leaves Datadog.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="when"> <span>I can explain when we use Datadog vs the OSS stack, and why CloudWatch alarms on AWS resources stay in either case.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="agent"> <span>I deployed the Agent on EKS with a DatadogAgent object and on Fargate as a sidecar with FireLens, with keys from Secrets Manager.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tagging"> <span>A service I configured shows traces, logs and container metrics joined by <code class="inline">env</code>, <code class="inline">service</code> and <code class="inline">version</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="indexes"> <span>I set trace ingestion sampling, a log pipeline, index exclusion filters and an S3 archive, and can explain what each costs.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dd-terraform"> <span class="font-semibold">In a Datadog sandbox org, opened a clinic-infra PR that manages the AWS integration (filtered), a booking-api 5xx monitor with runbook, an SLO, a dashboard, a log index with exclusion filters, and a usage budget monitor in Terraform. Attached the plan, a screenshot of the joined service page, and a before/after monthly cost estimate by driver (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.datadoghq.com/getting_started/tagging/unified_service_tagging/" target="_blank" rel="noopener">Datadog — Unified service tagging</a>: env, service and version on every platform.</li>
+        <li><a class="text-coral underline" href="https://docs.datadoghq.com/containers/datadog_operator/" target="_blank" rel="noopener">Datadog — Datadog Operator</a>: the DatadogAgent resource and its features.</li>
+        <li><a class="text-coral underline" href="https://docs.datadoghq.com/integrations/ecs_fargate/" target="_blank" rel="noopener">Datadog — ECS Fargate integration</a>: sidecar agent, FireLens logs and APM on Fargate.</li>
+        <li><a class="text-coral underline" href="https://docs.datadoghq.com/tracing/trace_pipeline/" target="_blank" rel="noopener">Datadog — APM trace pipeline</a>: ingestion controls and retention filters from Part III.</li>
+        <li><a class="text-coral underline" href="https://docs.datadoghq.com/logs/log_configuration/indexes/" target="_blank" rel="noopener">Datadog — Log indexes</a> · <a class="text-coral underline" href="https://docs.datadoghq.com/logs/log_configuration/pipelines/" target="_blank" rel="noopener">Log pipelines</a>: exclusion filters, daily limits and processors.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/providers/DataDog/datadog/latest/docs" target="_blank" rel="noopener">Terraform — Datadog provider</a>: monitors, SLOs, dashboards, logs and the AWS integration as code.</li>
+        <li><a class="text-coral underline" href="https://docs.datadoghq.com/account_management/billing/usage_metrics/" target="_blank" rel="noopener">Datadog — Estimated usage metrics</a>: the metrics behind the cost monitor in Part IV.</li>
+      </ul>

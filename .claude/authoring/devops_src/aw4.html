@@ -1,0 +1,729 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">S3, EBS, EFS &amp; CloudFront</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          The clinic platform stores three kinds of data outside its database: patient uploads (referral letters, insurance
+          cards, receipts) in S3, the disks under every EC2 instance and EKS node on EBS, and the occasional shared
+          directory on EFS. In front of all of it sits CloudFront, serving <code class="inline">booking-web</code>'s assets
+          from the edge. This module teaches you to pick the right storage for a job, to lock an S3 bucket down so patient
+          files can never become public, to let browsers upload directly with presigned URLs, to keep storage costs from
+          creeping up with lifecycle rules and the right volume types, and to put a CloudFront distribution in front of a
+          private bucket.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> public S3 buckets are still one of the most common causes of data
+          breaches on AWS, and for a clinic the data is medical. A bucket without versioning loses every file when a buggy
+          job deletes a prefix. A bucket <em>with</em> versioning but no lifecycle rule quietly keeps every overwritten
+          copy for ever and doubles its bill each year. A fleet still on gp2 volumes pays 20% more for slower disks. A
+          CloudFront distribution that caches the API serves one patient's appointment list to another. Each one is a few
+          lines of configuration, and each one is easy to miss in review.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · S3 fundamentals</div>
+      <h2 class="font-display text-2xl font-bold mt-2">S3 is a key-value store with a policy engine attached</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        S3 stores <strong>objects</strong> (bytes plus metadata, up to 5 TB each) under <strong>keys</strong> in
+        <strong>buckets</strong>. There are no real folders: <code class="inline">uploads/2026/10/ref-8812.pdf</code> is one
+        key, and the "folders" in the console are just a view of shared prefixes. A bucket lives in one region and stores
+        every object across at least three AZs, with 99.999999999% (eleven nines) designed durability. You will almost
+        never lose data to S3 itself. You will lose it to a delete, an overwrite, or a policy that let the wrong person in.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Buckets, keys and storage classes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Bucket names are global across all AWS customers, so ours follow
+        <code class="inline">gol-&lt;env&gt;-&lt;system&gt;-&lt;purpose&gt;</code>: <code class="inline">gol-prod-clinic-uploads</code>,
+        <code class="inline">gol-prod-clinic-web-assets</code>. Each object has a <strong>storage class</strong> that trades
+        storage price against retrieval cost and speed. Most data is read often in its first month and almost never after,
+        so the class should change as the object ages. That is what lifecycle rules are for.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Class</th><th class="px-4 py-3">Storage (approx. USD/GB-month, Singapore)</th><th class="px-4 py-3">Catch</th><th class="px-4 py-3">Our use</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Standard</td><td class="px-4 py-3">0.025</td><td class="px-4 py-3">None: no minimum, no retrieval fee</td><td class="px-4 py-3">New uploads, web assets</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Intelligent-Tiering</td><td class="px-4 py-3">0.025 → 0.0138 → 0.005 automatically</td><td class="px-4 py-3">Small monitoring fee per object; objects under 128 KB are never tiered</td><td class="px-4 py-3">Data with unknown access patterns</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Standard-IA</td><td class="px-4 py-3">~0.0138</td><td class="px-4 py-3">30-day minimum, 128 KB minimum size, per-GB retrieval fee</td><td class="px-4 py-3">Uploads older than 30 days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Glacier Instant Retrieval</td><td class="px-4 py-3">~0.005</td><td class="px-4 py-3">90-day minimum, higher retrieval fee, still milliseconds</td><td class="px-4 py-3">Uploads older than 180 days, still viewable in the app</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Glacier Deep Archive</td><td class="px-4 py-3">~0.002</td><td class="px-4 py-3">180-day minimum, retrieval takes up to 12 hours</td><td class="px-4 py-3">Logs and records kept only for compliance (<a href="./se3.html" class="text-viol underline decoration-viol/40">SE3</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Storage is rarely the surprise on an S3 bill. <strong>Requests</strong> and <strong>data transfer</strong> are.
+        Ten million tiny PUTs cost about USD 50 regardless of size, and data leaving AWS to the internet costs about
+        USD 0.12 per GB from Singapore. Serving files through CloudFront (Part IV) and avoiding small-object churn matter
+        more than the storage class.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Versioning and lifecycle rules, always together</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        With <strong>versioning</strong> on, an overwrite keeps the old object as a <em>noncurrent version</em> and a
+        delete only adds a <em>delete marker</em>, so both are reversible. It is your protection against buggy jobs and
+        compromised credentials, and replication (Part II) requires it. But noncurrent versions are billed like any other
+        object, so versioning without a lifecycle rule is a slow-growing cost leak. Turn both on, in the same PR.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 210" class="w-full min-w-[640px]" role="img" aria-label="Lifecycle of an uploaded referral letter: Standard for 30 days, Standard-IA until 180 days, Glacier Instant Retrieval after; noncurrent versions expire after 30 days">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ONE OBJECT'S LIFE · uploads/ prefix in gol-prod-clinic-uploads</text>
+          <g class="anim-pulse"><rect x="20" y="50" width="160" height="56" rx="9" fill="#2563EB"/>
+            <text x="100" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Standard</text>
+            <text x="100" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">day 0–30 · viewed often</text></g>
+          <g class="anim-pulse d1"><rect x="210" y="50" width="160" height="56" rx="9" fill="#6d5acd"/>
+            <text x="290" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Standard-IA</text>
+            <text x="290" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">day 30–180 · ~45% cheaper</text></g>
+          <g class="anim-pulse d2"><rect x="400" y="50" width="160" height="56" rx="9" fill="#0D9488"/>
+            <text x="480" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Glacier Instant</text>
+            <text x="480" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">day 180+ · ~80% cheaper</text></g>
+          <g class="anim-pulse d3"><rect x="590" y="50" width="120" height="56" rx="9" fill="#37474F"/>
+            <text x="650" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Expire</text>
+            <text x="650" y="89" text-anchor="middle" fill="#ffffffbb" font-size="9">per retention policy</text></g>
+          <line x1="180" y1="78" x2="210" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="370" y1="78" x2="400" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="560" y1="78" x2="590" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d4"><rect x="210" y="130" width="350" height="44" rx="9" fill="#DB2777"/>
+            <text x="385" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Noncurrent versions (overwrites, deletes)</text>
+            <text x="385" y="165" text-anchor="middle" fill="#ffffffbb" font-size="9">kept 30 days for recovery, then permanently removed</text></g>
+          <line x1="100" y1="106" x2="210" y2="150" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="360" y="200" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">no human ever moves an object: the lifecycle rule does it daily</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">lifecycle.json — gol-prod-clinic-uploads</span>
+        <pre class="code">{
+  "Rules": [
+    {
+      "ID": "uploads-tiering",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "uploads/" },
+      "Transitions": [
+        { "Days": 30,  "StorageClass": "STANDARD_IA" },
+        { "Days": 180, "StorageClass": "GLACIER_IR" }
+      ],
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 30 },   <span class="cm"># the line that stops versioning costs growing</span>
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }  <span class="cm"># failed uploads are billed too</span>
+    }
+  ]
+}</pre>
+      </div>
+      <pre class="code mt-3">aws s3api put-bucket-versioning --profile gol-dev --bucket gol-dev-clinic-uploads \
+  --versioning-configuration Status=Enabled
+aws s3api put-bucket-lifecycle-configuration --profile gol-dev --bucket gol-dev-clinic-uploads \
+  --lifecycle-configuration file://lifecycle.json
+aws s3api list-object-versions --profile gol-dev --bucket gol-dev-clinic-uploads \
+  --prefix uploads/2026/10/ref-8812.pdf --query '[Versions[].[VersionId,IsLatest,LastModified],DeleteMarkers[].[VersionId,IsLatest]]'
+<span class="out">[
+  [ ["3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY", false, "2026-10-28T03:12:09+00:00"] ],
+  [ ["Ex7Bd9vK2.wQ1mZp4sLc8rYtN0aFhG6uI", true] ]
+]</span>
+<span class="cm"># someone deleted it: the latest "version" is a delete marker. Remove the marker to restore the file</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Encryption: on by default, KMS when you need control</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every new object is encrypted at rest with S3-managed keys (SSE-S3) automatically since 2023, so "is it
+        encrypted?" is always yes. The real choice is whether to use <strong>SSE-KMS</strong> with our own customer-managed
+        key. KMS adds a second permission check: a principal needs <code class="inline">kms:Decrypt</code> on the key as well
+        as <code class="inline">s3:GetObject</code>, every access is logged in CloudTrail, and disabling the key makes the
+        data unreadable at once. Patient uploads use SSE-KMS. Turn on <strong>S3 Bucket Keys</strong> with it, which cuts
+        KMS request costs by up to 99% for busy buckets. Key policies and rotation are
+        <a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">s3.tf — default encryption for the uploads bucket</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_s3_bucket_server_side_encryption_configuration"</span> <span class="st">"uploads"</span> {
+  bucket = aws_s3_bucket.uploads.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = <span class="st">"aws:kms"</span>
+      kms_master_key_id = aws_kms_key.clinic_data.arn   <span class="cm"># our key, not the aws/s3 default</span>
+    }
+    bucket_key_enabled = <span class="kw">true</span>                         <span class="cm"># ~99% fewer KMS calls, much lower KMS bill</span>
+  }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Block Public Access, Object Ownership and the bucket policy</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Three settings decide who can reach a bucket. <strong>Block Public Access (BPA)</strong> overrides any policy or
+        ACL that would make data public; turn all four flags on at the <em>account</em> level in every account, so a single
+        bucket cannot opt out. <strong>Object Ownership = BucketOwnerEnforced</strong> disables ACLs entirely (the default
+        for new buckets), so access is decided by policies alone. The <strong>bucket policy</strong> then states the rules
+        that hold whoever the caller is.
+      </p>
+      <pre class="code mt-3">aws s3control get-public-access-block --profile gol-prod-ro --account-id 444455556666
+<span class="out">{
+    "PublicAccessBlockConfiguration": {
+        "BlockPublicAcls": true,
+        "IgnorePublicAcls": true,
+        "BlockPublicPolicy": true,
+        "RestrictPublicBuckets": true
+    }
+}</span>
+<span class="cm"># all four true, account-wide. Anything less in prod is a finding (SE1)</span></pre>
+      <div class="mt-4">
+        <span class="code-label">s3.tf — the same settings per bucket, as a backstop to the account level</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_s3_bucket"</span> <span class="st">"uploads"</span> {
+  bucket = <span class="st">"gol-prod-clinic-uploads"</span>          <span class="cm"># no force_destroy: terraform destroy must fail on a non-empty bucket</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_s3_bucket_ownership_controls"</span> <span class="st">"uploads"</span> {
+  bucket = aws_s3_bucket.uploads.id
+  rule { object_ownership = <span class="st">"BucketOwnerEnforced"</span> }   <span class="cm"># ACLs off</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_s3_bucket_public_access_block"</span> <span class="st">"uploads"</span> {
+  bucket                  = aws_s3_bucket.uploads.id
+  block_public_acls       = <span class="kw">true</span>
+  ignore_public_acls      = <span class="kw">true</span>
+  block_public_policy     = <span class="kw">true</span>
+  restrict_public_buckets = <span class="kw">true</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_s3_bucket_versioning"</span> <span class="st">"uploads"</span> {
+  bucket = aws_s3_bucket.uploads.id
+  versioning_configuration { status = <span class="st">"Enabled"</span> }
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">bucket-policy-uploads.json — rules that hold for every caller</span>
+        <pre class="code">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::gol-prod-clinic-uploads", "arn:aws:s3:::gol-prod-clinic-uploads/*"],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }      <span class="cm"># HTTPS only</span>
+    },
+    {
+      "Sid": "DenyOutsideOurOrg",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::gol-prod-clinic-uploads", "arn:aws:s3:::gol-prod-clinic-uploads/*"],
+      "Condition": { "StringNotEquals": { "aws:PrincipalOrgID": "o-a1b2c3d4e5" },
+                     "BoolIfExists": { "aws:PrincipalIsAWSService": "false" } }
+    }
+  ]
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice that this policy only denies. The task roles get their <em>allow</em> from their own identity policies
+        (<a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a>), which works because the bucket and the
+        roles are in the same account. The bucket policy is the outer fence: no plain HTTP, and no one from outside our
+        Organization, whatever their IAM policies say.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · S3 in the application</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Let browsers talk to S3 directly, with permission that expires</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The naive upload path streams a 15 MB scan through <code class="inline">booking-api</code>: it ties up a Node.js
+        worker, doubles the bandwidth bill and needs a bigger ALB timeout. The S3-native path lets the browser send the
+        file straight to S3, with a URL that the API signs for one key, one operation and five minutes. The API stays in
+        control of <em>who</em> uploads <em>what</em>; S3 does the heavy lifting.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Presigned URLs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>presigned URL</strong> is a normal S3 URL with a signature in the query string, created with the
+        signer's credentials. Whoever holds it can perform exactly that one request until it expires, with the signer's
+        permissions. So the signer (the <code class="inline">booking-api</code> task role) must be allowed to
+        <code class="inline">s3:PutObject</code> on the prefix, and the URL lifetime should be as short as the user flow
+        allows. Note that a URL signed with temporary role credentials also stops working when those credentials expire,
+        whatever expiry you asked for.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant B as Browser (booking-web)
+    participant A as booking-api
+    participant S as S3 gol-prod-clinic-uploads
+    participant W as booking-worker
+    B->>A: POST /uploads {type: application/pdf, size: 15 MB}
+    Note over A: authz: may this patient upload?<br/>pick key uploads/2026/10/ref-8812.pdf
+    A-->>B: presigned PUT URL (expires in 300 s)
+    B->>S: PUT file directly (TLS, SSE-KMS by default)
+    S-->>B: 200 OK + ETag
+    B->>A: POST /uploads/ref-8812/complete
+    A->>W: SQS message: scan + thumbnail (AW6)
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">booking-api/src/uploads/presign.ts</span>
+        <pre class="code"><span class="kw">import</span> { S3Client, PutObjectCommand } <span class="kw">from</span> <span class="st">"@aws-sdk/client-s3"</span>;
+<span class="kw">import</span> { getSignedUrl } <span class="kw">from</span> <span class="st">"@aws-sdk/s3-request-presigner"</span>;
+
+<span class="kw">const</span> s3 = <span class="kw">new</span> S3Client({ region: <span class="st">"ap-southeast-1"</span> });   <span class="cm">// credentials: the ECS task role</span>
+
+<span class="kw">export async function</span> <span class="fn">presignUpload</span>(key: string, contentType: string) {
+  <span class="kw">const</span> cmd = <span class="kw">new</span> PutObjectCommand({
+    Bucket: <span class="st">"gol-prod-clinic-uploads"</span>,
+    Key: key,                                  <span class="cm">// chosen by the server, never by the client</span>
+    ContentType: contentType,                  <span class="cm">// signed: the browser must send the same header</span>
+  });
+  <span class="kw">return</span> getSignedUrl(s3, cmd, { expiresIn: <span class="st">300</span> }); <span class="cm">// seconds</span>
+}</pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># the same thing from the CLI, for a quick download link while debugging</span>
+aws s3 presign s3://gol-staging-clinic-uploads/uploads/2026/10/ref-8812.pdf --expires-in 300 --profile gol-staging
+<span class="out">https://gol-staging-clinic-uploads.s3.ap-southeast-1.amazonaws.com/uploads/2026/10/ref-8812.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Credential=ASIA...%2F20261030%2Fap-southeast-1%2Fs3%2Faws4_request&amp;X-Amz-Date=20261030T031500Z&amp;X-Amz-Expires=300&amp;X-Amz-SignedHeaders=host&amp;X-Amz-Signature=5f1c...</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Presigned URLs are one of several ways to give something access to an object. Pick by who is asking and for how
+        long:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Who needs access</th><th class="px-4 py-3">Mechanism</th><th class="px-4 py-3">Lifetime</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Our own service (booking-worker)</td><td class="px-4 py-3">IAM task role policy on a prefix</td><td class="px-4 py-3">Role session, refreshed automatically</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A patient's browser, one file</td><td class="px-4 py-3">Presigned PUT/POST or GET from booking-api</td><td class="px-4 py-3">Minutes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Many users, many cached files</td><td class="px-4 py-3">CloudFront signed URLs or cookies (Part IV origin)</td><td class="px-4 py-3">Minutes to hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Another AWS account (CI, a partner)</td><td class="px-4 py-3">Bucket policy naming their role + their identity policy</td><td class="px-4 py-3">Until removed: review quarterly</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">The whole internet</td><td class="px-4 py-3">CloudFront with OAC in front of a private bucket</td><td class="px-4 py-3">Never a public bucket</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>A presigned PUT cannot limit file size.</strong> Whoever holds the
+        URL can upload 5 GB to that key. If size matters (it does for a clinic that pays for storage), use a
+        <strong>presigned POST</strong> with a <code class="inline">content-length-range</code> condition, and still check
+        the object's size in the completion step before you accept it. Never let the client choose the key: a client-chosen
+        key can overwrite another patient's file.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Cross-account bucket access</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <code class="inline">booking-web</code> build runs in <code class="inline">gol-shared</code> and publishes
+        static assets into <code class="inline">gol-prod-clinic-web-assets</code> in the prod account. As in AW1, both sides
+        must agree: the CI role's identity policy allows the writes, and the bucket policy allows that exact role. Grant the
+        smallest set of actions the job needs, on the bucket and its objects separately, because
+        <code class="inline">s3:ListBucket</code> applies to the bucket ARN and object actions to
+        <code class="inline">bucket/*</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">bucket-policy-web-assets.json — statement for the CI role</span>
+        <pre class="code">{
+  "Sid": "AllowCiPublish",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::111122223333:role/ci/gha-booking-web-publish" },
+  "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+  "Resource": [
+    "arn:aws:s3:::gol-prod-clinic-web-assets",          <span class="cm"># for ListBucket</span>
+    "arn:aws:s3:::gol-prod-clinic-web-assets/*"         <span class="cm"># for Put/Delete</span>
+  ]
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        With Object Ownership set to BucketOwnerEnforced, objects written by the other account are owned by the bucket
+        owner automatically. Before ACLs were disabled, cross-account uploads produced objects the bucket's own account
+        could not read, a confusing failure you may still meet in older client accounts.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Replication: a second copy somewhere else</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        S3 already survives the loss of an AZ. It does not survive someone with admin rights deleting the bucket, or a
+        region-wide event. <strong>Replication</strong> copies new objects asynchronously to another bucket:
+        <strong>cross-region (CRR)</strong> for disaster recovery, or into another account so that a compromised prod
+        account cannot touch the copy. Both buckets need versioning. Replication only copies objects written after you
+        enable it; use S3 Batch Replication for the backlog. The DR strategy that decides whether you need this, and the
+        RTO/RPO behind it, is <a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">replication.tf — uploads to a bucket in another account and region</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_s3_bucket_replication_configuration"</span> <span class="st">"uploads"</span> {
+  bucket = aws_s3_bucket.uploads.id
+  role   = aws_iam_role.s3_replication.arn          <span class="cm"># S3 assumes this role to read source, write destination</span>
+  rule {
+    id     = <span class="st">"uploads-to-dr"</span>
+    status = <span class="st">"Enabled"</span>
+    filter { prefix = <span class="st">"uploads/"</span> }
+    delete_marker_replication { status = <span class="st">"Disabled"</span> }   <span class="cm"># a delete in prod does not delete the DR copy</span>
+    source_selection_criteria {
+      sse_kms_encrypted_objects { status = <span class="st">"Enabled"</span> }
+    }
+    destination {
+      bucket        = <span class="st">"arn:aws:s3:::gol-dr-clinic-uploads-apne1"</span>   <span class="cm"># Tokyo, gol-log-archive account</span>
+      account       = <span class="st">"666677778888"</span>
+      storage_class = <span class="st">"STANDARD_IA"</span>
+      access_control_translation { owner = <span class="st">"Destination"</span> }
+      encryption_configuration { replica_kms_key_id = <span class="st">"arn:aws:kms:ap-northeast-1:666677778888:key/9f1e…"</span> }
+    }
+  }
+}</pre>
+      </div>
+      <pre class="code mt-3">aws s3api head-object --profile gol-prod-ro --bucket gol-prod-clinic-uploads \
+  --key uploads/2026/10/ref-8812.pdf --query ReplicationStatus
+<span class="out">"COMPLETED"</span>
+<span class="cm"># PENDING for minutes is normal; FAILED usually means the role or the destination KMS key policy is wrong</span></pre>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Block &amp; file storage</div>
+      <h2 class="font-display text-2xl font-bold mt-2">EBS is a disk for one machine; EFS is a share for many</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        S3 is accessed over HTTP by key. Some software needs a real filesystem instead: an OS root disk, a database's data
+        directory, a legacy app that writes reports to <code class="inline">/var/reports</code>. AWS offers two kinds.
+        <strong>EBS</strong> is a network-attached block device for one instance in one AZ. <strong>EFS</strong> is a
+        managed NFS filesystem that many instances and containers in many AZs can mount at once. Choosing between them is
+        mostly a question of who needs to read the data.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    Q["Where should this data live?"] --> A{"Accessed by an app<br/>over HTTP, by key?"}
+    A -->|yes| S3["S3<br/>uploads, assets, backups, logs"]
+    A -->|no, needs a filesystem| B{"Shared by more than<br/>one instance or pod?"}
+    B -->|no| C{"Must survive the<br/>instance stopping?"}
+    C -->|yes| EBS["EBS gp3<br/>root disks, self-managed DB, node disks"]
+    C -->|no, scratch only| IS["Instance store<br/>fast NVMe, wiped on stop"]
+    B -->|yes| EFS["EFS<br/>shared reports dir, legacy CMS uploads"]
+    S3 -.-> RDS["Relational data? → RDS (AW5), not a disk"]
+        </pre>
+      </div>
+
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Property</th><th class="px-4 py-3">S3</th><th class="px-4 py-3">EBS</th><th class="px-4 py-3">EFS</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Access</td><td class="px-4 py-3">HTTPS API, by key</td><td class="px-4 py-3">Block device, one instance</td><td class="px-4 py-3">NFS mount, many clients</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scope</td><td class="px-4 py-3">Region (3+ AZs)</td><td class="px-4 py-3">One AZ</td><td class="px-4 py-3">Region (mount target per AZ)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Billed on</td><td class="px-4 py-3">GB stored + requests + transfer</td><td class="px-4 py-3">GB <em>provisioned</em>, used or not</td><td class="px-4 py-3">GB stored + throughput (elastic)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Approx. USD/GB-month</td><td class="px-4 py-3">0.025 (Standard)</td><td class="px-4 py-3">0.096 (gp3)</td><td class="px-4 py-3">0.36 (Standard)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Survives AZ loss</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">No: restore from snapshot elsewhere</td><td class="px-4 py-3">Yes (Regional filesystems)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clinic example</td><td class="px-4 py-3">Patient uploads, web assets</td><td class="px-4 py-3">Node and instance root disks</td><td class="px-4 py-3">Shared report exports for a legacy admin tool</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For containers the answer is nearly always S3. A container that writes uploads to a local or shared disk cannot
+        scale out cleanly, and you have just made a stateless service stateful.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">EBS volume types: gp3 unless proven otherwise</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An EBS volume lives in one AZ and attaches to one instance in that AZ (multi-attach exists for io2, but you will not
+        need it). It survives stop and start, and it is billed per provisioned GB whether you use the space or not. The
+        type decides performance. <strong>gp3</strong> gives a baseline of 3,000 IOPS and 125 MiB/s at any size, and lets
+        you buy more IOPS or throughput separately. Its predecessor gp2 tied performance to size, so people over-provisioned
+        disks to get IOPS, and it costs about 20% more per GB.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Type</th><th class="px-4 py-3">Approx. USD/GB-month (Singapore)</th><th class="px-4 py-3">Performance</th><th class="px-4 py-3">Use</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">gp3</td><td class="px-4 py-3">0.096</td><td class="px-4 py-3">3,000 IOPS / 125 MiB/s included; more for a fee</td><td class="px-4 py-3">Everything by default: root disks, EKS nodes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">gp2</td><td class="px-4 py-3">0.12</td><td class="px-4 py-3">3 IOPS per GB, burst credits under 1 TB</td><td class="px-4 py-3">Nothing new. Migrate it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">io2 Block Express</td><td class="px-4 py-3">~0.138 + per provisioned IOPS</td><td class="px-4 py-3">Very high, consistent IOPS; 99.999% durability</td><td class="px-4 py-3">Self-managed databases with proven need</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">st1 / sc1</td><td class="px-4 py-3">~0.054 / ~0.018</td><td class="px-4 py-3">HDD, throughput-oriented, poor random I/O</td><td class="px-4 py-3">Large sequential data; rarely, S3 is usually better</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># find gp2 volumes, then convert in place: no detach, no downtime</span>
+aws ec2 describe-volumes --profile gol-dev --filters Name=volume-type,Values=gp2 \
+  --query 'Volumes[].[VolumeId,Size,State]' --output text
+<span class="out">vol-0b7e3c1a9d2f45806   100   in-use
+vol-04d2a8f6c1e9b3570   500   in-use</span>
+aws ec2 modify-volume --profile gol-dev --volume-id vol-04d2a8f6c1e9b3570 --volume-type gp3
+<span class="out">{ "VolumeModification": { "ModificationState": "modifying", "TargetVolumeType": "gp3", ... } }</span>
+<span class="cm"># 500 GB: USD 60 → USD 48 a month, and a 1,500-IOPS gp2 baseline becomes 3,000</span></pre>
+      <div class="mt-4 callout callout-info"><strong>Turn on EBS encryption by default</strong> in every region of every
+        account (<code class="inline">aws ec2 enable-ebs-encryption-by-default</code>). New volumes and the snapshots taken
+        from them are then always encrypted, with no performance cost, whether or not the launch template remembers to ask.</div>
+
+      <h3 class="font-semibold text-lg mt-8">EBS snapshots: incremental backups in S3</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>snapshot</strong> is a point-in-time copy of a volume, stored in S3 behind the scenes (you never see the
+        bucket). The first snapshot copies every used block; later ones store only the blocks that changed, so daily
+        snapshots of a quiet 100 GB disk cost far less than 100 GB each. Snapshots are regional; copy them to another
+        region for DR. Snapshots are crash-consistent, like pulling the power cord, so for anything with a database on the
+        disk prefer the database's own backups or AWS Backup with application-aware options. Scheduling and retention
+        belong in AWS Backup policies (<a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a>), not in
+        cron jobs.
+      </p>
+      <pre class="code mt-3">aws ec2 create-snapshot --profile gol-staging --volume-id vol-0b7e3c1a9d2f45806 \
+  --description "pre-upgrade reports-host 2026-10-30" \
+  --tag-specifications 'ResourceType=snapshot,Tags=[{Key=Purpose,Value=pre-change},{Key=DeleteAfter,Value=2026-11-30}]'
+<span class="out">{ "SnapshotId": "snap-0e2c9a7f4b1d36850", "State": "pending", "VolumeSize": 100, "Encrypted": true }</span>
+<span class="cm"># always tag a manual snapshot with why and until when: orphaned snapshots are a classic silent cost</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Snapshot storage costs about USD 0.05 per GB-month. A forgotten nightly snapshot job with no expiry on a 500 GB
+        volume with 5% daily churn adds roughly 25 GB a day. After a year that is about 9 TB, or roughly USD 450 a month,
+        before anyone looks.
+        Restoring is creating a new volume from the snapshot in any AZ, which is also how you move an EBS volume to
+        another AZ.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">EFS: shared files across AZs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>EFS</strong> is NFSv4.1 as a service. You create a filesystem, put one <strong>mount target</strong> (an
+        ENI) in each AZ's private subnet, and mount it from any number of instances, ECS tasks or EKS pods. It grows and
+        shrinks automatically and you pay for what you store: about USD 0.36 per GB-month for Standard in Singapore, with
+        Infrequent Access and Archive tiers at a small fraction of that through lifecycle policies. It is ten times the
+        price of S3 per GB and slower per operation than EBS, so use it only when the application genuinely needs a shared
+        POSIX filesystem. For EKS, the EFS CSI driver and its access points are
+        <a href="./ks4.html" class="text-viol underline decoration-viol/40">KS4</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">efs.tf — encrypted, one mount target per AZ, with a lifecycle</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_efs_file_system"</span> <span class="st">"reports"</span> {
+  creation_token   = <span class="st">"clinic-prod-reports"</span>
+  encrypted        = <span class="kw">true</span>
+  throughput_mode  = <span class="st">"elastic"</span>                 <span class="cm"># pay per GB transferred; no burst credits to run out of</span>
+  lifecycle_policy { transition_to_ia = <span class="st">"AFTER_30_DAYS"</span> }
+}
+
+<span class="kw">resource</span> <span class="st">"aws_efs_mount_target"</span> <span class="st">"reports"</span> {
+  for_each        = toset(module.vpc.private_subnets)  <span class="cm"># one per AZ, or other AZs cannot mount</span>
+  file_system_id  = aws_efs_file_system.reports.id
+  subnet_id       = each.value
+  security_groups = [aws_security_group.efs.id]       <span class="cm"># NFS 2049 from the app SG only</span>
+}</pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># on an instance with amazon-efs-utils installed: TLS in transit, IAM authorization</span>
+sudo mount -t efs -o tls,iam fs-0a9c3e7b1d2f45608:/ /mnt/reports
+df -h /mnt/reports
+<span class="out">Filesystem      Size  Used Avail Use% Mounted on
+127.0.0.1:/     8.0E  2.1G  8.0E   1% /mnt/reports</span>
+<span class="cm"># 8.0 exabytes "size": EFS has no fixed size, you pay for the 2.1 GB used</span></pre>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · CloudFront</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Put the edge in front, and keep the bucket private behind it</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <strong>CloudFront</strong> is AWS's CDN: hundreds of edge locations that terminate TLS close to the user and cache
+        responses. For the clinic platform it does three jobs. It serves <code class="inline">booking-web</code>'s static
+        assets from a private S3 bucket, so a clinic in Hanoi loads JavaScript from a nearby edge instead of Singapore. It
+        sits in front of the ALB for <code class="inline">app.clinic.example.com</code>, passing dynamic requests through
+        uncached. And it is cheaper than serving from S3 or the ALB directly: data out from CloudFront is billed at similar
+        or lower rates, the first 1 TB a month is free, and traffic from S3 or the ALB to CloudFront costs nothing.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Distributions, origins and behaviours</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>distribution</strong> has one or more <strong>origins</strong> (where content really lives) and an
+        ordered list of <strong>cache behaviours</strong>, each matching a path pattern and choosing an origin plus cache
+        settings. The default behaviour catches everything else. The first matching pattern wins, as with ALB listener
+        rules.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 740 250" class="w-full min-w-[660px]" role="img" aria-label="CloudFront distribution for app.clinic.example.com: /_next/static/* from the private S3 bucket via OAC with long caching, everything else from the ALB uncached">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">DISTRIBUTION · app.clinic.example.com (ACM cert in us-east-1)</text>
+          <g class="anim-pulse"><rect x="10" y="95" width="105" height="56" rx="9" fill="#37474F"/>
+            <text x="62" y="118" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Patient</text>
+            <text x="62" y="134" text-anchor="middle" fill="#ffffffbb" font-size="9">browser in Hanoi</text></g>
+          <g class="anim-pulse d1"><rect x="150" y="85" width="130" height="76" rx="9" fill="#D97757"/>
+            <text x="215" y="110" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Edge location</text>
+            <text x="215" y="126" text-anchor="middle" fill="#ffffffbb" font-size="9">TLS ends here</text>
+            <text x="215" y="142" text-anchor="middle" fill="#ffffffbb" font-size="9">cache HIT → done</text></g>
+          <g class="anim-pulse d2"><rect x="320" y="45" width="180" height="56" rx="9" fill="#2563EB"/>
+            <text x="410" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">/_next/static/*</text>
+            <text x="410" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">CachingOptimized · 1 year</text></g>
+          <g class="anim-pulse d3"><rect x="320" y="145" width="180" height="56" rx="9" fill="#6d5acd"/>
+            <text x="410" y="168" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">default (*)</text>
+            <text x="410" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">CachingDisabled · AllViewer</text></g>
+          <g class="anim-pulse d4"><rect x="540" y="45" width="190" height="56" rx="9" fill="#0D9488"/>
+            <text x="635" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">S3 web-assets (private)</text>
+            <text x="635" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">reachable only via OAC</text></g>
+          <g class="anim-pulse d2"><rect x="540" y="145" width="190" height="56" rx="9" fill="#DB2777"/>
+            <text x="635" y="168" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB → booking-web</text>
+            <text x="635" y="184" text-anchor="middle" fill="#ffffffbb" font-size="9">SSR pages, per-user data</text></g>
+          <line x1="115" y1="123" x2="150" y2="123" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="280" y1="110" x2="320" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="280" y1="138" x2="320" y2="173" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="500" y1="73" x2="540" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="500" y1="173" x2="540" y2="173" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="370" y="238" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">hashed assets cached for a year; anything per-user is never cached</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Origin Access Control: the bucket stays private</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The old way to serve a website from S3 was to make the bucket public with static website hosting. Do not do that.
+        With <strong>Origin Access Control (OAC)</strong>, CloudFront signs its requests to S3, and the bucket policy allows
+        reads only from the CloudFront service <em>for this one distribution</em>. Block Public Access stays fully on. OAC
+        replaces the older Origin Access Identity (OAI) and also works with SSE-KMS encrypted objects.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">bucket-policy-web-assets.json — the OAC statement</span>
+        <pre class="code">{
+  "Sid": "AllowCloudFrontOAC",
+  "Effect": "Allow",
+  "Principal": { "Service": "cloudfront.amazonaws.com" },
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::gol-prod-clinic-web-assets/*",
+  "Condition": { "StringEquals": {
+    "AWS:SourceArn": "arn:aws:cloudfront::444455556666:distribution/E2QWRUHAPOMQZL" } }  <span class="cm"># this distribution only</span>
+}</pre>
+      </div>
+      <pre class="code mt-3">curl -sI https://gol-prod-clinic-web-assets.s3.ap-southeast-1.amazonaws.com/_next/static/chunks/main-4f1a9c2e.js | head -1
+<span class="out">HTTP/1.1 403 Forbidden</span>
+curl -sI https://app.clinic.example.com/_next/static/chunks/main-4f1a9c2e.js | grep -iE '^(HTTP|x-cache|age)'
+<span class="out">HTTP/2 200
+x-cache: Hit from cloudfront
+age: 51234</span>
+<span class="cm"># direct S3 is denied, the edge serves it from cache: exactly the design</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Cache policies: what makes two requests "the same"</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>cache policy</strong> sets the TTLs and the <strong>cache key</strong>: which headers, cookies and query
+        strings make a response different. An <strong>origin request policy</strong> separately decides what is forwarded
+        to the origin without affecting the key. Use AWS's managed policies unless you have a measured reason not to.
+        Everything in a cache key that does not change the response lowers your hit rate; everything that changes the
+        response but is missing from the key is a data leak.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Path</th><th class="px-4 py-3">Cache policy</th><th class="px-4 py-3">Origin request policy</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/_next/static/*</code></td><td class="px-4 py-3">Managed-CachingOptimized</td><td class="px-4 py-3">none</td><td class="px-4 py-3">File names contain a content hash; a new build means new names</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">/images/*</code></td><td class="px-4 py-3">Managed-CachingOptimized</td><td class="px-4 py-3">none</td><td class="px-4 py-3">Public marketing images, same for everyone</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">default <code class="inline">*</code></td><td class="px-4 py-3">Managed-CachingDisabled</td><td class="px-4 py-3">Managed-AllViewerExceptHostHeader</td><td class="px-4 py-3">Pages depend on the session cookie: never cache, forward everything</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">api.clinic.example.com</code></td><td class="px-4 py-3">not behind CloudFront</td><td class="px-4 py-3">—</td><td class="px-4 py-3">Direct to the ALB with WAF; caching patient data at the edge is not worth the risk</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>Caching a personalised response leaks it to the next user.</strong>
+        If <code class="inline">/appointments</code> is cached with a key that ignores the session cookie, the first
+        patient's list is served to every patient for the TTL. It has happened to large companies. Default to
+        CachingDisabled for anything dynamic, have the app send <code class="inline">Cache-Control: private, no-store</code>
+        on per-user responses, and add caching path by path with a reviewer who asks "does this response differ per user?"</div>
+
+      <h3 class="font-semibold text-lg mt-8">Invalidations, and why you rarely need them</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An <strong>invalidation</strong> tells every edge to drop cached copies of some paths. The first 1,000 paths a
+        month are free, then USD 0.005 per path, and a wildcard counts as one path. It takes a minute or two to finish. If
+        you deploy hashed file names (Next.js does this for <code class="inline">/_next/static</code>), new code is new
+        URLs and nothing needs invalidating. Only unhashed entry points, such as <code class="inline">/robots.txt</code>
+        or a static <code class="inline">index.html</code>, need one, and the deploy pipeline
+        (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>) runs it after upload.
+      </p>
+      <pre class="code mt-3">aws cloudfront create-invalidation --profile gol-prod-deploy \
+  --distribution-id E2QWRUHAPOMQZL --paths "/robots.txt" "/sitemap.xml"
+<span class="out">{
+    "Location": "https://cloudfront.amazonaws.com/2020-05-31/distribution/E2QWRUHAPOMQZL/invalidation/I3KX0P9E2RTY7W",
+    "Invalidation": { "Id": "I3KX0P9E2RTY7W", "Status": "InProgress", ... }
+}</span>
+<span class="cm"># "/*" after every deploy works, and throws away a warm cache worldwide each time: avoid it</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two more details catch everyone once. CloudFront certificates must be requested in
+        <code class="inline">us-east-1</code>, whatever region your origins are in
+        (<a href="./aw7.html" class="text-viol underline decoration-viol/40">AW7</a>). And the ALB origin should accept
+        traffic only from CloudFront: allow the AWS-managed prefix list
+        <code class="inline">com.amazonaws.global.cloudfront.origin-facing</code> in the ALB security group, or use a
+        CloudFront VPC origin so the ALB can be internal.
+      </p>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Storage configuration is verbose and full of separate resources (a modern S3 bucket in Terraform is six or seven
+        of them), which makes it a good job for an agent and an easy place for one to leave something out. Ask for the
+        complete set by name, and check the policies line by line.
+      </p>
+      <pre class="code mt-3">Write Terraform for bucket gol-staging-clinic-uploads: versioning, SSE-KMS with
+aws_kms_key.clinic_data and bucket keys, BucketOwnerEnforced, all four Block Public Access
+flags, a bucket policy denying non-TLS and principals outside org o-a1b2c3d4e5, and the
+lifecycle rule (IA at 30 d, Glacier IR at 180 d, noncurrent versions 30 d, abort MPU 7 d).
+One resource per setting; list which AWS default each one changes.</pre>
+      <pre class="code mt-3">Review this CloudFront distribution and its cache behaviours. For every behaviour, tell me
+whether the response can differ per user (cookies, Authorization header) and whether the
+cache key includes what makes it differ. Flag any behaviour that could serve one user's
+response to another.</pre>
+      <pre class="code mt-3">With AWS_PROFILE=gol-dev-ro, list every EBS volume that is gp2 or unattached and every
+snapshot older than 90 days without a DeleteAfter tag. Read-only. Output a table with
+monthly cost at Singapore prices and the command to fix each, but do not run them.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Generate the full set of bucket resources and lifecycle JSON</li>
+            <li>Write presigned URL and presigned POST code with tests</li>
+            <li>Audit volumes, snapshots and buckets for cost and exposure, read-only</li>
+            <li>Explain <code class="inline">x-cache</code>, <code class="inline">age</code> and cache-key behaviour from <code class="inline">curl -I</code> output</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Block Public Access is fully on, and no policy has <code class="inline">"Principal": "*"</code> with an Allow</li>
+            <li>Versioning comes with a noncurrent-version expiry</li>
+            <li>The OAC condition names the exact distribution ARN</li>
+            <li>No dynamic or per-user path uses a caching policy</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written storage:</strong>
+        <code class="inline">block_public_policy = false</code> or <code class="inline">acl = "public-read"</code> "so
+        CloudFront can read it"; S3 static website hosting for an app that needs OAC; a presigned URL with
+        <code class="inline">expiresIn: 604800</code> (seven days) or a client-chosen key; <code class="inline">gp2</code>
+        anywhere; <code class="inline">force_destroy = true</code> on a prod bucket; an invalidation of
+        <code class="inline">/*</code> in every deploy; a cache behaviour that forwards cookies but uses CachingOptimized;
+        and an origin access identity (OAI) in new code.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has uploaded a file to S3 in the console and nothing more.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows S3, EBS and EFS are different kinds of storage and that buckets should not be public, but cannot say what makes one public.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Creates a bucket from our module, writes a presigned URL endpoint from an example, and converts gp2 volumes with a checklist.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Builds a private, versioned, KMS-encrypted bucket with lifecycle and a deny-based bucket policy, implements direct uploads with presigned URLs safely, chooses between S3, EBS and EFS with a reason, and puts CloudFront with OAC and correct cache policies in front of a private bucket.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the storage standards and retention rules for a client, designs cross-account replication for DR, and cuts storage and transfer costs with measured lifecycle and CDN changes.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, explain why
+        a bucket with Block Public Access on can still be read by another AWS account, and which line stops it. Then
+        show, with <code class="inline">curl</code>, that your assets bucket returns 403 directly and
+        <code class="inline">x-cache: Hit from cloudfront</code> through the distribution, and that a per-user page is
+        never a cache hit.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Lifecycle transitions for tiny objects</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Moving millions of 10 KB thumbnails to Standard-IA costs a transition fee per object and bills each as 128 KB. Filter lifecycle rules by prefix or object size (<code class="inline">ObjectSizeGreaterThan</code>).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Unattached volumes and orphaned snapshots</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Terminating an instance with <code class="inline">DeleteOnTermination=false</code> leaves a volume billing for ever. Check <code class="inline">describe-volumes --filters Name=status,Values=available</code> monthly (<a href="./ar2.html" class="text-viol underline decoration-viol/40">AR2</a>).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ EFS as a cheap database disk</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">NFS latency and locking semantics make Postgres or SQLite on EFS slow and fragile. Databases go on RDS (<a href="./aw5.html" class="text-viol underline decoration-viol/40">AW5</a>), or on EBS if self-managed.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Use S3 Storage Lens and the console's access findings</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The free Storage Lens dashboard shows noncurrent bytes, incomplete multipart uploads and buckets without lifecycle rules across the whole Organization. Look at it once a month.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Immutable caching for hashed assets</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Serve hashed files with <code class="inline">Cache-Control: public, max-age=31536000, immutable</code>. Browsers and edges keep them for a year, and deploys never need an invalidation.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="s3-bucket"> <span>I built a bucket with versioning, lifecycle, SSE-KMS with bucket keys, BPA and a deny-based bucket policy, and restored a deleted object by removing its delete marker.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="presigned"> <span>I implemented a direct browser upload with a server-chosen key, a short expiry and a size check.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="ebs-efs"> <span>I can choose between S3, EBS, EFS and instance store for a workload, converted a gp2 volume to gp3, and took a tagged snapshot.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cloudfront"> <span>I can explain origins, behaviours, cache keys and OAC, and say which clinic paths may be cached and why.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cdn-lab"> <span class="font-semibold">In a sandbox account, served a static build of booking-web from a private S3 bucket through CloudFront with OAC, with hashed assets cached for a year and HTML uncached, plus an uploads bucket with lifecycle and a presigned-upload demo. Shared the Terraform, the <code class="inline">curl -I</code> output proving 403 direct and a cache hit via CloudFront, and a monthly cost estimate (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html" target="_blank" rel="noopener">AWS — S3 security best practices</a>: BPA, Object Ownership, encryption and policies in one place.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html" target="_blank" rel="noopener">AWS — Managing the S3 object lifecycle</a>: transitions, minimum durations and noncurrent versions.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html" target="_blank" rel="noopener">AWS — Presigned URLs</a>: expiry rules and who can create them.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volume-types.html" target="_blank" rel="noopener">AWS — EBS volume types</a>: gp3, io2 and HDD performance in detail.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/efs/latest/ug/whatisefs.html" target="_blank" rel="noopener">AWS — Amazon EFS user guide</a>: mount targets, throughput modes and storage classes.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html" target="_blank" rel="noopener">AWS — Restrict access to an S3 origin (OAC)</a>: the bucket policy pattern from Part IV.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/controlling-the-cache-key.html" target="_blank" rel="noopener">AWS — Controlling the cache key</a>: cache and origin request policies, and the managed ones.</li>
+      </ul>

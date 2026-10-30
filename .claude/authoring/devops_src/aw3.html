@@ -1,0 +1,758 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">EC2, Auto Scaling &amp; Load Balancers</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Even on a container platform, EC2 is underneath almost everything: EKS worker nodes are EC2 instances, Karpenter
+          launches EC2 instances, and every request to <code class="inline">api.clinic.example.com</code> enters through an
+          Application Load Balancer. This module teaches the compute and traffic primitives directly. You will choose
+          instance types (and default to Graviton), launch instances from a launch template with safe defaults, run them
+          in an Auto Scaling group that heals and scales itself, put an ALB in front with health checks that tell the truth,
+          and get a shell on any instance without SSH. The worked example runs <code class="inline">booking-api</code> on
+          an Auto Scaling group, the shape we still deploy for clients not yet on containers.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> most "the site is down" pages for an EC2-backed service trace back
+          to four settings. A health check pointed at <code class="inline">/</code> instead of
+          <code class="inline">/healthz</code> keeps a broken instance in rotation. A health check grace period shorter than
+          boot time makes the Auto Scaling group kill every new instance before it finishes starting, in a loop. A
+          <code class="inline">t3.micro</code> runs out of CPU credits at 10 a.m. on the busiest booking day. A
+          deregistration delay of 300 seconds makes every deploy take twenty minutes. You will read these settings in
+          every Terraform plan for compute, whether a person or an agent wrote it.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Instances &amp; images</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pick the instance by workload shape, then default to Graviton</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An EC2 instance is a virtual machine with a fixed ratio of vCPU to memory, a network bandwidth ceiling and a
+        price per hour. There are hundreds of types. You do not need to know them all. You need to read a type name,
+        know which family fits which workload, and know the two traps (burstable credits and the wrong architecture)
+        that cause most surprises.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Reading an instance type name</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every type name packs four facts. Once you can decode it, a Terraform line like
+        <code class="inline">instance_type = "c7gn.2xlarge"</code> tells you what the author thought the workload needed,
+        and whether they were right.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="Decoding the instance type m7g.large: family m, generation 7, attribute g for Graviton, size large">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">DECODING · m7g.large</text>
+          <g class="anim-pulse"><rect x="30" y="50" width="130" height="62" rx="9" fill="#2563EB"/>
+            <text x="95" y="76" text-anchor="middle" fill="#fff" font-size="16" font-weight="700">m</text>
+            <text x="95" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">family: general purpose</text></g>
+          <g class="anim-pulse d1"><rect x="190" y="50" width="130" height="62" rx="9" fill="#6d5acd"/>
+            <text x="255" y="76" text-anchor="middle" fill="#fff" font-size="16" font-weight="700">7</text>
+            <text x="255" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">generation: newer = cheaper/faster</text></g>
+          <g class="anim-pulse d2"><rect x="350" y="50" width="130" height="62" rx="9" fill="#0D9488"/>
+            <text x="415" y="76" text-anchor="middle" fill="#fff" font-size="16" font-weight="700">g</text>
+            <text x="415" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">attribute: Graviton (arm64)</text></g>
+          <g class="anim-pulse d3"><rect x="510" y="50" width="160" height="62" rx="9" fill="#D97757"/>
+            <text x="590" y="76" text-anchor="middle" fill="#fff" font-size="16" font-weight="700">.large</text>
+            <text x="590" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">size: 2 vCPU · 8 GiB</text></g>
+          <line x1="160" y1="81" x2="190" y2="81" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="320" y1="81" x2="350" y2="81" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="480" y1="81" x2="510" y2="81" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="30" y="145" font-size="10" fill="#6E6B64">other attributes: i = Intel · a = AMD · d = local NVMe disk · n = extra network · e = extra memory</text>
+          <text x="30" y="163" font-size="10" fill="#6E6B64">each size step doubles vCPU, memory and price: large → xlarge → 2xlarge → 4xlarge</text>
+          <text x="350" y="190" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">c7gn.2xlarge = compute-optimised, gen 7, Graviton, extra network, 8 vCPU</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Family</th><th class="px-4 py-3">vCPU : GiB</th><th class="px-4 py-3">Fits</th><th class="px-4 py-3">Example (approx. on-demand, Singapore)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">t (burstable)</td><td class="px-4 py-3">1 : 2–4</td><td class="px-4 py-3">Low, spiky CPU: dev boxes, small admin tools</td><td class="px-4 py-3">t4g.medium · ~USD 0.042/h · ~USD 31/month</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">m (general)</td><td class="px-4 py-3">1 : 4</td><td class="px-4 py-3">Web APIs, EKS nodes: the default</td><td class="px-4 py-3">m7g.large · ~USD 0.10/h · ~USD 75/month</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">c (compute)</td><td class="px-4 py-3">1 : 2</td><td class="px-4 py-3">CPU-bound: PDF rendering, image processing, builds</td><td class="px-4 py-3">c7g.large · ~USD 0.09/h</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">r (memory)</td><td class="px-4 py-3">1 : 8</td><td class="px-4 py-3">Caches, JVM-heavy apps, in-memory analytics</td><td class="px-4 py-3">r7g.large · ~USD 0.13/h</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">i / d variants</td><td class="px-4 py-3">varies</td><td class="px-4 py-3">Fast local NVMe that is wiped on stop</td><td class="px-4 py-3">Rare for us; self-managed databases only</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Prices change and differ by region, so check the pricing page or
+        <code class="inline">aws pricing get-products</code> before you quote a client. The ratios between families are
+        what to remember.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Graviton by default</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Graviton instances (the <code class="inline">g</code> attribute) use AWS's own arm64 processors. For the same size
+        they cost roughly 20% less per hour than the Intel equivalent and usually run Node.js, Python, Go and Java
+        workloads as fast or faster. <code class="inline">booking-api</code> is TypeScript on Node.js 22, so the only
+        requirement is an arm64 container image, which our multi-arch build already produces
+        (<a href="./fn6.html" class="text-viol underline decoration-viol/40">FN6</a>). We pick Graviton unless a
+        dependency ships only x86 binaries.
+      </p>
+      <pre class="code mt-3"><span class="cm"># does the image you are about to run actually include arm64?</span>
+docker buildx imagetools inspect 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-api:1.8.2 | grep Platform
+<span class="out">  Platform:    linux/amd64
+  Platform:    linux/arm64</span>
+<span class="cm"># only linux/amd64? the task starts on Graviton and dies with "exec format error"</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">The burstable trap: CPU credits</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <code class="inline">t4g.medium</code> has 2 vCPUs but a <em>baseline</em> of only 20% of each. Below the
+        baseline it earns CPU credits; above it, it spends them. When credits run out in standard mode, the instance is
+        throttled to the baseline, and an API that was fine at 9 a.m. answers in eight seconds at 10 a.m. In unlimited mode
+        (the default for t4g) it keeps bursting and you pay for the surplus, which can make a t instance cost more than an m
+        instance. Watch the balance, and if a t instance sits above baseline all day, move it to m.
+      </p>
+      <pre class="code mt-3">aws cloudwatch get-metric-statistics --profile gol-dev \
+  --namespace AWS/EC2 --metric-name CPUCreditBalance \
+  --dimensions Name=InstanceId,Value=i-0a3f9c1e7b2d45860 \
+  --start-time 2026-10-29T00:00:00Z --end-time 2026-10-30T00:00:00Z \
+  --period 3600 --statistics Minimum --query 'sort_by(Datapoints,&amp;Timestamp)[-4:].Minimum'
+<span class="out">[ 41.2, 12.7, 0.0, 0.0 ]</span>
+<span class="cm"># zero for two hours = throttled (standard) or paying surplus (unlimited). Either way: wrong family</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">AMIs: start from the current one, not a hard-coded ID</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An <strong>AMI</strong> (Amazon Machine Image) is the disk snapshot an instance boots from. AMI IDs differ per
+        region and change every time AWS patches the image. Hard-coding <code class="inline">ami-0abc…</code> means you
+        launch a months-old, unpatched image forever. Look up the latest Amazon Linux 2023 image from the public SSM
+        parameter instead. Building our own pre-hardened "golden" AMIs with Packer and EC2 Image Builder is
+        <a href="./ia3.html" class="text-viol underline decoration-viol/40">IA3</a>.
+      </p>
+      <pre class="code mt-3">aws ssm get-parameter --region ap-southeast-1 \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
+  --query 'Parameter.[Value,LastModifiedDate]' --output text
+<span class="out">ami-0f5d2a8c4e6b13790    2026-10-21T18:04:11.902000+00:00</span></pre>
+      <div class="mt-4">
+        <span class="code-label">ami.tf — always the latest patched AL2023 for arm64</span>
+        <pre class="code"><span class="kw">data</span> <span class="st">"aws_ssm_parameter"</span> <span class="st">"al2023_arm64"</span> {
+  name = <span class="st">"/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"</span>
+}
+<span class="cm"># used as image_id in the launch template below; a new value = a new template version = an instance refresh</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Launching instances well</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The launch template is the contract; user data is the last mile</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Instances should be cattle: identical, replaceable, never fixed by hand. That only works if everything about how
+        an instance starts is written down in one versioned place, the <strong>launch template</strong>, and everything it
+        does on first boot is a short, repeatable script, the <strong>user data</strong>. Then the Auto Scaling group in
+        Part III can create the hundredth instance exactly like the first.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Launch templates with safe defaults</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A launch template holds the AMI, instance type, network settings, IAM instance profile, disks, metadata options and
+        user data. Every change creates a new numbered <strong>version</strong>, so you can see what changed and roll back.
+        Four settings in it matter more than the rest, and each one below is marked.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">launch-template.tf — booking-api on EC2</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_launch_template"</span> <span class="st">"booking_api"</span> {
+  name_prefix   = <span class="st">"booking-api-"</span>
+  image_id      = data.aws_ssm_parameter.al2023_arm64.value
+  instance_type = <span class="st">"m7g.large"</span>
+  vpc_security_group_ids = [aws_security_group.booking_api.id]   <span class="cm"># no public IP: private subnets only</span>
+
+  iam_instance_profile { name = aws_iam_instance_profile.booking_api.name }  <span class="cm"># 1. a role, never keys</span>
+
+  metadata_options {
+    http_tokens                 = <span class="st">"required"</span>   <span class="cm"># 2. IMDSv2 only: blocks the classic SSRF credential theft</span>
+    http_put_response_hop_limit = <span class="st">1</span>            <span class="cm">#    set 2 only if containers on the host need IMDS</span>
+  }
+
+  block_device_mappings {
+    device_name = <span class="st">"/dev/xvda"</span>
+    ebs {
+      volume_size = <span class="st">20</span>
+      volume_type = <span class="st">"gp3"</span>
+      encrypted   = <span class="kw">true</span>                     <span class="cm"># 3. always; account-level default encryption as a backstop</span>
+      delete_on_termination = <span class="kw">true</span>
+    }
+  }
+
+  user_data = base64encode(templatefile(<span class="st">"${path.module}/user-data.sh"</span>, { version = var.api_version }))
+  tag_specifications {
+    resource_type = <span class="st">"instance"</span>
+    tags = { Name = <span class="st">"booking-api"</span>, Service = <span class="st">"booking-api"</span>, Env = <span class="st">"prod"</span> }  <span class="cm"># 4. tags drive cost reports</span>
+  }
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>IMDSv1 turns an SSRF bug into stolen AWS credentials.</strong>
+        With IMDSv1, any code that can be tricked into fetching a URL (an image-resize endpoint, a webhook tester) can read
+        <code class="inline">http://169.254.169.254/latest/meta-data/iam/security-credentials/</code> and hand an attacker
+        the instance role's keys. IMDSv2 requires a PUT with a session token first, which those bugs cannot do. Set
+        <code class="inline">http_tokens = "required"</code> on every template, and make it the account default
+        (<code class="inline">aws ec2 modify-instance-metadata-defaults --http-tokens required</code>).</div>
+
+      <h3 class="font-semibold text-lg mt-8">User data: short, idempotent, observable</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        User data runs once, as root, on first boot, through cloud-init. Keep it short. Everything slow or complicated
+        (installing runtimes, hardening) belongs in the AMI, so boot is fast and the same every time. User data should only
+        do what differs per environment or per release: fetch config, pull the image, start the service. Use the bash
+        habits from <a href="./fn5.html" class="text-viol underline decoration-viol/40">FN5</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">user-data.sh — run by cloud-init on first boot</span>
+        <pre class="code"><span class="cm">#!/bin/bash</span>
+<span class="kw">set</span> -euo pipefail
+exec &gt; &gt;(tee -a /var/log/booking-bootstrap.log) 2&gt;&amp;1     <span class="cm"># every line ends up in a log you can read</span>
+
+dnf install -y docker
+systemctl enable --now docker
+
+REGISTRY=111122223333.dkr.ecr.ap-southeast-1.amazonaws.com
+aws ecr get-login-password --region ap-southeast-1 | docker login -u AWS --password-stdin "$REGISTRY"
+
+docker run -d --name booking-api --restart unless-stopped -p 8080:8080 \
+  -e APP_ENV=prod "$REGISTRY/booking-api:${version}"
+
+<span class="cm"># wait until the app is healthy, so a broken release fails here, visibly</span>
+<span class="kw">for</span> i <span class="kw">in</span> $(seq 1 30); <span class="kw">do</span> curl -fsS localhost:8080/healthz &amp;&amp; <span class="kw">exit</span> 0; sleep 2; <span class="kw">done</span>
+echo <span class="st">"booking-api never became healthy"</span>; <span class="kw">exit</span> 1</pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># on the instance (via Session Manager, below): did user data succeed?</span>
+sudo cloud-init status --long
+<span class="out">status: done
+extended_status: done
+detail: DataSourceEc2Local
+errors: []</span>
+sudo tail -3 /var/log/cloud-init-output.log</pre>
+
+      <h3 class="font-semibold text-lg mt-8">The instance lifecycle, and what survives each step</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An EBS-backed instance (the root disk is an EBS volume, which is every instance we run) moves through a small set
+        of states. The two questions that matter for each transition are "am I still paying?" and "what do I lose?".
+        Juniors usually learn the answer to the second question by stopping an instance that kept its data on instance
+        store.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> pending: RunInstances / ASG launch
+    pending --> running: boot + user data
+    running --> stopping: StopInstances
+    stopping --> stopped
+    stopped --> pending: StartInstances<br/>(new host, new public IP)
+    running --> shutting_down: TerminateInstances<br/>or ASG scale-in
+    stopped --> shutting_down
+    shutting_down --> terminated
+    terminated --> [*]: root EBS deleted<br/>(DeleteOnTermination)
+        </pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Action</th><th class="px-4 py-3">Billing</th><th class="px-4 py-3">Kept</th><th class="px-4 py-3">Lost</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Reboot</td><td class="px-4 py-3">Continues</td><td class="px-4 py-3">Everything, same host</td><td class="px-4 py-3">In-memory state</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Stop / start</td><td class="px-4 py-3">Instance stops; EBS keeps billing</td><td class="px-4 py-3">EBS volumes, private IP, instance ID</td><td class="px-4 py-3">Instance store data, auto-assigned public IP, the host</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hibernate</td><td class="px-4 py-3">Like stop</td><td class="px-4 py-3">RAM written to the encrypted root volume</td><td class="px-4 py-3">Instance store; rarely worth the setup for us</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Terminate</td><td class="px-4 py-3">Stops for all deleted volumes</td><td class="px-4 py-3">Volumes with <code class="inline">DeleteOnTermination=false</code>, snapshots</td><td class="px-4 py-3">The instance, for ever. Enable termination protection on anything hand-built</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        AWS also stops or retires instances for you when the underlying host degrades. You get a scheduled event a couple
+        of weeks ahead (<code class="inline">aws ec2 describe-instance-status --filters Name=event.code,Values=instance-stop</code>).
+        An instance in an Auto Scaling group does not care; a hand-built pet does. That is one more reason every
+        production instance belongs to an ASG.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Session Manager: a shell with no SSH</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        AW2 removed the bastion from the network side. On the instance side, Session Manager needs three things: the SSM
+        agent (preinstalled on Amazon Linux 2023), an instance profile with the AWS-managed policy
+        <code class="inline">AmazonSSMManagedInstanceCore</code>, and a way to reach the SSM service (NAT or the SSM
+        endpoints, <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>). Then no key pair, no port
+        22, and every session is logged to CloudWatch with who ran what.
+      </p>
+      <pre class="code mt-3">aws ssm describe-instance-information --profile gol-prod-ro \
+  --query 'InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion]' --output text
+<span class="out">i-0a3f9c1e7b2d45860   Online   Amazon Linux   3.3.1957.0
+i-07b2e5d9c4a1f3086   Online   Amazon Linux   3.3.1957.0
+i-0c8d1f4a6e2b97035   ConnectionLost   Amazon Linux   3.3.1957.0</span>
+<span class="cm"># ConnectionLost = agent cannot reach SSM: check the instance profile, NAT/endpoints, or the instance is unhealthy</span>
+aws ssm start-session --profile gol-prod-oncall --target i-0a3f9c1e7b2d45860
+<span class="out">Starting session with SessionId: an.nguyen@goldenowl.asia-04f1c7a2e9b6d3815
+sh-5.2$</span></pre>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Auto Scaling groups</div>
+      <h2 class="font-display text-2xl font-bold mt-2">An Auto Scaling group is a control loop for instances</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An <strong>Auto Scaling group (ASG)</strong> keeps a number of identical instances running across several AZs,
+        built from one launch template. It is the same idea as a Kubernetes ReplicaSet
+        (<a href="./ks1.html" class="text-viol underline decoration-viol/40">KS1</a>): you declare a desired count, and the
+        ASG replaces anything that dies and adds or removes instances when a scaling policy says so. EKS managed node
+        groups are ASGs underneath, so everything here carries over.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Min, max, desired, and the health check that matters</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Three numbers define the group: <strong>min</strong> (never fewer, even at 3 a.m.), <strong>max</strong> (the cost
+        ceiling) and <strong>desired</strong> (what the scaling policies move between them). The setting that decides
+        whether the group actually heals is the <strong>health check type</strong>. With the default
+        <code class="inline">EC2</code> type, the ASG replaces an instance only when the VM itself fails. A running VM whose
+        app returns 500 on every request counts as healthy. With <code class="inline">ELB</code>, the ASG also replaces
+        instances that the load balancer marks unhealthy.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">asg.tf — booking-api across three AZs</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_autoscaling_group"</span> <span class="st">"booking_api"</span> {
+  name                = <span class="st">"booking-api-prod"</span>
+  vpc_zone_identifier = module.vpc.private_subnets     <span class="cm"># one subnet per AZ: the ASG balances across them</span>
+  min_size            = <span class="st">3</span>                             <span class="cm"># one per AZ survives an AZ loss</span>
+  max_size            = <span class="st">12</span>
+  desired_capacity    = <span class="st">3</span>
+
+  launch_template {
+    id      = aws_launch_template.booking_api.id
+    version = aws_launch_template.booking_api.latest_version
+  }
+
+  target_group_arns         = [aws_lb_target_group.booking_api.arn]
+  health_check_type         = <span class="st">"ELB"</span>                <span class="cm"># replace instances the ALB considers unhealthy</span>
+  health_check_grace_period = <span class="st">180</span>                  <span class="cm"># seconds: longer than boot + user data</span>
+
+  instance_refresh {
+    strategy = <span class="st">"Rolling"</span>
+    preferences {
+      min_healthy_percentage = <span class="st">100</span>             <span class="cm"># launch before terminate</span>
+      max_healthy_percentage = <span class="st">150</span>
+    }
+  }
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Grace period shorter than boot time is a death loop.</strong> If
+        user data takes 150 seconds and the grace period is 60, the ALB marks the new instance unhealthy, the ASG
+        terminates it, launches a replacement, and repeats for ever. The activity history shows it clearly; read it
+        before you read anything else when an ASG "won't stay up".</div>
+      <pre class="code mt-3">aws autoscaling describe-scaling-activities --profile gol-prod-ro \
+  --auto-scaling-group-name booking-api-prod --max-items 3 \
+  --query 'Activities[].[StartTime,StatusCode,Cause]' --output text
+<span class="out">2026-10-30T02:14:51Z  Successful  ... an instance was taken out of service in response to an ELB system health check failure.
+2026-10-30T02:11:07Z  Successful  ... an instance was started in response to a difference between desired and actual capacity, increasing the capacity from 2 to 3.
+2026-10-30T02:10:58Z  Successful  ... an instance was taken out of service in response to an ELB system health check failure.</span>
+<span class="cm"># a launch-fail-replace cycle every ~4 minutes: grace period, wrong health path, or the app is really broken</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Scaling policies: target tracking first</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A scaling policy changes desired capacity. Start with <strong>target tracking</strong>: you pick a metric and a
+        target value, and AWS creates the CloudWatch alarms and does the maths, like a thermostat. For a web API, requests
+        per target is a better signal than CPU, because it rises before latency does.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Policy</th><th class="px-4 py-3">How it decides</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Target tracking</td><td class="px-4 py-3">Keep a metric near a target, e.g. 400 ALB requests per instance per minute</td><td class="px-4 py-3">The default for every web tier</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Step scaling</td><td class="px-4 py-3">Add N instances per alarm band you cross</td><td class="px-4 py-3">Queue depth for workers, where you want aggressive steps</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scheduled</td><td class="px-4 py-3">Set min/desired at a time, by cron</td><td class="px-4 py-3">Clinics open at 08:00 ICT: raise min to 6 at 07:30 on weekdays</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Predictive</td><td class="px-4 py-3">Forecasts from 14 days of history and scales ahead</td><td class="px-4 py-3">Strong daily cycles once you have the history; run in forecast-only mode first</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">scaling.tf — requests per target, plus the morning rush</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_autoscaling_policy"</span> <span class="st">"rps"</span> {
+  name                   = <span class="st">"booking-api-requests-per-target"</span>
+  autoscaling_group_name = aws_autoscaling_group.booking_api.name
+  policy_type            = <span class="st">"TargetTrackingScaling"</span>
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = <span class="st">"ALBRequestCountPerTarget"</span>
+      resource_label         = <span class="st">"${aws_lb.public.arn_suffix}/${aws_lb_target_group.booking_api.arn_suffix}"</span>
+    }
+    target_value = <span class="st">400</span>     <span class="cm"># from a load test (SR4): one m7g.large serves ~600 rpm at p99 &lt; 300 ms</span>
+  }
+}
+
+<span class="kw">resource</span> <span class="st">"aws_autoscaling_schedule"</span> <span class="st">"clinic_open"</span> {
+  scheduled_action_name  = <span class="st">"weekday-open"</span>
+  autoscaling_group_name = aws_autoscaling_group.booking_api.name
+  recurrence             = <span class="st">"30 7 * * MON-FRI"</span>
+  time_zone              = <span class="st">"Asia/Ho_Chi_Minh"</span>
+  min_size               = <span class="st">6</span>
+  max_size               = <span class="st">12</span>
+  desired_capacity       = <span class="st">6</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The target value must come from a measurement, not a guess. 400 requests per minute is roughly two-thirds of what
+        one instance handled in the load test, which leaves headroom for the two or three minutes a new instance needs to
+        boot. How to run that load test is <a href="./sr4.html" class="text-viol underline decoration-viol/40">SR4</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Rolling out a new version: instance refresh</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Changing the launch template does nothing to running instances. An <strong>instance refresh</strong> replaces them
+        in batches, waiting for each batch to pass health checks before continuing. With
+        <code class="inline">min_healthy_percentage = 100</code> it launches new instances before terminating old ones, so
+        capacity never drops. Add a checkpoint or auto-rollback so a bad release stops at the first batch.
+      </p>
+      <pre class="code mt-3">aws autoscaling start-instance-refresh --profile gol-prod-deploy \
+  --auto-scaling-group-name booking-api-prod \
+  --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":150,"InstanceWarmup":120,"AutoRollback":true}'
+<span class="out">{ "InstanceRefreshId": "5c2f8e1a-7b3d-4c9e-a6f0-2d1b8e4c7a93" }</span>
+aws autoscaling describe-instance-refreshes --profile gol-prod-ro \
+  --auto-scaling-group-name booking-api-prod --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text
+<span class="out">InProgress    33</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This is the EC2 version of a rolling deploy. Blue/green, canary and the rest of the release strategies, and how to
+        choose between them, are <a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Spot instances: 60–90% off, with two minutes' notice</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Spot</strong> instances use spare EC2 capacity at a steep discount, and AWS can reclaim them with a
+        two-minute warning. That is fine for anything that tolerates losing one instance: stateless API replicas behind an
+        ALB, queue workers like <code class="inline">booking-worker</code>, CI runners. It is not fine for a single instance
+        holding state. The safe pattern is a <strong>mixed instances policy</strong>: a base of on-demand capacity, Spot on
+        top, and many instance types so AWS can find capacity in some pool. Karpenter does the same for EKS
+        (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">asg.tf — replace the launch_template block with a mixed policy</span>
+        <pre class="code">  capacity_rebalance = <span class="kw">true</span>                         <span class="cm"># launch a replacement on the rebalance signal, before the 2-min notice</span>
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_base_capacity                  = <span class="st">2</span>   <span class="cm"># two on-demand instances, always</span>
+      on_demand_percentage_above_base_capacity = <span class="st">25</span>  <span class="cm"># then 25% on-demand, 75% Spot</span>
+      spot_allocation_strategy                 = <span class="st">"price-capacity-optimized"</span>
+    }
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.booking_api.id
+        version            = <span class="st">"$Latest"</span>
+      }
+      override { instance_type = <span class="st">"m7g.large"</span> }
+      override { instance_type = <span class="st">"m6g.large"</span> }
+      override { instance_type = <span class="st">"m8g.large"</span> }        <span class="cm"># all arm64: the AMI is arm64. More pools = fewer interruptions</span>
+    }
+  }</pre>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Load balancers</div>
+      <h2 class="font-display text-2xl font-bold mt-2">The ALB is the front door, and its health checks are its judgement</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A load balancer gives clients one stable address, spreads requests over healthy targets, and takes unhealthy ones
+        out of rotation. On our platform the same Application Load Balancer pattern fronts EC2 instances, ECS tasks
+        (<a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>) and EKS pods (through the AWS Load
+        Balancer Controller, <a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>). Learn it once
+        here.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 740 260" class="w-full min-w-[660px]" role="img" aria-label="Internet traffic to an ALB with HTTPS listener and host rules, forwarding to target groups for booking-api and booking-web, backed by an Auto Scaling group across three AZs">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">REQUEST PATH · api.clinic.example.com</text>
+          <g class="anim-pulse"><rect x="10" y="95" width="100" height="56" rx="9" fill="#37474F"/>
+            <text x="60" y="118" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Clients</text>
+            <text x="60" y="134" text-anchor="middle" fill="#ffffffbb" font-size="9">HTTPS :443</text></g>
+          <g class="anim-pulse d1"><rect x="150" y="70" width="150" height="106" rx="9" fill="#D97757"/>
+            <text x="225" y="94" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB clinic-prod</text>
+            <text x="225" y="112" text-anchor="middle" fill="#ffffffbb" font-size="9">listener :443 · ACM cert</text>
+            <text x="225" y="130" text-anchor="middle" fill="#ffffffbb" font-size="9">rule 10: host api.* → api-tg</text>
+            <text x="225" y="146" text-anchor="middle" fill="#ffffffbb" font-size="9">rule 20: host app.* → web-tg</text>
+            <text x="225" y="162" text-anchor="middle" fill="#ffffffbb" font-size="9">default: 404</text></g>
+          <g class="anim-pulse d2"><rect x="340" y="60" width="140" height="56" rx="9" fill="#2563EB"/>
+            <text x="410" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api-tg</text>
+            <text x="410" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">:8080 · GET /healthz</text></g>
+          <g class="anim-pulse d3"><rect x="340" y="140" width="140" height="56" rx="9" fill="#6d5acd"/>
+            <text x="410" y="163" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-web-tg</text>
+            <text x="410" y="179" text-anchor="middle" fill="#ffffffbb" font-size="9">:3000 · GET /api/health</text></g>
+          <g class="anim-pulse d4"><rect x="520" y="40" width="210" height="96" rx="9" fill="#0D9488"/>
+            <text x="625" y="63" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ASG booking-api-prod</text>
+            <text x="625" y="83" text-anchor="middle" fill="#ffffffbb" font-size="9">i-…a (AZ a) · healthy</text>
+            <text x="625" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">i-…b (AZ b) · healthy</text>
+            <text x="625" y="115" text-anchor="middle" fill="#ffffffbb" font-size="9">i-…c (AZ c) · unhealthy → replaced</text></g>
+          <g class="anim-pulse d2"><rect x="520" y="150" width="210" height="46" rx="9" fill="#6d5acd"/>
+            <text x="625" y="170" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-web tasks</text>
+            <text x="625" y="186" text-anchor="middle" fill="#ffffffbb" font-size="9">target type ip (ECS / EKS)</text></g>
+          <line x1="110" y1="123" x2="150" y2="123" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="300" y1="105" x2="340" y2="88" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="300" y1="145" x2="340" y2="168" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="480" y1="88" x2="520" y2="88" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="480" y1="168" x2="520" y2="172" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="370" y="240" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">TLS ends at the ALB; health checks run per target group, every 10 s</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">ALB vs NLB</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <strong>Application Load Balancer</strong> works at layer 7: it terminates TLS, reads HTTP, routes by host and
+        path, and can attach WAF. The <strong>Network Load Balancer</strong> works at layer 4: it forwards TCP/UDP
+        connections with very low latency, static IPs per AZ, and no idea what HTTP is. For the clinic platform the answer
+        is almost always ALB. The L4 vs L7 theory is in <a href="./fn3.html" class="text-viol underline decoration-viol/40">FN3</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Need</th><th class="px-4 py-3">ALB</th><th class="px-4 py-3">NLB</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">HTTP routing by host/path, redirects, fixed responses</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">No</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">WAF, OIDC/Cognito auth at the edge</td><td class="px-4 py-3">Yes (<a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>)</td><td class="px-4 py-3">No</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Static IPs a client can allow-list</td><td class="px-4 py-3">No (DNS name only)</td><td class="px-4 py-3">Yes, one Elastic IP per AZ</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Non-HTTP: Postgres proxy, MQTT, gRPC passthrough, UDP</td><td class="px-4 py-3">gRPC only</td><td class="px-4 py-3">Yes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Exposing a service to another account via PrivateLink</td><td class="px-4 py-3">Behind an NLB</td><td class="px-4 py-3">Yes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost (Singapore, approx.)</td><td class="px-4 py-3">~USD 0.025/h + LCUs: ~USD 25–40/month for the clinic</td><td class="px-4 py-3">~USD 0.025/h + NLCUs: similar at low traffic</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Target groups and health checks that tell the truth</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>target group</strong> is a set of targets (instances, IPs or Lambda functions) plus a health check. Use
+        target type <code class="inline">instance</code> for an ASG and <code class="inline">ip</code> for ECS awsvpc tasks
+        and EKS pods. The health check path must exercise the app, cheaply: <code class="inline">/healthz</code> returns
+        200 when the process is up and can serve, without calling every downstream dependency (if Postgres has a blip, you
+        do not want the ALB to drain every instance at once). Then shorten the defaults, which are tuned for 2010.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">alb.tf — the target group</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_lb_target_group"</span> <span class="st">"booking_api"</span> {
+  name        = <span class="st">"booking-api-prod"</span>
+  port        = <span class="st">8080</span>
+  protocol    = <span class="st">"HTTP"</span>
+  vpc_id      = module.vpc.vpc_id
+  target_type = <span class="st">"instance"</span>                  <span class="cm"># "ip" for ECS/EKS</span>
+
+  health_check {
+    path                = <span class="st">"/healthz"</span>
+    matcher             = <span class="st">"200"</span>
+    interval            = <span class="st">10</span>                 <span class="cm"># default 30</span>
+    healthy_threshold   = <span class="st">2</span>                  <span class="cm"># in service after ~20 s, default 5 checks</span>
+    unhealthy_threshold = <span class="st">3</span>                  <span class="cm"># out after ~30 s</span>
+  }
+  deregistration_delay = <span class="st">30</span>                  <span class="cm"># default 300 s: every deploy waits 5 min per batch</span>
+}</pre>
+      </div>
+      <pre class="code mt-3">aws elbv2 describe-target-health --profile gol-prod-ro \
+  --target-group-arn arn:aws:elasticloadbalancing:ap-southeast-1:444455556666:targetgroup/booking-api-prod/7e3a1c9f2b4d6e80 \
+  --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason]' --output text
+<span class="out">i-0a3f9c1e7b2d45860   healthy     None
+i-07b2e5d9c4a1f3086   healthy     None
+i-0c8d1f4a6e2b97035   unhealthy   Target.ResponseCodeMismatch</span>
+<span class="cm"># ResponseCodeMismatch = app answered, but not 200. Target.Timeout = SG blocks the ALB, or the app hangs</span></pre>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant ASG as Auto Scaling group
+    participant I as New instance
+    participant ALB as ALB target group
+    participant O as Old instance
+    ASG->>I: launch from template v14
+    ASG->>ALB: register target (state: initial)
+    loop every 10 s
+        ALB->>I: GET /healthz
+        I-->>ALB: 200
+    end
+    Note over ALB: 2 passes → healthy, receives traffic
+    ASG->>ALB: deregister old instance (state: draining)
+    Note over ALB,O: no new requests to O<br/>in-flight requests get 30 s to finish
+    ASG->>O: terminate
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The draining step is why deregistration delay matters both ways. Too long (300 s) and every rollout crawls. Too
+        short for your slowest request (a 45-second report export) and users get cut off mid-response. Set it a little
+        above your p99.9 request time, and make the app stop accepting new work on <code class="inline">SIGTERM</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Listeners and rules: one ALB, many services</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>listener</strong> is a port and protocol on the ALB. Its <strong>rules</strong> are evaluated in
+        priority order, and the first match decides the action: forward to a target group, redirect, or return a fixed
+        response. One ALB with host-based rules serves both <code class="inline">api.</code> and
+        <code class="inline">app.clinic.example.com</code>, which halves the hourly cost and the number of things to
+        monitor. The certificate comes from ACM, which <a href="./aw7.html" class="text-viol underline decoration-viol/40">AW7</a>
+        covers along with the DNS records that point at the ALB.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">alb.tf — listeners and a host rule</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_lb_listener"</span> <span class="st">"http"</span> {
+  load_balancer_arn = aws_lb.public.arn
+  port              = <span class="st">80</span>
+  protocol          = <span class="st">"HTTP"</span>
+  default_action {
+    type = <span class="st">"redirect"</span>                          <span class="cm"># port 80 exists only to send people to 443</span>
+    redirect {
+      protocol    = <span class="st">"HTTPS"</span>
+      port        = <span class="st">"443"</span>
+      status_code = <span class="st">"HTTP_301"</span>
+    }
+  }
+}
+
+<span class="kw">resource</span> <span class="st">"aws_lb_listener"</span> <span class="st">"https"</span> {
+  load_balancer_arn = aws_lb.public.arn
+  port              = <span class="st">443</span>
+  protocol          = <span class="st">"HTTPS"</span>
+  ssl_policy        = <span class="st">"ELBSecurityPolicy-TLS13-1-2-2021-06"</span>   <span class="cm"># TLS 1.2+ only</span>
+  certificate_arn   = aws_acm_certificate.clinic.arn
+  default_action {
+    type = <span class="st">"fixed-response"</span>                    <span class="cm"># unknown Host header → 404, not a random backend</span>
+    fixed_response {
+      content_type = <span class="st">"text/plain"</span>
+      status_code  = <span class="st">"404"</span>
+    }
+  }
+}
+
+<span class="kw">resource</span> <span class="st">"aws_lb_listener_rule"</span> <span class="st">"api"</span> {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = <span class="st">10</span>
+  condition {
+    host_header { values = [<span class="st">"api.clinic.example.com"</span>] }
+  }
+  action {
+    type             = <span class="st">"forward"</span>
+    target_group_arn = aws_lb_target_group.booking_api.arn
+  }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Reading 5xx at the load balancer</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The ALB reports two different 5xx metrics, and confusing them sends you to the wrong team.
+        <code class="inline">HTTPCode_Target_5XX_Count</code> means your app returned the error.
+        <code class="inline">HTTPCode_ELB_5XX_Count</code> means the ALB generated it, because it could not get a usable
+        answer from any target. Check which one moved first. The full troubleshooting playbook for ALB errors in front of
+        EKS is in <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">ALB-generated code</th><th class="px-4 py-3">It means</th><th class="px-4 py-3">Usual cause on our stack</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">502 Bad Gateway</td><td class="px-4 py-3">The target closed the connection or sent a malformed response</td><td class="px-4 py-3">Node.js <code class="inline">keepAliveTimeout</code> (default 5 s) shorter than the ALB idle timeout (60 s); app crashed mid-request</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">503 Service Unavailable</td><td class="px-4 py-3">No healthy targets in the target group</td><td class="px-4 py-3">Every target failing <code class="inline">/healthz</code>; ASG at 0; wrong target group on the rule</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">504 Gateway Timeout</td><td class="px-4 py-3">The target did not answer within the idle timeout</td><td class="px-4 py-3">A slow DB query; security group dropping ALB → target traffic</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">460</td><td class="px-4 py-3">The client gave up before the target answered</td><td class="px-4 py-3">Mobile clients with short timeouts during slow periods</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">aws cloudwatch get-metric-data --profile gol-prod-ro \
+  --start-time 2026-10-30T01:00:00Z --end-time 2026-10-30T02:00:00Z \
+  --metric-data-queries '[
+    {"Id":"elb","MetricStat":{"Metric":{"Namespace":"AWS/ApplicationELB","MetricName":"HTTPCode_ELB_502_Count",
+      "Dimensions":[{"Name":"LoadBalancer","Value":"app/clinic-prod/3f9a1c7e2b5d8e40"}]},"Period":3600,"Stat":"Sum"}},
+    {"Id":"app","MetricStat":{"Metric":{"Namespace":"AWS/ApplicationELB","MetricName":"HTTPCode_Target_5XX_Count",
+      "Dimensions":[{"Name":"LoadBalancer","Value":"app/clinic-prod/3f9a1c7e2b5d8e40"}]},"Period":3600,"Stat":"Sum"}}]' \
+  --query 'MetricDataResults[].[Id,Values[0]]' --output text
+<span class="out">elb     212
+app     0</span>
+<span class="cm"># 212 ALB 502s, zero app 5xx: the app never saw these requests fail. Check keep-alive first:</span>
+<span class="cm"># server.keepAliveTimeout = 65_000 (above the ALB's 60 s idle timeout) in booking-api</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Turn on ALB access logs on day one.</strong> They go to S3, cost
+        little, and record for every request the target it went to, the time spent at each stage, and both status codes
+        (<code class="inline">elb_status_code</code> and <code class="inline">target_status_code</code>). A 502 with
+        <code class="inline">target_status_code = -</code> is the keep-alive race above, every time.</div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code writes launch templates, ASGs and ALB resources fluently, and it is good at reading scaling activity
+        and target health output. Its weak spot is defaults: it will happily leave IMDSv1 on, the health check at
+        <code class="inline">/</code> and the deregistration delay at 300 seconds, because that is what the examples on the
+        internet do. Ask for the settings explicitly, and make it explain them.
+      </p>
+      <pre class="code mt-3">Write Terraform for booking-api on EC2: launch template (AL2023 arm64 via the SSM
+parameter, m7g.large, IMDSv2 required, encrypted gp3, no public IP, instance profile with
+AmazonSSMManagedInstanceCore), an ASG across module.vpc.private_subnets (min 3, max 12,
+ELB health checks, grace period 180 s) and an ALB target group on /healthz. Comment
+every setting that differs from the AWS default and say why.</pre>
+      <pre class="code mt-3">Here is `describe-scaling-activities` and `describe-target-health` output for an ASG
+that keeps replacing instances. Rank the likely causes (grace period, health path, SG,
+app crash) and give me the read-only command that confirms or rules out each one.</pre>
+      <pre class="code mt-3">Our ALB shows HTTPCode_ELB_502_Count rising with no Target_5XX. booking-api is Node.js
+22 with Fastify. Explain the keep-alive race between the ALB idle timeout and Node's
+keepAliveTimeout, and write the code change plus a test that proves it.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft launch templates, ASGs, scaling policies and ALB resources</li>
+            <li>Turn scaling activity, target health and access logs into a diagnosis</li>
+            <li>Compare instance types and prices for a workload profile you give it</li>
+            <li>Write user data scripts with logging and a health wait</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><code class="inline">http_tokens = "required"</code> and no <code class="inline">associate_public_ip_address</code></li>
+            <li>Health check type <code class="inline">ELB</code>, a real health path, grace period above boot time</li>
+            <li>AMI and all instance types share one architecture</li>
+            <li>The plan does not replace the ALB (its DNS name would change) or the ASG in one step</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written compute:</strong> a hard-coded
+        <code class="inline">ami-…</code> ID; <code class="inline">key_name</code> and an SG rule for port 22;
+        <code class="inline">t2</code>/<code class="inline">t3.micro</code> for a production API; health check on
+        <code class="inline">/</code> or on a TCP port only; <code class="inline">health_check_type = "EC2"</code> behind
+        an ALB; a launch template with an x86 AMI and Graviton types (or the reverse); Spot for a single-instance service;
+        secrets passed in user data, which anyone with <code class="inline">ec2:DescribeInstanceAttribute</code> can read;
+        and an HTTPS listener with an old TLS 1.0 policy.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has launched an instance from the console wizard with a key pair and SSH, and nothing more.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows what an ASG and an ALB are for, but cannot say why an instance was replaced or why the ALB returns 503.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adapts an existing launch template and ASG, reads target health, and runs an instance refresh with a senior watching.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses instance families and Graviton with a reason, writes a launch template with IMDSv2 and no SSH, builds an ASG with ELB health checks and target tracking behind an ALB with host rules, rolls out with instance refresh, and tells 502, 503 and 504 apart from metrics and access logs.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the compute defaults for the team (instance families, Spot policy, health-check standards), sizes scaling targets from load tests, and leads the move of EC2 workloads to containers where it pays off.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> a mentor breaks your sandbox
+        stack in three ways (health path changed to <code class="inline">/health</code>, grace period set to 20 s, ALB
+        security group removed from the instance SG). Using only read-only commands, find each fault in under ten minutes
+        and say which metric or activity message gave it away.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Fixing an instance by hand</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A change made over Session Manager disappears at the next scale-out or instance refresh. Put it in the launch template, user data or AMI, then refresh.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Deep health checks</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A <code class="inline">/healthz</code> that queries Postgres, Redis and Stripe turns a 10-second Stripe blip into "every target unhealthy" and a full 503 outage. Check the process; report dependencies on a separate endpoint and in metrics.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Scaling on CPU for an I/O-bound API</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">booking-api</code> mostly waits on Postgres. CPU sits at 25% while latency doubles. Scale on requests per target, and check latency in the load test.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Graviton and gp3 as defaults</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">About 20% off compute and about 20% off disk (gp3 vs gp2, <a href="./aw4.html" class="text-viol underline decoration-viol/40">AW4</a>) for a one-line change each. Make the exceptions justify themselves.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Read the activity history first</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">describe-scaling-activities</code> tells you in plain English why every instance was launched or terminated. It answers most "what is my ASG doing?" questions before you open a dashboard.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="instances"> <span>I can decode any instance type name, pick a family for a workload, and explain the burstable credit trap.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="launch-tpl"> <span>I wrote a launch template with the SSM AMI parameter, IMDSv2 required, encrypted gp3, an instance profile and logged user data.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="asg"> <span>I built an ASG with ELB health checks, a correct grace period, target tracking and an instance refresh.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="alb"> <span>I configured an ALB with an HTTPS listener, host rules and a tuned target group, and can tell ELB 502/503/504 from target 5xx.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="asg-lab"> <span class="font-semibold">In a sandbox account, deployed booking-api (or any HTTP container) on a Graviton ASG behind an ALB, reached an instance only through Session Manager, ran an instance refresh to a new version with zero failed requests during a 5-minute load test, and fixed three faults a mentor injected. Shared the Terraform, the refresh output and a target-health screenshot (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/ec2/latest/instancetypes/instance-type-names.html" target="_blank" rel="noopener">AWS — Instance type naming conventions</a>: every family and attribute letter.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html" target="_blank" rel="noopener">AWS — Instance Metadata Service (IMDSv2)</a>: why tokens are required and how to enforce them.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html" target="_blank" rel="noopener">AWS — Target tracking scaling policies</a>: metrics, cooldowns and warm-up.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/autoscaling/ec2/userguide/asg-instance-refresh.html" target="_blank" rel="noopener">AWS — Instance refresh</a>: checkpoints, auto-rollback and skip-matching.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html" target="_blank" rel="noopener">AWS — ALB target group health checks</a>: every setting and reason code.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html" target="_blank" rel="noopener">AWS — Troubleshoot your Application Load Balancer</a>: the 502/503/504 causes in Part IV.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-instances.html" target="_blank" rel="noopener">AWS — Spot Instances</a>: interruptions, rebalance signals and allocation strategies.</li>
+      </ul>
