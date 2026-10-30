@@ -8,6 +8,7 @@ Read-only. Exits non-zero if any FAIL is reported.
     python3 .claude/authoring/qa.py --all --density      # add the density gates
     python3 .claude/authoring/qa.py --registry           # registry + counts only
     python3 .claude/authoring/qa.py --program intern --all   # intern/ program (qa_intern.py)
+    python3 .claude/authoring/qa.py --program devops --all   # devops/ program (qa_devops.py)
 """
 from __future__ import annotations
 import argparse, json, os, re, sys
@@ -392,6 +393,10 @@ def main() -> int:
             sys.path.insert(0, str(Path(__file__).parent))
             import qa_intern
             return qa_intern.main(rest)
+        if prog == "devops":
+            sys.path.insert(0, str(Path(__file__).parent))
+            import qa_devops
+            return qa_devops.main(rest)
         if prog != "aifde":
             print(f"unknown program: {prog}"); return 2
         sys.argv = [sys.argv[0]] + rest

@@ -1,0 +1,747 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Managed Databases: RDS, Aurora, DynamoDB &amp; ElastiCache</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          The clinic booking platform keeps its state in three places: Postgres on RDS for appointments and patients,
+          Valkey on ElastiCache for sessions and the slot-availability cache, and a small DynamoDB table for idempotency
+          keys. This module teaches you to choose between these services, run them so they survive an AZ failure, restore
+          them to a point in time when someone runs a bad <code class="inline">UPDATE</code>, and upgrade them without a
+          weekend outage. By the end you can read a Terraform plan for a database and say whether it is safe for prod.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> stateless services are forgiving. If you break
+          <code class="inline">booking-api</code>, you redeploy the previous image. If you break the database, you lose
+          patient bookings, and there is no image to roll back to. Database incidents are rarer than app incidents, but
+          they are the ones that end up in front of the client's CEO: a 20-minute failover nobody had rehearsed, a backup
+          retention of 1 day discovered on day 2, a major-version upgrade that locked a table during clinic opening hours.
+          Every one of them is prevented by settings you choose on day one.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Choosing a data store</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pick the store from the access pattern, not from the hype</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        AWS sells more than fifteen database services. A junior DevOps engineer at our company needs to operate four of
+        them well: <strong>RDS for PostgreSQL</strong>, <strong>Aurora PostgreSQL</strong>, <strong>DynamoDB</strong>
+        and <strong>ElastiCache</strong> (Valkey or Redis OSS). The schema and query design belong to the developers
+        (intern <a href="../../intern/modules/sd1.html" class="text-viol underline decoration-viol/40">SD1</a>). Your job
+        is the part they rarely think about: where it runs, how it fails over, how it is backed up, how much it costs and
+        how it is upgraded.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">What the clinic platform stores, and where</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Start every design by listing the data and how it is read. Bookings need transactions ("this slot is free, take
+        it, charge the deposit"), joins and reporting, so they belong in a relational database. Session tokens and the
+        "free slots this week" cache are read thousands of times per minute and can be rebuilt, so they belong in memory.
+        Idempotency keys are a pure key lookup with a 24-hour life, which is exactly what DynamoDB is good at.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 260" class="w-full min-w-[640px]" role="img" aria-label="Clinic data tier: booking-api and booking-worker in private subnets talk to RDS Postgres, ElastiCache Valkey and DynamoDB">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">CLINIC DATA TIER · gol-prod · ap-southeast-1</text>
+          <g class="anim-pulse"><rect x="20" y="60" width="150" height="50" rx="9" fill="#2563EB"/>
+            <text x="95" y="81" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api</text>
+            <text x="95" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">ECS / EKS · private subnets</text></g>
+          <g class="anim-pulse d1"><rect x="20" y="150" width="150" height="50" rx="9" fill="#6d5acd"/>
+            <text x="95" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-worker</text>
+            <text x="95" y="186" text-anchor="middle" fill="#ffffffbb" font-size="9">SQS consumer</text></g>
+          <rect x="260" y="36" width="440" height="200" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="272" y="54" font-size="10" font-weight="700" fill="#6E6B64">ISOLATED DB SUBNETS · 3 AZs · no route to the internet</text>
+          <g class="anim-pulse d2"><rect x="280" y="68" width="190" height="56" rx="9" fill="#0D9488"/>
+            <text x="375" y="90" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">RDS PostgreSQL 17</text>
+            <text x="375" y="106" text-anchor="middle" fill="#ffffffbb" font-size="9">bookings · patients · Multi-AZ</text></g>
+          <g class="anim-pulse d3"><rect x="490" y="68" width="190" height="56" rx="9" fill="#D97757"/>
+            <text x="585" y="90" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ElastiCache Valkey 8</text>
+            <text x="585" y="106" text-anchor="middle" fill="#ffffffbb" font-size="9">sessions · slot cache · 1+1</text></g>
+          <g class="anim-pulse d4"><rect x="385" y="160" width="190" height="56" rx="9" fill="#37474F"/>
+            <text x="480" y="182" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">DynamoDB</text>
+            <text x="480" y="198" text-anchor="middle" fill="#ffffffbb" font-size="9">idempotency keys · TTL 24 h</text></g>
+          <line x1="170" y1="80" x2="280" y2="92" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="170" y1="75" x2="490" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="170" y1="175" x2="280" y2="110" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="170" y1="185" x2="385" y2="188" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="480" y="252" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">DynamoDB is a regional endpoint: reached through a gateway VPC endpoint, not a subnet</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Subnet layout, security groups and the DynamoDB gateway endpoint are designed in
+        <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>. The rule you enforce here: the
+        database security group accepts port 5432 only from the application security groups, never from a CIDR range.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The decision table</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most of the time the answer is "RDS for PostgreSQL, plus Valkey if reads are hot". Reach for the others only when
+        a specific requirement pushes you there. These are the requirements that do.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Service</th><th class="px-4 py-3">Right when</th><th class="px-4 py-3">Wrong when</th><th class="px-4 py-3">Failover / durability</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">RDS PostgreSQL</td><td class="px-4 py-3">The default for relational data up to a few TB and a few thousand writes per second</td><td class="px-4 py-3">You need fast failover under 30 s, or more than 5 read replicas with low lag</td><td class="px-4 py-3">Multi-AZ instance: typically 60–120 s; EBS storage in one AZ per copy</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Aurora PostgreSQL</td><td class="px-4 py-3">Large or spiky load, fast failover, up to 15 low-lag readers, Serverless v2 for dev and bursty apps</td><td class="px-4 py-3">Small steady workloads where the I/O or ACU bill beats a plain instance</td><td class="px-4 py-3">Usually under 30 s; 6 storage copies across 3 AZs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">DynamoDB</td><td class="px-4 py-3">Known key-based access, very high or very spiky traffic, no ops, TTL-expiring data</td><td class="px-4 py-3">Ad-hoc queries, joins, reporting, or access patterns that are still changing</td><td class="px-4 py-3">No failover to manage; data replicated across 3 AZs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ElastiCache Valkey</td><td class="px-4 py-3">Caches, sessions, rate limits, leaderboards: data you can rebuild</td><td class="px-4 py-3">The only copy of anything that matters</td><td class="px-4 py-3">Replica promoted in seconds to about a minute; data since last replication lost</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Caching patterns (cache-aside, TTLs, stampede protection) are application design and live in intern
+        <a href="../../intern/modules/sd7.html" class="text-viol underline decoration-viol/40">SD7</a>. This module covers
+        the infrastructure that serves them.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">What a month costs, roughly</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Clients ask "how much will the database cost?" in the first meeting. Learn the shape of the bill so you can answer
+        within 20% without opening the calculator. Figures below are on-demand list prices in Singapore, rounded, and they
+        move every year, so treat them as orders of magnitude and confirm in the
+        <a class="text-coral underline" href="https://aws.amazon.com/rds/postgresql/pricing/" target="_blank" rel="noopener">pricing page</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Setup</th><th class="px-4 py-3">Main cost drivers</th><th class="px-4 py-3">Ballpark / month</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Dev: RDS <code class="inline">db.t4g.micro</code>, single-AZ, 20 GB gp3</td><td class="px-4 py-3">Instance hours</td><td class="px-4 py-3">USD 15–20</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Prod: RDS <code class="inline">db.m7g.large</code> Multi-AZ, 100 GB gp3</td><td class="px-4 py-3">Instance × 2 (standby is billed), storage × 2, backups beyond DB size</td><td class="px-4 py-3">USD 380–450</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Prod: Aurora <code class="inline">db.r7g.large</code> writer + 1 reader</td><td class="px-4 py-3">Two instances, storage per GB-month, I/O (or I/O-Optimized at about 30% more per instance)</td><td class="px-4 py-3">USD 500–650</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">DynamoDB on-demand, 5 M writes + 20 M reads</td><td class="px-4 py-3">Request units, storage, PITR</td><td class="px-4 py-3">USD 5–15</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ElastiCache Valkey <code class="inline">cache.t4g.small</code> primary + replica</td><td class="px-4 py-3">Node hours (Valkey is about 20% cheaper than Redis OSS)</td><td class="px-4 py-3">USD 45–55</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>Graviton by default:</strong> the <code class="inline">g</code>
+        families (<code class="inline">t4g</code>, <code class="inline">m7g</code>, <code class="inline">r7g</code>,
+        <code class="inline">r8g</code>) cost less than the Intel equivalents for the same or better performance, and for a
+        managed database the CPU architecture is invisible to the app. There is no reason to choose an Intel class for a
+        new RDS, Aurora or ElastiCache deployment. Wider cost work (Savings Plans, reserved instances for RDS) is
+        <a href="./ar2.html" class="text-viol underline decoration-viol/40">AR2</a>.</div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · RDS and Aurora</div>
+      <h2 class="font-display text-2xl font-bold mt-2">High availability is a setting; recovery is a skill you rehearse</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        RDS takes away the operating system, patching and backup plumbing. It does not take away the decisions: how many
+        copies, in which AZs, how long backups are kept, which parameters are set, and when upgrades happen. Get those
+        right in Terraform once and every environment inherits them.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Multi-AZ, read replicas and Aurora: three different things</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Juniors mix these up constantly, and the mix-up shows up in incidents. A <strong>Multi-AZ standby</strong> exists
+        for availability: it is written synchronously, takes no traffic, and takes over the same DNS name when the primary
+        fails. A <strong>read replica</strong> exists for read scaling: it is asynchronous, has its own endpoint, can lag
+        by seconds, and does not take over automatically. <strong>Aurora</strong> separates compute from a shared storage
+        volume, so its readers are both read scaling and failover targets.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 250" class="w-full min-w-[640px]" role="img" aria-label="RDS Multi-AZ instance with synchronous standby compared with Aurora cluster sharing a six-copy storage volume">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">RDS MULTI-AZ INSTANCE</text>
+          <g class="anim-pulse"><rect x="20" y="40" width="130" height="50" rx="9" fill="#0D9488"/>
+            <text x="85" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Primary · AZ a</text>
+            <text x="85" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">reads + writes</text></g>
+          <g class="anim-pulse d1"><rect x="200" y="40" width="130" height="50" rx="9" fill="#37474F"/>
+            <text x="265" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Standby · AZ b</text>
+            <text x="265" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">no traffic</text></g>
+          <line x1="150" y1="65" x2="200" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="175" y="58" text-anchor="middle" font-size="9" fill="#6E6B64">sync</text>
+          <g class="anim-pulse d2"><rect x="110" y="140" width="130" height="50" rx="9" fill="#6d5acd"/>
+            <text x="175" y="161" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Read replica</text>
+            <text x="175" y="176" text-anchor="middle" fill="#ffffffbb" font-size="9">async · own endpoint</text></g>
+          <line x1="85" y1="90" x2="150" y2="140" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="80" y="125" font-size="9" fill="#6E6B64">async</text>
+          <text x="175" y="222" text-anchor="middle" font-size="10" fill="#A8A49B">failover: 60–120 s · DNS flips</text>
+          <text x="392" y="22" font-size="11" font-weight="700" fill="#6E6B64">AURORA CLUSTER</text>
+          <g class="anim-pulse d1"><rect x="392" y="40" width="130" height="50" rx="9" fill="#0D9488"/>
+            <text x="457" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Writer · AZ a</text>
+            <text x="457" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">cluster endpoint</text></g>
+          <g class="anim-pulse d2"><rect x="572" y="40" width="130" height="50" rx="9" fill="#6d5acd"/>
+            <text x="637" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Reader · AZ b</text>
+            <text x="637" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">reader endpoint</text></g>
+          <g class="anim-pulse d3"><rect x="392" y="140" width="310" height="50" rx="9" fill="#2563EB"/>
+            <text x="547" y="161" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Shared cluster volume</text>
+            <text x="547" y="176" text-anchor="middle" fill="#ffffffbb" font-size="9">6 copies · 3 AZs · grows automatically</text></g>
+          <line x1="457" y1="90" x2="457" y2="140" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="637" y1="90" x2="637" y2="140" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="547" y="222" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">failover: reader promoted, usually under 30 s</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        There is a third RDS option, the <strong>Multi-AZ DB cluster</strong> (one writer plus two readable standbys,
+        failover typically under 35 s). It is a reasonable middle ground when you want Aurora-like failover without
+        Aurora's storage pricing. For the clinic, prod runs a Multi-AZ instance; dev runs single-AZ because a dev outage
+        costs nothing but time.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">A production RDS instance in Terraform</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Almost every line below is a decision someone will regret if it is left at the default. Terraform itself is taught
+        in <a href="./ia1.html" class="text-viol underline decoration-viol/40">IA1</a>; here, read the comments.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/rds.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_db_instance"</span> <span class="st">"booking"</span> {
+  identifier                  = <span class="st">"clinic-prod-booking"</span>
+  engine                      = <span class="st">"postgres"</span>
+  engine_version              = <span class="st">"17"</span>             <span class="cm"># major only: minor versions roll forward</span>
+  auto_minor_version_upgrade  = <span class="kw">true</span>
+  instance_class              = <span class="st">"db.m7g.large"</span>
+  allocated_storage           = 100
+  max_allocated_storage       = 500              <span class="cm"># storage autoscaling: no 3 a.m. disk-full</span>
+  storage_type                = <span class="st">"gp3"</span>
+  storage_encrypted           = <span class="kw">true</span>             <span class="cm"># cannot be turned on later without a restore</span>
+  multi_az                    = <span class="kw">true</span>
+  db_subnet_group_name        = aws_db_subnet_group.db.name
+  vpc_security_group_ids      = [aws_security_group.db.id]
+  parameter_group_name        = aws_db_parameter_group.pg17.name
+  manage_master_user_password = <span class="kw">true</span>             <span class="cm"># Secrets Manager owns and rotates it (CI3)</span>
+  backup_retention_period     = 14               <span class="cm"># days of PITR; the default 7 is too short</span>
+  backup_window               = <span class="st">"18:00-18:30"</span>    <span class="cm"># UTC = 01:00 ICT, clinics closed</span>
+  maintenance_window          = <span class="st">"sun:19:00-sun:20:00"</span>
+  copy_tags_to_snapshot       = <span class="kw">true</span>
+  deletion_protection         = <span class="kw">true</span>
+  skip_final_snapshot         = <span class="kw">false</span>
+  final_snapshot_identifier   = <span class="st">"clinic-prod-booking-final"</span>
+  performance_insights_enabled = <span class="kw">true</span>
+  monitoring_interval         = 60               <span class="cm"># Enhanced Monitoring: OS-level metrics</span>
+  monitoring_role_arn         = aws_iam_role.rds_monitoring.arn
+  enabled_cloudwatch_logs_exports = [<span class="st">"postgresql"</span>]
+  apply_immediately           = <span class="kw">false</span>            <span class="cm"># risky changes wait for the window</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The password never appears in Terraform state or in a variable: with
+        <code class="inline">manage_master_user_password</code> RDS creates a Secrets Manager secret and the app reads it
+        at start-up (<a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a> covers how it is injected
+        into ECS and EKS). Plan to give the app its own least-privileged Postgres role; the master user is for migrations
+        and break-glass only.
+      </p>
+      <div class="mt-4 callout callout-warn"><strong>Some changes replace the database.</strong> Changing
+        <code class="inline">identifier</code>, <code class="inline">storage_encrypted</code>,
+        <code class="inline">kms_key_id</code>, <code class="inline">availability_zone</code>, <code class="inline">engine</code> or
+        <code class="inline">username</code> on an existing instance makes Terraform plan
+        <code class="inline">-/+ destroy and then create replacement</code>. On a database that means an empty new
+        instance. <code class="inline">deletion_protection = true</code> makes the apply fail instead of destroying data,
+        which is exactly what you want. How to spot this in a plan is in
+        <a href="./ia1.html" class="text-viol underline decoration-viol/40">IA1</a>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Parameter groups: static vs dynamic, and the pending-reboot trap</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You never edit <code class="inline">postgresql.conf</code> on RDS. You attach a <strong>parameter group</strong>
+        (Aurora adds a cluster parameter group as well). Never modify the <code class="inline">default.postgres17</code>
+        group: you cannot, and you would not want to. Create your own, version it in Terraform, and know which kind each
+        parameter is. <strong>Dynamic</strong> parameters apply within seconds. <strong>Static</strong> ones wait for a
+        reboot, and until then the instance shows <code class="inline">pending-reboot</code>, which means the value in
+        Terraform is not the value running.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/rds_params.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_db_parameter_group"</span> <span class="st">"pg17"</span> {
+  name   = <span class="st">"clinic-prod-pg17"</span>
+  family = <span class="st">"postgres17"</span>                      <span class="cm"># must match the major version</span>
+
+  parameter {
+    name  = <span class="st">"log_min_duration_statement"</span>       <span class="cm"># dynamic: log queries slower than 500 ms</span>
+    value = <span class="st">"500"</span>
+  }
+  parameter {
+    name  = <span class="st">"idle_in_transaction_session_timeout"</span>
+    value = <span class="st">"60000"</span>                           <span class="cm"># kill sessions holding locks idle for 60 s</span>
+  }
+  parameter {
+    name         = <span class="st">"shared_preload_libraries"</span>    <span class="cm"># static: needs a reboot</span>
+    value        = <span class="st">"pg_stat_statements"</span>
+    apply_method = <span class="st">"pending-reboot"</span>
+  }
+  parameter {
+    name  = <span class="st">"rds.force_ssl"</span>                    <span class="cm"># reject unencrypted connections</span>
+    value = <span class="st">"1"</span>
+  }
+  lifecycle { create_before_destroy = <span class="kw">true</span> }  <span class="cm"># family change: new group first</span>
+}</pre>
+      </div>
+      <pre class="code mt-3">aws rds describe-db-instances --db-instance-identifier clinic-prod-booking \
+  --query 'DBInstances[0].DBParameterGroups'
+<span class="out">[
+    {
+        "DBParameterGroupName": "clinic-prod-pg17",
+        "ParameterApplyStatus": "pending-reboot"
+    }
+]</span>
+<span class="cm"># schedule the reboot in the maintenance window; with Multi-AZ it is a ~1–2 min failover</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">rds.force_ssl</code> is already <code class="inline">1</code> by default on PostgreSQL 15 and
+        later; setting it explicitly documents the intent and protects you if someone copies the group to an older engine.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Connections and RDS Proxy</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every Postgres connection is a backend process that costs memory (several MB each). <code class="inline">max_connections</code>
+        is derived from instance memory, so a <code class="inline">db.t4g.micro</code> allows about 80 and a
+        <code class="inline">db.m7g.large</code> roughly 900. Do the maths before an autoscaling event does it for you: 20
+        <code class="inline">booking-api</code> tasks with a pool of 20 each is 400 connections, plus workers, plus
+        migrations. Lambda is worse, because every concurrent invocation opens its own connection.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Situation</th><th class="px-4 py-3">Do this</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A few long-lived containers</td><td class="px-4 py-3">App-side pool sized so tasks × pool &lt; 70% of <code class="inline">max_connections</code></td><td class="px-4 py-3">No extra hop, no extra bill</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lambda or aggressive autoscaling</td><td class="px-4 py-3">RDS Proxy in front of the instance</td><td class="px-4 py-3">Multiplexes thousands of client connections onto a small pool</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Failover must be fast for clients</td><td class="px-4 py-3">RDS Proxy, or the AWS Advanced JDBC/Python wrapper drivers</td><td class="px-4 py-3">The proxy keeps client connections open and reconnects to the new primary, cutting failover impact substantially</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Heavy session state (temp tables, <code class="inline">SET</code>, advisory locks)</td><td class="px-4 py-3">Measure pinning before adopting the proxy</td><td class="px-4 py-3">Pinned sessions cannot be multiplexed, so the proxy stops helping</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># who is connected right now, and from where? (run as the master user via SSM port-forward)</span>
+psql "$DB_URL" -c "SELECT usename, client_addr, state, count(*)
+  FROM pg_stat_activity GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 5;"
+<span class="out"> usename      | client_addr | state               | count
+--------------+-------------+---------------------+-------
+ booking_app  | 10.20.11.42 | idle                |    18
+ booking_app  | 10.20.12.17 | idle                |    18
+ booking_app  | 10.20.13.9  | idle in transaction |     3
+ worker_app   | 10.20.11.88 | active              |     4</span>
+<span class="cm"># "idle in transaction" holds locks: that is what idle_in_transaction_session_timeout is for</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">When Aurora earns its price: Serverless v2</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Aurora Serverless v2 sizes each instance in <strong>Aurora Capacity Units</strong> (ACUs, about 2 GiB of memory
+        each) and scales in fine steps within seconds. Since late 2024 the minimum can be <strong>0 ACU</strong>: an idle
+        instance pauses after a timeout you choose and resumes on the next connection in about 15 seconds. That makes it a
+        good fit for the clinic's per-PR preview databases, which sit idle most of the day, and for clients with a
+        sharp morning peak. It is a poor fit for steady 24/7 load, where a provisioned instance of the same size is cheaper.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/preview-db/main.tf — excerpt</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_rds_cluster"</span> <span class="st">"booking"</span> {
+  cluster_identifier          = <span class="st">"clinic-preview-${var.pr}"</span>
+  engine                      = <span class="st">"aurora-postgresql"</span>
+  engine_version              = <span class="st">"17.4"</span>        <span class="cm"># Aurora wants a full version string</span>
+  manage_master_user_password = <span class="kw">true</span>
+  storage_encrypted           = <span class="kw">true</span>
+  serverlessv2_scaling_configuration {
+    min_capacity             = 0                <span class="cm"># pause when idle: pay only for storage</span>
+    max_capacity             = 4
+    seconds_until_auto_pause = 1800             <span class="cm"># 30 min of no connections</span>
+  }
+}
+<span class="kw">resource</span> <span class="st">"aws_rds_cluster_instance"</span> <span class="st">"writer"</span> {
+  cluster_identifier = aws_rds_cluster.booking.id
+  instance_class     = <span class="st">"db.serverless"</span>
+  engine             = aws_rds_cluster.booking.engine
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The first request of the morning waits for the resume, so tell the developers, and keep
+        <code class="inline">min_capacity</code> at 0.5 or more for anything a client demos from. For prod, the clinic
+        stays on a provisioned RDS instance: its load is steady and the bill is 30–40% lower.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Backups, recovery and upgrades</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A backup you have never restored is a hope, not a backup</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Multi-AZ protects you from hardware and AZ failure. It does nothing against the more common disaster: a person or
+        a migration deleting the wrong rows, which the standby faithfully replicates within milliseconds. For that you need
+        point-in-time recovery, and you need to have practised it. Cross-region DR, RTO/RPO targets and AWS Backup plans
+        are <a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a>; this Part is the single-region
+        basics every engineer on call must be able to do.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Automated backups, snapshots and PITR</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        RDS takes a daily storage snapshot in the backup window and ships transaction logs to S3 every five minutes. Together
+        they let you restore to any second inside the retention period (1–35 days), usually up to about five minutes ago.
+        Manual snapshots are separate: they live until you delete them and are what you take before a risky change.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Mechanism</th><th class="px-4 py-3">Granularity</th><th class="px-4 py-3">Lifetime</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Automated backups + PITR</td><td class="px-4 py-3">Any second in the window</td><td class="px-4 py-3">Retention period; deleted with the instance unless retained</td><td class="px-4 py-3">"Undo" a bad write or migration</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Manual snapshot</td><td class="px-4 py-3">One moment</td><td class="px-4 py-3">Until deleted</td><td class="px-4 py-3">Before upgrades and big migrations; long-term copies</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AWS Backup plan</td><td class="px-4 py-3">Schedule you define</td><td class="px-4 py-3">Policy-driven, can be cross-account and cross-region, vault lock</td><td class="px-4 py-3">Compliance and ransomware resilience (SR3)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Final snapshot</td><td class="px-4 py-3">At deletion</td><td class="px-4 py-3">Until deleted</td><td class="px-4 py-3">The last line of defence against a <code class="inline">terraform destroy</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">aws rds describe-db-instances --db-instance-identifier clinic-prod-booking \
+  --query 'DBInstances[0].[BackupRetentionPeriod,LatestRestorableTime]' --output text
+<span class="out">14    2026-10-30T03:41:12+00:00</span>
+<span class="cm"># the latest restorable time should never be more than ~5 minutes old; alarm if it is</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Running a point-in-time restore</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The scenario you will meet: at 10:14 ICT a developer runs a migration that sets every appointment in one clinic to
+        <code class="inline">cancelled</code>. A restore <strong>never overwrites</strong> the existing instance. It
+        creates a new one, which is good: you copy the affected rows back instead of throwing away every booking made since
+        10:14.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant O as On-call engineer
+    participant R as RDS
+    participant N as New instance (restored)
+    participant P as Prod instance
+    O->>R: restore-db-instance-to-point-in-time<br/>target 03:13:00Z (10:13 ICT)
+    R->>N: snapshot + replay logs to 03:13:00
+    Note over N: 15–40 min for ~100 GB
+    O->>N: SELECT affected rows (clinic_id = 42)
+    O->>P: UPDATE appointments from the export,<br/>reviewed and run in a transaction
+    O->>R: delete restored instance after sign-off
+    Note over O,P: prod stays online throughout<br/>bookings made after 10:14 are kept
+        </pre>
+      </div>
+      <pre class="code mt-3">aws rds restore-db-instance-to-point-in-time \
+  --source-db-instance-identifier clinic-prod-booking \
+  --target-db-instance-identifier clinic-prod-booking-pitr-1013 \
+  --restore-time 2026-10-30T03:13:00Z \
+  --db-subnet-group-name clinic-prod-db --vpc-security-group-ids sg-0db1a2b3c4d5e6f70 \
+  --db-instance-class db.m7g.large --no-multi-az --no-publicly-accessible
+<span class="out">{ "DBInstance": { "DBInstanceIdentifier": "clinic-prod-booking-pitr-1013",
+                 "DBInstanceStatus": "creating", ... } }</span>
+aws rds wait db-instance-available --db-instance-identifier clinic-prod-booking-pitr-1013
+<span class="cm"># always pass subnet group and SG explicitly, or the restore lands in the default VPC config</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>Restore time is your real RTO.</strong> A restore of a 100 GB
+        instance takes tens of minutes, and the new instance starts with cold storage (blocks are loaded lazily from S3),
+        so the first queries are slow. Measure it on a copy of prod once per quarter and write the number into the runbook.
+        If the client's contract promises recovery in 15 minutes, a PITR restore alone cannot meet it.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Minor and major upgrades</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Minor</strong> versions (17.4 → 17.6) are bug and security fixes. Let <code class="inline">auto_minor_version_upgrade</code>
+        apply them in the maintenance window; with Multi-AZ the outage is a failover. <strong>Major</strong> versions
+        (16 → 17) can change behaviour and are never automatic, until standard support ends. After that RDS enrols the
+        instance in <strong>Extended Support</strong> and bills an extra per-vCPU-hour fee, which on a prod Multi-AZ
+        instance can double the database bill. Track end-of-support dates in the client's backlog a year ahead.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Method</th><th class="px-4 py-3">Downtime</th><th class="px-4 py-3">Rollback</th><th class="px-4 py-3">Use when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">In-place major upgrade</td><td class="px-4 py-3">Minutes to tens of minutes, both AZs upgrade together</td><td class="px-4 py-3">Restore the pre-upgrade snapshot (data loss since then)</td><td class="px-4 py-3">Dev and staging; small prod DBs with an agreed window</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">RDS Blue/Green Deployment</td><td class="px-4 py-3">Switchover typically under a minute</td><td class="px-4 py-3">Before switchover: delete green. After: harder, plan forward fixes</td><td class="px-4 py-3">Prod majors, parameter changes needing reboot, instance class changes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">aws rds create-blue-green-deployment \
+  --blue-green-deployment-name clinic-prod-pg18 \
+  --source arn:aws:rds:ap-southeast-1:444455556666:db:clinic-prod-booking \
+  --target-engine-version 18 --target-db-parameter-group-name clinic-prod-pg18
+<span class="cm"># green is a logical-replication copy; run the app's smoke tests against its endpoint, then:</span>
+aws rds switchover-blue-green-deployment \
+  --blue-green-deployment-identifier bgd-0a1b2c3d4e5f --switchover-timeout 300
+<span class="out">"Status": "SWITCHOVER_IN_PROGRESS"</span>
+<span class="cm"># endpoints are renamed, so the app keeps the same DNS name; writes pause during the switch</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two things to check before any major: extensions (<code class="inline">SELECT * FROM pg_extension;</code>) have
+        versions supported on the target, and you have run <code class="inline">ANALYZE</code> after the upgrade, because
+        planner statistics are not carried over and the first hour of queries can be slow without them.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Seeing what the database is doing</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "The database is slow" is not a diagnosis. <strong>CloudWatch Database Insights</strong> (which absorbed the old
+        Performance Insights console) shows database load as average active sessions, broken down by wait event and by SQL
+        statement. Standard mode is free with 7 days of history; Advanced mode adds longer retention, execution plans and
+        fleet views. Combine it with four CloudWatch metrics that are worth an alarm on every instance
+        (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a> builds the alarms).
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Metric</th><th class="px-4 py-3">Alarm at</th><th class="px-4 py-3">What it usually means</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">CPUUtilization</code></td><td class="px-4 py-3">&gt; 80% for 15 min</td><td class="px-4 py-3">A missing index or a new expensive query; check top SQL first, resize second</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">FreeStorageSpace</code></td><td class="px-4 py-3">&lt; 15% of allocated</td><td class="px-4 py-3">Autoscaling is capped, or bloat from a long transaction blocking vacuum</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">DatabaseConnections</code></td><td class="px-4 py-3">&gt; 80% of <code class="inline">max_connections</code></td><td class="px-4 py-3">Pool misconfiguration or a scale-out event; see RDS Proxy above</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">ReplicaLag</code></td><td class="px-4 py-3">&gt; 30 s</td><td class="px-4 py-3">Readers serve stale data; heavy writes or an undersized replica</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">DBLoad</code> vs vCPUs</td><td class="px-4 py-3">Sustained above vCPU count</td><td class="px-4 py-3">Sessions are queueing: look at the dominant wait event</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> subscribe an SNS topic to RDS
+        <strong>event notifications</strong> for the categories <code class="inline">failover</code>,
+        <code class="inline">failure</code>, <code class="inline">maintenance</code> and
+        <code class="inline">low storage</code>. Then a failover at 3 a.m. shows up in the on-call channel as
+        "RDS-EVENT-0049: Multi-AZ failover completed" instead of as a mystery spike of 5xx at the ALB.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · DynamoDB and ElastiCache</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Key-value stores are fast because they refuse to do most things</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        DynamoDB and Valkey both answer in about a millisecond at any scale, and both get there by giving up flexibility.
+        DynamoDB gives up ad-hoc queries; you must design keys around the questions you will ask. Valkey gives up
+        durability; you must treat everything in it as rebuildable. Operate them well by respecting those limits instead of
+        fighting them.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">DynamoDB keys, items and GSIs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every item has a <strong>partition key</strong> (hashed to pick a storage partition) and optionally a
+        <strong>sort key</strong> (ordered within the partition). <code class="inline">GetItem</code> and
+        <code class="inline">Query</code> on the key are cheap and fast. <code class="inline">Scan</code> reads the whole
+        table and costs accordingly. A <strong>global secondary index</strong> (GSI) is a second copy of the data keyed
+        differently, updated asynchronously, so reads from it are eventually consistent. Items are capped at 400 KB.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    Q1["Access pattern:<br/>has this request<br/>been processed?"] --> T["Table clinic-prod-idempotency<br/>PK = idem_key"]
+    Q2["Access pattern:<br/>all keys for one clinic<br/>in the last hour"] --> G["GSI by-clinic<br/>PK = clinic_id · SK = created_at"]
+    T -->|"async copy<br/>eventually consistent"| G
+    T -->|"TTL attribute expires_at"| X["Deleted within a few days<br/>of expiry, free"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/dynamodb.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_dynamodb_table"</span> <span class="st">"idempotency"</span> {
+  name         = <span class="st">"clinic-prod-idempotency"</span>
+  billing_mode = <span class="st">"PAY_PER_REQUEST"</span>           <span class="cm"># on-demand: no capacity planning</span>
+  hash_key     = <span class="st">"idem_key"</span>
+
+  attribute {
+    name = <span class="st">"idem_key"</span>
+    type = <span class="st">"S"</span>
+  }
+  attribute {
+    name = <span class="st">"clinic_id"</span>
+    type = <span class="st">"S"</span>
+  }
+  <span class="cm"># + attribute "created_at" (N): every key used by the table or a GSI is declared</span>
+
+  global_secondary_index {
+    name            = <span class="st">"by-clinic"</span>
+    hash_key        = <span class="st">"clinic_id"</span>
+    range_key       = <span class="st">"created_at"</span>
+    projection_type = <span class="st">"KEYS_ONLY"</span>              <span class="cm"># smallest copy = cheapest writes</span>
+  }
+  ttl {
+    attribute_name = <span class="st">"expires_at"</span>
+    enabled        = <span class="kw">true</span>
+  }
+  point_in_time_recovery { enabled = <span class="kw">true</span> }   <span class="cm"># 35 days, off by default</span>
+  deletion_protection_enabled = <span class="kw">true</span>
+  server_side_encryption { enabled = <span class="kw">true</span> }   <span class="cm"># customer-managed KMS key optional</span>
+}</pre>
+      </div>
+      <pre class="code mt-3">aws dynamodb put-item --table-name clinic-prod-idempotency \
+  --item '{"idem_key":{"S":"bk-7f3a"},"clinic_id":{"S":"42"},"created_at":{"N":"1793331600"},"expires_at":{"N":"1793418000"}}' \
+  --condition-expression 'attribute_not_exists(idem_key)'
+<span class="cm"># second call with the same key:</span>
+<span class="out">An error occurred (ConditionalCheckFailedException) when calling the PutItem operation:
+The conditional request failed</span>
+<span class="cm"># that exception IS the feature: the API returns the stored result instead of booking twice</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Capacity modes and hot partitions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>On-demand</strong> bills per request and scales instantly to double your previous peak. Since AWS halved
+        on-demand prices in late 2024 it is the right default for nearly every new table. <strong>Provisioned</strong>
+        capacity with auto scaling is cheaper only for steady, predictable traffic above roughly 30–40% average
+        utilisation. Either way, each partition has a ceiling of about 3,000 read units and 1,000 write units per second, so
+        a key everyone writes to (one counter for "today") throttles no matter what you pay.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Mode</th><th class="px-4 py-3">Billing</th><th class="px-4 py-3">Throttles when</th><th class="px-4 py-3">Pick it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">On-demand</td><td class="px-4 py-3">Per read/write request unit</td><td class="px-4 py-3">Traffic more than doubles within 30 min, or a hot key</td><td class="px-4 py-3">New tables, spiky or unknown traffic, dev/staging</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Provisioned + auto scaling</td><td class="px-4 py-3">Per RCU/WCU-hour, reservable</td><td class="px-4 py-3">Traffic rises faster than scaling reacts (minutes)</td><td class="px-4 py-3">Steady high-volume tables after you have a month of metrics</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Watch <code class="inline">ThrottledRequests</code> and the CloudWatch Contributor Insights report for the table: it
+        names the most-accessed keys, which turns "DynamoDB is throttling" into "clinic 42's reminder job writes the same
+        key 900 times a second".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">ElastiCache: Valkey, replication groups and cluster mode</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Valkey</strong> is the open-source fork of Redis maintained under the Linux Foundation, protocol-compatible
+        with Redis OSS clients. On ElastiCache it is about 20% cheaper per node (33% for Serverless) and is our default for
+        new caches. A <strong>replication group</strong> is one primary plus up to five replicas; with Multi-AZ and
+        automatic failover enabled, a replica in another AZ is promoted if the primary dies. <strong>Cluster mode
+        enabled</strong> shards keys across several primaries; you need it only when one node cannot hold the data or the
+        writes.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/cache.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_elasticache_replication_group"</span> <span class="st">"cache"</span> {
+  replication_group_id       = <span class="st">"clinic-prod-cache"</span>
+  description                = <span class="st">"sessions and slot-availability cache"</span>
+  engine                     = <span class="st">"valkey"</span>
+  engine_version             = <span class="st">"8.0"</span>
+  node_type                  = <span class="st">"cache.t4g.small"</span>
+  num_cache_clusters         = 2                  <span class="cm"># 1 primary + 1 replica, cluster mode disabled</span>
+  automatic_failover_enabled = <span class="kw">true</span>
+  multi_az_enabled           = <span class="kw">true</span>
+  subnet_group_name          = aws_elasticache_subnet_group.db.name
+  security_group_ids         = [aws_security_group.cache.id]
+  parameter_group_name       = aws_elasticache_parameter_group.valkey8.name  <span class="cm"># maxmemory-policy</span>
+  at_rest_encryption_enabled = <span class="kw">true</span>
+  transit_encryption_enabled = <span class="kw">true</span>             <span class="cm"># clients must connect with TLS</span>
+  user_group_ids             = [aws_elasticache_user_group.app.id]  <span class="cm"># RBAC users, not one shared AUTH token (CI3)</span>
+  snapshot_retention_limit   = 1                  <span class="cm"># cache: 1 day is enough</span>
+  maintenance_window         = <span class="st">"sun:20:00-sun:21:00"</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The parameter that decides behaviour under pressure is <code class="inline">maxmemory-policy</code>. For a cache set
+        it to <code class="inline">allkeys-lru</code>, so old keys are evicted when memory fills. If the same cluster
+        holds sessions that must not be evicted, use <code class="inline">volatile-lru</code> (evicts only keys with a TTL)
+        or, better, a separate cluster. <strong>ElastiCache Serverless</strong> removes node sizing entirely and is a good
+        fit for dev and for traffic you cannot predict; it bills per GB stored and per request, with a minimum that makes
+        tiny caches cost more than a <code class="inline">t4g.micro</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Operating the cache: the metrics that predict an outage</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A cache incident looks like a database incident. When the cache empties (failover, flush, eviction storm) every
+        request falls through to Postgres at once, and RDS CPU jumps to 100%. So the cache metrics belong on the same
+        dashboard as the database, and a cache failover drill belongs in the same game day.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Metric</th><th class="px-4 py-3">Healthy</th><th class="px-4 py-3">Act when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">EngineCPUUtilization</code></td><td class="px-4 py-3">&lt; 60%</td><td class="px-4 py-3">&gt; 80%: the single engine thread is the bottleneck; look for big keys or <code class="inline">KEYS *</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">DatabaseMemoryUsagePercentage</code></td><td class="px-4 py-3">&lt; 75%</td><td class="px-4 py-3">&gt; 90%: evictions start; size up or shorten TTLs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">Evictions</code></td><td class="px-4 py-3">Near zero for sessions</td><td class="px-4 py-3">Any sustained rate on a session store means users are being logged out</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">CacheHitRate</code></td><td class="px-4 py-3">&gt; 90% for the slot cache</td><td class="px-4 py-3">A sudden drop after a deploy: the app changed its key format</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">ReplicationLag</code></td><td class="px-4 py-3">&lt; 1 s</td><td class="px-4 py-3">Growing lag means a failover will lose more writes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># rehearse a failover in staging and time the client impact</span>
+aws elasticache test-failover --replication-group-id clinic-staging-cache --node-group-id 0001
+<span class="out">{ "ReplicationGroup": { "Status": "modifying", ... } }</span>
+aws elasticache describe-events --source-type replication-group --duration 30 \
+  --query 'Events[].[Date,Message]' --output text | tail -3
+<span class="out">2026-10-30T04:02:11Z  Failover to replica node clinic-staging-cache-002 completed
+2026-10-30T04:02:47Z  Recovering cache nodes 0001
+2026-10-30T04:03:30Z  Finished recovery for cache nodes 0001</span>
+<span class="cm"># the primary endpoint moved in ~40 s; clients that cache DNS for longer stay broken</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Always connect to the endpoint, never to a node.</strong> Apps must
+        use the replication group's primary endpoint (or the configuration endpoint in cluster mode) and the RDS instance
+        or cluster endpoint, and must not cache DNS for longer than about 30 seconds. A JVM with an infinite DNS cache, or a
+        connection string that names <code class="inline">clinic-prod-cache-001</code>, turns a 40-second failover into an
+        outage that lasts until someone restarts the service.</div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code writes database Terraform quickly and is good at reading Database Insights exports and
+        <code class="inline">pg_stat_statements</code> output. Run it with plan-only credentials in
+        <code class="inline">gol-dev</code>, and never give it a role that can call <code class="inline">rds:DeleteDBInstance</code>
+        or <code class="inline">ModifyDBInstance</code> in prod.
+      </p>
+      <pre class="code mt-3">Write Terraform for an RDS PostgreSQL 17 instance for clinic staging: Multi-AZ, gp3 with
+storage autoscaling to 300 GB, manage_master_user_password, 14-day backups, deletion
+protection, a custom parameter group with pg_stat_statements. Then list every argument
+that would force replacement if changed later.</pre>
+      <pre class="code mt-3">Here is the output of `terraform plan` for clinic-infra/envs/prod. For every
+aws_db_instance, aws_rds_cluster and aws_elasticache_replication_group, tell me whether
+the change is in-place, needs a reboot, or replaces the resource. Do not run apply.</pre>
+      <pre class="code mt-3">These are the top 10 statements from pg_stat_statements on clinic-prod-booking, sorted by
+total_exec_time. Group them by table, suggest the index each needs, and estimate the write
+cost of each index. Output a markdown table; do not connect to any database.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft RDS, Aurora, DynamoDB and ElastiCache Terraform from a short requirements list</li>
+            <li>Classify plan changes as in-place, reboot or replace</li>
+            <li>Write the PITR and failover runbook steps with exact CLI commands</li>
+            <li>Analyse slow-query logs and propose indexes for a developer to review</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><code class="inline">deletion_protection</code>, encryption and a final snapshot are set on every prod data store</li>
+            <li>No password, <code class="inline">auth_token</code> or connection string appears in code, variables or outputs</li>
+            <li>The plan shows no <code class="inline">-/+</code> on any stateful resource</li>
+            <li>Backup retention, windows and instance sizes match what the client agreed to pay for</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written database infra:</strong>
+        <code class="inline">publicly_accessible = true</code>; <code class="inline">skip_final_snapshot = true</code> in
+        prod; <code class="inline">apply_immediately = true</code> on a prod instance; a literal
+        <code class="inline">password = "..."</code> or <code class="inline">random_password</code> written to state; a
+        security group allowing 5432 from <code class="inline">0.0.0.0/0</code> or the whole VPC CIDR;
+        <code class="inline">backup_retention_period = 0</code> or 1; Intel instance classes such as
+        <code class="inline">db.m5</code>; <code class="inline">engine = "redis"</code> for a new cache; and a DynamoDB
+        design that needs <code class="inline">Scan</code> for a user-facing request.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has used a database from an app but never provisioned or operated one on AWS.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can name RDS, Aurora, DynamoDB and ElastiCache and roughly what each is for, but confuses Multi-AZ with read replicas.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Creates an RDS instance from an existing module, reads its metrics, and runs a restore by following a runbook someone else wrote.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses the right store for a requirement and defends it with cost and failover numbers, writes production-grade Terraform for RDS, DynamoDB and ElastiCache, performs a PITR restore and a failover drill unaided, and plans a major upgrade with Blue/Green.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the data-tier standards for all clients (module defaults, alarms, restore drills), tracks engine end-of-support across accounts, and leads database incidents calmly.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, explain to a
+        developer the difference between a Multi-AZ standby, a read replica and an Aurora reader, including failover time
+        for each. Then restore staging to a point 30 minutes ago, connect to the restored instance, prove a deleted row is
+        there, and state how long the whole restore took.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Using a read replica as the HA plan</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A replica does not take over on its own, has a different endpoint, and may be seconds behind. Availability comes from Multi-AZ or Aurora; replicas are for read scaling.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Forgetting encryption at creation</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An unencrypted RDS instance can only be encrypted by snapshot, copy-with-encryption and restore: a migration with downtime. Turn on <code class="inline">storage_encrypted</code> on day one, even in dev.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Ignoring end-of-standard-support dates</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Nothing breaks on the date. The bill does: Extended Support charges start silently and can double the cost of a prod instance until someone does the upgrade you postponed.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Snapshot before every risky change</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">aws rds create-db-snapshot</code> before a major upgrade, a large migration or a parameter change takes a minute and gives you a named restore point that does not age out of the PITR window.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Rehearse restore and failover quarterly</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Reboot-with-failover on staging RDS and <code class="inline">test-failover</code> on the cache, timed, with the app under load. The first drill always finds a client that caches DNS forever.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="choose"> <span>I can choose between RDS, Aurora, DynamoDB and ElastiCache for a requirement and justify it with access pattern, failover time and monthly cost.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="ha"> <span>I can explain Multi-AZ, Multi-AZ DB cluster, read replicas and Aurora readers, and what each does during an AZ failure.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="pitr"> <span>I performed a point-in-time restore into a new instance and recovered specific rows from it.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="upgrade"> <span>I can plan a major PostgreSQL upgrade with RDS Blue/Green, including extension checks and post-upgrade <code class="inline">ANALYZE</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="kv"> <span>I wrote Terraform for a DynamoDB table with TTL and PITR, and a Valkey replication group with TLS and automatic failover.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="drill"> <span class="font-semibold">In gol-dev, provisioned the clinic data tier with Terraform (RDS PostgreSQL, Valkey, DynamoDB), ran a timed RDS failover and a PITR restore, and wrote a one-page runbook with the commands, the measured times and the alarms you would add (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html" target="_blank" rel="noopener">AWS — RDS Multi-AZ deployments</a> — instance vs DB cluster deployments and how failover works.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_PIT.html" target="_blank" rel="noopener">AWS — Restoring a DB instance to a specified time</a> — the PITR procedure from Part III.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments.html" target="_blank" rel="noopener">AWS — RDS Blue/Green Deployments</a> — limitations and switchover guardrails before you plan a major upgrade.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Overview.html" target="_blank" rel="noopener">AWS — What is Amazon Aurora?</a> — the storage architecture behind faster failover.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/best-practices.html" target="_blank" rel="noopener">AWS — DynamoDB best practices</a> — partition key design, GSIs and capacity modes.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/WhatIs.html" target="_blank" rel="noopener">AWS — ElastiCache user guide</a> — Valkey, replication groups, cluster mode and Serverless.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/db_instance" target="_blank" rel="noopener">Terraform Registry — aws_db_instance</a> — every argument, including which ones force replacement.</li>
+      </ul>

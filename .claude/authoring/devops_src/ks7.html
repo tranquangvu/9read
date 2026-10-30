@@ -1,0 +1,841 @@
+<!-- meta: days=5 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">EKS Security: Access, Pod Identity &amp; Policy</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          An EKS cluster has two identity systems, AWS IAM and Kubernetes RBAC, and most security mistakes happen where
+          they meet. This module covers four boundaries in the order a request crosses them: who can call the Kubernetes
+          API (access entries and RBAC), which AWS permissions a Pod gets (EKS Pod Identity, with IRSA as the older
+          option), what is allowed into the cluster at all (Pod Security Standards, Kyverno, image signature checks), and
+          how secrets reach <code class="inline">booking-api</code> without being stored in Git or left readable in
+          etcd.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> in a real EKS compromise, the attacker rarely breaks Kubernetes
+          itself. They get into one Pod through an application bug, then find the node's IAM role through the instance
+          metadata service, a service account token allowed to list Secrets, or a privileged container that can reach
+          the host. Each of those is a default you have to turn off on purpose. An agent will happily write a
+          <code class="inline">ClusterRoleBinding</code> to <code class="inline">cluster-admin</code> to make an error go
+          away. This module teaches you to spot that and to build a cluster where it is blocked anyway.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Who can talk to the cluster</div>
+      <h2 class="font-display text-2xl font-bold mt-2">IAM gets you through the door; RBAC decides what you can touch</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Every request to the EKS API server goes through <strong>authentication</strong> (who are you?), then
+        <strong>authorisation</strong> (may you do this?), then <strong>admission</strong> (is this object acceptable?).
+        On EKS, authentication is always AWS IAM. Authorisation is Kubernetes RBAC plus EKS access policies. Admission is
+        Part III. You set up access entries in <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>
+        to get into your own cluster. Here you design access for a whole team.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The authentication path, step by step</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">kubectl</code> has no password for EKS. The kubeconfig written by
+        <code class="inline">aws eks update-kubeconfig</code> runs <code class="inline">aws eks get-token</code>, which
+        creates a pre-signed STS <code class="inline">GetCallerIdentity</code> URL and sends it as a bearer token. The
+        API server asks STS who signed it, then looks that IAM principal up in the cluster's <strong>access
+        entries</strong>. No access entry means no access, whatever the IAM policy says.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U as kubectl (SSO role)
+    participant A as EKS API server
+    participant S as AWS STS
+    participant E as Access entries
+    participant R as Authorizers
+    U->>U: aws eks get-token → presigned GetCallerIdentity
+    U->>A: GET /api/v1/namespaces/booking/pods<br/>Authorization: Bearer k8s-aws-v1.…
+    A->>S: verify signature
+    S-->>A: arn:aws:sts::444455556666:assumed-role/AWSReservedSSO_BookingOncall_…
+    A->>E: lookup IAM role ARN
+    E-->>A: username + kubernetes groups + access policies
+    A->>R: EKS access policies, then RBAC
+    R-->>A: allow / deny
+    Note over A: then admission (Part III), then etcd
+        </pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># who does the cluster think I am?</span>
+kubectl auth whoami
+<span class="out">ATTRIBUTE                                           VALUE
+Username                                            arn:aws:sts::444455556666:assumed-role/AWSReservedSSO_BookingOncall_5c1e2a9f0b3d7e41/linh.nguyen
+Groups                                              [booking-oncall system:authenticated]
+Extra: arn                                          [arn:aws:sts::444455556666:assumed-role/AWSReservedSSO_BookingOncall_5c1e2a9f0b3d7e41/linh.nguyen]</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Access entries and access policies in Terraform</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An <strong>access entry</strong> maps an IAM principal to the cluster. You then authorise it either with an AWS
+        managed <strong>access policy</strong> (cluster-wide or limited to namespaces) or by giving it Kubernetes
+        <strong>groups</strong> that your own RBAC binds to. The cluster runs with
+        <code class="inline">authentication_mode = "API"</code>, so the old <code class="inline">aws-auth</code> ConfigMap is
+        ignored completely. Each team role comes from IAM Identity Center
+        (<a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/access.tf</span>
+        <pre class="code">module "eks" {
+  # ...
+  authentication_mode                      = "API"
+  enable_cluster_creator_admin_permissions = false   <span class="cm"># no invisible admin for whoever ran apply</span>
+
+  access_entries = {
+    platform_admin = {
+      principal_arn = "arn:aws:iam::444455556666:role/AWSReservedSSO_PlatformAdmin_8a1f3c2e9d7b6a54"
+      policy_associations = {
+        admin = {
+          policy_arn   = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          access_scope = { type = "cluster" }
+        }
+      }
+    }
+    booking_oncall = {
+      principal_arn     = "arn:aws:iam::444455556666:role/AWSReservedSSO_BookingOncall_5c1e2a9f0b3d7e41"
+      kubernetes_groups = ["booking-oncall"]          <span class="cm"># fine-grained rules in our own RBAC</span>
+      policy_associations = {
+        view = {
+          policy_arn   = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+          access_scope = { type = "namespace", namespaces = ["booking"] }
+        }
+      }
+    }
+  }
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>SSO role ARNs have a path that access entries reject.</strong> IAM
+        shows Identity Center roles as <code class="inline">arn:aws:iam::…:role/aws-reserved/sso.amazonaws.com/ap-southeast-1/AWSReservedSSO_…</code>.
+        The access entry must use the ARN <em>without</em> the path, as above. With the path, Terraform applies cleanly
+        and every user in that permission set gets <code class="inline">Unauthorized</code>.</div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Access policy</th><th class="px-4 py-3">Roughly equals</th><th class="px-4 py-3">Who gets it on clinic-prod-eks</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">AmazonEKSClusterAdminPolicy</td><td class="px-4 py-3"><code class="inline">cluster-admin</code></td><td class="px-4 py-3">Platform admins (2 people) and the break-glass role</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AmazonEKSAdminPolicy</td><td class="px-4 py-3"><code class="inline">admin</code>, namespace-scoped</td><td class="px-4 py-3">Nobody in prod; app leads in dev</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AmazonEKSEditPolicy</td><td class="px-4 py-3"><code class="inline">edit</code> (includes reading Secrets)</td><td class="px-4 py-3">Developers in dev only; prod changes go through Argo CD</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AmazonEKSViewPolicy</td><td class="px-4 py-3"><code class="inline">view</code> (no Secrets)</td><td class="px-4 py-3">Every engineer, scoped to their namespaces</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">aws eks list-associated-access-policies --cluster-name clinic-prod-eks \
+  --principal-arn arn:aws:iam::444455556666:role/AWSReservedSSO_BookingOncall_5c1e2a9f0b3d7e41 \
+  --query 'associatedAccessPolicies[].[policyArn,accessScope.type,accessScope.namespaces[0]]' --output text
+<span class="out">arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy   namespace   booking</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">RBAC for what access policies cannot express</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The managed policies are coarse. On-call engineers need to restart a Deployment and read logs during an incident,
+        but should not edit specs (Git does that) or read Secrets. That is a custom <strong>Role</strong> bound to the
+        <code class="inline">booking-oncall</code> group from the access entry. A Role and RoleBinding apply to one
+        namespace. A ClusterRole and ClusterRoleBinding apply cluster-wide. Prefer a ClusterRole <em>bound with
+        RoleBindings</em>, so you write the rules once and grant them per namespace.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/rbac/oncall.yaml</span>
+        <pre class="code">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: oncall-operator
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "patch"]   <span class="cm"># patch = rollout restart; no update, no delete</span>
+  - apiGroups: [""]
+    resources: ["pods/log", "events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]          <span class="cm"># kill a stuck Pod; its controller replaces it</span>
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: booking-oncall
+  namespace: booking                          <span class="cm"># cluster rules, namespace grant</span>
+subjects:
+  - { kind: Group, name: booking-oncall, apiGroup: rbac.authorization.k8s.io }
+roleRef: { kind: ClusterRole, name: oncall-operator, apiGroup: rbac.authorization.k8s.io }</pre>
+      </div>
+      <pre class="code mt-3">kubectl auth can-i --list -n booking --as=x --as-group=booking-oncall | grep -E 'deployments|secrets'
+<span class="out">deployments.apps   []   []   [get list watch patch]</span>
+kubectl auth can-i get secrets -n booking --as=x --as-group=booking-oncall
+<span class="out">no</span>
+<span class="cm"># test every RBAC change with can-i before merging, in CI if you can</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Permission</th><th class="px-4 py-3">Why it is dangerous</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">get/list secrets</code></td><td class="px-4 py-3"><code class="inline">list</code> returns every value in the namespace, including service account tokens and DB passwords</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">create pods</code> (or deployments)</td><td class="px-4 py-3">Run any image with any service account in that namespace, inheriting its AWS role</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">pods/exec</code></td><td class="px-4 py-3">A shell inside a running Pod, with its environment and credentials</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">escalate</code>, <code class="inline">bind</code>, <code class="inline">impersonate</code></td><td class="px-4 py-3">Grant yourself, or act as, any role: effectively admin</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Wildcards <code class="inline">*</code></td><td class="px-4 py-3">Also cover resources and verbs added in future versions and by CRDs</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Bootstrap admin and break-glass</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Before access entries (late 2023), whoever created an EKS cluster became an invisible, permanent
+        <code class="inline">system:masters</code> admin. Today that is the cluster's
+        <code class="inline">bootstrap_cluster_creator_admin_permissions</code> setting. The module keeps it off and
+        offers <code class="inline">enable_cluster_creator_admin_permissions</code> instead, which we also leave false, so
+        every admin is visible in Terraform. Keep cluster-admin to
+        <strong>two named roles at most</strong>: the platform admin permission set and a
+        <strong>break-glass</strong> IAM role. The break-glass role needs MFA to assume, has no other permissions, and sends
+        an alert when anyone uses it:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/security/breakglass-alarm.tf</span>
+        <pre class="code">resource "aws_cloudwatch_event_rule" "eks_breakglass" {
+  name = "eks-breakglass-assumed"
+  event_pattern = jsonencode({
+    source        = ["aws.sts"]
+    "detail-type" = ["AWS API Call via CloudTrail"]
+    detail = {
+      eventName         = ["AssumeRole"]
+      requestParameters = { roleArn = ["arn:aws:iam::444455556666:role/eks-breakglass"] }
+    }
+  })
+}
+<span class="cm"># target: SNS → on-call channel. Every use gets a ticket and a review within 24 h</span></pre>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Workload identity</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Pods get AWS credentials from Pod Identity, never from the node</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <code class="inline">booking-api</code> writes to the uploads S3 bucket, <code class="inline">booking-worker</code>
+        reads from SQS, and platform controllers such as the Load Balancer Controller
+        (<a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>) and Karpenter
+        (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>) call AWS APIs. Each needs its own IAM
+        role with its own short-lived credentials, bound to a Kubernetes service account. That is the same idea as the
+        ECS task role in <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>, applied per Pod.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Why the node role is the wrong answer</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every EC2 node has an instance profile with the permissions the kubelet needs: pull from ECR, let the CNI manage
+        ENIs. If a Pod can reach the instance metadata service (IMDS) at <code class="inline">169.254.169.254</code>, it
+        can borrow those credentials. Adding S3 permissions to the node role "to make uploads work" gives them to every
+        Pod on every node, including a compromised one. Close the door at the node level: require IMDSv2 and set the PUT
+        response hop limit to 1, so the token cannot make the extra network hop into a Pod's namespace.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">karpenter/ec2nodeclass-default.yaml — metadata options</span>
+        <pre class="code">spec:
+  metadataOptions:
+    httpEndpoint: enabled
+    httpTokens: required             <span class="cm"># IMDSv2 only</span>
+    httpPutResponseHopLimit: 1       <span class="cm"># Pods (one hop away) cannot get a token</span></pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># prove it from inside a booking Pod</span>
+kubectl -n booking exec deploy/booking-api -- curl -s -m 2 -X PUT http://169.254.169.254/latest/api/token \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' ; echo "exit=$?"
+<span class="out">exit=28</span>
+<span class="cm"># 28 = timeout: the token response was dropped at the hop limit. Good.</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Karpenter v1 uses these values by default. Managed node groups and older launch templates often use a hop limit
+        of 2, so check every node pool. Host-network Pods (the CNI, the Pod Identity agent) still reach IMDS, which is
+        why so few Pods should be allowed to use <code class="inline">hostNetwork</code> (Part III).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">EKS Pod Identity: how it works</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You create a <strong>Pod Identity association</strong>: cluster + namespace + service account → IAM role. When a
+        Pod using that service account starts, an EKS webhook injects two environment variables and a projected token. The
+        AWS SDK sees them and asks the <strong>Pod Identity agent</strong> (a DaemonSet add-on listening on
+        <code class="inline">169.254.170.23</code>) for credentials. The agent exchanges the token with the EKS Auth API,
+        which assumes the role and returns credentials that last a few hours and are refreshed automatically. No OIDC
+        provider, and no cluster-specific trust policy.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 250" class="w-full min-w-[640px]" role="img" aria-label="EKS Pod Identity flow: Pod with projected token asks the node agent, which calls EKS Auth to assume the IAM role">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">EKS POD IDENTITY · credentials per service account</text>
+          <rect x="10" y="34" width="330" height="200" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="22" y="52" font-size="10" fill="#6E6B64">node · clinic-prod-eks</text>
+          <g class="anim-pulse"><rect x="25" y="65" width="140" height="56" rx="9" fill="#0D9488"/>
+            <text x="95" y="87" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api Pod</text>
+            <text x="95" y="102" text-anchor="middle" fill="#ffffffbb" font-size="9">SA booking-api · SDK</text>
+            <text x="95" y="114" text-anchor="middle" fill="#ffffffbb" font-size="9">projected token</text></g>
+          <g class="anim-pulse d1"><rect x="185" y="65" width="140" height="56" rx="9" fill="#6d5acd"/>
+            <text x="255" y="87" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Pod Identity agent</text>
+            <text x="255" y="102" text-anchor="middle" fill="#ffffffbb" font-size="9">169.254.170.23</text>
+            <text x="255" y="114" text-anchor="middle" fill="#ffffffbb" font-size="9">DaemonSet add-on</text></g>
+          <g class="anim-pulse d2"><rect x="400" y="65" width="140" height="56" rx="9" fill="#2563EB"/>
+            <text x="470" y="87" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">EKS Auth API</text>
+            <text x="470" y="102" text-anchor="middle" fill="#ffffffbb" font-size="9">AssumeRoleForPodIdentity</text>
+            <text x="470" y="114" text-anchor="middle" fill="#ffffffbb" font-size="9">checks association</text></g>
+          <g class="anim-pulse d3"><rect x="575" y="65" width="130" height="56" rx="9" fill="#D97757"/>
+            <text x="640" y="87" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">IAM role</text>
+            <text x="640" y="102" text-anchor="middle" fill="#ffffffbb" font-size="9">booking-api-prod</text>
+            <text x="640" y="114" text-anchor="middle" fill="#ffffffbb" font-size="9">+ session tags</text></g>
+          <g class="anim-pulse d4"><rect x="400" y="160" width="140" height="50" rx="9" fill="#37474F"/>
+            <text x="470" y="181" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">S3 · SQS · Secrets</text>
+            <text x="470" y="196" text-anchor="middle" fill="#ffffffbb" font-size="9">least-privilege calls</text></g>
+          <line x1="165" y1="93" x2="185" y2="93" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="325" y1="93" x2="400" y2="93" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="540" y1="93" x2="575" y2="93" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="95" y1="121" x2="400" y2="185" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="180" y="210" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">temporary credentials, refreshed by the SDK</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/apps/booking-api-identity.tf</span>
+        <pre class="code">data "aws_iam_policy_document" "pod_identity_trust" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]   <span class="cm"># TagSession is required</span>
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]       <span class="cm"># same trust policy for every cluster</span>
+    }
+  }
+}
+
+resource "aws_iam_role" "booking_api" {
+  name               = "booking-api-prod"
+  assume_role_policy = data.aws_iam_policy_document.pod_identity_trust.json
+}
+
+resource "aws_eks_pod_identity_association" "booking_api" {
+  cluster_name    = "clinic-prod-eks"
+  namespace       = "booking"
+  service_account = "booking-api"                    <span class="cm"># the SA must exist in the Helm chart (KS9)</span>
+  role_arn        = aws_iam_role.booking_api.arn
+}</pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking exec deploy/booking-api -- env | grep AWS_CONTAINER
+<span class="out">AWS_CONTAINER_CREDENTIALS_FULL_URI=http://169.254.170.23/v1/credentials
+AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token</span>
+kubectl -n booking exec deploy/booking-api -- aws sts get-caller-identity --query Arn --output text
+<span class="out">arn:aws:sts::444455556666:assumed-role/booking-api-prod/eks-clinic-pro-booking-ap-7c1d0e4f-2b9a-4e8d-a1c3-5f6e7d8c9b0a</span></pre>
+      <div class="mt-4 callout callout-info"><strong>Associations apply at Pod start.</strong> Creating or changing an
+        association does nothing for Pods that are already running. Restart the Deployment. Also, the SDK must be recent
+        enough to know the container credential provider (anything released since early 2024 is). An old SDK silently
+        falls back to IMDS, gets nothing because of the hop limit, and fails with "Unable to locate credentials".</div>
+
+      <h3 class="font-semibold text-lg mt-8">Least privilege, with session tags doing the scoping</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Pod Identity adds session tags to every session: <code class="inline">eks-cluster-name</code>,
+        <code class="inline">kubernetes-namespace</code>, <code class="inline">kubernetes-service-account</code> and more.
+        You can use them in policies (attribute-based access control), so one role can serve the same app in several
+        clusters while each cluster only reaches its own prefix. Here is the whole <code class="inline">booking-api</code>
+        policy. It is short, and that is the goal.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/apps/booking-api-policy.json</span>
+        <pre class="code">{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "Uploads",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::gol-prod-clinic-uploads/${aws:PrincipalTag/kubernetes-namespace}/*" },
+    { "Sid": "Notify",
+      "Effect": "Allow",
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:ap-southeast-1:444455556666:clinic-prod-bookings" },
+    { "Sid": "NoDeleteEver",
+      "Effect": "Deny",
+      "Action": ["s3:DeleteObject", "s3:DeleteBucket"],
+      "Resource": "*" }
+  ]
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Check what a role can really do with IAM Access Analyzer's unused-access findings after two weeks in production,
+        and remove anything it never used. Pod Identity also supports a <strong>target role</strong> in another account on
+        the association, which replaces hand-built role chaining for cross-account access (for example, writing to an S3
+        bucket in <code class="inline">gol-shared</code>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">IRSA: the older alternative you will still meet</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>IAM Roles for Service Accounts</strong> came first (2019). The cluster's OIDC issuer is registered as an
+        IAM identity provider, the service account carries an annotation with the role ARN, and the role's trust policy
+        names the exact cluster, namespace and service account. It works well, and many charts and client clusters still
+        use it. Recognise it, and migrate when you get the chance:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">IRSA — the two pieces you will see in older repos</span>
+        <pre class="code"><span class="cm"># 1. the ServiceAccount annotation</span>
+metadata:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::444455556666:role/booking-api-prod
+<span class="cm"># 2. the trust policy condition: bound to ONE cluster's OIDC issuer</span>
+"Condition": { "StringEquals": {
+  "oidc.eks.ap-southeast-1.amazonaws.com/id/7A3F9C1E2B4D:sub": "system:serviceaccount:booking:booking-api",
+  "oidc.eks.ap-southeast-1.amazonaws.com/id/7A3F9C1E2B4D:aud": "sts.amazonaws.com" } }</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Concern</th><th class="px-4 py-3">EKS Pod Identity</th><th class="px-4 py-3">IRSA</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Trust policy</td><td class="px-4 py-3">One generic policy (<code class="inline">pods.eks.amazonaws.com</code>)</td><td class="px-4 py-3">Per cluster OIDC issuer; edit every role when you replace a cluster</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Binding lives in</td><td class="px-4 py-3">EKS API (association), managed in Terraform</td><td class="px-4 py-3">ServiceAccount annotation in the app's manifests</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Blue/green cluster upgrade</td><td class="px-4 py-3">Create associations on the new cluster; roles unchanged</td><td class="px-4 py-3">Add the new issuer to every trust policy</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Session tags / ABAC</td><td class="px-4 py-3">Built in</td><td class="px-4 py-3">No</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Still needed for</td><td class="px-4 py-3">—</td><td class="px-4 py-3">Fargate Pods, and old SDKs or tools that only know web-identity tokens</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Admission &amp; policy</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Block it at admission, not in code review</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        RBAC decides <em>who</em> may create a Pod. It says nothing about <em>what kind</em> of Pod. A developer with edit
+        rights in <code class="inline">booking</code> can still create a privileged container that mounts the host
+        filesystem. <strong>Admission control</strong> closes that gap: every object passes through mutating and then
+        validating admission before it is stored, and a policy can reject it with a clear message. Code review catches
+        some of these. Admission catches all of them, including the ones applied in a hurry at 2 a.m.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 200" class="w-full min-w-[640px]" role="img" aria-label="API request path: authentication, authorisation, mutating admission, schema validation, validating admission, then etcd">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">EVERY WRITE TO THE API SERVER · left to right, any step can reject</text>
+          <g class="anim-pulse"><rect x="10" y="50" width="100" height="56" rx="9" fill="#37474F"/>
+            <text x="60" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Authn</text>
+            <text x="60" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">IAM → entry</text></g>
+          <g class="anim-pulse d1"><rect x="130" y="50" width="100" height="56" rx="9" fill="#2563EB"/>
+            <text x="180" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Authz</text>
+            <text x="180" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">policies + RBAC</text></g>
+          <g class="anim-pulse d2"><rect x="250" y="50" width="120" height="56" rx="9" fill="#6d5acd"/>
+            <text x="310" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Mutating</text>
+            <text x="310" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">Pod Identity, Kyverno</text>
+            <text x="310" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">image → digest</text></g>
+          <g class="anim-pulse d3"><rect x="390" y="50" width="100" height="56" rx="9" fill="#37474F"/>
+            <text x="440" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Schema</text>
+            <text x="440" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">OpenAPI check</text></g>
+          <g class="anim-pulse d4"><rect x="510" y="50" width="120" height="56" rx="9" fill="#D97757"/>
+            <text x="570" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Validating</text>
+            <text x="570" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">PSA, Kyverno,</text>
+            <text x="570" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">signature check</text></g>
+          <g class="anim-pulse d1"><rect x="650" y="50" width="60" height="56" rx="9" fill="#0D9488"/>
+            <text x="680" y="82" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">etcd</text></g>
+          <line x1="110" y1="78" x2="130" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="230" y1="78" x2="250" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="370" y1="78" x2="390" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="490" y1="78" x2="510" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="630" y1="78" x2="650" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="60" y="130" text-anchor="middle" font-size="9" fill="#6E6B64">401</text>
+          <text x="180" y="130" text-anchor="middle" font-size="9" fill="#6E6B64">403 Forbidden</text>
+          <text x="440" y="130" text-anchor="middle" font-size="9" fill="#6E6B64">400 invalid</text>
+          <text x="570" y="130" text-anchor="middle" font-size="9" fill="#6E6B64">403 denied by policy</text>
+          <text x="360" y="175" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">policy rejects with a message the developer can act on, before anything runs</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Pod Security Standards with namespace labels</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Kubernetes ships three <strong>Pod Security Standards</strong>: <code class="inline">privileged</code> (no rules),
+        <code class="inline">baseline</code> (blocks known privilege escalations such as hostPath, hostNetwork and
+        privileged containers) and <code class="inline">restricted</code> (also requires non-root, dropped capabilities
+        and a seccomp profile). The built-in <strong>Pod Security Admission</strong> controller enforces them per namespace
+        through labels. It needs no installation, and you should use it on every cluster.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/namespaces/booking.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: Namespace
+metadata:
+  name: booking
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.33   <span class="cm"># pin: upgrades never tighten rules silently</span>
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+    elbv2.k8s.aws/pod-readiness-gate-inject: enabled     <span class="cm"># from KS6</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking apply -f debug-pod-root.yaml
+<span class="out">Error from server (Forbidden): error when creating "debug-pod-root.yaml": pods "debug" is forbidden:
+violates PodSecurity "restricted:v1.33": allowPrivilegeEscalation != false (container "shell" must set
+securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "shell" must set
+securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true, seccompProfile (pod or container "shell"
+must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Namespace</th><th class="px-4 py-3">Level</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">booking and all app namespaces</td><td class="px-4 py-3">enforce restricted</td><td class="px-4 py-3">Our images run as non-root already (<a href="./fn6.html" class="text-viol underline decoration-viol/40">FN6</a>); nothing legitimate needs more</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">argocd, external-secrets, keda</td><td class="px-4 py-3">enforce restricted</td><td class="px-4 py-3">Controllers only talk to APIs; check each chart once</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">monitoring</td><td class="px-4 py-3">enforce baseline, warn restricted</td><td class="px-4 py-3">node-exporter needs hostNetwork and hostPID</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">kube-system</td><td class="px-4 py-3">privileged</td><td class="px-4 py-3">CNI and CSI drivers touch the host; only the platform team can deploy here</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">A restricted-compliant booking-api</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Meeting <code class="inline">restricted</code> is five fields, plus a writable <code class="inline">/tmp</code> if
+        you also make the root filesystem read-only, which we do. Put these in the shared Helm chart
+        (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>) once, so no service has to remember
+        them:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api/deployment.yaml — security fields</span>
+        <pre class="code">    spec:
+      serviceAccountName: booking-api
+      automountServiceAccountToken: false     <span class="cm"># the app never calls the K8s API</span>
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: { sizeLimit: 256Mi } }]</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Turning off <code class="inline">automountServiceAccountToken</code> does not break Pod Identity, because Pod
+        Identity uses its own projected token with a different audience. It removes a Kubernetes API credential that
+        <code class="inline">booking-api</code> never needed.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Kyverno for the rules PSA cannot express</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Pod Security covers Pod-level privileges only. Organisation rules need a policy engine: images only from our ECR,
+        no <code class="inline">:latest</code>, a <code class="inline">team</code> label on every workload, no
+        <code class="inline">type: LoadBalancer</code> without a class. We use <strong>Kyverno</strong> because its
+        policies are Kubernetes YAML that any engineer can read. (OPA Gatekeeper, which uses Rego, is the alternative.
+        Kubernetes' built-in <code class="inline">ValidatingAdmissionPolicy</code>, written in CEL, is fine for one or two
+        simple rules.) Install it with three admission-controller replicas, because when its webhook is down, Pod creation
+        stops.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/kyverno/policies/restrict-image-registries.yaml</span>
+        <pre class="code">apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+  annotations:
+    policies.kyverno.io/description: Images must come from the clinic ECR registry and be pinned.
+spec:
+  background: true                         <span class="cm"># also report on existing Pods</span>
+  rules:
+    - name: clinic-ecr-only
+      match:
+        any: [{ resources: { kinds: [Pod], namespaces: ["booking", "booking-*"] } }]
+      validate:
+        failureAction: Audit               <span class="cm"># start in Audit; switch to Enforce after a clean week</span>
+        message: "Image {{ request.object.spec.containers[0].image }} is not from 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic or uses :latest."
+        pattern:
+          spec:
+            containers:
+              - image: "111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/* &amp; !*:latest"</pre>
+      </div>
+      <pre class="code mt-3">kubectl get policyreport -n booking
+<span class="out">NAME                                   KIND         NAME                         PASS   FAIL   WARN   ERROR   SKIP   AGE
+1c2d3e4f-…                             Deployment   booking-api                  4      0      0      0       0      2d
+5a6b7c8d-…                             Deployment   booking-redis-debug          3      1      0      0       0      2d</span>
+<span class="cm"># one failing workload: fix or except it BEFORE switching to Enforce</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Exclude system namespaces and keep the webhook healthy.</strong> A
+        Kyverno policy that matches <code class="inline">kube-system</code>, combined with a Kyverno outage and
+        <code class="inline">failurePolicy: Fail</code>, can stop CoreDNS and the CNI from starting on new nodes. That is a
+        cluster-wide outage caused by a security tool. Exclude system namespaces, run three replicas with a PDB, and alert
+        on webhook latency and errors.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Image provenance: only run what CI signed</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <a href="./ci4.html" class="text-viol underline decoration-viol/40">CI4</a> signs every
+        <code class="inline">booking-api</code> image with cosign, using a KMS key, in the release pipeline. Admission is
+        where the signature becomes useful: Kyverno's <code class="inline">verifyImages</code> rule checks the signature
+        against the KMS public key and rewrites the tag to an immutable digest. An image someone pushed by hand, or a tag
+        that was overwritten, never starts.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/kyverno/policies/verify-clinic-images.yaml</span>
+        <pre class="code">apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-clinic-images
+spec:
+  webhookTimeoutSeconds: 15
+  rules:
+    - name: cosign-kms
+      match:
+        any: [{ resources: { kinds: [Pod], namespaces: ["booking"] } }]
+      verifyImages:
+        - imageReferences: ["111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/*"]
+          failureAction: Enforce
+          mutateDigest: true                <span class="cm"># tag → @sha256:…, so what was verified is what runs</span>
+          attestors:
+            - entries:
+                - keys:
+                    kms: awskms:///arn:aws:kms:ap-southeast-1:111122223333:alias/cosign-clinic</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Kyverno itself now needs AWS permissions: ECR read to fetch signatures and <code class="inline">kms:GetPublicKey</code>
+        on the signing key. Give them to the <code class="inline">kyverno-admission-controller</code> service account
+        through Pod Identity. Then measure the cost: verification adds about 1–3 s to the first admission of each new
+        digest (results are cached), which matters for KEDA-driven bursts in
+        <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Secrets on EKS</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Secrets live in AWS; the cluster only holds a short-lived copy</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a> made AWS Secrets Manager the source of
+        truth for credentials such as the <code class="inline">booking-api</code> database password, with rotation and
+        KMS keys. This Part covers the EKS end: how the value gets into a Pod without passing through Git, how it is
+        protected while in etcd, and how you find out who read it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">A Kubernetes Secret is base64, not encryption</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A Secret object stores values base64-encoded, and anyone with <code class="inline">get secrets</code> can decode
+        them in one command. Two separate protections exist, and you need both. <strong>At rest</strong>, EKS encrypts
+        Kubernetes API data in etcd with envelope encryption. Clusters on 1.28 and later get this by default with an
+        AWS-owned key, and our module configures a <strong>customer-managed KMS key</strong> instead, so the key policy
+        and CloudTrail records are ours. <strong>In use</strong>, RBAC is the only thing between a user and the
+        plaintext, which is why <code class="inline">get secrets</code> was the first row in Part I's danger table.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/main.tf — encryption</span>
+        <pre class="code">module "eks" {
+  # ...
+  create_kms_key = true                       <span class="cm"># customer-managed key, rotation on</span>
+  kms_key_administrators = ["arn:aws:iam::444455556666:role/AWSReservedSSO_PlatformAdmin_8a1f3c2e9d7b6a54"]
+  encryption_config = { resources = ["secrets"] }
+}</pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking get secret booking-api-db -o jsonpath='{.data.DATABASE_PASSWORD}' | base64 -d
+<span class="out">q7R!vT2m…</span>
+<span class="cm"># KMS protects the disk, not this command. Only RBAC protects this command.</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">External Secrets Operator: sync from Secrets Manager</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>External Secrets Operator</strong> (ESO) reads values from Secrets Manager and writes them into ordinary
+        Kubernetes Secrets, refreshing them on a schedule. Apps keep using <code class="inline">envFrom</code> or volume
+        mounts as in <a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>, and Git only holds a
+        pointer to the secret. This is our default because it works with every app and every Helm chart.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    G["clinic-gitops<br/>ExternalSecret<br/>(name of secret only)"] -->|Argo CD| ES["ExternalSecret<br/>booking-api-db"]
+    ES --> ESO["ESO controller<br/>Pod Identity role:<br/>clinic/prod/booking/*"]
+    ESO -->|GetSecretValue| SM["Secrets Manager<br/>clinic/prod/booking/db<br/>rotated every 30 days"]
+    ESO -->|create / update| KS["K8s Secret<br/>booking-api-db<br/>(KMS-encrypted in etcd)"]
+    KS -->|envFrom| P["booking-api Pods"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">platform/external-secrets/clustersecretstore-booking.yaml</span>
+        <pre class="code">apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: clinic-prod-booking
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: ap-southeast-1                <span class="cm"># no auth block: uses ESO's own Pod Identity role</span>
+  conditions:
+    - namespaces: ["booking"]               <span class="cm"># only booking may use this store</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-api/externalsecret.yaml</span>
+        <pre class="code">apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: booking-api-db
+  namespace: booking
+spec:
+  refreshInterval: 1h                        <span class="cm"># picks up a rotation within an hour</span>
+  secretStoreRef: { kind: ClusterSecretStore, name: clinic-prod-booking }
+  target:
+    name: booking-api-db
+    deletionPolicy: Retain                   <span class="cm"># deleting the ExternalSecret must not break running Pods</span>
+  data:
+    - secretKey: DATABASE_PASSWORD
+      remoteRef: { key: clinic/prod/booking/db, property: password }</pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking get externalsecret
+<span class="out">NAME             STORE                 REFRESH INTERVAL   STATUS         READY
+booking-api-db   clinic-prod-booking   1h                 SecretSynced   True</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Scope the ESO controller's IAM role to <code class="inline">clinic/prod/*</code> resources, and use one
+        ClusterSecretStore per namespace with a <code class="inline">conditions</code> block. Otherwise any namespace that
+        can create an ExternalSecret can copy any secret ESO can read into its own namespace. Remember the last step too:
+        an updated Secret does not restart Pods. Use a checksum annotation in the chart or a reloader, and make sure the
+        rotation schedule allows for the one-hour refresh.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Secrets Store CSI Driver: mount without a Secret object</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <strong>Secrets Store CSI Driver</strong> with the <strong>AWS provider (ASCP)</strong> fetches the value when
+        the Pod starts and mounts it as a file in a tmpfs volume. No Kubernetes Secret is created, so nobody with
+        <code class="inline">get secrets</code> can read it. The cost is that the app must read a file, and that a
+        Secrets Manager outage blocks Pod start-up.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking/secretproviderclass-payments.yaml</span>
+        <pre class="code">apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: booking-payments-key
+  namespace: booking
+spec:
+  provider: aws
+  parameters:
+    usePodIdentity: "true"                   <span class="cm"># fetch with the Pod's own role, not a shared one</span>
+    objects: |
+      - objectName: "clinic/prod/booking/payment-gateway-key"
+        objectType: "secretsmanager"</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Concern</th><th class="px-4 py-3">External Secrets Operator</th><th class="px-4 py-3">Secrets Store CSI + ASCP</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Where the value lives in-cluster</td><td class="px-4 py-3">K8s Secret (KMS-encrypted)</td><td class="px-4 py-3">tmpfs file in the Pod only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">App changes needed</td><td class="px-4 py-3">None: env or volume as usual</td><td class="px-4 py-3">Read from a file path</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">IAM identity used</td><td class="px-4 py-3">ESO controller's role</td><td class="px-4 py-3">Each Pod's own role</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Secrets Manager outage</td><td class="px-4 py-3">Running and new Pods keep the last synced value</td><td class="px-4 py-3">New Pods fail to start</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Our use</td><td class="px-4 py-3">Default for everything</td><td class="px-4 py-3">High-value keys (payment gateway) where no human should be able to read them</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Detection: know who read what</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Prevention fails eventually, so make the cluster auditable. The EKS <code class="inline">audit</code> control
+        plane log (enabled in <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>) records every
+        API request with the IAM identity behind it. Save this CloudWatch Logs Insights query and run it during access
+        reviews:
+      </p>
+      <pre class="code mt-3">fields @timestamp, user.username, verb, objectRef.namespace, objectRef.name
+| filter objectRef.resource = "secrets" and verb in ["get", "list", "watch"]
+| filter user.username not like /^system:/
+| stats count() as reads by user.username, objectRef.namespace
+| sort reads desc
+<span class="out">user.username                                                          objectRef.namespace   reads
+arn:aws:sts::444455556666:assumed-role/AWSReservedSSO_PlatformAdmin_…   booking               3</span>
+<span class="cm"># every human read of a prod Secret should match a ticket</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On top of audit logs, <strong>GuardDuty EKS Protection</strong> flags suspicious API activity (anonymous access,
+        a Pod mounting the host, known attacker IPs), and <strong>Runtime Monitoring</strong> watches process and network
+        behaviour on the nodes. Enabling them across the organisation and handling findings is
+        <a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>. Your job here is to make sure every
+        finding can be traced to a namespace, a service account and an IAM role, which is exactly what Parts I and II set up.
+      </p>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Security config is the area where "make the error go away" and "make it correct" are furthest apart. Ask the
+        agent for least privilege explicitly, give it the threat you care about, and have it prove each grant with
+        <code class="inline">kubectl auth can-i</code> or IAM policy simulation rather than trusting its reasoning.
+      </p>
+      <pre class="code mt-3">Write the Terraform for a Pod Identity association and IAM role for booking-worker
+(namespace booking, SA booking-worker). It needs sqs:ReceiveMessage/DeleteMessage/
+GetQueueAttributes on clinic-prod-bookings and s3:GetObject on gol-prod-clinic-uploads/booking/*.
+No wildcards in actions. Then give me the aws iam simulate-principal-policy commands that
+prove it cannot delete objects or read other prefixes.</pre>
+      <pre class="code mt-3">Review platform/rbac/ for privilege escalation paths. For each Role or ClusterRole, list any
+of: secrets get/list, pods create, pods/exec, escalate, bind, impersonate, wildcards. Show the
+kubectl auth can-i command that demonstrates each finding. Do not change any file.</pre>
+      <pre class="code mt-3">Here is a Helm chart's rendered Deployment. Make it pass Pod Security "restricted:v1.33"
+with the fewest changes, explain each change, and tell me if the image will still work with
+readOnlyRootFilesystem (which paths does it write to?).</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft IAM policies, Pod Identity associations and access entries from a stated need</li>
+            <li>Audit RBAC manifests for escalation paths</li>
+            <li>Make third-party charts compliant with <code class="inline">restricted</code></li>
+            <li>Write Kyverno policies and the test resources that should pass and fail them</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every new <code class="inline">cluster-admin</code> or <code class="inline">AmazonEKSClusterAdminPolicy</code> grant: almost always wrong</li>
+            <li>IAM actions and resources have no wildcards that the use case does not need</li>
+            <li>New Kyverno policies start in Audit and exclude system namespaces</li>
+            <li>No secret value appears in Git, Helm values, Terraform state outputs or the PR description</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written EKS security:</strong> edits to the
+        <code class="inline">aws-auth</code> ConfigMap (ignored on our clusters, so a sign the agent's knowledge is old);
+        a <code class="inline">ClusterRoleBinding</code> to <code class="inline">cluster-admin</code> "to fix permissions";
+        S3 or SQS permissions added to the node role; <code class="inline">"Action": "*"</code> or
+        <code class="inline">"Resource": "*"</code>; <code class="inline">privileged: true</code> or
+        <code class="inline">hostPath</code> in an app chart; the PSA namespace label removed to "unblock a deploy";
+        a <code class="inline">kind: Secret</code> with real data committed to Git; Kyverno policies created directly in
+        <code class="inline">Enforce</code>.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Uses whatever kubeconfig works; puts AWS access keys in environment variables of Pods.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows EKS uses IAM for login and that Pods should have their own roles, but cannot explain how either works.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds an access entry or a Pod Identity association by copying an existing one; needs help when a Pod gets "Unable to locate credentials" or PSA rejects a chart.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Designs access entries and RBAC for a team and proves them with <code class="inline">can-i</code>; gives every workload a least-privilege Pod Identity role; runs app namespaces at <code class="inline">restricted</code>; rolls out a Kyverno policy from Audit to Enforce; wires secrets through ESO with no value in Git.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the cluster security baseline for all client clusters, runs quarterly access reviews from audit logs, leads the IRSA-to-Pod-Identity migration, and writes the policy exception process.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> from a Pod in
+        <code class="inline">booking</code>, show that the node role is unreachable, that
+        <code class="inline">aws sts get-caller-identity</code> returns the Pod's own role, and that the role cannot touch
+        another namespace's S3 prefix. Then show a privileged Pod being rejected by PSA and an unsigned image being rejected
+        by Kyverno, with the exact error messages.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ "Edit" access in production</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The edit role can read every Secret and create Pods with any service account in the namespace. In prod, humans get view plus a narrow on-call role; changes go through Argo CD.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Forgetting the hop limit</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Pod Identity everywhere is pointless if one node pool still allows IMDS from Pods. Check every launch template and EC2NodeClass for <code class="inline">httpPutResponseHopLimit: 1</code>.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Enforcing a new policy on day one</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An untested Enforce policy blocks the next deploy of a workload nobody checked, often during an incident. Audit, read the PolicyReports, fix or except, then enforce.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Security fields live in the shared chart</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Put the restricted securityContext, <code class="inline">automountServiceAccountToken: false</code> and the ServiceAccount in the shared Helm chart (KS9). Each service gets them by default and has to opt out explicitly.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Test RBAC and policies in CI</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Run <code class="inline">kyverno test</code> against known-good and known-bad manifests, and a <code class="inline">kubectl auth can-i</code> matrix on a kind cluster, in the PR pipeline. Security config is code and needs tests too.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="access"> <span>I designed access entries and RBAC for platform, on-call and developer roles and proved each with <code class="inline">kubectl auth can-i</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="pod-identity"> <span>I gave a workload a least-privilege IAM role through EKS Pod Identity and can explain how IRSA differs.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="psa"> <span>I run app namespaces at Pod Security <code class="inline">restricted</code> and made a non-compliant chart pass.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="kyverno"> <span>I rolled out a Kyverno policy from Audit to Enforce using PolicyReports, and I can explain image signature verification at admission.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="secrets"> <span>I delivered a Secrets Manager secret to a Pod through External Secrets Operator, with nothing secret in Git.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="harden-lab"> <span class="font-semibold">Hardened booking-api on a dev EKS cluster: Pod Identity role scoped by session tag, IMDS blocked, restricted PSA, a Kyverno registry policy in Enforce, and the DB password via ESO. Shared the PR plus a short report with the can-i matrix and the rejection messages for three attack attempts (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/access-entries.html" target="_blank" rel="noopener">AWS — Grant IAM users access with EKS access entries</a>: access entries, access policies and the SSO ARN rules.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html" target="_blank" rel="noopener">AWS — EKS Pod Identity</a>: associations, session tags, SDK versions and cross-account target roles.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/reference/access-authn-authz/rbac/" target="_blank" rel="noopener">Kubernetes — Using RBAC authorization</a> · <a class="text-coral underline" href="https://kubernetes.io/docs/concepts/security/rbac-good-practices/" target="_blank" rel="noopener">RBAC good practices</a>: roles, bindings and the escalation risks in Part I.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/concepts/security/pod-security-standards/" target="_blank" rel="noopener">Kubernetes — Pod Security Standards</a>: exactly what each level allows and forbids.</li>
+        <li><a class="text-coral underline" href="https://github.com/kyverno/kyverno" target="_blank" rel="noopener">Kyverno — README and docs</a>: validate, mutate and verifyImages rules, PolicyReports and the CLI.</li>
+        <li><a class="text-coral underline" href="https://github.com/external-secrets/external-secrets" target="_blank" rel="noopener">External Secrets Operator — README</a>: the AWS Secrets Manager provider and store scoping.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/best-practices/security.html" target="_blank" rel="noopener">AWS — EKS Best Practices: Security</a>: the full baseline these controls come from.</li>
+      </ul>

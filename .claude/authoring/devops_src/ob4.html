@@ -1,0 +1,721 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">OpenTelemetry &amp; Distributed Tracing</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          OpenTelemetry (OTel) is how we instrument every service, whichever backend the client uses. The application emits
+          traces, metrics and logs once, in a vendor-neutral format, and the OpenTelemetry Collector decides where they go:
+          CloudWatch and X-Ray, Prometheus and Tempo, or Datadog. This module covers the OTel model (signals, SDKs,
+          auto-instrumentation, resources and semantic conventions), context propagation across HTTP and SQS, the Collector
+          and ADOT on EKS and ECS, exporting the same telemetry to all three backends, head and tail sampling, and the
+          trace-log-metric correlation that makes an incident a five-minute investigation instead of an hour.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> a patient reports that reminders arrive late. The trace of the
+          booking request ends at the SQS <code class="inline">SendMessage</code> call, because nobody propagated context
+          through the queue. The worker's traces are separate, so nobody can connect the slow reminder to the request that
+          created it. Elsewhere, 100% head sampling quietly ships 4 billion spans a month, and a 5% head sample throws away
+          95% of the error traces you need. And instrumentation written against one vendor's SDK has to be rewritten when the
+          client changes vendor. OTel fixes all three, but only if the propagation, sampling and routing are designed on
+          purpose. Agents add OTel packages quickly. Whether a trace survives every hop is your responsibility.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · OpenTelemetry concepts</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Instrument once with OTel; the backend is a configuration choice</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The routing rule from <a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a> puts OTel at the
+        bottom of the stack. Every service is instrumented with OpenTelemetry. The Collector, or ADOT (the AWS Distro for
+        OpenTelemetry), sends traces to X-Ray on ECS/Lambda projects, to Tempo on EKS projects with the OSS stack, and to
+        Datadog when the client has bought it. Metrics and logs follow the same rule
+        (<a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>,
+        <a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>). The code never names a vendor.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The parts of OpenTelemetry</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        OTel is a specification plus implementations. The <strong>API</strong> is what your code calls to create spans and
+        record metrics; on its own it does nothing, which is what lets libraries use it safely. The <strong>SDK</strong> is
+        the implementation you configure at startup: sampling, batching, exporters. <strong>OTLP</strong> is the wire
+        protocol (gRPC on 4317, HTTP on 4318). The <strong>Collector</strong> is a separate process that receives, processes
+        and exports telemetry. Traces, metrics and logs are stable signals; profiles are still being developed.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 210" class="w-full min-w-[640px]" role="img" aria-label="OpenTelemetry layers: application code calls the OTel API, the SDK samples and batches, OTLP carries data to the Collector, which exports to CloudWatch, Prometheus/Tempo/Loki or Datadog">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ONE INSTRUMENTATION, THREE POSSIBLE BACKENDS</text>
+          <rect x="10" y="36" width="300" height="150" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="22" y="54" font-size="10" font-weight="700" fill="#6E6B64">booking-api process</text>
+          <g class="anim-pulse"><rect x="22" y="64" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="87" y="85" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">your code + libs</text>
+            <text x="87" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">call the OTel API</text></g>
+          <g class="anim-pulse d1"><rect x="168" y="64" width="130" height="50" rx="9" fill="#6d5acd"/>
+            <text x="233" y="85" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">OTel SDK</text>
+            <text x="233" y="100" text-anchor="middle" fill="#ffffffbb" font-size="9">resource · sampler · batch</text></g>
+          <g class="anim-pulse d2"><rect x="22" y="126" width="276" height="44" rx="9" fill="#0D9488"/>
+            <text x="160" y="145" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">auto-instrumentation</text>
+            <text x="160" y="159" text-anchor="middle" fill="#ffffffbb" font-size="9">HTTP · pg · ioredis · aws-sdk · no code changes</text></g>
+          <g class="anim-pulse d3"><rect x="370" y="80" width="140" height="56" rx="9" fill="#D97757"/>
+            <text x="440" y="103" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Collector / ADOT</text>
+            <text x="440" y="118" text-anchor="middle" fill="#ffffffbb" font-size="9">receive · process · export</text></g>
+          <g class="anim-pulse"><rect x="560" y="40" width="150" height="40" rx="9" fill="#37474F"/>
+            <text x="635" y="64" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">CloudWatch · X-Ray</text></g>
+          <g class="anim-pulse d1"><rect x="560" y="90" width="150" height="40" rx="9" fill="#DB2777"/>
+            <text x="635" y="114" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">AMP · Tempo · Loki</text></g>
+          <g class="anim-pulse d2"><rect x="560" y="140" width="150" height="40" rx="9" fill="#6d5acd"/>
+            <text x="635" y="164" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Datadog</text></g>
+          <line x1="152" y1="89" x2="168" y2="89" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="298" y1="100" x2="370" y2="105" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="510" y1="98" x2="560" y2="60" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="510" y1="108" x2="560" y2="110" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="510" y1="118" x2="560" y2="160" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="335" y="95" text-anchor="middle" font-size="9" fill="#6E6B64">OTLP</text>
+          <text x="440" y="200" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">change the exporter, not the code</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Term</th><th class="px-4 py-3">Means</th><th class="px-4 py-3">booking-api example</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Trace</td><td class="px-4 py-3">All spans of one request, sharing a 16-byte trace ID</td><td class="px-4 py-3"><code class="inline">4bf92f3577b34da6a3ce929d0e0e4736</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Span</td><td class="px-4 py-3">One timed operation with a parent, attributes, events and a status</td><td class="px-4 py-3"><code class="inline">POST /v1/bookings</code> 2.4 s, child <code class="inline">pg.query INSERT</code> 2.3 s</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Resource</td><td class="px-4 py-3">Attributes describing who emitted the telemetry</td><td class="px-4 py-3"><code class="inline">service.name=booking-api</code>, <code class="inline">k8s.pod.name</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Span kind</td><td class="px-4 py-3">SERVER, CLIENT, PRODUCER, CONSUMER, INTERNAL</td><td class="px-4 py-3">SQS send = PRODUCER, worker processing = CONSUMER</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Exemplar</td><td class="px-4 py-3">A trace ID attached to a metric data point</td><td class="px-4 py-3">The p99 bucket links to one slow trace</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Resources and semantic conventions: agree on names</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Telemetry only correlates if everyone uses the same attribute names. <strong>Semantic conventions</strong> are
+        OTel's standard names for common things: HTTP, databases, messaging, Kubernetes, cloud. Three resource attributes
+        are mandatory for every service we run, because every backend keys on them. They map directly to Datadog's
+        <code class="inline">service</code>/<code class="inline">version</code>/<code class="inline">env</code> and to
+        Prometheus <code class="inline">job</code> labels. The HTTP conventions were renamed when they became stable, so
+        older dashboards and agent-written queries often use the old names.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Current (stable) name</th><th class="px-4 py-3">Old name you'll still see</th><th class="px-4 py-3">Value for booking-api</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">service.name</code></td><td class="px-4 py-3">(unchanged)</td><td class="px-4 py-3"><code class="inline">booking-api</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">service.version</code></td><td class="px-4 py-3">(unchanged)</td><td class="px-4 py-3"><code class="inline">1.8.3</code>, the image tag</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">deployment.environment.name</code></td><td class="px-4 py-3"><code class="inline">deployment.environment</code></td><td class="px-4 py-3"><code class="inline">prod</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">http.request.method</code></td><td class="px-4 py-3"><code class="inline">http.method</code></td><td class="px-4 py-3"><code class="inline">POST</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">http.response.status_code</code></td><td class="px-4 py-3"><code class="inline">http.status_code</code></td><td class="px-4 py-3"><code class="inline">503</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">http.route</code></td><td class="px-4 py-3">(unchanged)</td><td class="px-4 py-3"><code class="inline">/v1/clinics/:id/slots</code>, templated, never the raw path</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># set resource attributes through env vars, not code: the platform owns them</span>
+OTEL_SERVICE_NAME=booking-api
+OTEL_RESOURCE_ATTRIBUTES=service.version=1.8.3,deployment.environment.name=prod,service.namespace=clinic
+<span class="cm"># k8s.* and cloud.* attributes are added by the Collector (k8sattributes, resourcedetection), not by the app</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Auto-instrumentation first, manual spans for business steps</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Auto-instrumentation</strong> patches common libraries (HTTP server and client, Postgres, Redis, the AWS SDK)
+        at startup, so you get useful traces with zero code changes. On EKS, the <strong>OpenTelemetry Operator</strong>
+        injects it: one <code class="inline">Instrumentation</code> object per namespace, and one annotation per workload.
+        Then add <strong>manual spans</strong> only where the business logic needs its own timing or attributes, such as
+        "check slot availability" or "charge deposit". In this example <code class="inline">booking-api</code> is Node.js;
+        Java, Python, .NET and Go work the same way.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking/instrumentation.yaml</span>
+        <pre class="code">apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata: { name: default, namespace: booking }
+spec:
+  exporter:
+    endpoint: http://otel-agent.observability.svc:4318   <span class="cm"># node-local agent Collector (Part III)</span>
+  propagators: [tracecontext, baggage]
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1.0"                     <span class="cm"># keep all at the SDK; the Collector tail-samples (Part IV)</span>
+  nodejs:
+    env:
+      - { name: OTEL_NODE_DISABLED_INSTRUMENTATIONS, value: "fs,dns" }   <span class="cm"># noisy, low value</span>
+<span class="cm">---
+# on the Deployment's pod template:</span>
+metadata:
+  annotations:
+    instrumentation.opentelemetry.io/inject-nodejs: "true"</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/booking-api/src/bookings/create.ts</span>
+        <pre class="code"><span class="kw">import</span> { trace, SpanStatusCode } <span class="kw">from</span> <span class="st">'@opentelemetry/api'</span>;   <span class="cm">// API only: no vendor, no SDK</span>
+<span class="kw">const</span> tracer = trace.<span class="fn">getTracer</span>(<span class="st">'booking-api'</span>);
+
+<span class="kw">export async function</span> <span class="fn">createBooking</span>(req: BookingRequest) {
+  <span class="kw">return</span> tracer.<span class="fn">startActiveSpan</span>(<span class="st">'booking.create'</span>, <span class="kw">async</span> (span) =&gt; {
+    span.<span class="fn">setAttributes</span>({
+      <span class="st">'clinic.id'</span>: req.clinicId,          <span class="cm">// high cardinality is FINE on a span…</span>
+      <span class="st">'booking.slot_minutes'</span>: req.slotMinutes,
+    });                                     <span class="cm">// …and never fine as a metric label (OB2)</span>
+    <span class="kw">try</span> {
+      <span class="kw">return await</span> <span class="fn">reserveSlotAndCharge</span>(req);   <span class="cm">// pg + payment calls appear as child spans</span>
+    } <span class="kw">catch</span> (err) {
+      span.<span class="fn">recordException</span>(err <span class="kw">as</span> Error);
+      span.<span class="fn">setStatus</span>({ code: SpanStatusCode.ERROR });   <span class="cm">// tail sampling keys on this</span>
+      <span class="kw">throw</span> err;
+    } <span class="kw">finally</span> {
+      span.<span class="fn">end</span>();                            <span class="cm">// an un-ended span is never exported</span>
+    }
+  });
+}</pre>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Context propagation</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A trace is only as long as its weakest hop</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A distributed trace exists because each service passes the trace context to the next one. Over HTTP that happens
+        automatically once both sides are instrumented. Across a queue, a cron job, a third-party webhook or a proxy that
+        drops headers, it doesn't, and the trace splits into unconnected pieces. Most "tracing doesn't work" tickets are
+        really propagation gaps.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">W3C Trace Context: the traceparent header</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        OTel's default propagator is <strong>W3C Trace Context</strong>. The caller sends a <code class="inline">traceparent</code>
+        header with the trace ID, its own span ID (which becomes the callee's parent) and a sampled flag. The callee
+        continues the same trace. The <code class="inline">parentbased_*</code> samplers respect the caller's sampled flag,
+        so a trace is kept or dropped as a whole, not half on each side.
+      </p>
+      <pre class="code mt-3">traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  │                                │                └─ flags: 01 = sampled
+             │  │                                └─ parent span ID (8 bytes)
+             │  └─ trace ID (16 bytes): the same in every service for this request
+             └─ version
+<span class="cm"># prove it end to end: send your own traceparent and find the trace by that ID</span>
+curl -s -o /dev/null -w '%{http_code}\n' https://api.clinic.example.com/v1/clinics/c-0042/slots \
+  -H 'traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
+<span class="out">200</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Propagator</th><th class="px-4 py-3">Header</th><th class="px-4 py-3">Enable when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">tracecontext</td><td class="px-4 py-3"><code class="inline">traceparent</code>, <code class="inline">tracestate</code></td><td class="px-4 py-3">Always: the default for every service</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">baggage</td><td class="px-4 py-3"><code class="inline">baggage</code></td><td class="px-4 py-3">Always on, but carry only safe keys (below)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">xray</td><td class="px-4 py-3"><code class="inline">X-Amzn-Trace-Id</code></td><td class="px-4 py-3">ECS/Lambda projects whose traces must join AWS-originated X-Ray segments (API Gateway, Lambda)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">datadog</td><td class="px-4 py-3"><code class="inline">x-datadog-trace-id</code></td><td class="px-4 py-3">Only while migrating services that still run <code class="inline">dd-trace</code> (<a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>Baggage leaks.</strong> Baggage is copied onto every outgoing call,
+        including calls to the payment provider and SMS gateway. Never put a patient ID, phone number or token in baggage.
+        Limit it to coarse, non-sensitive keys such as <code class="inline">clinic.tier=premium</code>, and strip
+        <code class="inline">baggage</code> at the egress proxy for third-party hosts.</div>
+
+      <h3 class="font-semibold text-lg mt-8">The full booking flow, hop by hop</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Follow one booking through the platform and mark where context is carried. The synchronous hops are handled by
+        auto-instrumentation. The queue hop is where traces usually break, because the "request" is now a message that might
+        be processed minutes later by another process.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant W as booking-web (Next.js)
+    participant A as booking-api
+    participant P as Postgres (RDS)
+    participant Q as SQS reminders
+    participant K as booking-worker
+    W->>A: POST /v1/bookings<br/>traceparent: 00-4bf9…-a1-01
+    A->>P: INSERT booking (child span, same trace)
+    A->>Q: SendMessage<br/>MessageAttributes.traceparent = 00-4bf9…-b2-01
+    Note over A,Q: PRODUCER span ends here<br/>HTTP response returns to the patient
+    K->>Q: ReceiveMessage (minutes later)
+    Note over K: extract traceparent from attributes<br/>CONSUMER span: same trace ID, or a span link
+    K->>K: send SMS reminder (child of CONSUMER)
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Across SQS: message attributes and the 10-attribute trap</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The OTel AWS SDK instrumentation injects <code class="inline">traceparent</code> into SQS
+        <strong>message attributes</strong> on send and extracts it on receive. Two things break this in practice. First,
+        SQS allows at most <strong>10 message attributes</strong>. If the app already uses 10, injection is skipped with
+        only a debug-level warning. Second, batch receives mean one receive call carries many traces, so the worker must
+        create a processing span <em>per message</em>, using that message's context. When in doubt, extract explicitly:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/booking-worker/src/consume.ts</span>
+        <pre class="code"><span class="kw">import</span> { context, propagation, trace, SpanKind } <span class="kw">from</span> <span class="st">'@opentelemetry/api'</span>;
+<span class="kw">const</span> tracer = trace.<span class="fn">getTracer</span>(<span class="st">'booking-worker'</span>);
+
+<span class="kw">for</span> (<span class="kw">const</span> msg <span class="kw">of</span> resp.Messages ?? []) {
+  <span class="kw">const</span> carrier = Object.<span class="fn">fromEntries</span>(
+    Object.<span class="fn">entries</span>(msg.MessageAttributes ?? {}).<span class="fn">map</span>(([k, v]) =&gt; [k, v.StringValue ?? <span class="st">''</span>]));
+  <span class="kw">const</span> parent = propagation.<span class="fn">extract</span>(context.<span class="fn">active</span>(), carrier);   <span class="cm">// per MESSAGE, not per batch</span>
+  <span class="kw">await</span> tracer.<span class="fn">startActiveSpan</span>(<span class="st">'reminders process'</span>,
+    { kind: SpanKind.CONSUMER, attributes: { <span class="st">'messaging.system'</span>: <span class="st">'aws_sqs'</span>,
+      <span class="st">'messaging.message.id'</span>: msg.MessageId } },
+    parent, <span class="kw">async</span> (span) =&gt; {
+      <span class="kw">try</span> { <span class="kw">await</span> <span class="fn">sendReminder</span>(msg); } <span class="kw">finally</span> { span.<span class="fn">end</span>(); }
+    });
+}</pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># check that messages really carry the context (staging queue, read-only peek)</span>
+aws sqs receive-message --queue-url https://sqs.ap-southeast-1.amazonaws.com/333344445555/clinic-staging-reminders \
+  --message-attribute-names All --visibility-timeout 0 --max-number-of-messages 1 \
+  --query 'Messages[0].MessageAttributes.traceparent.StringValue'
+<span class="out">"00-4bf92f3577b34da6a3ce929d0e0e4736-b2c4e1d07a9f3e21-01"</span>
+<span class="cm"># "null" here means the trace ends at SendMessage: count the attributes the app already sets</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Whether the consumer span is a <em>child</em> of the producer (one long trace) or a new trace with a
+        <strong>span link</strong> back to it is a design choice. For a reminder sent 24 hours later, a link is better,
+        because a 24-hour trace makes latency views meaningless. For a job processed within seconds, a child span reads
+        more naturally. Pick one per queue and document it. Queue design itself is in
+        <a href="../../intern/modules/sd8.html" class="text-viol underline decoration-viol/40">intern SD8</a> and
+        <a href="./aw6.html" class="text-viol underline decoration-viol/40">AW6</a>.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · The Collector and ADOT</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Run Collectors as agents and gateways, and route by config, not code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Apps could export straight to a backend, but then every service carries backend credentials, retries and batching,
+        and changing the backend means redeploying every service. The Collector moves all of that out of the app. Apps
+        send OTLP to a nearby Collector, and the Collector enriches, filters, samples and exports. Everything
+        backend-specific lives in one YAML file owned by the platform team.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Pipeline anatomy: receivers, processors, exporters</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A Collector config declares components, then wires them into <strong>pipelines</strong>, one per signal.
+        <strong>Receivers</strong> take data in (OTLP, Prometheus scrape, filelog). <strong>Processors</strong> run in
+        order: <code class="inline">memory_limiter</code> always first, so overload is refused instead of crashing the
+        process, and <code class="inline">batch</code> last. <strong>Exporters</strong> send data out.
+        <strong>Connectors</strong> join pipelines (for example, turning spans into RED metrics). A component that is
+        declared but not used in a pipeline does nothing, which is a common silent mistake.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/platform/observability/otel-gateway/config.yaml (core)</span>
+        <pre class="code">receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+processors:
+  memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 20 }
+  k8sattributes:                                  <span class="cm"># adds k8s.namespace.name, k8s.pod.name, k8s.deployment.name</span>
+    extract: { metadata: [k8s.namespace.name, k8s.pod.name, k8s.deployment.name, k8s.node.name] }
+  resourcedetection: { detectors: [env, eks, ec2], timeout: 2s }   <span class="cm"># cloud.region, k8s.cluster.name</span>
+  filter/noise:
+    error_mode: ignore
+    traces:
+      span: ['attributes["http.route"] == "/healthz"']             <span class="cm"># probes are not user traffic</span>
+  batch: { send_batch_size: 8192, timeout: 5s }
+exporters:
+  otlp/tempo: { endpoint: tempo-distributor.monitoring.svc:4317, tls: { insecure: true } }
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, filter/noise, batch]
+      exporters: [otlp/tempo]
+  telemetry:
+    metrics: { level: normal }                    <span class="cm"># the Collector's own metrics, scraped by Prometheus</span></pre>
+      </div>
+      <pre class="code mt-3">otelcol-contrib validate --config=config.yaml      <span class="cm"># run in CI on every change</span>
+<span class="out">Error: invalid configuration: service::pipelines::traces: references processor "filter/nosie" which is not configured</span>
+<span class="cm"># a typo found in CI, not after a silent rollout that dropped every trace</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Agent vs gateway, and where ADOT fits</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Two deployment roles. An <strong>agent</strong> runs next to the app (a DaemonSet on EKS, a sidecar on ECS) and does
+        cheap, local work: receive OTLP, add host and pod metadata, forward. A <strong>gateway</strong> is a central
+        Deployment behind a Service that does the expensive, global work: tail sampling, credentials, export. Small
+        clusters can skip the agent and send straight to the gateway. <strong>ADOT</strong> is AWS's supported distribution
+        of the Collector and SDKs. It ships a curated set of components, with AWS support, and installs as an EKS add-on or
+        an ECS sidecar image.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 240" class="w-full min-w-[640px]" role="img" aria-label="Collector topology on EKS: app pods send OTLP to an agent DaemonSet on each node, agents forward to a gateway Deployment that tail-samples and exports to the project's backend">
+          <rect x="10" y="30" width="230" height="195" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="22" y="48" font-size="10" font-weight="700" fill="#6E6B64">NODE A</text>
+          <g class="anim-pulse"><rect x="22" y="58" width="95" height="44" rx="9" fill="#2563EB"/>
+            <text x="69" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api</text>
+            <text x="69" y="91" text-anchor="middle" fill="#ffffffbb" font-size="9">SDK · OTLP</text></g>
+          <g class="anim-pulse d1"><rect x="132" y="58" width="95" height="44" rx="9" fill="#2563EB"/>
+            <text x="179" y="77" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-worker</text>
+            <text x="179" y="91" text-anchor="middle" fill="#ffffffbb" font-size="9">SDK · OTLP</text></g>
+          <g class="anim-pulse d2"><rect x="50" y="140" width="150" height="50" rx="9" fill="#0D9488"/>
+            <text x="125" y="161" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">agent (DaemonSet)</text>
+            <text x="125" y="176" text-anchor="middle" fill="#ffffffbb" font-size="9">k8sattributes · batch</text></g>
+          <g class="anim-pulse d3"><rect x="300" y="95" width="170" height="70" rx="9" fill="#D97757"/>
+            <text x="385" y="120" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">gateway (Deployment ×3)</text>
+            <text x="385" y="136" text-anchor="middle" fill="#ffffffbb" font-size="9">tail sampling · auth</text>
+            <text x="385" y="150" text-anchor="middle" fill="#ffffffbb" font-size="9">exporters per project</text></g>
+          <g class="anim-pulse"><rect x="540" y="40" width="170" height="44" rx="9" fill="#37474F"/>
+            <text x="625" y="59" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">X-Ray · CloudWatch</text>
+            <text x="625" y="73" text-anchor="middle" fill="#ffffffbb" font-size="9">sigv4auth</text></g>
+          <g class="anim-pulse d1"><rect x="540" y="108" width="170" height="44" rx="9" fill="#DB2777"/>
+            <text x="625" y="127" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Tempo · AMP · Loki</text>
+            <text x="625" y="141" text-anchor="middle" fill="#ffffffbb" font-size="9">OSS stack on EKS</text></g>
+          <g class="anim-pulse d2"><rect x="540" y="176" width="170" height="44" rx="9" fill="#6d5acd"/>
+            <text x="625" y="195" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Datadog</text>
+            <text x="625" y="209" text-anchor="middle" fill="#ffffffbb" font-size="9">exporter or Agent OTLP</text></g>
+          <line x1="69" y1="102" x2="100" y2="140" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="179" y1="102" x2="150" y2="140" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="200" y1="165" x2="300" y2="135" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="470" y1="115" x2="540" y2="62" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="470" y1="130" x2="540" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="470" y1="145" x2="540" y2="198" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="385" y="210" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">one project = one exporter set</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Platform</th><th class="px-4 py-3">How we run it</th><th class="px-4 py-3">Distribution</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">EKS, OSS stack</td><td class="px-4 py-3">OpenTelemetry Operator: agent DaemonSet + gateway Deployment as <code class="inline">OpenTelemetryCollector</code> objects</td><td class="px-4 py-3">ADOT add-on or upstream contrib</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EKS, CloudWatch-centric</td><td class="px-4 py-3"><code class="inline">amazon-cloudwatch-observability</code> add-on (Application Signals) or ADOT add-on</td><td class="px-4 py-3">CloudWatch agent / ADOT</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ECS on Fargate</td><td class="px-4 py-3">Sidecar container in each task; apps send to <code class="inline">localhost:4317</code></td><td class="px-4 py-3">ADOT image (<code class="inline">public.ecr.aws/aws-observability/aws-otel-collector</code>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lambda</td><td class="px-4 py-3">ADOT Lambda layer, or Application Signals for Lambda</td><td class="px-4 py-3">ADOT</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Datadog client</td><td class="px-4 py-3">Datadog Agent's OTLP receiver (<a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>), or a Collector with the Datadog exporter</td><td class="px-4 py-3">Upstream contrib (check ADOT's component list first)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># ADOT on EKS needs cert-manager first (the operator's webhooks use it)</span>
+aws eks create-addon --cluster-name clinic-prod-eks --addon-name adot \
+  --configuration-values '{"manager":{"resources":{"limits":{"memory":"256Mi"}}}}'
+aws eks describe-addon --cluster-name clinic-prod-eks --addon-name adot --query 'addon.status'
+<span class="out">"ACTIVE"</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On ECS there is no DaemonSet, so the ADOT Collector runs as a sidecar in every task. The task role (not the
+        execution role, <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>) needs
+        write permissions for the exporters it uses: start from the AWS managed
+        <code class="inline">AWSXrayWriteOnlyPolicy</code> and <code class="inline">CloudWatchAgentServerPolicy</code>,
+        then cut them down to the log groups and namespaces the project actually writes. Budget about 0.25 vCPU and
+        512 MiB per task. The config comes from SSM Parameter Store, so the exporter set can change without rebuilding the
+        image.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/ecs-service/otel.tf — sidecar container definition</span>
+        <pre class="code">{
+  name      = <span class="st">"aws-otel-collector"</span>
+  image     = <span class="st">"public.ecr.aws/aws-observability/aws-otel-collector:v0.43.3"</span>   <span class="cm"># pin; bump deliberately</span>
+  essential = false                         <span class="cm"># app keeps serving if the collector dies</span>
+  secrets   = [{ name = <span class="st">"AOT_CONFIG_CONTENT"</span>, valueFrom = aws_ssm_parameter.otel_config.arn }]  <span class="cm"># ADOT reads this var as its config</span>
+  cpu       = 256
+  memory    = 512
+  healthCheck = { command = [<span class="st">"/healthcheck"</span>], interval = 15, retries = 3, timeout = 5 }
+},
+{
+  name        = <span class="st">"booking-api"</span>
+  environment = [
+    { name = <span class="st">"OTEL_EXPORTER_OTLP_ENDPOINT"</span>, value = <span class="st">"http://localhost:4317"</span> },  <span class="cm"># same task, same network namespace</span>
+    { name = <span class="st">"OTEL_SERVICE_NAME"</span>, value = <span class="st">"booking-api"</span> },
+    { name = <span class="st">"OTEL_RESOURCE_ATTRIBUTES"</span>, value = <span class="st">"service.version=${var.image_tag},deployment.environment.name=${var.env}"</span> },
+  ]
+  dependsOn = [{ containerName = <span class="st">"aws-otel-collector"</span>, condition = <span class="st">"START"</span> }]
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The same telemetry, three exporter sets</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Here is the payoff of the routing rule. The receivers and processors above are identical on every project. Only the
+        <code class="inline">exporters</code> block and the pipeline's exporter list change. During a migration (a client
+        moving from the OSS stack to Datadog, say) you can list both sets for two weeks and compare, then remove the old
+        one. Credentials come from Pod Identity (SigV4) or a mounted secret, never from the file.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">exporters-cloudwatch.yaml — ECS/Lambda-style projects</span>
+        <pre class="code">extensions:
+  sigv4auth/xray: { region: ap-southeast-1, service: xray }
+  sigv4auth/logs: { region: ap-southeast-1, service: logs }
+exporters:
+  otlphttp/xray:                                   <span class="cm"># X-Ray OTLP endpoint (needs Transaction Search on)</span>
+    traces_endpoint: https://xray.ap-southeast-1.amazonaws.com/v1/traces
+    auth: { authenticator: sigv4auth/xray }
+  otlphttp/cwlogs:
+    logs_endpoint: https://logs.ap-southeast-1.amazonaws.com/v1/logs
+    headers: { x-aws-log-group: /otel/clinic-prod/booking, x-aws-log-stream: gateway }
+    auth: { authenticator: sigv4auth/logs }
+  awsemf:                                          <span class="cm"># metrics as EMF → CloudWatch custom metrics (OB1)</span>
+    namespace: Clinic/Booking
+    log_group_name: /aws/otel/clinic-prod/metrics
+    dimension_rollup_option: NoDimensionRollup     <span class="cm"># rollups multiply metric count: off</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">exporters-oss.yaml — EKS with AMP, Tempo and Loki</span>
+        <pre class="code">extensions:
+  sigv4auth/aps: { region: ap-southeast-1, service: aps }
+exporters:
+  otlp/tempo:   { endpoint: tempo-distributor.monitoring.svc:4317, tls: { insecure: true } }
+  otlphttp/loki: { endpoint: http://loki-gateway.monitoring.svc/otlp }       <span class="cm"># Loki 3 native OTLP</span>
+  prometheusremotewrite/amp:
+    endpoint: https://aps-workspaces.ap-southeast-1.amazonaws.com/workspaces/ws-7d1c3b2e-9a4f-4e61-8b0d-5f2a6c9e1d38/api/v1/remote_write
+    auth: { authenticator: sigv4auth/aps }
+    resource_to_telemetry_conversion: { enabled: false }   <span class="cm"># true copies EVERY resource attr into labels: cardinality</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">exporters-datadog.yaml — client bought Datadog</span>
+        <pre class="code">exporters:
+  datadog:
+    api: { site: ap1.datadoghq.com, key: ${env:DD_API_KEY} }   <span class="cm"># from a Secret via env, never inline</span>
+connectors:
+  datadog/connector: {}                            <span class="cm"># computes APM trace metrics from 100% of spans</span>
+service:
+  pipelines:
+    traces/in:  { receivers: [otlp], processors: [memory_limiter, batch], exporters: [datadog/connector] }
+    traces/out: { receivers: [datadog/connector], processors: [tail_sampling, batch], exporters: [datadog] }
+    metrics:    { receivers: [otlp, datadog/connector], processors: [memory_limiter, batch], exporters: [datadog] }</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Don't fan out to every backend "just in case".</strong> Each extra
+        exporter doubles egress, cost and failure modes, and a slow backend fills the shared sending queue. One project
+        gets one exporter set, chosen by the routing rule in <a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>.
+        Dual export is a time-boxed migration tool with an end date in the ticket.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Sampling and correlation</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Decide what to keep after you know how the request ended</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <code class="inline">booking-api</code> at 200 requests per second with about 8 spans per request produces roughly
+        4 billion spans a month. Nobody reads 4 billion spans, and every backend charges for them: per span on X-Ray, per GB
+        ingested and per million indexed on Datadog, and S3 plus compute for Tempo. Sampling decides which traces survive.
+        Correlation makes the surviving traces reachable from the metric or log line that brought you there.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Head sampling: cheap, simple, and blind</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Head sampling</strong> decides at the first span, from the trace ID alone, before anything has happened.
+        <code class="inline">parentbased_traceidratio</code> at 0.05 keeps 5% of traces, consistently across services. It
+        costs nothing to run and needs no Collector, but it can't know whether a request will fail. At 5%, 95% of your error
+        traces are thrown away, and during an incident affecting 1% of requests you keep only a handful of the traces that
+        show the problem.
+      </p>
+      <pre class="code mt-3"><span class="cm"># head sampling via env vars (SDK); the right default for dev, staging and low-traffic services</span>
+OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=0.05
+<span class="cm"># 4.1 B spans/month × 5% ≈ 207 M spans/month
+# an incident failing 1% of 200 req/s for 20 min = 2,400 failed requests → only ~120 error traces kept</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Tail sampling in a two-tier Collector</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Tail sampling</strong> waits until a trace is complete (or a timeout passes), then decides using the whole
+        trace: keep every error, every slow request, and a small percentage of the rest. The catch is that all spans of a
+        trace must reach the <em>same</em> Collector instance. So tail sampling needs two tiers: a load-balancing layer that
+        routes by trace ID, and sampler instances behind it. Each sampler holds traces in memory for
+        <code class="inline">decision_wait</code>, which you size from traffic.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    A1["agent node A"] --> LB["tier 1: gateway<br/>loadbalancing exporter<br/>routing_key: traceID"]
+    A2["agent node B"] --> LB
+    A3["agent node C"] --> LB
+    LB -->|"trace 4bf9… always here"| S1["tier 2: sampler-0<br/>tail_sampling<br/>decision_wait 10s"]
+    LB -->|"trace 0af7… always here"| S2["tier 2: sampler-1"]
+    S1 --> B["backend<br/>errors 100% · slow 100% · rest 5%"]
+    S2 --> B
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">otel-gateway (tier 1) and otel-sampler (tier 2) — the relevant parts</span>
+        <pre class="code"><span class="cm"># tier 1: route every span of a trace to the same sampler pod</span>
+exporters:
+  loadbalancing:
+    routing_key: traceID
+    protocol: { otlp: { tls: { insecure: true } } }
+    resolver:
+      dns: { hostname: otel-sampler-headless.observability.svc.cluster.local, port: 4317 }
+<span class="cm"># tier 2: decide on the complete trace (policies are OR-ed: any match keeps it)</span>
+processors:
+  tail_sampling:
+    decision_wait: 10s                 <span class="cm"># the worker's async spans must arrive within this window</span>
+    num_traces: 50000                  <span class="cm"># traces held in memory per pod</span>
+    expected_new_traces_per_sec: 300
+    policies:
+      - { name: errors, type: status_code, status_code: { status_codes: [ERROR] } }
+      - { name: slow,   type: latency,     latency: { threshold_ms: 1500 } }
+      - { name: rest,   type: probabilistic, probabilistic: { sampling_percentage: 5 } }</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Strategy</th><th class="px-4 py-3">Keeps</th><th class="px-4 py-3">Costs you</th><th class="px-4 py-3">Use for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Head, 100%</td><td class="px-4 py-3">Everything</td><td class="px-4 py-3">~4.1 B spans/month for booking-api</td><td class="px-4 py-3">dev only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Head, 5%</td><td class="px-4 py-3">5% at random, including only 5% of errors</td><td class="px-4 py-3">~207 M spans/month, no Collector state</td><td class="px-4 py-3">staging; low-value services</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tail: errors + slow + 5%</td><td class="px-4 py-3">Every error and slow trace, 5% of the rest</td><td class="px-4 py-3">~220 M spans/month + two Collector tiers (~3 pods × 2 GB)</td><td class="px-4 py-3">prod default for EKS projects</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Vendor-side (X-Ray rules, Datadog retention filters)</td><td class="px-4 py-3">What the backend's rules keep</td><td class="px-4 py-3">You pay ingestion first, then filter</td><td class="px-4 py-3">ECS/Datadog projects without a gateway (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>, <a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Compute RED metrics before you sample.</strong> If dashboards and
+        SR1's SLO alerts are built from spans, they must be computed from 100% of spans: use the
+        <code class="inline">spanmetrics</code> connector (or Datadog's connector) <em>before</em> the tail sampler, or use
+        the SDK's own HTTP metrics. Never add <code class="inline">clinic.id</code> as a spanmetrics dimension. It is a span
+        attribute for a reason (<a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a> shows the
+        cost).</div>
+
+      <h3 class="font-semibold text-lg mt-8">Trace, log and metric correlation</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The investigation path during an incident is metric → trace → logs. It works only if each hop carries the link.
+        Put <code class="inline">trace_id</code> and <code class="inline">span_id</code> in every log line (the OTel logging
+        instrumentation for pino, winston, logback and others does this automatically), attach <strong>exemplars</strong>
+        to latency histograms, and configure each backend to follow the links.
+      </p>
+      <pre class="code mt-3"><span class="cm"># a booking-api log line with the logger instrumentation enabled</span>
+{"level":"error","time":"2026-10-29T07:15:42.118Z","msg":"booking insert failed",
+ "err":"pq: sorry, too many clients already","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736",
+ "span_id":"a1c0e2f4b6d8e0f2","trace_flags":"01","service.name":"booking-api"}</pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Backend</th><th class="px-4 py-3">Metric → trace</th><th class="px-4 py-3">Trace → logs</th><th class="px-4 py-3">Logs → trace</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">CloudWatch</td><td class="px-4 py-3">Application Signals operation → sampled traces</td><td class="px-4 py-3">X-Ray trace view → correlated log groups</td><td class="px-4 py-3">Logs Insights <code class="inline">filter trace_id = "…"</code> → X-Ray</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Grafana (AMP · Tempo · Loki)</td><td class="px-4 py-3">Prometheus exemplars on the histogram panel</td><td class="px-4 py-3">Tempo data source "trace to logs" on <code class="inline">service.name</code> + time</td><td class="px-4 py-3">Loki derived field / structured metadata <code class="inline">trace_id</code> → Tempo</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Datadog</td><td class="px-4 py-3">Trace metrics → traces on the service page</td><td class="px-4 py-3">Built in when <code class="inline">service</code> + trace ID match</td><td class="px-4 py-3">Trace ID remapper in the log pipeline (OB3)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Test the whole chain once per project, as part of the definition of done: trigger a known failing request, start
+        from the alert, and time how long it takes to reach the log line that names the cause. On a well-wired project that
+        takes under two minutes. Above ten minutes, a link is missing.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On the OSS stack, Tempo's <strong>TraceQL</strong> lets you search traces by attribute, which only works because
+        <code class="inline">clinic.id</code> and the status were recorded on spans rather than as metric labels:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">TraceQL in Grafana Explore (Tempo data source)</span>
+        <pre class="code">{ resource.service.name = "booking-api" &amp;&amp; span.http.route = "/v1/bookings"
+  &amp;&amp; status = error &amp;&amp; duration &gt; 1500ms } | select(span.clinic.id)
+<span class="out">Trace ID                           Root                 Duration   span.clinic.id
+4bf92f3577b34da6a3ce929d0e0e4736   POST /v1/bookings    2.41 s     c-0042
+9c1e04d2b7a35f6e81d0c4a9b2e7f310   POST /v1/bookings    2.37 s     c-0042
+1f7a3c09e5d24b6a90c8e1f2d3b4a5c6   POST /v1/bookings    1.98 s     c-0311</span>
+<span class="cm"># two of three slow failures are one clinic: a question no metric dashboard could answer</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Operating the Collector itself</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The Collector is now on the critical path of every signal, so it needs its own alerts. It exposes Prometheus
+        metrics about itself. Three failure modes cover nearly every incident: the memory limiter refusing data (undersized
+        or a traffic spike), exporters failing (bad credentials, backend throttling), and the sending queue filling up
+        (backend slower than intake). Give the gateway at least 2 replicas, a PodDisruptionBudget
+        (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>) and an HPA on CPU
+        (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>).
+      </p>
+      <pre class="code mt-3"><span class="cm"># spans refused because the memory limiter kicked in (data is LOST, not delayed)</span>
+sum by (receiver) (rate(otelcol_receiver_refused_spans_total{job="otel-gateway"}[5m])) &gt; 0
+<span class="cm"># exporter failures: credentials, throttling, DNS</span>
+sum by (exporter) (rate(otelcol_exporter_send_failed_spans_total{job="otel-gateway"}[5m])) &gt; 0
+<span class="cm"># queue saturation: page before it reaches 100%</span>
+max by (exporter) (otelcol_exporter_queue_size / otelcol_exporter_queue_capacity) &gt; 0.8
+<span class="out">{exporter="otlphttp/xray"}  0.93   <span class="cm"># X-Ray throttling: raise the quota or sample harder</span></span></pre>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code is good at adding OTel to a service and at writing Collector configs. Give it the routing rule and the
+        semantic conventions up front, have it validate every config with <code class="inline">otelcol-contrib validate</code>,
+        and ask it to prove propagation with a real trace ID rather than claiming it works.
+      </p>
+      <pre class="code mt-3">Add OpenTelemetry to booking-worker: auto-instrumentation via the Operator annotation, a CONSUMER
+span per SQS message using the message's traceparent, trace_id in pino logs. Use only @opentelemetry/api
+in app code. Then send a booking in staging and show me the single trace ID across api and worker.</pre>
+      <pre class="code mt-3">Write the otel-gateway config for clinic-prod-eks with the OSS exporter set (Tempo, AMP via
+sigv4auth, Loki OTLP), memory_limiter first and batch last, a two-tier tail sampler (errors, &gt;1.5 s,
+5% rest), and spanmetrics computed before sampling. Run otelcol-contrib validate and show the output.</pre>
+      <pre class="code mt-3">Audit our services for semantic-convention drift: list every attribute using a deprecated name
+(http.method, http.status_code, deployment.environment) in spans and in dashboard queries, with the fix.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Wire SDKs, auto-instrumentation and manual spans for business steps</li>
+            <li>Draft and validate Collector pipelines per exporter set</li>
+            <li>Find propagation gaps by following real trace IDs across services</li>
+            <li>Rename deprecated attributes in code and dashboards</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>App code imports only the OTel API, never a vendor SDK or exporter</li>
+            <li>Processor order: <code class="inline">memory_limiter</code> first, <code class="inline">batch</code> last; every declared component is in a pipeline</li>
+            <li>Tail sampling sits behind trace-ID load balancing, and RED metrics are computed before it</li>
+            <li>No PII in baggage or span attributes; no credentials in the config file</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written OTel:</strong> the app exporting directly to a
+        vendor endpoint with an API key; new code using the X-Ray SDK or <code class="inline">dd-trace</code> custom-span APIs;
+        <code class="inline">tail_sampling</code> on a multi-replica Deployment with no <code class="inline">loadbalancing</code>
+        tier; <code class="inline">batch</code> before <code class="inline">memory_limiter</code>;
+        <code class="inline">resource_to_telemetry_conversion: true</code> towards Prometheus;
+        <code class="inline">http.target</code> or raw URLs as span names; patient identifiers in baggage; and a fan-out to
+        all three backends with no end date.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has heard of tracing but cannot say what a span, a trace ID or a Collector is.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can read a trace waterfall and knows OTel is vendor-neutral, but cannot explain how context crosses a service boundary.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds auto-instrumentation to a service and edits an existing Collector config; misses queue propagation, processor order or sampling trade-offs without review.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Instruments services with correct resources and semantic conventions, keeps traces whole across HTTP and SQS, runs agent and gateway Collectors (or ADOT) with the right exporter set for the project, chooses and sizes head or tail sampling, and wires metric-trace-log correlation in the project's backend.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the shared Collector configs and instrumentation conventions across clients, runs backend migrations with time-boxed dual export, and teaches teams to debug with traces first.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, draw the booking
+        flow from Part II and mark where <code class="inline">traceparent</code> travels at each hop, including SQS. Then
+        explain why tail sampling needs a load-balancing tier, and calculate the monthly span volume for a service at
+        100 requests per second with head 10% and with tail sampling (errors 1%, slow 2%, rest 5%).</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Instrumenting only the API</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A trace that stops at <code class="inline">booking-api</code> can't explain a slow worker or a slow frontend. Instrument every hop, including the Next.js server and the queue consumer.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Raw paths as span names</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">GET /v1/clinics/c-0042/slots</code> creates one "operation" per clinic in every backend. Name spans by <code class="inline">http.route</code>; put the ID in an attribute.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Forgetting to end spans</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A span without <code class="inline">end()</code> on an error path is never exported, so the failures are exactly the traces you lose. Always end in <code class="inline">finally</code>.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Version in every resource</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Set <code class="inline">service.version</code> from the image tag in CI. Comparing error rate by version is the fastest way to spot a bad canary (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>), in every backend.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Validate configs in CI</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">otelcol-contrib validate</code> on every Collector change, plus a smoke test that sends one span through a local Collector, catches typos that otherwise silently drop all telemetry.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="concepts"> <span>I can explain API vs SDK vs Collector, resources, semantic conventions, and how the Collector's exporters implement our routing rule.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="instrument"> <span>I instrumented a service with auto-instrumentation plus one manual business span, with correct <code class="inline">service.*</code> and <code class="inline">deployment.environment.name</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="propagation"> <span>I showed one trace ID spanning booking-web, booking-api, SQS and booking-worker, and can explain child vs span link for the queue hop.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="collector"> <span>I deployed agent and gateway Collectors (or ADOT) with a validated config and alerts on refused spans, export failures and queue saturation.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="sampling"> <span>I chose between head and tail sampling for a service, with span-volume and cost numbers, and kept RED metrics computed from 100% of traffic.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="otel-pr"> <span class="font-semibold">On clinic-dev-eks, opened clinic-app and clinic-gitops PRs that instrument booking-api and booking-worker with OTel (SQS propagation included), run a two-tier Collector with tail sampling and the OSS exporter set, and put trace_id in logs. Shared a recording or screenshots going from a latency alert to the trace to the log line that names the cause, with timings (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://opentelemetry.io/docs/concepts/" target="_blank" rel="noopener">OpenTelemetry — Concepts</a>: signals, context propagation, resources and sampling explained by the project.</li>
+        <li><a class="text-coral underline" href="https://opentelemetry.io/docs/specs/semconv/" target="_blank" rel="noopener">OpenTelemetry — Semantic conventions</a>: the attribute names from Part I, including the stable HTTP set.</li>
+        <li><a class="text-coral underline" href="https://opentelemetry.io/docs/collector/" target="_blank" rel="noopener">OpenTelemetry — Collector</a> · <a class="text-coral underline" href="https://opentelemetry.io/docs/collector/deployment/" target="_blank" rel="noopener">deployment patterns</a>: pipelines, agent vs gateway, scaling.</li>
+        <li><a class="text-coral underline" href="https://opentelemetry.io/docs/platforms/kubernetes/operator/automatic/" target="_blank" rel="noopener">OpenTelemetry — Operator auto-instrumentation</a>: the Instrumentation object and injection annotations.</li>
+        <li><a class="text-coral underline" href="https://github.com/aws-observability/aws-otel-collector" target="_blank" rel="noopener">AWS — ADOT Collector README</a> · <a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/opentelemetry.html" target="_blank" rel="noopener">ADOT on EKS</a>: components, the EKS add-on and ECS sidecar setup.</li>
+        <li><a class="text-coral underline" href="https://opentelemetry.io/blog/2022/tail-sampling/" target="_blank" rel="noopener">OpenTelemetry — Tail sampling</a>: why it needs trace-ID-aware routing and how to size it.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-OTLPEndpoint.html" target="_blank" rel="noopener">AWS — CloudWatch OTLP endpoints</a>: sending traces and logs to X-Ray and CloudWatch Logs over OTLP.</li>
+      </ul>

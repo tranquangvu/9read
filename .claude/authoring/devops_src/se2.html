@@ -1,0 +1,746 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">DevSecOps: Security in the Pipeline</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Security review at the end of a project finds problems when they are most expensive to fix. This module moves the
+          checks into the places engineers already work: the pre-commit hook, the pull request, the merge to main and the
+          deploy to staging. You will add SAST, dependency scanning, secret scanning, IaC scanning, container gates and a DAST
+          scan to the clinic booking platform's GitHub Actions pipelines, then design the part most teams skip: a gate
+          policy with an exception process, so the gates stay on when a deadline arrives.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> the S3 bucket that leaked patient files, the security group with
+          5432 open to the internet, the Stripe key in a commit from 2023: each was visible in a pull request before it
+          reached production. Scanners catch most of these in seconds. They also produce noise, and a pipeline that fails
+          on 40 Low findings nobody understands gets switched to <code class="inline">continue-on-error: true</code> within
+          a month. The skill is not installing the tools. It is tuning them until every failure means something.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · The shift-left model</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Cheap checks early, expensive checks late, every gate has an owner</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        "Shift left" means running a check at the earliest point it can give a useful answer. A secret scan can run before
+        a commit exists. A Terraform misconfiguration is visible in the HCL. A missing security header is only visible
+        once the app is running. Put each check where it is cheapest and still accurate, and give it a time budget, because
+        a PR that takes 25 minutes to go green trains people to batch changes, which is worse for security than any
+        missing scanner. Pipeline mechanics (jobs, reusable workflows, OIDC, SHA pinning) are in
+        <a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Where each check runs, and what it may block</h3>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Security checks placed along the pipeline from pre-commit to nightly scans">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">THE PIPELINE · left is cheap and fast, right is slow and realistic</text>
+          <g class="anim-pulse"><rect x="15" y="45" width="120" height="56" rx="9" fill="#2563EB"/>
+            <text x="75" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Pre-commit</text>
+            <text x="75" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">gitleaks · fmt · tflint</text></g>
+          <g class="anim-pulse d1"><rect x="155" y="45" width="130" height="56" rx="9" fill="#6d5acd"/>
+            <text x="220" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Pull request</text>
+            <text x="220" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">SAST · SCA · IaC · plan</text></g>
+          <g class="anim-pulse d2"><rect x="305" y="45" width="130" height="56" rx="9" fill="#0D9488"/>
+            <text x="370" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Build on main</text>
+            <text x="370" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">image scan · SBOM (CI4)</text></g>
+          <g class="anim-pulse d3"><rect x="455" y="45" width="120" height="56" rx="9" fill="#D97757"/>
+            <text x="515" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Staging deploy</text>
+            <text x="515" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">ZAP baseline</text></g>
+          <g class="anim-pulse d4"><rect x="595" y="45" width="110" height="56" rx="9" fill="#37474F"/>
+            <text x="650" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Nightly</text>
+            <text x="650" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">full scans · rescan</text></g>
+          <line x1="135" y1="73" x2="155" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="285" y1="73" x2="305" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="435" y1="73" x2="455" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="575" y1="73" x2="595" y2="73" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="75" y="125" text-anchor="middle" font-size="9" fill="#6E6B64">&lt; 5 s</text>
+          <text x="220" y="125" text-anchor="middle" font-size="9" fill="#6E6B64">&lt; 8 min total</text>
+          <text x="370" y="125" text-anchor="middle" font-size="9" fill="#6E6B64">&lt; 2 min</text>
+          <text x="515" y="125" text-anchor="middle" font-size="9" fill="#6E6B64">&lt; 10 min</text>
+          <text x="650" y="125" text-anchor="middle" font-size="9" fill="#6E6B64">hours, nobody waits</text>
+          <rect x="15" y="145" width="420" height="30" rx="8" fill="none" stroke="#DB2777" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="225" y="164" text-anchor="middle" font-size="10" fill="#DB2777" font-weight="700">BLOCKS the change: author fixes it in the same PR</text>
+          <rect x="455" y="145" width="250" height="30" rx="8" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="580" y="164" text-anchor="middle" font-size="10" fill="#6E6B64" font-weight="700">TICKETS with an SLA, rarely blocks</text>
+          <text x="360" y="210" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">a finding is cheapest to fix in the PR that introduced it</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Check</th><th class="px-4 py-3">Our tool</th><th class="px-4 py-3">Runs on</th><th class="px-4 py-3">Blocks when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Secret scanning</td><td class="px-4 py-3">GitHub push protection, gitleaks</td><td class="px-4 py-3">Push, pre-commit</td><td class="px-4 py-3">Any verified secret, always</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SAST</td><td class="px-4 py-3">CodeQL, Semgrep for custom rules</td><td class="px-4 py-3">PR to <code class="inline">clinic-app</code></td><td class="px-4 py-3">New High/Critical alert in changed code</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SCA (dependencies)</td><td class="px-4 py-3">dependency-review-action, Trivy fs</td><td class="px-4 py-3">PR that changes a lockfile</td><td class="px-4 py-3">New dependency with a High CVE that has a fix, or a denied licence</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">IaC scanning</td><td class="px-4 py-3">Checkov, Trivy config</td><td class="px-4 py-3">PR to <code class="inline">clinic-infra</code>, <code class="inline">clinic-gitops</code></td><td class="px-4 py-3">Failed check not in the baseline or exception list</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Container scan</td><td class="px-4 py-3">Trivy image, Inspector rescans (<a href="./ci4.html" class="text-viol underline decoration-viol/40">CI4</a>)</td><td class="px-4 py-3">Build on main</td><td class="px-4 py-3">Critical CVE with a fix available</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">DAST</td><td class="px-4 py-3">OWASP ZAP baseline / full</td><td class="px-4 py-3">After staging deploy, nightly</td><td class="px-4 py-3">Baseline High alert blocks promotion to prod</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice that every row says "new". Gates compare against a baseline: a PR is judged on what it adds, not on the 200
+        findings that already existed when the scanner was switched on. Existing findings go into a backlog with an SLA.
+        Without that rule, the first PR after you enable a scanner fails for reasons its author did not cause, and the
+        scanner is disabled by Friday.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Threat modelling an infra change in 20 minutes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Scanners check rules someone already wrote. Threat modelling finds the problems nobody wrote a rule for. For infra
+        changes keep it short: draw the data flow, mark every trust boundary it crosses, and ask four questions at each
+        boundary. Do it for any change that adds a public endpoint, a new data store, a cross-account role or a third-party
+        integration. Here is the real example from the clinic platform: letting patients upload referral letters directly
+        to S3 with presigned URLs.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    P["Patient browser<br/>app.clinic.example.com"] -->|"1 · POST /v1/uploads<br/>(session cookie)"| API["booking-api<br/>gol-prod · ECS"]
+    API -->|"2 · presigned POST policy<br/>5 min, 10 MB, PDF only"| P
+    P ==>|"3 · POST object<br/>crosses internet → AWS"| S3[("gol-prod-clinic-uploads<br/>SSE-KMS")]
+    S3 -->|"4 · ObjectCreated"| Q["SQS"]
+    Q --> W["booking-worker<br/>malware scan, then link"]
+    subgraph TB1["trust boundary: internet"]
+      P
+    end
+    subgraph TB2["trust boundary: gol-prod"]
+      API
+      S3
+      Q
+      W
+    end
+        </pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Question at each boundary</th><th class="px-4 py-3">Answer for step 3</th><th class="px-4 py-3">Control that came out of it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Who can send this, and how do we know?</td><td class="px-4 py-3">Anyone holding the URL for 5 minutes</td><td class="px-4 py-3">Short expiry; key includes the booking ID; one URL per upload</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">What is the worst content they could send?</td><td class="px-4 py-3">A 5 GB file, an HTML page, malware</td><td class="px-4 py-3"><code class="inline">content-length-range</code> and content type in the presigned POST policy; worker malware scan before linking</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">What else can that identity reach?</td><td class="px-4 py-3">The presign uses the task role, which can also read every upload</td><td class="px-4 py-3">Separate signing role limited to <code class="inline">s3:PutObject</code> on <code class="inline">incoming/*</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Would we know if it was abused?</td><td class="px-4 py-3">Not before this change</td><td class="px-4 py-3">CloudTrail data events on the bucket, GuardDuty S3 protection (<a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Twenty minutes, four controls, and none of them would have come from a scanner. Save the diagram and the table in
+        the PR description or an ADR (<a href="./ar1.html" class="text-viol underline decoration-viol/40">AR1</a>), so the
+        next reviewer can see what was considered.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">One reusable security workflow for every repo</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Do not copy scanner steps into thirty repositories. Put them in one reusable workflow in
+        <code class="inline">golden-owl/gha-platform</code>, versioned with tags, and call it from each repo with a few inputs.
+        When you tune a rule or bump a scanner, every repo gets it on the next run. The permissions block matters: scanners
+        need to upload SARIF (<code class="inline">security-events: write</code>) and nothing else.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.github/workflows/security.yml — the caller</span>
+        <pre class="code">name: security
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 19 * * *"              <span class="cm"># 02:17 ICT nightly: rescans catch new CVEs in old code</span>
+permissions:
+  contents: read
+  security-events: write               <span class="cm"># upload SARIF to code scanning</span>
+  pull-requests: write                 <span class="cm"># dependency-review comment</span>
+jobs:
+  scan:
+    uses: golden-owl/gha-platform/.github/workflows/security-scan.yml@v3.2.0
+    with:
+      languages: javascript-typescript
+      iac-paths: ""                    <span class="cm"># clinic-infra sets this to "."</span>
+      fail-severity: high
+    secrets: inherit</pre>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>Licensing note:</strong> on private repositories, CodeQL code scanning
+        and dependency review need <strong>GitHub Code Security</strong>, and secret scanning plus push protection need
+        <strong>GitHub Secret Protection</strong>, both priced per active committer since GitHub split Advanced Security
+        in 2025. Check what the client's GitHub plan includes before promising a control. Where they don't pay, Semgrep,
+        Trivy and gitleaks cover the same ground with more tuning work.</div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Code, dependencies &amp; secrets</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Tune SAST and SCA for signal, or they will be ignored</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Application scanners are where most false positives come from, so this is where tuning pays most. The aim is a
+        PR check that fails rarely and is right when it does. Measure it: if more than about one failure in five is
+        dismissed as a false positive, the ruleset is too broad for this codebase.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">CodeQL for the languages we ship</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        CodeQL builds a database of the code and runs data-flow queries over it: does user input reach a SQL query, a
+        shell command or a redirect without passing a sanitiser? <strong>Default setup</strong> (one click per repo) is
+        fine to start with. Use <strong>advanced setup</strong>, a workflow file, once you need a custom query pack, a
+        build step, or monorepo path filters. Use the <code class="inline">security-extended</code> suite for
+        <code class="inline">booking-api</code> because it handles patient data, and the default suite elsewhere.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">golden-owl/gha-platform/.github/workflows/security-scan.yml — SAST job (excerpt)</span>
+        <pre class="code">  codeql:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        language: ${{ fromJSON(format('["{0}"]', inputs.languages)) }}
+    steps:
+      - uses: actions/checkout@v4             <span class="cm"># pin by SHA in the real file (CI1)</span>
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+          config: |
+            paths-ignore: ["**/test/**", "**/*.spec.ts", "e2e/**"]   <span class="cm"># test fixtures are noise</span>
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Then make it a gate. In the repository ruleset for <code class="inline">main</code>, add a <strong>code scanning
+        merge protection</strong> rule: block merging when CodeQL reports a new alert of High or above. The gate is the
+        ruleset, not the workflow exit code. CodeQL uploads results and the ruleset decides, which means only alerts the PR
+        introduces block it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Semgrep for rules that are specific to us</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        CodeQL knows generic vulnerability classes. It does not know that in our codebase every query must go through the
+        repository layer, or that <code class="inline">booking-api</code> must never log the
+        <code class="inline">patient</code> object. Semgrep rules look like the code they match, so a developer can write
+        one in ten minutes after a code review comment repeats for the third time. (The open-source engine is Semgrep
+        Community Edition; the Opengrep fork runs the same rule syntax.)
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.semgrep/no-patient-in-logs.yml</span>
+        <pre class="code">rules:
+  - id: no-patient-object-in-logs
+    languages: [typescript]
+    severity: ERROR
+    message: &gt;-
+      Logging a Patient object writes name, phone and DOB to CloudWatch and Datadog.
+      Log patient.id only. (Personal data rules: see SE3.)
+    patterns:
+      - pattern-either:
+          - pattern: logger.$LEVEL(..., $P, ...)
+          - pattern: console.$LEVEL(..., $P, ...)
+      - metavariable-pattern:
+          metavariable: $P
+          patterns:
+            - pattern-either:
+                - pattern: patient            <span class="cm"># the variable name we use everywhere</span>
+                - pattern: "{..., patient, ...}"</pre>
+      </div>
+      <pre class="code mt-3">semgrep scan --config .semgrep/ --config p/typescript --error --baseline-commit origin/main
+<span class="out">┌─────────────────┐
+│ 1 Code Finding  │
+└─────────────────┘
+    src/bookings/confirm.ts
+   ❯❱ no-patient-object-in-logs
+          Logging a Patient object writes name, phone and DOB to CloudWatch and Datadog.
+           42┆ logger.info("booking confirmed", { bookingId, patient });</span>
+<span class="cm"># --baseline-commit: only findings introduced since main fail the run</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Dependency scanning: block new risk, ticket old risk</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Most of the code in <code class="inline">booking-web</code> is dependencies: about 1,100 packages in the lockfile
+        for 40 direct ones. SCA matches those packages against vulnerability databases. On a PR, the
+        <strong>dependency review action</strong> compares the lockfile before and after and fails only on what the PR adds:
+        a new package with a known High CVE that has a fixed version, or a licence we cannot ship. Keeping dependencies up
+        to date (Dependabot and Renovate) is owned by <a href="./ci4.html" class="text-viol underline decoration-viol/40">CI4</a>;
+        this is the gate.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">security-scan.yml — SCA job (excerpt)</span>
+        <pre class="code">  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          fail-on-scopes: runtime              <span class="cm"># a CVE in a test-only dev dependency doesn't block</span>
+          allow-licenses: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, MPL-2.0
+          comment-summary-in-pr: on-failure
+          allow-ghsas: GHSA-xxxx-yyyy-zzzz     <span class="cm"># exceptions live in the register (Part IV), copied here</span></pre>
+      </div>
+      <pre class="code mt-3"><span class="out">Dependency Review: 1 vulnerable package, 0 license issues
+  + axios@1.7.2 (runtime)
+    high  GHSA-jr5f-v2jv-69x6  axios Requests Vulnerable To Possible SSRF and Credential Leakage
+          via Absolute URL — fixed in 1.8.2
+✖ Dependency review detected vulnerable packages.</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The fix is usually a one-line version bump in the same PR. Reachability matters for the backlog, not for the gate:
+        a vulnerable function the app never calls is lower priority, but proving it is never called takes longer than the
+        upgrade in nine cases out of ten.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Secret scanning: stop the push, not the incident</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A secret that reached a remote repository must be treated as leaked, even if you force-push it away a minute later:
+        forks, clones, CI caches and the GitHub event API all keep copies. So the checks that matter run <em>before</em> the
+        push. GitHub <strong>push protection</strong> rejects pushes containing recognised secret formats (AWS keys,
+        Stripe, Slack and around 200 others). A <strong>gitleaks</strong> pre-commit hook catches them even earlier and
+        also catches our own formats. What to do once a key has leaked (rotation, revocation, CloudTrail review) is
+        <a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a> and the runbook in
+        <a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.pre-commit-config.yaml</span>
+        <pre class="code">repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.2                         <span class="cm"># pin; bump through Renovate</span>
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.99.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_tflint</pre>
+      </div>
+      <pre class="code mt-3">git commit -m "feat(payments): add deposit checkout"
+<span class="out">gitleaks.................................................................Failed
+Finding:     ...STRIPE_KEY = "sk_live_51Hx9T...REDACTED"
+Secret:      sk_live_51Hx9T...REDACTED
+RuleID:      stripe-access-token
+File:        src/payments/config.ts
+Line:        7</span>
+<span class="cm"># nothing left your laptop: move it to Secrets Manager (CI3), no rotation needed</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Pre-commit hooks are optional for the person committing.</strong>
+        Anyone can skip them with <code class="inline">--no-verify</code> or simply not install them. They are a
+        convenience for honest mistakes. The enforced controls are push protection on the server and a CI job that scans
+        the PR's commits, which a developer cannot skip. Track push-protection bypasses: each bypass sends an alert, and
+        every one needs a reason recorded within a day.</div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Infrastructure &amp; container scanning</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Scan the plan as well as the HCL</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        In <code class="inline">clinic-infra</code> a misconfiguration is one attribute away from an incident:
+        <code class="inline">publicly_accessible = true</code> on RDS, a missing <code class="inline">kms_key_id</code>, a
+        security group with <code class="inline">0.0.0.0/0</code>. IaC scanners catch these in the PR, before
+        <code class="inline">terraform apply</code>. How Terraform runs in GitHub Actions (plan on PR, apply on merge) and
+        policy-as-code with OPA/Conftest are owned by <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>;
+        this Part adds the security scanners to that pipeline.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Checkov on <code class="inline">clinic-infra</code></h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Checkov ships about a thousand built-in checks for Terraform, Kubernetes, Helm, Dockerfiles and GitHub Actions
+        workflows. Run it on every PR against the changed directories, and output SARIF so findings appear as annotations
+        on the changed lines.
+      </p>
+      <pre class="code mt-3">checkov -d modules/uploads --framework terraform --compact --quiet
+<span class="out">terraform scan results:
+
+Passed checks: 38, Failed checks: 3, Skipped checks: 1
+
+Check: CKV2_AWS_6: "Ensure that S3 bucket has a Public Access block"
+	FAILED for resource: aws_s3_bucket.uploads
+	File: /modules/uploads/main.tf:1-9
+Check: CKV_AWS_145: "Ensure that S3 buckets are encrypted with KMS by default"
+	FAILED for resource: aws_s3_bucket.uploads
+	File: /modules/uploads/main.tf:1-9
+Check: CKV_AWS_18: "Ensure the S3 bucket has access logging enabled"
+	FAILED for resource: aws_s3_bucket.uploads
+	File: /modules/uploads/main.tf:1-9</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two of these are real and get fixed in the PR. The third, access logging, we cover with CloudTrail data events
+        instead (<a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>), so it gets an inline skip
+        <em>with a reason and a ticket</em>. A skip without a reason is a finding hidden from the next reviewer.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/uploads/main.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_s3_bucket"</span> <span class="st">"uploads"</span> {
+  <span class="cm">#checkov:skip=CKV_AWS_18:Object-level access is logged by org CloudTrail data events (SEC-112)</span>
+  <span class="cm">#checkov:skip=CKV_AWS_144:Cross-region replication handled by AWS Backup plan (SR3, SEC-113)</span>
+  bucket = <span class="st">"gol-prod-clinic-uploads"</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_s3_bucket_public_access_block"</span> <span class="st">"uploads"</span> {
+  bucket                  = aws_s3_bucket.uploads.id
+  block_public_acls       = <span class="kw">true</span>
+  block_public_policy     = <span class="kw">true</span>
+  ignore_public_acls      = <span class="kw">true</span>
+  restrict_public_buckets = <span class="kw">true</span>
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Trivy config, and scanning the plan instead of the source</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        tfsec has been folded into Trivy, so <code class="inline">trivy config</code> is now the second opinion we run next
+        to Checkov. Both share a weakness when they read HCL: they cannot see values that only exist at plan time, such as
+        a module input from another state, a <code class="inline">for_each</code> over a variable, or a registry module's
+        defaults. Scanning the <strong>plan JSON</strong> fixes that: the plan contains the fully resolved resource
+        attributes that will actually be applied.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    PR["PR to clinic-infra<br/>envs/prod/*.tf"] --> S1["checkov -d · trivy config<br/>static HCL · 20 s"]
+    PR --> PL["terraform plan -out<br/>OIDC plan-only role (IA2)"]
+    PL --> J["terraform show -json<br/>tfplan.json"]
+    J --> S2["checkov -f tfplan.json<br/>resolved values · 15 s"]
+    S1 --> G{"new failures<br/>not in register?"}
+    S2 --> G
+    G -->|yes| B["PR check fails<br/>annotations on lines"]
+    G -->|no| OK["plan comment posted<br/>reviewer approves"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">security-scan.yml — IaC job for clinic-infra (excerpt)</span>
+        <pre class="code">      - name: Plan
+        run: |
+          terraform -chdir=envs/prod init -input=false
+          terraform -chdir=envs/prod plan -input=false -out=tfplan
+          terraform -chdir=envs/prod show -json tfplan &gt; tfplan.json
+      - name: Checkov on resolved plan
+        run: |
+          <span class="cm"># --baseline: findings that existed before the scanner was enabled don't fail the PR</span>
+          checkov -f tfplan.json --framework terraform_plan \
+            --baseline .checkov.baseline \
+            --output cli --output sarif --output-file-path console,results
+      - name: Trivy config on source
+        run: trivy config --severity HIGH,CRITICAL --exit-code 1 --tf-exclude-downloaded-modules envs/prod
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()                                     <span class="cm"># upload even when the scan failed</span>
+        with:
+          sarif_file: results/results_sarif.sarif
+          category: checkov-prod</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tool</th><th class="px-4 py-3">Good at</th><th class="px-4 py-3">Weak at</th><th class="px-4 py-3">Where we run it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Checkov</td><td class="px-4 py-3">Broad AWS coverage, plan scanning, graph checks across resources (<code class="inline">CKV2_*</code>)</td><td class="px-4 py-3">Slower, more noise until baselined</td><td class="px-4 py-3">Every IaC PR, on HCL and plan</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Trivy config</td><td class="px-4 py-3">Fast, same tool as image scanning, Helm and K8s too</td><td class="px-4 py-3">Fewer cross-resource checks</td><td class="px-4 py-3">Every IaC PR, Helm charts</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">tflint</td><td class="px-4 py-3">Provider-aware correctness: invalid instance types, deprecated args</td><td class="px-4 py-3">Not a security tool</td><td class="px-4 py-3">Pre-commit and PR (<a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">OPA / Conftest</td><td class="px-4 py-3">Our own rules: tagging, allowed regions, instance size caps</td><td class="px-4 py-3">You write and test every rule</td><td class="px-4 py-3">Plan JSON, owned by <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Kubernetes manifests and Helm charts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The same scanners read Kubernetes YAML. Scan what will actually be applied: render the chart or Kustomize overlay
+        first (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>), then scan the output, in the PR to
+        <code class="inline">clinic-gitops</code>. The cluster enforces the same rules at admission with Kyverno
+        (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>). The pipeline check exists so the author
+        finds out in the PR, not when Argo CD shows a sync failure at 18:00.
+      </p>
+      <pre class="code mt-3">helm template booking-api charts/booking-api -f envs/prod/values.yaml &gt; rendered.yaml
+trivy config --severity HIGH,CRITICAL rendered.yaml
+<span class="out">rendered.yaml (kubernetes)
+Tests: 94 (SUCCESSES: 92, FAILURES: 2)
+Failures: 2 (HIGH: 2, CRITICAL: 0)
+
+HIGH: Container 'api' of Deployment 'booking-api' should set 'securityContext.readOnlyRootFilesystem' to true
+HIGH: Container 'api' of Deployment 'booking-api' should set 'securityContext.allowPrivilegeEscalation' to false</span>
+<span class="cm"># both are two-line fixes in values.yaml; the app writes temp files, so mount an emptyDir at /tmp</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Container image gates: block what has a fix</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        ECR repositories, scanning configuration, SBOMs and signing are owned by
+        <a href="./ci4.html" class="text-viol underline decoration-viol/40">CI4</a>. The question here is the gate policy.
+        Block the build on <strong>Critical CVEs that have a fixed version</strong>. Do not block on unfixed CVEs: the author
+        cannot do anything about them, and blocking teaches people to bypass the gate. Unfixed Critical findings go to the
+        backlog and Inspector rescans them daily (<a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>),
+        so you hear when a fix ships.
+      </p>
+      <pre class="code mt-3">trivy image --severity CRITICAL --ignore-unfixed --exit-code 1 \
+  --ignorefile .trivyignore.yaml booking-api:${GITHUB_SHA::12}
+<span class="out">booking-api:4f2a9c1e7b03 (debian 12.11)
+Total: 1 (CRITICAL: 1)
+
+┌─────────┬────────────────┬──────────┬────────┬───────────────────┬──────────────────┐
+│ Library │ Vulnerability  │ Severity │ Status │ Installed Version │ Fixed Version    │
+├─────────┼────────────────┼──────────┼────────┼───────────────────┼──────────────────┤
+│ libssl3 │ CVE-2025-xxxxx │ CRITICAL │ fixed  │ 3.0.15-1~deb12u1  │ 3.0.17-1~deb12u2 │
+└─────────┴────────────────┴──────────┴────────┴───────────────────┴──────────────────┘</span>
+<span class="cm"># exit code 1: rebuild on the patched base image (FN6) and push again</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Most image CVEs come from the base image, not your code.</strong>
+        Moving <code class="inline">booking-api</code> from a full <code class="inline">node:22</code> image to a distroless
+        or <code class="inline">-slim</code> base (<a href="./fn6.html" class="text-viol underline decoration-viol/40">FN6</a>)
+        took its findings from 214 to 9 in our case. Each finding you remove at the base never needs triage again. That is
+        a better use of a day than writing ignore rules.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Runtime testing &amp; gate governance</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A gate without an exception process becomes a gate people bypass</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Static scanners read code. DAST attacks the running app the way an outsider would. And all of it only works if
+        the rules for "what blocks, what doesn't, and how you get an exception" are written down, enforced by the
+        pipeline and reviewed. This Part covers both.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">DAST with ZAP against staging</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        OWASP ZAP crawls the running app and checks responses for problems no static tool can see: missing security
+        headers, cookies without <code class="inline">Secure</code> or <code class="inline">SameSite</code>, information
+        leaks in error pages, reflected input. Run the <strong>baseline scan</strong> (passive, about 2 minutes, safe)
+        after every staging deploy and the <strong>full scan</strong> (active attacks, 30 minutes or more) nightly against
+        staging only. Never point an active scan at production. It submits forms, so it would create real bookings and send
+        real SMS messages to real phone numbers.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.github/workflows/dast.yml</span>
+        <pre class="code">name: dast
+on:
+  workflow_run:
+    workflows: [deploy-staging]
+    types: [completed]
+jobs:
+  zap-baseline:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write                         <span class="cm"># ZAP opens/updates one tracking issue</span>
+    steps:
+      - uses: actions/checkout@v4
+      - uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: https://app.staging.clinic.example.com
+          rules_file_name: .zap/rules.tsv      <span class="cm"># per-rule IGNORE / WARN / FAIL</span>
+          cmd_options: "-a -j"                 <span class="cm"># include alpha rules, use the AJAX spider for Next.js</span>
+          fail_action: true</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.zap/rules.tsv</span>
+        <pre class="code">10038	FAIL	(Content Security Policy header not set)
+10020	FAIL	(Missing anti-clickjacking header)
+10010	FAIL	(Cookie without HttpOnly flag)
+10054	FAIL	(Cookie without SameSite attribute)
+10096	IGNORE	(Timestamp disclosure: booking slot times are meant to be public)
+10027	WARN	(Information disclosure in comments: Next.js build ids)</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The first baseline run against <code class="inline">booking-web</code> reported 14 alert types. Three header fixes
+        in the CloudFront response headers policy (<a href="./aw4.html" class="text-viol underline decoration-viol/40">AW4</a>)
+        closed nine of them. Encode each decision in <code class="inline">rules.tsv</code> with the reason in the comment, so
+        the file doubles as a record of accepted risk.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The gate policy, written down</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every team will ask "does this block my PR?" The answer must be in one table that the pipeline implements exactly,
+        not in someone's head. Ours is below. Severity is the scanner's severity adjusted by context: a High in an internal
+        admin tool reachable only through SSM is not the same as a High in <code class="inline">booking-api</code>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Severity (new finding)</th><th class="px-4 py-3">PR</th><th class="px-4 py-3">Deploy to prod</th><th class="px-4 py-3">Fix SLA if it already exists</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Verified secret</td><td class="px-4 py-3">Blocks, no exceptions</td><td class="px-4 py-3">Blocks</td><td class="px-4 py-3">Rotate within 4 hours (<a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Critical, fix available</td><td class="px-4 py-3">Blocks</td><td class="px-4 py-3">Blocks</td><td class="px-4 py-3">7 days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">High</td><td class="px-4 py-3">Blocks for SAST, SCA and IaC; warns for images</td><td class="px-4 py-3">Warns</td><td class="px-4 py-3">30 days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Medium</td><td class="px-4 py-3">Annotation only</td><td class="px-4 py-3">No</td><td class="px-4 py-3">90 days, or accept the risk</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Low / Info</td><td class="px-4 py-3">Not shown on the PR</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Quarterly review</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Publish the SLAs and report against them monthly. "Critical findings older than 7 days: 0" is a number a client's
+        auditor understands (<a href="./se3.html" class="text-viol underline decoration-viol/40">SE3</a>), and it tells you
+        far more than a total count of open findings.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Exceptions: owned, justified and expiring</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Sometimes the right call is to ship with a known finding: the fix needs a vendor release, or the finding does not
+        apply in our context. That is acceptable when the exception has an owner, a reason, a compensating control and an
+        <strong>expiry date</strong>. Keep all exceptions for a repo in one register file, reviewed through CODEOWNERS by the
+        security owner, and have CI fail when one expires. Scattered <code class="inline">nosec</code> comments with no date
+        are how a temporary exception becomes permanent.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    F["Gate fails on a finding"] --> Q{"Real and<br/>applicable?"}
+    Q -->|yes| FIX["Fix in this PR<br/>(the default)"]
+    Q -->|"not applicable"| FP["Suppress with reason<br/>tuning PR to the ruleset"]
+    Q -->|"real, can't fix now"| EX["Add to security-exceptions.yaml<br/>owner · reason · control · expiry ≤ 90 d"]
+    EX --> R["CODEOWNERS review<br/>by security owner"]
+    R --> M["Merge: gate passes"]
+    M --> EXP{"Expiry date<br/>reached?"}
+    EXP -->|yes| F
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/security-exceptions.yaml</span>
+        <pre class="code">- id: GHSA-xxxx-yyyy-zzzz
+  scanner: dependency-review
+  package: pdfkit@0.15.0
+  reason: Vulnerable path is font subsetting from user-supplied fonts; we only embed our own fonts.
+  compensating_control: Fonts are bundled at build time; no upload path accepts font files.
+  owner: "@golden-owl/clinic-backend"
+  ticket: SEC-131
+  expires: 2026-12-15                  <span class="cm"># CI fails the day after this date</span>
+- id: CKV_AWS_18
+  scanner: checkov
+  resource: aws_s3_bucket.uploads
+  reason: Object access is logged via org CloudTrail data events.
+  owner: "@golden-owl/platform"
+  ticket: SEC-112
+  expires: 2027-03-31</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">scripts/check_exceptions.py — runs as the first job of security.yml</span>
+        <pre class="code"><span class="kw">import</span> sys, datetime, yaml
+today = datetime.date.today()
+expired, missing = [], []
+<span class="kw">for</span> ex <span class="kw">in</span> yaml.safe_load(open(<span class="st">"security-exceptions.yaml"</span>)) <span class="kw">or</span> []:
+    <span class="kw">for</span> field <span class="kw">in</span> (<span class="st">"reason"</span>, <span class="st">"owner"</span>, <span class="st">"ticket"</span>, <span class="st">"expires"</span>):
+        <span class="kw">if not</span> ex.get(field):
+            missing.append(<span class="st">f"{ex['id']}: missing {field}"</span>)
+    exp = ex.get(<span class="st">"expires"</span>)
+    <span class="kw">if</span> exp <span class="kw">and</span> exp &lt; today:
+        expired.append(<span class="st">f"{ex['id']} expired {exp} (owner {ex.get('owner')}, {ex.get('ticket')})"</span>)
+    <span class="kw">if</span> exp <span class="kw">and</span> (exp - today).days &gt; 90:
+        missing.append(<span class="st">f"{ex['id']}: expiry more than 90 days out"</span>)  <span class="cm"># forces a re-review</span>
+<span class="kw">for</span> line <span class="kw">in</span> missing + expired:
+    print(<span class="st">f"::error::{line}"</span>)
+sys.exit(1 <span class="kw">if</span> missing <span class="kw">or</span> expired <span class="kw">else</span> 0)</pre>
+      </div>
+      <pre class="code mt-3">python scripts/check_exceptions.py
+<span class="out">::error::GHSA-xxxx-yyyy-zzzz expired 2026-10-15 (owner @golden-owl/clinic-backend, SEC-131)</span>
+<span class="cm"># the PR is blocked until someone fixes it or re-justifies it with a new date</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>Never let the pipeline's own config weaken the gate silently.</strong>
+        A PR that adds <code class="inline">continue-on-error: true</code> to a scan job, removes a scanner, lowers
+        <code class="inline">fail-on-severity</code> or adds a <code class="inline">--skip-check</code> flag changes the
+        security posture of every future PR. Put <code class="inline">.github/workflows/</code>,
+        <code class="inline">.semgrep/</code>, <code class="inline">.zap/</code> and the exceptions file under CODEOWNERS for
+        the security owner (<a href="./fn4.html" class="text-viol underline decoration-viol/40">FN4</a>), and make the
+        security workflow a required status check in the ruleset so it cannot be dropped.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Measuring whether it works</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Scanner counts go up when you add scanners, so they say nothing about whether you are getting safer. Track four
+        numbers per repo per month, taken from GitHub's security overview and the exceptions file, and review them in
+        the monthly platform meeting.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Metric</th><th class="px-4 py-3">Why</th><th class="px-4 py-3">Clinic platform, Oct 2026</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Coverage</td><td class="px-4 py-3">Repos with the reusable security workflow as a required check</td><td class="px-4 py-3">5 of 5</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SLA breaches</td><td class="px-4 py-3">Critical older than 7 days, High older than 30</td><td class="px-4 py-3">0 Critical, 2 High</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Mean time to remediate</td><td class="px-4 py-3">From first detection to closed, for High and above</td><td class="px-4 py-3">6 days</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">False-positive rate</td><td class="px-4 py-3">Share of PR failures dismissed as not applicable</td><td class="px-4 py-3">12%, below the 20% limit</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are good at the tedious half of DevSecOps: triaging 60 Checkov findings, writing Semgrep rules from a
+        description, and drafting fixes. They are also very willing to make a red check green by the shortest path, which
+        is usually a suppression. Ask for fixes, and review every skip the agent adds as carefully as a code change.
+      </p>
+      <pre class="code mt-3">Here is the Checkov output for clinic-infra/modules/uploads. For each failed check: say whether it
+applies to a private bucket that holds patient referral letters, propose the Terraform fix as a
+diff, and only if it truly does not apply, propose a skip comment with a specific reason.
+Do not add any skip without explaining the compensating control.</pre>
+      <pre class="code mt-3">Write a Semgrep rule (TypeScript) that flags any call to pg's client.query() whose first
+argument is a template literal or string concatenation containing a variable. Include three
+true-positive and two true-negative test cases in Semgrep's test format, and run semgrep --test.</pre>
+      <pre class="code mt-3">Review this PR to .github/workflows/security.yml. List every change that could make the
+security gate weaker (severity thresholds, removed jobs, continue-on-error, new skips,
+broader permissions, unpinned actions) and say whether each one is justified by the PR text.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Triage scanner output into fix / not applicable / needs a human</li>
+            <li>Write fixes for IaC and Dockerfile findings as diffs</li>
+            <li>Write and test Semgrep rules and ZAP rule files</li>
+            <li>Review workflow changes for anything that weakens a gate</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every new skip, ignore or <code class="inline">nosec</code> has a real reason and a ticket</li>
+            <li>The "fix" doesn't just change the code so the scanner can no longer see it</li>
+            <li>Severity thresholds and <code class="inline">exit-code</code> flags are unchanged</li>
+            <li>Workflow permissions stay minimal and actions stay pinned</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written pipeline security:</strong>
+        <code class="inline">continue-on-error: true</code> on a scan step; <code class="inline">--soft-fail</code> on
+        Checkov or <code class="inline">--exit-code 0</code> on Trivy; a blanket <code class="inline">.trivyignore</code>
+        or <code class="inline">skip-check</code> list added "to unblock CI"; <code class="inline">permissions: write-all</code>;
+        scanner actions referenced by <code class="inline">@master</code>; a ZAP full (active) scan pointed at
+        <code class="inline">api.clinic.example.com</code>; and secrets "fixed" by moving them from code into a
+        committed <code class="inline">.env</code> file.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Thinks of security as a review that happens before go-live, done by someone else.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can say what SAST, SCA, IaC scanning and DAST each look for, but has not wired one into a pipeline or read its output critically.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds a scanner to a workflow from an example and fixes the findings it reports, but suppresses noise ad hoc and is unsure which findings should block.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Builds the reusable security workflow with baselines, scans Terraform plans and rendered manifests, sets image gates on fixable Criticals, runs ZAP against staging, maintains an expiring exceptions register, and threat-models an infra change before it is built.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the gate policy across clients, keeps the false-positive rate down with custom rules, reports SLA metrics to client stakeholders, and teaches developers to write their own Semgrep rules.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> take a repo with no security
+        checks and, in one day, add SAST, SCA, secret, IaC and image scanning through a reusable workflow that only fails on
+        <em>new</em> findings. Then have a mentor open three PRs (a public bucket, a vulnerable dependency, a hard-coded key)
+        and confirm each is blocked with a clear message, while an unrelated PR stays green.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Turning on every rule on day one</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Hundreds of pre-existing findings fail every PR, and the scanner is disabled within a week. Baseline what exists, gate on what is new, and burn the backlog down separately.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Blocking on unfixable CVEs</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">If no fixed version exists, the author can only bypass the gate. Use <code class="inline">--ignore-unfixed</code> on the gate and let Inspector tell you when a fix ships.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Scanning HCL but never the plan</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Registry modules and variables hide the real values. A bucket that looks private in source can be public after the module defaults apply. Scan <code class="inline">tfplan.json</code> too.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ One reusable workflow, tagged</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">All repos call <code class="inline">security-scan.yml@vX.Y.Z</code>. Tuning happens once, rollouts are a version bump, and you can see which repos still run an old version.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Fix the base image before writing ignores</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Switching to a slim or distroless base removes most image findings permanently. Time spent there beats time spent triaging the same CVEs every week.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="placement"> <span>I can place each check (secret, SAST, SCA, IaC, image, DAST) in the pipeline and say what it blocks and why.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="threat-model"> <span>I threat-modelled one infra change with a data-flow diagram and turned the answers into concrete controls.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="iac-plan"> <span>I scanned a Terraform plan JSON with Checkov and fixed or justified every finding.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="exceptions"> <span>I set up an exceptions register with expiry dates and a CI check that fails on expired or incomplete entries.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="sec-pipeline"> <span class="font-semibold">Built a reusable security workflow (CodeQL or Semgrep, dependency review, gitleaks, Checkov on plan, Trivy image, ZAP baseline on a staging URL) for a copy of clinic-app and clinic-infra, then opened three deliberately bad PRs and showed each one blocked with a clear annotation. Shared the workflow PR and screenshots of the three failures (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.github.com/en/code-security/code-scanning/introduction-to-code-scanning/about-code-scanning-with-codeql" target="_blank" rel="noopener">GitHub — About code scanning with CodeQL</a> — default vs advanced setup and query suites.</li>
+        <li><a class="text-coral underline" href="https://docs.github.com/en/code-security/supply-chain-security/understanding-your-software-supply-chain/about-dependency-review" target="_blank" rel="noopener">GitHub — About dependency review</a> — the action's inputs and how it compares lockfiles.</li>
+        <li><a class="text-coral underline" href="https://docs.github.com/en/code-security/secret-scanning/introduction/about-push-protection" target="_blank" rel="noopener">GitHub — Push protection</a> — what it catches, bypass flow and alerts.</li>
+        <li><a class="text-coral underline" href="https://github.com/bridgecrewio/checkov" target="_blank" rel="noopener">Checkov README</a> — plan scanning, baselines, skip syntax and the check catalogue.</li>
+        <li><a class="text-coral underline" href="https://github.com/aquasecurity/trivy" target="_blank" rel="noopener">Trivy README</a> — image, filesystem and config scanning in one tool.</li>
+        <li><a class="text-coral underline" href="https://github.com/zaproxy/action-baseline" target="_blank" rel="noopener">ZAP baseline action README</a> — inputs, rules file format and issue reporting.</li>
+        <li><a class="text-coral underline" href="https://github.com/semgrep/semgrep" target="_blank" rel="noopener">Semgrep README</a> — rule syntax and testing your own rules.</li>
+      </ul>

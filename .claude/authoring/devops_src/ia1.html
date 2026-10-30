@@ -1,0 +1,835 @@
+<!-- meta: days=5 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Terraform Fundamentals</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Terraform is how every piece of AWS infrastructure in this program gets created, changed and reviewed. This module
+          teaches the core loop (write, init, plan, apply), the language (providers, resources, data sources, variables,
+          locals, outputs, <code class="inline">for_each</code>), state and the S3 backend with native locking, and how to
+          bring existing resources under management with <code class="inline">import</code> and
+          <code class="inline">moved</code> blocks. The running example is the clinic's dev environment: a VPC and a
+          PostgreSQL instance in <code class="inline">gol-dev</code>. Above all, you will learn to read a plan and spot the
+          line that would destroy a database.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> Terraform does exactly what the plan says, at API speed, across
+          every resource in the state. That is its value and its danger. A renamed resource address plans as "destroy and
+          recreate". A changed <code class="inline">count</code> shifts every index and replaces three subnets. A local state
+          file on a laptop gets applied over a colleague's change. None of these errors are in Terraform: they are in a plan
+          nobody read properly. Agents now write most of our HCL, so reading plans is the most important Terraform skill
+          you can have.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · The workflow</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Terraform compares three things: your code, its state and reality</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        You have built VPCs, instances and buckets in the console in
+        <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>–<a href="./aw4.html" class="text-viol underline decoration-viol/40">AW4</a>.
+        From here on, nothing in <code class="inline">gol-staging</code> or <code class="inline">gol-prod</code> is created
+        by hand. Terraform reads code that describes the infrastructure you want, compares it with what it created last
+        time, and calls AWS APIs to close the difference. Like the Kubernetes control loop, but it runs only when you ask.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Why code instead of clicks or scripts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Clicking is fine for learning. It does not scale to three environments that must match, and it leaves no record
+        of who changed what. Scripts with the AWS CLI (<a href="./fn5.html" class="text-viol underline decoration-viol/40">FN5</a>)
+        record the steps but not the result: run one twice and you get two VPCs. Terraform is <strong>declarative</strong>:
+        you describe the end state, and running it again with no code change does nothing.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Approach</th><th class="px-4 py-3">Repeatable</th><th class="px-4 py-3">Reviewable</th><th class="px-4 py-3">Knows what exists</th><th class="px-4 py-3">Our use</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Console</td><td class="px-4 py-3">No</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Only by looking</td><td class="px-4 py-3">Learning, read-only investigation</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CLI / boto3 scripts</td><td class="px-4 py-3">Only if you write idempotency yourself</td><td class="px-4 py-3">The script, not the result</td><td class="px-4 py-3">No</td><td class="px-4 py-3">One-off operations, glue</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Terraform</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">Code and the plan, in a PR</td><td class="px-4 py-3">Yes, through state</td><td class="px-4 py-3">All AWS infrastructure</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        AWS CDK, Pulumi and OpenTofu (the open-source fork of Terraform) exist and are fine tools; our clients' code and
+        this program use Terraform.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The core loop: init, plan, apply</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">init</code> downloads providers and modules and connects to the state backend.
+        <code class="inline">plan</code> refreshes what it knows about real resources, diffs that against your code and
+        prints the actions it would take. <code class="inline">apply</code> executes a plan and records the results in
+        state. Everything interesting happens in plan.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 250" class="w-full min-w-[640px]" role="img" aria-label="Terraform plan compares configuration, state and real AWS resources, then apply calls AWS APIs and writes new state">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ONE PLAN · three inputs, one diff</text>
+          <g class="anim-pulse"><rect x="15" y="40" width="150" height="50" rx="9" fill="#2563EB"/>
+            <text x="90" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Configuration</text>
+            <text x="90" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">*.tf in clinic-infra</text></g>
+          <g class="anim-pulse d1"><rect x="15" y="105" width="150" height="50" rx="9" fill="#37474F"/>
+            <text x="90" y="126" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">State</text>
+            <text x="90" y="141" text-anchor="middle" fill="#ffffffbb" font-size="9">S3 · address → AWS ID</text></g>
+          <g class="anim-pulse d2"><rect x="15" y="170" width="150" height="50" rx="9" fill="#0D9488"/>
+            <text x="90" y="191" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Reality</text>
+            <text x="90" y="206" text-anchor="middle" fill="#ffffffbb" font-size="9">AWS APIs (refresh)</text></g>
+          <g class="anim-pulse d3"><rect x="260" y="95" width="150" height="70" rx="9" fill="#6d5acd"/>
+            <text x="335" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">terraform plan</text>
+            <text x="335" y="138" text-anchor="middle" fill="#ffffffbb" font-size="9">+ create · ~ update</text>
+            <text x="335" y="151" text-anchor="middle" fill="#ffffffbb" font-size="9">- destroy · -/+ replace</text></g>
+          <g class="anim-pulse d4"><rect x="480" y="95" width="100" height="70" rx="9" fill="#D97757"/>
+            <text x="530" y="125" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">You review</text>
+            <text x="530" y="141" text-anchor="middle" fill="#ffffffbb" font-size="9">in the PR</text></g>
+          <g class="anim-pulse d1"><rect x="620" y="95" width="90" height="70" rx="9" fill="#DB2777"/>
+            <text x="665" y="125" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">apply</text>
+            <text x="665" y="141" text-anchor="middle" fill="#ffffffbb" font-size="9">API calls</text></g>
+          <line x1="165" y1="65" x2="260" y2="115" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="165" y1="130" x2="260" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="165" y1="195" x2="260" y2="145" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="410" y1="130" x2="480" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="580" y1="130" x2="620" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="665" y1="165" x2="165" y2="135" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="440" y="185" text-anchor="middle" font-size="9" fill="#6E6B64">apply writes the new IDs back into state</text>
+          <text x="360" y="238" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">state is Terraform's memory: lose it and Terraform forgets it created anything</text>
+        </svg>
+      </div>
+      <pre class="code mt-3">cd clinic-infra/envs/dev
+terraform init
+<span class="out">Initializing the backend...
+Successfully configured the backend "s3"! Terraform will automatically
+use this backend unless the backend configuration changes.
+Initializing modules...
+Downloading registry.terraform.io/terraform-aws-modules/vpc/aws 6.5.1 for vpc...
+Initializing provider plugins...
+- Finding hashicorp/aws versions matching "&gt;= 6.0.0, ~&gt; 6.0"...
+- Installing hashicorp/aws v6.18.0...
+- Installed hashicorp/aws v6.18.0 (signed by HashiCorp)
+Terraform has created a lock file .terraform.lock.hcl to record the provider
+selections it made above.
+Terraform has been successfully initialized!</span>
+<span class="cm"># commit .terraform.lock.hcl; never commit the .terraform/ directory</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Project layout and the version pins</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A Terraform <strong>root module</strong> is just a directory of <code class="inline">.tf</code> files; Terraform
+        reads them all as one. The file names are convention, not syntax, but every repo in our company uses the same
+        names so you can find things in any client's code. How to split environments and reuse code across them is
+        <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>; for now there is one directory per
+        environment.
+      </p>
+      <pre class="code mt-3">clinic-infra/envs/dev/
+├── versions.tf           <span class="cm"># required_version + required_providers</span>
+├── backend.tf            <span class="cm"># where state lives</span>
+├── providers.tf          <span class="cm"># region, account guard, default tags</span>
+├── variables.tf          <span class="cm"># inputs, with types and validation</span>
+├── locals.tf             <span class="cm"># derived values: names, CIDRs, tags</span>
+├── network.tf            <span class="cm"># the VPC (registry module)</span>
+├── database.tf           <span class="cm"># RDS PostgreSQL + its security group</span>
+├── outputs.tf            <span class="cm"># values other stacks and humans need</span>
+├── terraform.tfvars      <span class="cm"># values for this environment (no secrets)</span>
+└── .terraform.lock.hcl   <span class="cm"># exact provider versions + checksums, committed</span></pre>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/versions.tf + providers.tf</span>
+        <pre class="code"><span class="kw">terraform</span> {
+  required_version = <span class="st">"&gt;= 1.10"</span>                <span class="cm"># S3 native locking needs 1.10+</span>
+  required_providers {
+    aws = {
+      source  = <span class="st">"hashicorp/aws"</span>
+      version = <span class="st">"~&gt; 6.0"</span>                       <span class="cm"># any 6.x, never 7.0 by surprise</span>
+    }
+  }
+}
+
+<span class="kw">provider</span> <span class="st">"aws"</span> {
+  region              = var.region
+  allowed_account_ids = [<span class="st">"222233334444"</span>]     <span class="cm"># gol-dev: refuse to run anywhere else</span>
+  default_tags {
+    tags = local.tags                          <span class="cm"># every taggable resource gets them</span>
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">allowed_account_ids</code> is the cheapest safety net in Terraform. If your shell still holds
+        prod credentials from the last session, the plan fails with "account ID not allowed" instead of planning dev's
+        changes against prod. Credentials themselves come from <code class="inline">aws sso login --profile gol-dev</code>
+        (<a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a>), never from keys in a file.
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · The language</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Build the clinic dev environment from a dozen small blocks</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        HCL has few concepts. <strong>Resources</strong> are things Terraform creates and owns. <strong>Data
+        sources</strong> are things it only reads. <strong>Variables</strong> are inputs, <strong>locals</strong> are
+        named expressions, <strong>outputs</strong> are results. References between them form a graph, and Terraform
+        works out the order from that graph. This Part builds the dev VPC and database with each of these in turn.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Variables, locals and functions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Give every variable a type, a description and, where a wrong value would hurt, a <code class="inline">validation</code>
+        block. Use locals to compute values once (names, CIDRs, tags) so the resources stay readable. Test any expression
+        in <code class="inline">terraform console</code> before you put it in code.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/variables.tf + locals.tf</span>
+        <pre class="code"><span class="kw">variable</span> <span class="st">"env"</span> {
+  type        = string
+  description = <span class="st">"Environment name, used in every resource name"</span>
+  validation {
+    condition     = contains([<span class="st">"dev"</span>, <span class="st">"staging"</span>, <span class="st">"prod"</span>], var.env)
+    error_message = <span class="st">"env must be dev, staging or prod."</span>
+  }
+}
+<span class="kw">variable</span> <span class="st">"vpc_cidr"</span> {
+  type    = string
+  default = <span class="st">"10.10.0.0/16"</span>                     <span class="cm"># dev; staging 10.15, prod 10.20</span>
+}
+<span class="kw">variable</span> <span class="st">"region"</span> {
+  type    = string
+  default = <span class="st">"ap-southeast-1"</span>
+}
+
+<span class="kw">locals</span> {
+  name = <span class="st">"clinic-${var.env}"</span>
+  azs  = slice(<span class="kw">data</span>.aws_availability_zones.available.names, 0, 3)
+  private_subnets  = [<span class="kw">for</span> i <span class="kw">in</span> range(3) : cidrsubnet(var.vpc_cidr, 4, i)]       <span class="cm"># /20 each</span>
+  public_subnets   = [<span class="kw">for</span> i <span class="kw">in</span> range(3) : cidrsubnet(var.vpc_cidr, 8, 48 + i)]  <span class="cm"># /24 each</span>
+  database_subnets = [<span class="kw">for</span> i <span class="kw">in</span> range(3) : cidrsubnet(var.vpc_cidr, 8, 60 + i)]
+  tags = { project = <span class="st">"clinic"</span>, env = var.env, managed_by = <span class="st">"terraform"</span>, repo = <span class="st">"golden-owl/clinic-infra"</span> }
+}</pre>
+      </div>
+      <pre class="code mt-3">terraform console
+<span class="out">&gt; [for i in range(3) : cidrsubnet("10.10.0.0/16", 4, i)]
+[
+  "10.10.0.0/20",
+  "10.10.16.0/20",
+  "10.10.32.0/20",
+]
+&gt; cidrsubnet("10.10.0.0/16", 8, 60)
+"10.10.60.0/24"</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Values come from <code class="inline">terraform.tfvars</code> (committed, no secrets),
+        <code class="inline">-var</code> flags or <code class="inline">TF_VAR_env</code> environment variables, in increasing
+        priority. CIDR planning itself (why /20 for private, why database subnets have no route out) is
+        <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>.
+      </p>
+      <div class="mt-4 callout callout-tip"><strong>Habit from day one:</strong> run
+        <code class="inline">terraform fmt -recursive</code> and <code class="inline">terraform validate</code> before every
+        commit (a pre-commit hook does it for you). Formatting noise disappears from reviews, and
+        <code class="inline">validate</code> catches wrong argument names and types in a second, without credentials.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Data sources and a registry module for the VPC</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>data source</strong> asks AWS a question at plan time: which AZs are available, which account am I in,
+        what is the ID of the zone someone else created. A <strong>module</strong> is a packaged set of resources with
+        inputs and outputs. For the VPC we use the community module from the registry, pinned to a major version, rather
+        than writing 20 resources by hand. Designing your own modules is
+        <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/network.tf</span>
+        <pre class="code"><span class="kw">data</span> <span class="st">"aws_availability_zones"</span> <span class="st">"available"</span> {
+  state = <span class="st">"available"</span>
+}
+
+<span class="kw">module</span> <span class="st">"vpc"</span> {
+  source  = <span class="st">"terraform-aws-modules/vpc/aws"</span>
+  version = <span class="st">"~&gt; 6.0"</span>                          <span class="cm"># pin the major; read the changelog to bump</span>
+
+  name             = local.name
+  cidr             = var.vpc_cidr
+  azs              = local.azs
+  private_subnets  = local.private_subnets
+  public_subnets   = local.public_subnets
+  database_subnets = local.database_subnets
+  create_database_subnet_group = <span class="kw">true</span>
+
+  enable_nat_gateway   = <span class="kw">true</span>
+  single_nat_gateway   = <span class="kw">true</span>                 <span class="cm"># dev: 1 NAT (~USD 45/month), prod uses 3</span>
+  enable_dns_hostnames = <span class="kw">true</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Read a module's inputs and outputs on its registry page, not by guessing. The module exposes
+        <code class="inline">module.vpc.vpc_id</code>, <code class="inline">module.vpc.private_subnets</code> and
+        <code class="inline">module.vpc.database_subnet_group_name</code>, which the database uses next.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Resources, references and the dependency graph</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When one block references another's attribute (<code class="inline">aws_security_group.db.id</code>), Terraform
+        records a dependency and creates them in the right order, in parallel where it can. You almost never need
+        <code class="inline">depends_on</code>; when you reach for it, it usually means a reference is missing. Here is
+        the dev database, deliberately cheaper and less protected than prod in
+        <a href="./aw5.html" class="text-viol underline decoration-viol/40">AW5</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/database.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_security_group"</span> <span class="st">"db"</span> {
+  name   = <span class="st">"${local.name}-db"</span>
+  vpc_id = module.vpc.vpc_id                      <span class="cm"># reference = dependency on the VPC</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_vpc_security_group_ingress_rule"</span> <span class="st">"db_from_app"</span> {
+  security_group_id            = aws_security_group.db.id
+  referenced_security_group_id = aws_security_group.app.id   <span class="cm"># app SG only, never a CIDR</span>
+  ip_protocol                  = <span class="st">"tcp"</span>
+  from_port                    = 5432
+  to_port                      = 5432
+}
+
+<span class="kw">resource</span> <span class="st">"aws_db_instance"</span> <span class="st">"booking"</span> {
+  identifier                  = <span class="st">"${local.name}-booking"</span>
+  engine                      = <span class="st">"postgres"</span>
+  engine_version              = <span class="st">"17"</span>
+  instance_class              = <span class="st">"db.t4g.micro"</span>
+  allocated_storage           = 20
+  storage_encrypted           = <span class="kw">true</span>
+  username                    = <span class="st">"clinic_admin"</span>
+  manage_master_user_password = <span class="kw">true</span>              <span class="cm"># no password in code or state</span>
+  db_subnet_group_name        = module.vpc.database_subnet_group_name
+  vpc_security_group_ids      = [aws_security_group.db.id]
+  backup_retention_period     = 3
+  skip_final_snapshot         = <span class="kw">true</span>              <span class="cm"># dev only: never in staging or prod</span>
+}</pre>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    AZ["data.aws_availability_zones"] --> L["local.azs"]
+    L --> VPC["module.vpc<br/>VPC · subnets · NAT · subnet group"]
+    VPC --> SG["aws_security_group.db"]
+    SG --> R["aws_vpc_security_group_ingress_rule<br/>db_from_app"]
+    APP["aws_security_group.app"] --> R
+    VPC --> DB["aws_db_instance.booking"]
+    SG --> DB
+    DB --> OUT["output.db_endpoint"]
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The graph decides the order of destroy as well: the database goes before its security group, the security group
+        before the VPC. <code class="inline">terraform graph</code> prints it in DOT format when you need to debug an
+        ordering problem, which is rare once all references are real references.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8"><code class="inline">count</code> versus <code class="inline">for_each</code></h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Both create several copies of a resource. <code class="inline">count</code> addresses them by position
+        (<code class="inline">[0]</code>, <code class="inline">[1]</code>); <code class="inline">for_each</code> by key
+        (<code class="inline">["booking-api"]</code>). Positions shift when you remove an item from the middle of a list,
+        and Terraform then sees every later item as changed. Keys do not shift. Use <code class="inline">for_each</code>
+        for anything that is a set of named things, and <code class="inline">count</code> only for "zero or one".
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/logs.tf — one log group per service</span>
+        <pre class="code"><span class="kw">variable</span> <span class="st">"services"</span> {
+  type    = set(string)
+  default = [<span class="st">"booking-api"</span>, <span class="st">"booking-web"</span>, <span class="st">"booking-worker"</span>]
+}
+
+<span class="kw">resource</span> <span class="st">"aws_cloudwatch_log_group"</span> <span class="st">"svc"</span> {
+  for_each          = var.services                <span class="cm"># address: aws_cloudwatch_log_group.svc["booking-web"]</span>
+  name              = <span class="st">"/clinic/${var.env}/${each.key}"</span>
+  retention_in_days = 14
+}
+
+<span class="kw">resource</span> <span class="st">"aws_db_instance"</span> <span class="st">"replica"</span> {
+  count               = var.create_replica ? 1 : 0   <span class="cm"># the legitimate use of count: on/off</span>
+  replicate_source_db = aws_db_instance.booking.identifier
+  instance_class      = <span class="st">"db.t4g.micro"</span>
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Change</th><th class="px-4 py-3">With <code class="inline">count</code> over a list</th><th class="px-4 py-3">With <code class="inline">for_each</code> over a set</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Remove <code class="inline">booking-api</code> (first item)</td><td class="px-4 py-3"><code class="inline">[0]</code> renamed to web, <code class="inline">[1]</code> renamed to worker, <code class="inline">[2]</code> destroyed: 2 replaced, 1 destroyed, logs lost</td><td class="px-4 py-3"><code class="inline">["booking-api"]</code> destroyed; the others untouched</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Add a service in the middle</td><td class="px-4 py-3">Every later index changes</td><td class="px-4 py-3">One create</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Keys unknown until apply</td><td class="px-4 py-3">Works</td><td class="px-4 py-3">Fails: "for_each value depends on resource attributes that cannot be determined until apply"</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That last row is the one limitation: <code class="inline">for_each</code> keys must be known at plan time, so key
+        by names you choose (service names, AZ names), not by IDs AWS generates.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Outputs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Outputs are the stack's public interface: what other stacks, pipelines and humans read after an apply. Output IDs
+        and endpoints, never secrets. Mark anything sensitive with <code class="inline">sensitive = true</code>, and
+        remember that it is still stored in plain text in state; the flag only hides it from the terminal.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/outputs.tf</span>
+        <pre class="code"><span class="kw">output</span> <span class="st">"vpc_id"</span> {
+  value = module.vpc.vpc_id
+}
+<span class="kw">output</span> <span class="st">"db_endpoint"</span> {
+  value       = aws_db_instance.booking.address
+  description = <span class="st">"Hostname for booking-api's DATABASE_HOST"</span>
+}
+<span class="kw">output</span> <span class="st">"db_secret_arn"</span> {
+  value = aws_db_instance.booking.master_user_secret[0].secret_arn   <span class="cm"># the ARN, not the password</span>
+}</pre>
+      </div>
+      <pre class="code mt-3">terraform output -raw db_endpoint
+<span class="out">clinic-dev-booking.c9x2k1q7ab3d.ap-southeast-1.rds.amazonaws.com</span></pre>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · State</div>
+      <h2 class="font-display text-2xl font-bold mt-2">State is the most important file you never edit by hand</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        State is a JSON document that maps every resource address in your code to the real object in AWS
+        (<code class="inline">aws_db_instance.booking</code> → <code class="inline">db-7HQX…</code>) along with its last
+        known attributes. Without it Terraform cannot know that the VPC it is about to "create" already exists. Lose it,
+        and the next apply tries to create everything again; corrupt it, and Terraform may delete things it thinks it does
+        not own.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">What lives in state, and why it must be remote</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        By default state is a local <code class="inline">terraform.tfstate</code> file. That breaks the moment two people
+        work on the same environment: each has a different file, and each apply overwrites the other's view. Remote state
+        in S3 gives one shared copy, versioning for recovery, encryption at rest, and a lock so two applies cannot run at
+        once.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">State contains</th><th class="px-4 py-3">Consequence</th><th class="px-4 py-3">So we</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Every resource's ID and attributes</td><td class="px-4 py-3">It is a full map of the client's infrastructure</td><td class="px-4 py-3">Restrict bucket access to the Terraform roles</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Any secret a resource returns (generated passwords, private keys)</td><td class="px-4 py-3">Plain text, even when marked <code class="inline">sensitive</code></td><td class="px-4 py-3">Let AWS manage secrets (<code class="inline">manage_master_user_password</code>), encrypt the bucket</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A serial number and lineage</td><td class="px-4 py-3">Terraform refuses to write an older state over a newer one</td><td class="px-4 py-3">Never copy state files around by hand</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The S3 backend with native locking</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Since Terraform 1.10 the S3 backend locks state by writing a <code class="inline">.tflock</code> object next to
+        the state file using S3 conditional writes. The DynamoDB lock table that older tutorials create is no longer
+        needed, and is deprecated. One state bucket per account, one key per stack.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/backend.tf</span>
+        <pre class="code"><span class="kw">terraform</span> {
+  backend <span class="st">"s3"</span> {
+    bucket       = <span class="st">"gol-dev-tfstate-ap-southeast-1"</span>   <span class="cm"># in gol-dev; versioned, encrypted, private</span>
+    key          = <span class="st">"clinic/dev/core.tfstate"</span>          <span class="cm"># one key per stack</span>
+    region       = <span class="st">"ap-southeast-1"</span>
+    encrypt      = <span class="kw">true</span>
+    use_lockfile = <span class="kw">true</span>                               <span class="cm"># S3-native lock, no DynamoDB table</span>
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Backend blocks cannot use variables, so the bucket name is written out. The bucket itself is created once per
+        account by a small bootstrap stack, with versioning on (your undo button for state), Block Public Access on, and a
+        lifecycle rule expiring old versions after 90 days.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant M as Minh (apply)
+    participant S3 as S3 gol-dev-tfstate
+    participant L as Lan (apply)
+    M->>S3: PUT core.tfstate.tflock (If-None-Match: *)
+    S3-->>M: 200 · lock acquired
+    L->>S3: PUT core.tfstate.tflock (If-None-Match: *)
+    S3-->>L: 412 PreconditionFailed · lock held by Minh
+    M->>S3: PUT core.tfstate (new serial)
+    M->>S3: DELETE core.tfstate.tflock
+    Note over L,S3: Lan re-runs plan against the new state<br/>her old plan is now stale
+        </pre>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>The bootstrap problem:</strong> the state bucket cannot store its own
+        state before it exists. Create it once per account with a tiny stack that uses local state, then add a
+        <code class="inline">backend "s3"</code> block to that stack and run <code class="inline">terraform init -migrate-state</code>
+        to move its state into the bucket it just created. Every other stack starts remote from day one.</div>
+      <p class="mt-3 text-[15px] leading-relaxed">When two people apply at once, the second one sees this:</p>
+      <pre class="code mt-3">terraform apply
+<span class="out">Error: Error acquiring the state lock
+
+Error message: operation error S3: PutObject, https response error StatusCode: 412,
+api error PreconditionFailed: At least one of the pre-conditions you specified did not hold
+Lock Info:
+  ID:        3f1c2a9e-7b1d-4c55-9e0a-5d2b8c7f1e44
+  Path:      gol-dev-tfstate-ap-southeast-1/clinic/dev/core.tfstate
+  Operation: OperationTypeApply
+  Who:       minh@minh-mbp
+  Created:   2026-10-30 03:12:44 UTC</span>
+<span class="cm"># the lock works: ask Minh, do NOT reach for force-unlock</span></pre>
+      <div class="mt-4 callout callout-danger"><strong><code class="inline">terraform force-unlock</code> is for dead
+        processes only.</strong> Use it when you are certain the process holding the lock has died (a CI runner was
+        killed, a laptop lost network mid-apply), and after checking with the person named in <code class="inline">Who</code>.
+        Unlocking a live apply lets two processes write state at once, which is how you end up with resources that exist
+        in AWS but not in state.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Inspecting and changing state safely</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You will read state often and change it rarely. Reading is always safe. For changes, prefer the declarative
+        blocks below, which go through plan and review, over the imperative <code class="inline">terraform state</code>
+        subcommands, which change state immediately with no plan.
+      </p>
+      <pre class="code mt-3">terraform state list | head -6
+<span class="out">data.aws_availability_zones.available
+aws_cloudwatch_log_group.svc["booking-api"]
+aws_cloudwatch_log_group.svc["booking-web"]
+aws_db_instance.booking
+aws_security_group.db
+module.vpc.aws_vpc.this[0]</span>
+terraform state show aws_db_instance.booking | grep -E 'instance_class|engine_version_actual|multi_az'
+<span class="out">    engine_version_actual = "17.6"
+    instance_class        = "db.t4g.micro"
+    multi_az              = false</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">You want to</th><th class="px-4 py-3">Prefer (declarative, reviewed)</th><th class="px-4 py-3">Avoid (imperative, immediate)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Rename or move a resource in code</td><td class="px-4 py-3"><code class="inline">moved</code> block</td><td class="px-4 py-3"><code class="inline">terraform state mv</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Adopt an existing AWS resource</td><td class="px-4 py-3"><code class="inline">import</code> block</td><td class="px-4 py-3"><code class="inline">terraform import</code> command</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Stop managing a resource without deleting it</td><td class="px-4 py-3"><code class="inline">removed</code> block with <code class="inline">destroy = false</code></td><td class="px-4 py-3"><code class="inline">terraform state rm</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Accept changes made outside Terraform into state</td><td class="px-4 py-3"><code class="inline">terraform apply -refresh-only</code> after reviewing its plan</td><td class="px-4 py-3">Editing the JSON</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8"><code class="inline">import</code> blocks: adopting what was clicked</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every client arrives with resources someone created in the console. An <strong><code class="inline">import</code>
+        block</strong> tells Terraform "this address corresponds to that existing ID"; the plan shows the import, and the
+        apply records it in state without changing the resource. Terraform can even draft the HCL for you.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/imports.tf</span>
+        <pre class="code"><span class="kw">import</span> {
+  to = aws_s3_bucket.uploads                       <span class="cm"># created by hand last year</span>
+  id = <span class="st">"clinic-dev-uploads"</span>                        <span class="cm"># the ID format is on each resource's registry page</span>
+}</pre>
+      </div>
+      <pre class="code mt-3">terraform plan -generate-config-out=generated_uploads.tf
+<span class="out">aws_s3_bucket.uploads: Preparing import... [id=clinic-dev-uploads]
+aws_s3_bucket.uploads: Refreshing state... [id=clinic-dev-uploads]
+
+Terraform will perform the following actions:
+
+  # aws_s3_bucket.uploads will be imported
+  # (config will be generated)
+    resource "aws_s3_bucket" "uploads" {
+        bucket = "clinic-dev-uploads"
+        ...
+    }
+
+Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.</span>
+<span class="cm"># generated code is a draft: delete computed and default arguments, move it into storage.tf,
+# then plan again until it says "1 to import, 0 to change"</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8"><code class="inline">moved</code> and <code class="inline">removed</code> blocks: refactoring without destroying</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Renaming a resource in code changes its address. Without help, Terraform sees one resource deleted and a new one
+        created: for a database, a destroy. A <strong><code class="inline">moved</code></strong> block records the rename so
+        the plan shows a move and nothing else. It also handles the common migration from <code class="inline">count</code>
+        to <code class="inline">for_each</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/dev/refactor.tf</span>
+        <pre class="code"><span class="kw">moved</span> {
+  from = aws_db_instance.this                      <span class="cm"># the agent's first draft called it "this"</span>
+  to   = aws_db_instance.booking
+}
+<span class="kw">moved</span> {
+  from = aws_cloudwatch_log_group.svc[0]           <span class="cm"># count index ...</span>
+  to   = aws_cloudwatch_log_group.svc[<span class="st">"booking-api"</span>]   <span class="cm"># ... to for_each key</span>
+}
+<span class="kw">removed</span> {
+  from = aws_s3_bucket.legacy_exports              <span class="cm"># hand it over to another stack</span>
+  lifecycle {
+    destroy = <span class="kw">false</span>                               <span class="cm"># forget it, do not delete it</span>
+  }
+}</pre>
+      </div>
+      <pre class="code mt-3">terraform plan
+<span class="out">  # aws_db_instance.this has moved to aws_db_instance.booking
+    resource "aws_db_instance" "booking" {
+        id = "db-7HQXK2M4ZP3B5N6C"
+        # (52 unchanged attributes hidden)
+    }
+
+  # aws_s3_bucket.legacy_exports will no longer be managed by Terraform, but will not be destroyed
+  # (destroy = false is set in the configuration)
+
+Plan: 0 to add, 0 to change, 0 to destroy.</span>
+<span class="cm"># "0 to destroy" is the whole point. Keep moved blocks until every environment has applied them</span></pre>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Reading a plan safely</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Read every plan as if it could delete production, because one day it will</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The plan is the contract. Whatever it says, apply does, and nothing else. Reviewing Terraform therefore means
+        reviewing the plan, not just the code diff: the same three-line code change can be harmless in dev and replace a
+        database in prod because the state differs. This Part teaches you to read plans line by line and to put guardrails
+        in place for the times a tired reviewer does not.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The symbols</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every resource in a plan starts with a symbol. Learn them until you see them without reading. The two that should
+        stop you are any <code class="inline">-</code> and any line ending in <code class="inline"># forces replacement</code>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Symbol</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">Risk on a stateful resource</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">+</code> create</td><td class="px-4 py-3">A new object will be created</td><td class="px-4 py-3">Low; check cost and naming</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">~</code> update in-place</td><td class="px-4 py-3">Same object, some attributes change via a modify API</td><td class="px-4 py-3">Usually low, but an in-place RDS class change still restarts the instance</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">-</code> destroy</td><td class="px-4 py-3">The object will be deleted</td><td class="px-4 py-3">High: data gone unless snapshots or versioning save you</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">-/+</code> destroy, then create replacement</td><td class="px-4 py-3">An attribute that cannot be modified changed; the old object is deleted first</td><td class="px-4 py-3">Highest: an empty new database, a new IP, a downtime window</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">+/-</code> create replacement, then destroy</td><td class="px-4 py-3">Same, with <code class="inline">create_before_destroy</code>: the new object exists first</td><td class="px-4 py-3">Less downtime, same data loss for stateful objects</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">&lt;=</code> read</td><td class="px-4 py-3">A data source will be read during apply (its inputs are unknown now)</td><td class="px-4 py-3">None by itself, but it can make dependent values unknown</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline"># forces replacement</code></td><td class="px-4 py-3">Marks the attribute that caused a <code class="inline">-/+</code></td><td class="px-4 py-3">This is the line to find and question</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">(known after apply)</code></td><td class="px-4 py-3">The value is computed by AWS during apply</td><td class="px-4 py-3">Expected on new objects; suspicious on an ID of an existing one</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 232" class="w-full min-w-[640px]" role="img" aria-label="Replacement order: destroy then create leaves a gap with no resource; create before destroy overlaps old and new">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">-/+ DESTROY THEN CREATE (default)</text>
+          <g class="anim-pulse"><rect x="20" y="35" width="180" height="44" rx="9" fill="#37474F"/>
+            <text x="110" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">old object</text>
+            <text x="110" y="69" text-anchor="middle" fill="#ffffffbb" font-size="9">deleted first</text></g>
+          <g class="anim-pulse d1"><rect x="230" y="35" width="150" height="44" rx="9" fill="#DB2777"/>
+            <text x="305" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">nothing exists</text>
+            <text x="305" y="69" text-anchor="middle" fill="#ffffffbb" font-size="9">outage window</text></g>
+          <g class="anim-pulse d2"><rect x="410" y="35" width="290" height="44" rx="9" fill="#0D9488"/>
+            <text x="555" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">new object</text>
+            <text x="555" y="69" text-anchor="middle" fill="#ffffffbb" font-size="9">new ID · new endpoint · empty if stateful</text></g>
+          <line x1="200" y1="57" x2="230" y2="57" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="380" y1="57" x2="410" y2="57" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="12" y="118" font-size="11" font-weight="700" fill="#6E6B64">+/- CREATE BEFORE DESTROY (lifecycle)</text>
+          <g class="anim-pulse d1"><rect x="20" y="128" width="330" height="38" rx="9" fill="#37474F"/>
+            <text x="185" y="144" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">old object keeps serving</text>
+            <text x="185" y="158" text-anchor="middle" fill="#ffffffbb" font-size="9">until the new one is ready</text></g>
+          <g class="anim-pulse d3"><rect x="230" y="172" width="470" height="38" rx="9" fill="#2563EB"/>
+            <text x="525" y="188" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">new object</text>
+            <text x="525" y="202" text-anchor="middle" fill="#ffffffbb" font-size="9">needs a unique name: use name_prefix</text></g>
+          <text x="360" y="226" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">neither order brings data with it: a replaced database is a new, empty database</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Walking through a dangerous plan</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An agent was asked to "upsize the dev database and use a clearer admin user name". The code diff is two lines and
+        looks harmless. The plan is not. Read it top to bottom with the symbols table in mind.
+      </p>
+      <pre class="code mt-3">terraform plan -out=tfplan
+<span class="out">Terraform used the selected providers to generate the following execution plan.
+Resource actions are indicated with the following symbols:
+  ~ update in-place
+-/+ destroy and then create replacement
+
+Terraform will perform the following actions:
+
+  # aws_db_instance.booking must be replaced
+-/+ resource "aws_db_instance" "booking" {
+      ~ address         = "clinic-dev-booking.c9x2k1q7ab3d.ap-southeast-1.rds.amazonaws.com" -&gt; (known after apply)
+      ~ id              = "db-7HQXK2M4ZP3B5N6C" -&gt; (known after apply)
+      ~ instance_class  = "db.t4g.micro" -&gt; "db.t4g.small"
+      ~ username        = "clinic_admin" -&gt; "booking_admin" # forces replacement
+        # (48 unchanged attributes hidden)
+    }
+
+  # aws_security_group.db will be updated in-place
+  ~ resource "aws_security_group" "db" {
+      ~ tags     = {
+          + "service" = "booking"
+        }
+        # (8 unchanged attributes hidden)
+    }
+
+Plan: 1 to add, 1 to change, 1 to destroy.</span></pre>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Start at the summary line.</strong> "1 to destroy" in a change that was meant to resize something is a
+          stop sign on its own. Any destroy must be explained in the PR description.</li>
+        <li><strong>Find the cause.</strong> <code class="inline">username … # forces replacement</code>: the master user
+          name cannot be changed on an existing RDS instance, so Terraform plans a new, empty database.</li>
+        <li><strong>Separate the intents.</strong> The class change alone would be <code class="inline">~</code>. Ask the
+          author to drop the rename (create a new Postgres role with SQL instead) and re-plan.</li>
+        <li><strong>Check the knock-on effects.</strong> A replaced database gets a new <code class="inline">address</code>,
+          which would change every output and app config that reads it.</li>
+      </ul>
+      <div class="mt-4 callout callout-warn"><strong>"It is only dev" is how prod gets deleted.</strong> The same module
+        and the same change will be applied to staging and prod next week, by a pipeline, from a plan nobody reads as
+        carefully. Treat a <code class="inline">-/+</code> on a stateful resource in dev as a bug in the change, not as an
+        acceptable dev-only side effect.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Guardrails in code: lifecycle and saved plans</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Reviews miss things. Put the important rules in code so Terraform itself refuses. The
+        <code class="inline">lifecycle</code> block has three arguments worth knowing, and saved plans close the gap
+        between what you reviewed and what runs.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Guardrail</th><th class="px-4 py-3">Effect</th><th class="px-4 py-3">Put it on</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">prevent_destroy = true</code></td><td class="px-4 py-3">Any plan that would destroy or replace the resource fails with an error</td><td class="px-4 py-3">Staging and prod databases, state buckets, apex hosted zones, KMS keys</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">create_before_destroy = true</code></td><td class="px-4 py-3">Replacement creates the new object first (<code class="inline">+/-</code>)</td><td class="px-4 py-3">Launch templates, certificates, security groups attached to live ENIs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">ignore_changes = [...]</code></td><td class="px-4 py-3">Terraform stops diffing listed attributes</td><td class="px-4 py-3">Attributes another system owns, e.g. <code class="inline">desired_count</code> under autoscaling. Never as a way to silence a diff you do not understand</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Provider-level protection</td><td class="px-4 py-3"><code class="inline">deletion_protection</code> on RDS, DynamoDB, ALB</td><td class="px-4 py-3">Every stateful prod resource, in addition to <code class="inline">prevent_destroy</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">plan -out</code> then <code class="inline">apply tfplan</code></td><td class="px-4 py-3">Apply executes exactly the reviewed plan, or fails if state moved on</td><td class="px-4 py-3">Every non-dev apply; pipelines do this in <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># machine-check a saved plan: list every delete or replacement</span>
+terraform show -json tfplan \
+  | jq -r '.resource_changes[] | select(.change.actions | index("delete"))
+           | "\(.change.actions | join("+"))  \(.address)"'
+<span class="out">delete+create  aws_db_instance.booking</span>
+<span class="cm"># empty output = no deletes. Any output on a database, bucket or zone = do not apply</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Drift and the plan review checklist</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When someone changes a resource in the console, the next plan shows Terraform putting it back. The plan header
+        says "Objects have changed outside of Terraform" and lists the differences first. Decide which side is right: if the
+        console change was an emergency fix that should stay, put it in code; if not, let the apply revert it. Run
+        <code class="inline">terraform plan -refresh-only</code> to see drift on its own without proposing changes.
+        Continuous drift detection is <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>.
+      </p>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Before you approve a plan</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Right account and workspace: the plan header and resource ARNs show the expected account ID</li>
+            <li>Summary line matches the intent of the PR</li>
+            <li>No <code class="inline">-</code>, <code class="inline">-/+</code> or <code class="inline">+/-</code> on databases, buckets, zones, keys, volumes</li>
+            <li>Every <code class="inline"># forces replacement</code> explained</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">Things that look small and are not</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>A changed <code class="inline">count</code> length or list order</li>
+            <li>A resource renamed without a <code class="inline">moved</code> block</li>
+            <li>A provider or module major-version bump in the same PR as other changes</li>
+            <li>Security group rules replaced (brief connection drop) and IAM policies widened to <code class="inline">*</code></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code writes good HCL, runs <code class="inline">fmt</code>, <code class="inline">validate</code> and
+        <code class="inline">plan</code> in a loop until they pass, and drafts import blocks for console-created resources.
+        Give it a role in gol-dev that can plan but not apply, and keep <code class="inline">apply</code> a human action
+        until <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a> moves it into a reviewed pipeline.
+        Guardrails for agents in infra repos are covered in depth in
+        <a href="./ar6.html" class="text-viol underline decoration-viol/40">AR6</a>.
+      </p>
+      <pre class="code mt-3">In clinic-infra/envs/dev, add an ElastiCache Valkey replication group for sessions in the
+database subnets, reachable only from the app security group. Run terraform fmt, validate
+and plan (profile gol-dev-readonly). Do not run apply. Paste the plan summary and explain
+every resource the plan creates.</pre>
+      <pre class="code mt-3">Here is a saved plan as JSON (terraform show -json tfplan). List every resource whose
+actions include "delete", and for each one name the attribute that forces replacement
+and propose a code change that avoids it (moved block, lifecycle, or a different approach).</pre>
+      <pre class="code mt-3">These S3 buckets and security groups in gol-dev were created by hand (list attached).
+Write import blocks for them, run plan -generate-config-out, then clean the generated code
+until the plan shows only imports and zero changes.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Write resources, variables with validation, and outputs from a short spec</li>
+            <li>Iterate on <code class="inline">fmt</code> / <code class="inline">validate</code> / <code class="inline">plan</code> errors</li>
+            <li>Draft import and moved blocks for refactors and adoptions</li>
+            <li>Summarise a long plan and flag every delete or replacement</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The plan, yourself, line by line for anything stateful; the agent's summary is not the review</li>
+            <li>Provider and module versions are pinned and the lock file is committed</li>
+            <li>The backend uses <code class="inline">use_lockfile = true</code> and no state file was created locally</li>
+            <li>No secrets in variables, tfvars, outputs or state</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written Terraform:</strong> a
+        <code class="inline">dynamodb_table</code> argument in the S3 backend (outdated pattern); provider blocks with
+        <code class="inline">access_key</code>/<code class="inline">secret_key</code>; unpinned providers or modules;
+        <code class="inline">count</code> over a list of names; renamed resources with no <code class="inline">moved</code>
+        block; <code class="inline">ignore_changes = all</code>; <code class="inline">depends_on</code> sprinkled where a
+        reference belongs; <code class="inline">random_password</code> feeding a database password into state; an agent
+        that ran <code class="inline">terraform apply -auto-approve</code>, <code class="inline">state rm</code> or
+        <code class="inline">force-unlock</code> to "fix" an error; and arguments from AWS provider v4/v5 that v6 removed or
+        renamed, which <code class="inline">validate</code> will catch if you run it.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Creates AWS resources only through the console.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can run init, plan and apply on existing code, but cannot explain what state is or why a plan shows a replacement.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds resources and variables to an existing stack following its patterns; needs a reviewer to catch replacements and index shifts.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Builds a stack from scratch with a remote S3 backend and native locking, uses <code class="inline">for_each</code>, data sources and registry modules correctly, adopts and refactors resources with import and moved blocks, and reads any plan to find every destroy and its cause.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the team's Terraform conventions (layout, naming, guardrails), reviews others' plans as the last line of defence, and teaches juniors to read plans before writing code.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> given five unlabelled plans
+        from a mentor (an in-place change, a forced replacement, an index shift, a move, an import), name what each one does
+        and which line tells you, in under ten minutes. Then rename a resource in your dev stack and get a plan that says
+        "0 to destroy".</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Reading the code diff instead of the plan</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The diff shows intent; the plan shows consequence. A one-word change to <code class="inline">username</code> or <code class="inline">availability_zone</code> looks trivial in the diff and replaces a database in the plan.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Fixing state by hand</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Editing <code class="inline">terraform.tfstate</code>, or running <code class="inline">state rm</code> to make an error go away, trades a visible problem for an invisible one: resources that exist in AWS but nowhere in code.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Applying a fresh plan instead of the reviewed one</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">terraform apply</code> without a plan file re-plans. If someone merged a change in between, you apply something nobody reviewed. Save the plan with <code class="inline">-out</code> and apply that file.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Small stacks, small plans</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A plan with 4 changes gets read; a plan with 140 gets skimmed. Keep network, data and app layers in separate states so each plan stays reviewable (state splitting in <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Paste the plan summary into every PR</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">"Plan: 2 to add, 1 to change, 0 to destroy" in the PR description makes the reviewer's first check free, and a surprise in that line gets noticed before anyone opens the full output.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="loop"> <span>I can explain how plan compares configuration, state and reality, and what init, plan and apply each do.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="language"> <span>I wrote a stack with typed and validated variables, locals, data sources, a registry module, <code class="inline">for_each</code> and outputs.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="backend"> <span>I configured an S3 backend with <code class="inline">use_lockfile = true</code> and saw the lock stop a second concurrent apply.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="refactor"> <span>I adopted a console-created resource with an <code class="inline">import</code> block and renamed a resource with a <code class="inline">moved</code> block, both with zero destroys.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="plan-reading"> <span>I can read a plan, explain every symbol, and find the attribute behind each forced replacement.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dev-stack"> <span class="font-semibold">Built the clinic dev environment in gol-dev (VPC from the registry module, RDS PostgreSQL, log groups with for_each) with remote state, then opened a PR in clinic-infra containing the code, the saved plan's summary, one import and one moved block, and a short note on a forced replacement you caught and avoided (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://developer.hashicorp.com/terraform/tutorials/aws-get-started" target="_blank" rel="noopener">HashiCorp — Get started with Terraform on AWS</a> — the official hands-on tutorial if Part I felt fast.</li>
+        <li><a class="text-coral underline" href="https://developer.hashicorp.com/terraform/language/backend/s3" target="_blank" rel="noopener">HashiCorp — S3 backend</a> — every option, including <code class="inline">use_lockfile</code> and the required IAM permissions.</li>
+        <li><a class="text-coral underline" href="https://developer.hashicorp.com/terraform/language/meta-arguments/for_each" target="_blank" rel="noopener">HashiCorp — The for_each meta-argument</a> — keys, <code class="inline">each.value</code> and the plan-time limitation.</li>
+        <li><a class="text-coral underline" href="https://developer.hashicorp.com/terraform/language/import" target="_blank" rel="noopener">HashiCorp — Import blocks</a> · <a class="text-coral underline" href="https://developer.hashicorp.com/terraform/language/modules/develop/refactoring" target="_blank" rel="noopener">Refactoring with moved blocks</a> — the two tools of Part III.</li>
+        <li><a class="text-coral underline" href="https://developer.hashicorp.com/terraform/cli/commands/plan" target="_blank" rel="noopener">HashiCorp — terraform plan command</a> — <code class="inline">-out</code>, <code class="inline">-refresh-only</code>, <code class="inline">-generate-config-out</code>.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws/latest" target="_blank" rel="noopener">Terraform Registry — terraform-aws-modules/vpc</a> — inputs and outputs of the module used for the dev VPC.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs/guides/version-6-upgrade" target="_blank" rel="noopener">Terraform Registry — AWS provider v6 upgrade guide</a> — what changed in 6.0, so you can spot outdated arguments in older examples.</li>
+      </ul>

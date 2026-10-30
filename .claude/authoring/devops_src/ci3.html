@@ -1,0 +1,748 @@
+<!-- meta: days=3 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Secrets &amp; Configuration: Secrets Manager, SSM &amp; KMS</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Every service on the clinic booking platform needs configuration it should not hard-code: a database password,
+          a Stripe key, a feature toggle, the URL of the SQS queue. This module gives you one opinionated system for all of
+          it: plain config in SSM Parameter Store, real secrets in Secrets Manager, every key you control in KMS, and values
+          injected at runtime by reference into ECS, EKS, Lambda and GitHub Actions. It ends with the part nobody plans for:
+          what to do in the first fifteen minutes after a key leaks.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> leaked credentials are one of the most common ways AWS accounts are
+          compromised, and bots scrape public GitHub for AWS keys within minutes of a push. The quieter failures are just as
+          real: a password rotated in Secrets Manager that running tasks never pick up, a key policy that locks out the only
+          role allowed to decrypt backups, a Terraform state file in S3 holding the production database password in plain
+          text. Each one is cheap to prevent and expensive to discover.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Config vs secrets</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Config and secrets have different lifecycles, so they live in different stores</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        In CI1 you authenticated GitHub Actions to AWS with OIDC, so the pipeline itself needs no stored keys. The
+        application still needs values at runtime. The mistake is treating all of them the same way, either all in
+        environment variables in the task definition or all in Secrets Manager at USD 0.40 each. Sort values by what happens
+        if they leak and how often they change, then pick the store.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Three kinds of value, three homes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The test is simple: <strong>would you be comfortable pasting this value in a public Slack channel?</strong> If yes, it
+        is config. If no but nobody can log in with it, it is sensitive config. If someone can authenticate with it, it is a
+        secret, and it needs rotation and an audit trail.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Kind</th><th class="px-4 py-3">Clinic examples</th><th class="px-4 py-3">Store</th><th class="px-4 py-3">Rotation</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Plain config</td><td class="px-4 py-3"><code class="inline">LOG_LEVEL</code>, SQS queue URL, <code class="inline">BOOKING_SLOT_MINUTES=15</code></td><td class="px-4 py-3">SSM <code class="inline">String</code>, or a Terraform-rendered env var</td><td class="px-4 py-3">Never: it changes when the product changes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sensitive config</td><td class="px-4 py-3">Internal webhook URL, Sentry DSN, partner clinic IDs</td><td class="px-4 py-3">SSM <code class="inline">SecureString</code> (KMS-encrypted)</td><td class="px-4 py-3">Manual, when it is exposed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Secret</td><td class="px-4 py-3">RDS password, Stripe secret key, JWT signing key, SMTP credentials</td><td class="px-4 py-3">Secrets Manager</td><td class="px-4 py-3">Scheduled: 30–90 days, or managed by RDS</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On a typical clinic environment this gives about 25 SSM parameters and 6 secrets. That is USD 2.40 a month for
+        Secrets Manager instead of USD 12.40 if everything went there, and, more importantly, the 6 secrets get rotation and
+        the 25 parameters do not carry rotation machinery they never use.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Secrets Manager vs Parameter Store, honestly compared</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Both stores encrypt with KMS, both are called with IAM, and both can be referenced from an ECS task definition. The
+        differences that matter are rotation, cross-account sharing, size and throughput. Know these numbers; they decide
+        the design.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Property</th><th class="px-4 py-3">SSM Parameter Store</th><th class="px-4 py-3">Secrets Manager</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Price</td><td class="px-4 py-3">Standard tier free; Advanced USD 0.05/parameter/month</td><td class="px-4 py-3">USD 0.40/secret/month + USD 0.05 per 10,000 API calls</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Max value size</td><td class="px-4 py-3">4 KB standard, 8 KB advanced</td><td class="px-4 py-3">64 KB</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Built-in rotation</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Yes: Lambda-based, or fully managed for RDS, Aurora, Redshift</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cross-account access</td><td class="px-4 py-3">Advanced tier only, shared through AWS RAM</td><td class="px-4 py-3">Resource policy on the secret (plus a customer managed KMS key)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Multi-region</td><td class="px-4 py-3">No: copy it yourself</td><td class="px-4 py-3">Replica secrets in other regions, kept in sync</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Throughput</td><td class="px-4 py-3">40 TPS shared by default; "higher throughput" setting is paid</td><td class="px-4 py-3">Thousands of <code class="inline">GetSecretValue</code> TPS; cache anyway</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Versioning</td><td class="px-4 py-3">Numbered versions and labels</td><td class="px-4 py-3">Staging labels <code class="inline">AWSCURRENT</code> / <code class="inline">AWSPENDING</code> / <code class="inline">AWSPREVIOUS</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>The 40 TPS trap:</strong> a <code class="inline">booking-worker</code>
+        that reads three parameters on every SQS message will hit
+        <code class="inline">ThrottlingException</code> the first time the queue backs up. Read configuration once at start-up
+        (or through a cache with a TTL of a few minutes), never per request. That rule applies to Secrets Manager too, where
+        every call is also billed.</div>
+
+      <h3 class="font-semibold text-lg mt-8">One naming scheme, enforced by IAM</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Names are not cosmetic. A hierarchy of <code class="inline">/&lt;system&gt;/&lt;env&gt;/&lt;service&gt;/&lt;key&gt;</code>
+        lets you write one IAM statement per service that grants exactly its own path, and lets you list everything a
+        service depends on with one call. Each environment lives in its own account (AW1), so the
+        <code class="inline">env</code> segment is redundant for isolation but invaluable when someone pastes a name in a
+        ticket.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 240" class="w-full min-w-[640px]" role="img" aria-label="Where booking-api gets each kind of value: env vars from the task definition, parameters from SSM, secrets from Secrets Manager, all decrypted through KMS">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">WHERE booking-api GETS ITS VALUES · gol-prod account</text>
+          <g class="anim-pulse"><rect x="20" y="45" width="170" height="50" rx="9" fill="#37474F"/>
+            <text x="105" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Task definition env</text>
+            <text x="105" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">LOG_LEVEL · PORT=8080</text></g>
+          <g class="anim-pulse d1"><rect x="20" y="110" width="170" height="50" rx="9" fill="#2563EB"/>
+            <text x="105" y="131" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SSM Parameter Store</text>
+            <text x="105" y="146" text-anchor="middle" fill="#ffffffbb" font-size="9">/clinic/prod/booking-api/*</text></g>
+          <g class="anim-pulse d2"><rect x="20" y="175" width="170" height="50" rx="9" fill="#6d5acd"/>
+            <text x="105" y="196" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Secrets Manager</text>
+            <text x="105" y="211" text-anchor="middle" fill="#ffffffbb" font-size="9">clinic/prod/booking-api/db</text></g>
+          <g class="anim-pulse d3"><rect x="275" y="110" width="160" height="50" rx="9" fill="#D97757"/>
+            <text x="355" y="131" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ECS agent at start</text>
+            <text x="355" y="146" text-anchor="middle" fill="#ffffffbb" font-size="9">uses the execution role</text></g>
+          <g class="anim-pulse d4"><rect x="520" y="110" width="180" height="50" rx="9" fill="#0D9488"/>
+            <text x="610" y="131" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api container</text>
+            <text x="610" y="146" text-anchor="middle" fill="#ffffffbb" font-size="9">sees plain env vars only</text></g>
+          <g class="anim-pulse d2"><rect x="275" y="190" width="160" height="40" rx="9" fill="#DB2777"/>
+            <text x="355" y="208" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">KMS</text>
+            <text x="355" y="221" text-anchor="middle" fill="#ffffffbb" font-size="9">kms:Decrypt on the CMK</text></g>
+          <line x1="190" y1="70" x2="275" y2="125" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="190" y1="135" x2="275" y2="135" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="190" y1="200" x2="275" y2="145" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="435" y1="135" x2="520" y2="135" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="355" y1="160" x2="355" y2="190" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="560" y="200" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">values are resolved once, when the task starts</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/service-config/main.tf</span>
+        <pre class="code"><span class="kw">locals</span> {
+  prefix = <span class="st">"/clinic/${var.env}/${var.service}"</span>   <span class="cm"># /clinic/prod/booking-api</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_ssm_parameter"</span> <span class="st">"config"</span> {
+  for_each = var.config                           <span class="cm"># { LOG_LEVEL = "info", SLOT_MINUTES = "15" }</span>
+  name     = <span class="st">"${local.prefix}/${each.key}"</span>
+  type     = <span class="st">"String"</span>
+  value    = each.value
+}
+
+<span class="kw">resource</span> <span class="st">"aws_secretsmanager_secret"</span> <span class="st">"this"</span> {
+  for_each   = toset(var.secret_names)            <span class="cm"># ["stripe", "jwt"]: the container, not the value</span>
+  name       = <span class="st">"clinic/${var.env}/${var.service}/${each.key}"</span>
+  kms_key_id = var.kms_key_arn                    <span class="cm"># our CMK, not aws/secretsmanager</span>
+  recovery_window_in_days = 7                     <span class="cm"># a deleted secret can be restored for a week</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice what is missing: no <code class="inline">aws_secretsmanager_secret_version</code> with the Stripe key in it.
+        Terraform creates the empty secret; a human or a rotation function puts the value in. Part III explains why, and the
+        one Terraform feature that lets you set a value safely when you must.
+      </p>
+      <pre class="code mt-3">aws ssm get-parameters-by-path --path /clinic/prod/booking-api --recursive \
+  --query 'Parameters[].[Name,Type]' --output text --profile gol-prod
+<span class="out">/clinic/prod/booking-api/LOG_LEVEL        String
+/clinic/prod/booking-api/SLOT_MINUTES     String
+/clinic/prod/booking-api/SENTRY_DSN       SecureString</span>
+<span class="cm"># the full dependency list of one service, in one call</span></pre>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · KMS</div>
+      <h2 class="font-display text-2xl font-bold mt-2">KMS never sees your data; it guards the keys that do</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        AWS Key Management Service holds key material in hardware security modules and never lets it leave. Every
+        encrypted thing on the platform (RDS storage, S3 objects, EBS volumes, SecureStrings, secrets, Terraform state) ends
+        in a call to KMS. Understanding KMS means understanding two ideas: <strong>envelope encryption</strong>, which
+        explains how it scales, and the <strong>key policy</strong>, which explains who can use it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Envelope encryption: encrypt the data with a key, encrypt that key with KMS</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        KMS <code class="inline">Encrypt</code> only accepts 4 KB of plaintext, and sending a 2 GB database backup to KMS
+        would be slow anyway. So services ask KMS for a <strong>data key</strong>: KMS returns it twice, once in plaintext
+        and once encrypted under your KMS key. The service encrypts the data locally with the plaintext key, throws that
+        key away, and stores the encrypted data key next to the ciphertext. To read the data, it sends only the small
+        encrypted data key back to KMS for decryption.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Envelope encryption: KMS returns a plaintext and an encrypted data key; the data is encrypted locally and stored with the encrypted data key">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ENVELOPE ENCRYPTION · what Secrets Manager, S3 and RDS do for you</text>
+          <g class="anim-pulse"><rect x="20" y="70" width="150" height="56" rx="9" fill="#DB2777"/>
+            <text x="95" y="93" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">KMS key (CMK)</text>
+            <text x="95" y="109" text-anchor="middle" fill="#ffffffbb" font-size="9">never leaves the HSM</text></g>
+          <g class="anim-pulse d1"><rect x="250" y="40" width="160" height="46" rx="9" fill="#D97757"/>
+            <text x="330" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Plaintext data key</text>
+            <text x="330" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">used once, then wiped</text></g>
+          <g class="anim-pulse d2"><rect x="250" y="120" width="160" height="46" rx="9" fill="#6d5acd"/>
+            <text x="330" y="140" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Encrypted data key</text>
+            <text x="330" y="154" text-anchor="middle" fill="#ffffffbb" font-size="9">safe to store anywhere</text></g>
+          <g class="anim-pulse d3"><rect x="500" y="40" width="200" height="46" rx="9" fill="#2563EB"/>
+            <text x="600" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">AES-256-GCM locally</text>
+            <text x="600" y="74" text-anchor="middle" fill="#ffffffbb" font-size="9">secret value → ciphertext</text></g>
+          <g class="anim-pulse d4"><rect x="500" y="120" width="200" height="46" rx="9" fill="#0D9488"/>
+            <text x="600" y="140" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Stored together</text>
+            <text x="600" y="154" text-anchor="middle" fill="#ffffffbb" font-size="9">ciphertext + encrypted key</text></g>
+          <line x1="170" y1="90" x2="250" y2="63" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="170" y1="105" x2="250" y2="143" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="410" y1="63" x2="500" y2="63" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="410" y1="143" x2="500" y2="143" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="600" y1="86" x2="600" y2="120" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="95" y="150" text-anchor="middle" font-size="9" fill="#6E6B64">GenerateDataKey</text>
+          <text x="360" y="205" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">to decrypt: send only the small encrypted key back to KMS · kms:Decrypt is the permission that matters</text>
+        </svg>
+      </div>
+      <pre class="code mt-3">aws kms generate-data-key --key-id alias/clinic-prod-secrets --key-spec AES_256 \
+  --encryption-context service=booking-api --profile gol-prod
+<span class="out">{
+    "CiphertextBlob": "AQIDAHh0x8...k3Q==",
+    "Plaintext": "q8Hf2c1...Wz0=",
+    "KeyId": "arn:aws:kms:ap-southeast-1:444455556666:key/6f1c2b9e-..."
+}</span>
+<span class="cm"># store CiphertextBlob next to the data; use Plaintext once, then drop it from memory</span>
+<span class="cm"># the same encryption context must be supplied to Decrypt, and it appears in CloudTrail</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will rarely call <code class="inline">GenerateDataKey</code> yourself; Secrets Manager, S3 and RDS do it for
+        you. What you take from it is operational: <strong>losing access to the KMS key means losing the data</strong>, even
+        though the data itself is still in the bucket. Deleting a key, or editing its policy so nobody can use it, is the
+        one AWS mistake that cannot be fixed by support.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">AWS managed keys vs customer managed keys</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every service offers a free AWS managed key such as <code class="inline">aws/secretsmanager</code> or
+        <code class="inline">aws/ebs</code>. You cannot edit its policy, so it only works inside one account. For anything
+        that crosses an account boundary (a secret read from <code class="inline">gol-shared</code>, an RDS snapshot copied to
+        <code class="inline">gol-log-archive</code>, an ECR image pulled cross-account) you need a customer managed key.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Key type</th><th class="px-4 py-3">Cost</th><th class="px-4 py-3">Policy control</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">AWS owned</td><td class="px-4 py-3">Free, invisible</td><td class="px-4 py-3">None, not even visible in your account</td><td class="px-4 py-3">Defaults you never think about (SQS SSE-SQS, DynamoDB default)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AWS managed (<code class="inline">aws/…</code>)</td><td class="px-4 py-3">Free storage, per-request charges</td><td class="px-4 py-3">Read-only policy, same account only</td><td class="px-4 py-3">Dev accounts, single-account data with no sharing</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Customer managed (CMK)</td><td class="px-4 py-3">USD 1/key/month + USD 0.03 per 10,000 requests</td><td class="px-4 py-3">Full: key policy, grants, rotation schedule, deletion</td><td class="px-4 py-3">Prod secrets, cross-account sharing, anything an auditor asks about</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Our default per prod account is four CMKs: <code class="inline">clinic-prod-secrets</code>,
+        <code class="inline">clinic-prod-data</code> (RDS, S3, EBS), <code class="inline">clinic-prod-logs</code> and
+        <code class="inline">clinic-prod-tfstate</code>. That is USD 4 a month, and it buys separate blast radius: revoking
+        access to logs does not touch the database.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Cross-account reads need <strong>both</strong> doors open: the secret's resource policy and the CMK's key policy must
+        name the reader. Here the <code class="inline">gol-shared</code> CI role reads one secret owned by
+        <code class="inline">gol-prod</code>:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/secrets-sharing.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_secretsmanager_secret_policy"</span> <span class="st">"sentry_token"</span> {
+  secret_arn = aws_secretsmanager_secret.sentry_release_token.arn
+  policy = jsonencode({
+    Version = <span class="st">"2012-10-17"</span>
+    Statement = [{
+      Effect    = <span class="st">"Allow"</span>
+      Principal = { AWS = <span class="st">"arn:aws:iam::111122223333:role/gha-clinic-app-ecr-push"</span> }
+      Action    = <span class="st">"secretsmanager:GetSecretValue"</span>
+      Resource  = <span class="st">"*"</span>                          <span class="cm"># "*" here means "this secret": it is a resource policy</span>
+    }]
+  })
+}
+<span class="cm"># door 2: the key policy of alias/clinic-prod-secrets must also allow kms:Decrypt for that role</span></pre>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> run
+        <code class="inline">aws secretsmanager validate-resource-policy</code> in CI for every secret policy, and pass
+        <code class="inline">--block-public-policy</code> when you put one. Both reject a policy that would let any AWS
+        principal read the secret, which is exactly the mistake that turns a cross-account share into a public one.</div>
+
+      <h3 class="font-semibold text-lg mt-8">The key policy is the root of trust</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        For most AWS resources, an IAM policy alone grants access. KMS is different: <strong>the key policy must allow the
+        account (or the principal) first</strong>, and only then do IAM policies count. The standard first statement
+        delegates to IAM in the owning account. Without it, only the principals named in the key policy can use or even
+        manage the key, and if those roles are deleted the key is orphaned. Write key policies in Terraform, never in the
+        console.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/kms.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_kms_key"</span> <span class="st">"secrets"</span> {
+  description             = <span class="st">"clinic-prod secrets (Secrets Manager, SSM SecureString)"</span>
+  enable_key_rotation     = true
+  rotation_period_in_days = 365
+  deletion_window_in_days = 30                       <span class="cm"># the maximum: buys time to notice a mistake</span>
+  policy                  = data.aws_iam_policy_document.secrets_key.json
+}
+
+<span class="kw">data</span> <span class="st">"aws_iam_policy_document"</span> <span class="st">"secrets_key"</span> {
+  statement {                                        <span class="cm"># 1. let IAM in this account decide: never remove</span>
+    sid       = <span class="st">"EnableIAMPolicies"</span>
+    actions   = [<span class="st">"kms:*"</span>]
+    resources = [<span class="st">"*"</span>]
+    principals { type = <span class="st">"AWS"</span>, identifiers = [<span class="st">"arn:aws:iam::444455556666:root"</span>] }
+  }
+  statement {                                        <span class="cm"># 2. decrypt only when called through these services</span>
+    sid       = <span class="st">"DecryptViaSecretsServices"</span>
+    actions   = [<span class="st">"kms:Decrypt"</span>]
+    resources = [<span class="st">"*"</span>]
+    principals { type = <span class="st">"AWS"</span>, identifiers = [aws_iam_role.booking_api_exec.arn] }
+    condition {
+      test     = <span class="st">"StringEquals"</span>
+      variable = <span class="st">"kms:ViaService"</span>
+      values   = [<span class="st">"secretsmanager.ap-southeast-1.amazonaws.com"</span>, <span class="st">"ssm.ap-southeast-1.amazonaws.com"</span>]
+    }
+  }
+}
+
+<span class="kw">resource</span> <span class="st">"aws_kms_alias"</span> <span class="st">"secrets"</span> {
+  name          = <span class="st">"alias/clinic-prod-secrets"</span>       <span class="cm"># code refers to the alias, never the key ID</span>
+  target_key_id = aws_kms_key.secrets.key_id
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">kms:ViaService</code> condition means a stolen execution role credential cannot call
+        <code class="inline">kms:Decrypt</code> directly on a ciphertext copied out of a backup: the call has to come
+        through Secrets Manager or SSM, which apply their own authorisation and log a
+        <code class="inline">GetSecretValue</code> event. Two statements, and one whole class of misuse is gone.
+      </p>
+      <div class="mt-4 callout callout-danger"><strong>Never let a plan delete a KMS key without a second reviewer.</strong>
+        <code class="inline">aws_kms_key</code> destruction schedules deletion after the window (7–30 days); after that,
+        every snapshot, object and secret encrypted with it is unreadable forever. If a plan shows
+        <code class="inline">- destroy</code> on a key, stop. Add <code class="inline">lifecycle { prevent_destroy = true }</code>
+        to every prod key, and alert on the CloudTrail event <code class="inline">ScheduleKeyDeletion</code>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Key rotation is free and invisible; turn it on</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Automatic rotation</strong> creates new key material on a schedule (any period from 90 to 2,560 days; we use
+        365) and keeps all old material, so nothing needs re-encrypting. New encryptions use the new material, and old
+        ciphertexts still decrypt. You can also trigger an on-demand rotation after a suspected exposure. Key rotation is
+        <em>not</em> secret rotation: rotating the KMS key does nothing to a leaked database password. Those are different
+        problems with different tools, and Part III covers the second.
+      </p>
+      <pre class="code mt-3">aws kms get-key-rotation-status --key-id alias/clinic-prod-secrets --profile gol-prod
+<span class="out">{
+    "KeyRotationEnabled": true,
+    "RotationPeriodInDays": 365,
+    "NextRotationDate": "2027-03-14T00:00:00+07:00"
+}</span>
+aws kms rotate-key-on-demand --key-id alias/clinic-prod-secrets --profile gol-prod
+<span class="cm"># on-demand rotation: up to 10 per key, does not reset the automatic schedule</span></pre>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Injection &amp; rotation</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Inject by reference at runtime; never bake values into images, code or state</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A secret in a Docker image is in every registry layer and every laptop that pulled it. A secret in Terraform state is
+        readable by everyone who can run <code class="inline">terraform plan</code>. The pattern that avoids both is the
+        same on every runtime: the deploy artefact holds only an <strong>ARN or name</strong>, and the platform resolves it
+        to a value at start-up using the workload's own IAM role.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">ECS: <code class="inline">secrets</code> in the task definition</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The ECS agent reads each <code class="inline">valueFrom</code> using the <strong>task execution role</strong> (not the
+        task role; <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a> explains the difference) and
+        sets it as an environment variable before your process starts. You can pick one JSON key out of a secret with the
+        <code class="inline">arn:…:secret:name-SUFFIX:json-key::</code> form, so one RDS secret feeds both
+        <code class="inline">DB_USER</code> and <code class="inline">DB_PASSWORD</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api task definition — container excerpt</span>
+        <pre class="code">"environment": [
+  { "name": "LOG_LEVEL", "value": "info" }
+],
+"secrets": [
+  { "name": "DB_USER",
+    "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:444455556666:secret:clinic/prod/booking-api/db-Xy12Ab:username::" },
+  { "name": "DB_PASSWORD",
+    "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:444455556666:secret:clinic/prod/booking-api/db-Xy12Ab:password::" },
+  { "name": "STRIPE_SECRET_KEY",
+    "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:444455556666:secret:clinic/prod/booking-api/stripe-Qw98Zx" },
+  { "name": "SENTRY_DSN",
+    "valueFrom": "arn:aws:ssm:ap-southeast-1:444455556666:parameter/clinic/prod/booking-api/SENTRY_DSN" }
+]</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/ecs-service/iam.tf — execution role, exact resources only</span>
+        <pre class="code"><span class="kw">data</span> <span class="st">"aws_iam_policy_document"</span> <span class="st">"exec_secrets"</span> {
+  statement {
+    actions   = [<span class="st">"secretsmanager:GetSecretValue"</span>]
+    resources = [<span class="st">"arn:aws:secretsmanager:ap-southeast-1:444455556666:secret:clinic/prod/booking-api/*"</span>]
+  }
+  statement {
+    actions   = [<span class="st">"ssm:GetParameters"</span>]          <span class="cm"># plural: that is the call the agent makes</span>
+    resources = [<span class="st">"arn:aws:ssm:ap-southeast-1:444455556666:parameter/clinic/prod/booking-api/*"</span>]
+  }
+  statement {
+    actions   = [<span class="st">"kms:Decrypt"</span>]
+    resources = [aws_kms_key.secrets.arn]           <span class="cm"># needed because the secrets use our CMK</span>
+  }
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Values are read once, when the task starts.</strong> After a rotation,
+        running tasks keep the old password until they are replaced. Either the rotation keeps the old credential valid for
+        a while (the alternating-users strategy below), or the rotation event triggers
+        <code class="inline">aws ecs update-service --force-new-deployment</code>. A task that cannot read a secret fails
+        with <code class="inline">ResourceInitializationError: unable to pull secrets or registry auth</code>; check the
+        execution role first, then the KMS key policy.</div>
+
+      <h3 class="font-semibold text-lg mt-8">EKS, Lambda and GitHub Actions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The other runtimes follow the same rule with different plumbing. On EKS we sync Secrets Manager into Kubernetes
+        Secrets with the <strong>External Secrets Operator</strong>; the full EKS story (Pod Identity for the operator,
+        Secrets Store CSI as the alternative, KMS envelope encryption of etcd) belongs to
+        <a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>. Lambda uses the
+        <strong>AWS Parameters and Secrets Lambda Extension</strong>, a local HTTP cache on port 2773, so a hot function does
+        not call Secrets Manager on every invocation.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Runtime</th><th class="px-4 py-3">Mechanism</th><th class="px-4 py-3">Identity that reads</th><th class="px-4 py-3">Picks up a rotation</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">ECS / Fargate</td><td class="px-4 py-3"><code class="inline">secrets[].valueFrom</code></td><td class="px-4 py-3">Task execution role</td><td class="px-4 py-3">On next task start (redeploy)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EKS</td><td class="px-4 py-3">External Secrets Operator → K8s Secret</td><td class="px-4 py-3">ESO's Pod Identity role</td><td class="px-4 py-3">At <code class="inline">refreshInterval</code>; Pods need a restart unless they re-read a mounted file</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lambda</td><td class="px-4 py-3">Parameters and Secrets extension</td><td class="px-4 py-3">Function execution role</td><td class="px-4 py-3">After the cache TTL (default 300 s)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">GitHub Actions</td><td class="px-4 py-3"><code class="inline">aws-secretsmanager-get-secrets</code> action</td><td class="px-4 py-3">OIDC-assumed deploy role</td><td class="px-4 py-3">Every run</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-api/externalsecret.yaml</span>
+        <pre class="code">apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata: { name: booking-api-db, namespace: booking }
+spec:
+  refreshInterval: 1h                         <span class="cm"># how often ESO re-reads Secrets Manager</span>
+  secretStoreRef: { kind: ClusterSecretStore, name: aws-secrets-manager }
+  target: { name: booking-api-db }            <span class="cm"># the Kubernetes Secret ESO writes</span>
+  dataFrom:
+    - extract: { key: clinic/prod/booking-api/db }   <span class="cm"># every JSON key becomes a Secret key</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.github/workflows/migrate.yml — excerpt</span>
+        <pre class="code">permissions: { id-token: write, contents: read }
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4     <span class="cm"># pin by SHA in real workflows (CI1)</span>
+    with:
+      role-to-assume: arn:aws:iam::333344445555:role/gha-clinic-app-deploy
+      aws-region: ap-southeast-1
+  - uses: aws-actions/aws-secretsmanager-get-secrets@v2
+    with:
+      secret-ids: DB, clinic/staging/booking-api/db    <span class="cm"># alias DB → env vars DB_USERNAME, DB_PASSWORD</span>
+      parse-json-secrets: true                         <span class="cm"># values are masked in the log automatically</span>
+  - run: npx prisma migrate deploy</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Use <strong>GitHub environment secrets</strong> only for values AWS cannot hold for you, such as a third-party
+        token the pipeline itself needs before it reaches AWS. Anything the application needs at runtime belongs in AWS,
+        where the workload reads it with its own role and CloudTrail records each read.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Rotation: let RDS do it, and design for overlap</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        For the RDS master password, set <code class="inline">manage_master_user_password = true</code>. RDS creates the
+        secret, encrypts it with your key, and rotates it every 7 days by default, with no Lambda to maintain. For
+        application users and third-party keys, Secrets Manager runs a rotation Lambda through four fixed steps, moving
+        staging labels as it goes. The diagram shows the <strong>alternating-users</strong> strategy, which keeps the
+        previous credential valid so running ECS tasks do not break.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant SM as Secrets Manager
+    participant L as Rotation Lambda
+    participant DB as RDS Postgres
+    participant T as booking-api tasks
+    SM->>L: createSecret
+    L->>SM: new password for booking_app_b, label AWSPENDING
+    SM->>L: setSecret
+    L->>DB: ALTER ROLE booking_app_b PASSWORD '…'
+    SM->>L: testSecret
+    L->>DB: connect as booking_app_b, SELECT 1
+    SM->>L: finishSecret
+    L->>SM: move AWSCURRENT to the new version (old one becomes AWSPREVIOUS)
+    Note over T,DB: running tasks still use booking_app_a, which stays valid<br/>new tasks read AWSCURRENT and log in as booking_app_b
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/rds.tf — no password in code or state</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_db_instance"</span> <span class="st">"booking"</span> {
+  identifier                    = <span class="st">"clinic-prod-booking"</span>
+  engine                        = <span class="st">"postgres"</span>
+  username                      = <span class="st">"clinic_admin"</span>
+  manage_master_user_password   = true                     <span class="cm"># RDS owns the secret and rotates it</span>
+  master_user_secret_kms_key_id = aws_kms_key.secrets.arn
+  <span class="cm"># ... instance class, storage, subnets: see AW5</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_secretsmanager_secret_rotation"</span> <span class="st">"stripe"</span> {
+  secret_id           = aws_secretsmanager_secret.this[<span class="st">"stripe"</span>].id
+  rotation_lambda_arn = aws_lambda_function.rotate_stripe.arn
+  rotation_rules { schedule_expression = <span class="st">"rate(90 days)"</span> }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Terraform state is a secrets store whether you like it or not</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Any value Terraform reads or writes lands in state in plain text: a <code class="inline">random_password</code>, a
+        <code class="inline">secret_string</code>, a data source that reads a secret. The state bucket is encrypted at rest,
+        but everyone with <code class="inline">s3:GetObject</code> on it can read the value. Three tools keep secrets out of
+        state, in order of preference.
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Let the service generate it</strong>: <code class="inline">manage_master_user_password</code> for RDS and
+          Aurora, generated ElastiCache auth tokens stored by rotation. Terraform never sees the value.</li>
+        <li><strong>Write-only arguments</strong> (Terraform 1.11+): <code class="inline">secret_string_wo</code> on
+          <code class="inline">aws_secretsmanager_secret_version</code> and <code class="inline">password_wo</code> on
+          <code class="inline">aws_db_instance</code> are sent to AWS but never stored. Bump the matching
+          <code class="inline">_wo_version</code> to push a new value.</li>
+        <li><strong>Ephemeral resources</strong> (Terraform 1.10+): <code class="inline">ephemeral "aws_secretsmanager_secret_version"</code>
+          reads a secret for use in a provider block or a write-only argument, and is never persisted to state or plan.</li>
+      </ul>
+      <pre class="code mt-3"><span class="cm"># audit: does the prod state contain anything that looks like a credential?</span>
+terraform state pull | jq -r '.. | objects | to_entries[] | select(.key | test("password|secret_string|token")) | "\(.key)=\(.value|tostring|.[0:4])…"'
+<span class="out">master_user_secret=[{"…
+secret_string=sk_l…</span>
+<span class="cm"># the second line is a live Stripe key in state: move it to secret_string_wo and rotate the key</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Plan files are state too.</strong> A saved
+        <code class="inline">terraform plan -out=tfplan</code> contains every value the plan knows, sensitive ones
+        included, so never upload it as a public workflow artifact or attach it to a PR comment
+        (<a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>). The same reasoning is why we share
+        values between states through SSM parameters (non-secret IDs and ARNs only) rather than
+        <code class="inline">terraform_remote_state</code>, which grants read access to the entire other state.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Hygiene &amp; leaks</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Assume a secret will leak; make detection fast and the response boring</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Prevention lowers the odds, but across a dozen repos and twenty engineers a key will eventually end up in a commit,
+        a screenshot or a pasted log. What separates a near miss from an incident is how quickly you find out and whether
+        everyone knows the first three steps without looking them up.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7"><code class="inline">.env</code> files: local only, never real values</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">.env</code> files are fine for the local compose stack (FN6) with throwaway credentials. They
+        become a problem when someone copies a staging password into one "just for today". The rule: the repo holds a
+        committed <code class="inline">.env.example</code> with every key and no real values, <code class="inline">.env</code>
+        is ignored, and anything that must be real is fetched on demand with the developer's own SSO session.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/scripts/dev-env.sh</span>
+        <pre class="code"><span class="cm">#!/usr/bin/env bash</span>
+set -euo pipefail
+<span class="cm"># pull the dev Stripe test key into the current shell only: nothing written to disk</span>
+aws sso login --profile gol-dev &gt;/dev/null
+export STRIPE_SECRET_KEY="$(aws secretsmanager get-secret-value \
+  --secret-id clinic/dev/booking-api/stripe --query SecretString --output text --profile gol-dev)"
+echo "STRIPE_SECRET_KEY loaded (${#STRIPE_SECRET_KEY} chars) for this shell"</pre>
+      </div>
+      <pre class="code mt-3">cat .gitignore | grep -n env
+<span class="out">4:.env
+5:.env.*
+6:!.env.example</span>
+git log --all --diff-filter=A --name-only --format= | grep -E '(^|/)\.env($|\.)' | grep -v example
+<span class="out">services/booking-api/.env.staging</span>
+<span class="cm"># someone committed one in the past: it is still in history, so treat its values as leaked</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Catch it before the push, then catch it again on GitHub</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Two layers, because each misses things. A <strong>gitleaks pre-commit hook</strong> stops the commit on the laptop.
+        <strong>GitHub secret scanning with push protection</strong>, enabled at the <code class="inline">golden-owl</code> org
+        level, blocks the push on the server for known token formats (AWS, Stripe, Slack, GitHub) and alerts on anything
+        that got through. Secret scanning as part of the wider shift-left pipeline, with SAST and SCA, is owned by
+        <a href="./se2.html" class="text-viol underline decoration-viol/40">SE2</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.pre-commit-config.yaml</span>
+        <pre class="code">repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0                   <span class="cm"># pin: a floating rev is a supply-chain risk (CI4)</span>
+    hooks:
+      - id: gitleaks</pre>
+      </div>
+      <pre class="code mt-3">git commit -m "feat: stripe webhook"
+<span class="out">gitleaks.................................................................Failed
+Finding:     STRIPE_KEY = "sk_live_51N…"
+RuleID:      stripe-access-token
+File:        services/booking-api/src/payments/client.ts
+Line:        12
+WRN leaks found: 1</span>
+<span class="cm"># the commit never happened: move the value to Secrets Manager and read STRIPE_SECRET_KEY from env</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">The leaked-key runbook: revoke first, investigate second</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The instinct is to rewrite Git history first. Don't: the key was copied the moment it became public, and history
+        rewriting takes an hour of coordination. <strong>Make the credential worthless first</strong>, then find out whether
+        it was used, then clean up. For an AWS access key, AWS may already have attached the
+        <code class="inline">AWSCompromisedKeyQuarantineV3</code> policy to the user and opened a support case; that limits
+        damage but is not a fix.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    A["Alert: secret scanning,<br/>GuardDuty or a colleague"] --> B{"What leaked?"}
+    B -->|AWS access key| C["Deactivate key<br/>update-access-key Inactive"]
+    B -->|DB password / API key| D["Rotate now<br/>rotate-secret or vendor console"]
+    C --> E["CloudTrail: every call by<br/>that key since the leak"]
+    D --> F["Redeploy consumers<br/>force-new-deployment"]
+    E --> G{"Any calls you<br/>don't recognise?"}
+    G -->|yes| H["Security incident<br/>SE1 response + SR2 roles"]
+    G -->|no| I["Delete key, remove from<br/>history, write a short postmortem"]
+    F --> I
+        </pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># 1. make it worthless (minute 0-5)</span>
+aws iam update-access-key --user-name legacy-ci --access-key-id AKIA4EXAMPLE7Q2LX --status Inactive --profile gol-prod
+<span class="cm"># 2. was it used? (minute 5-15)</span>
+aws cloudtrail lookup-events --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=AKIA4EXAMPLE7Q2LX \
+  --start-time 2026-10-28T00:00:00Z --query 'Events[].[EventTime,EventName,EventSource]' --output text
+<span class="out">2026-10-29T14:02:11+07:00  GetCallerIdentity  sts.amazonaws.com
+2026-10-29T14:02:15+07:00  ListBuckets        s3.amazonaws.com
+2026-10-29T14:02:19+07:00  RunInstances       ec2.amazonaws.com</span>
+<span class="cm"># GetCallerIdentity → ListBuckets → RunInstances from an unknown IP is the classic crypto-mining pattern: escalate</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Step</th><th class="px-4 py-3">Target time</th><th class="px-4 py-3">Done when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Revoke or rotate</td><td class="px-4 py-3">≤ 15 min from the alert</td><td class="px-4 py-3">Old value rejected by the system it unlocks (test it)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Restore service</td><td class="px-4 py-3">≤ 30 min</td><td class="px-4 py-3">Consumers redeployed with the new value, health checks green</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Investigate use</td><td class="px-4 py-3">≤ 2 h</td><td class="px-4 py-3">CloudTrail or vendor logs reviewed for the whole exposure window</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clean up</td><td class="px-4 py-3">≤ 1 day</td><td class="px-4 py-3">Value removed from code and history, scanning alert closed, root cause fixed</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        If the investigation finds activity you cannot explain, this is no longer a hygiene task: hand over to the
+        compromised-credential response in <a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a> and
+        run it as an incident with the roles from <a href="./sr2.html" class="text-viol underline decoration-viol/40">SR2</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Audit who read what</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every <code class="inline">GetSecretValue</code> and every <code class="inline">kms:Decrypt</code> is a CloudTrail
+        management event. That makes a simple, high-value alarm possible: a human role reading a production secret is
+        unusual, so it should page someone or at least post to the security channel. Keep the query handy for incident
+        reviews as well.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">CloudWatch Logs Insights — org trail log group</span>
+        <pre class="code">fields eventTime, userIdentity.arn, requestParameters.secretId, sourceIPAddress
+| filter eventSource = "secretsmanager.amazonaws.com" and eventName = "GetSecretValue"
+| filter userIdentity.arn not like /booking-api-exec|booking-worker-exec|external-secrets/
+| sort eventTime desc
+| limit 20</pre>
+      </div>
+      <pre class="code mt-3"><span class="out">eventTime            userIdentity.arn                                              secretId
+2026-10-29 09:41:07  arn:aws:sts::444455556666:assumed-role/AWSReservedSSO_Admin/an  clinic/prod/booking-api/db</span>
+<span class="cm"># an engineer read the prod DB secret: fine during an incident, worth a question otherwise</span></pre>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code is good at IAM and KMS policy boilerplate and at finding secrets in code. Give it plan-only credentials,
+        never a role that can call <code class="inline">GetSecretValue</code> in prod, and never paste a real secret into the
+        conversation to "test" something.
+      </p>
+      <pre class="code mt-3">Scan this repo for hard-coded credentials, .env files in Git history, and config values
+that should move to SSM or Secrets Manager. Output a table: file, line, value type, target
+store (SSM String / SecureString / Secrets Manager), proposed name under /clinic/&lt;env&gt;/.
+Do not print any secret value; show the first 4 characters only.</pre>
+      <pre class="code mt-3">Write the Terraform for a customer managed KMS key for clinic-prod secrets: rotation on,
+30-day deletion window, prevent_destroy, the standard root delegation statement, and
+kms:Decrypt for the booking-api execution role only via Secrets Manager and SSM.
+Then explain which statement would lock us out if it were removed.</pre>
+      <pre class="code mt-3">Here is the booking-api task definition and its execution role policy. A task fails with
+ResourceInitializationError: unable to pull secrets. List the possible causes in order of
+likelihood and the exact read-only aws CLI command that confirms or rules out each one.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Inventory config and secrets across a repo and propose names and stores</li>
+            <li>Draft key policies, execution role policies and <code class="inline">secrets</code> blocks</li>
+            <li>Write rotation Lambda skeletons for the four rotation steps</li>
+            <li>Turn CloudTrail JSON into a timeline during a leak investigation</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The root delegation statement is still in every key policy</li>
+            <li>Resources are exact ARNs or service paths, never <code class="inline">"*"</code> on <code class="inline">GetSecretValue</code></li>
+            <li>No <code class="inline">secret_string</code>, <code class="inline">password</code> or <code class="inline">random_password</code> ends up in state</li>
+            <li>The agent's own session had no access to read production secret values</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written secrets code:</strong>
+        <code class="inline">secretsmanager:*</code> or <code class="inline">kms:*</code> granted to a workload role; a key
+        policy without the account root statement; <code class="inline">aws_secretsmanager_secret_version</code> with a
+        literal or a <code class="inline">var.</code> value instead of <code class="inline">secret_string_wo</code>;
+        secrets in <code class="inline">environment</code> instead of <code class="inline">secrets</code> in a task
+        definition; <code class="inline">recovery_window_in_days = 0</code>; long-lived
+        <code class="inline">AWS_ACCESS_KEY_ID</code> in GitHub secrets instead of OIDC; and a "fix" that adds
+        <code class="inline">kms:Decrypt</code> on <code class="inline">"*"</code> to make an error go away.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Keeps credentials in <code class="inline">.env</code> files or code and has never opened Secrets Manager or KMS.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows secrets belong in Secrets Manager and that KMS encrypts things, but cannot explain envelope encryption or what a key policy controls.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds a secret and references it from a task definition by following an existing example. Needs help when a task cannot read it.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Classifies a service's values into SSM and Secrets Manager, writes the KMS key, policies and task definition wiring in Terraform with no secret in state, sets up rotation that does not break running tasks, and runs the leaked-key runbook without notes.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the org-wide naming and key strategy, turns on push protection and read-audit alarms across accounts, and runs leak drills so the team practises the first fifteen minutes.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, draw envelope
+        encryption and say which call needs <code class="inline">kms:Decrypt</code>. Then take a mentor's broken task
+        definition (wrong role, missing KMS permission, a secret in <code class="inline">environment</code>) and find all
+        three faults in under ten minutes, and explain how a running task picks up a rotated password.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Rotating without redeploying</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">ECS reads secrets at task start. A single-user rotation invalidates the password running tasks hold, and the outage arrives at 3 a.m. when the schedule fires. Use alternating users, or redeploy as part of rotation.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Rewriting history before revoking</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A leaked key has already been copied. Force-pushing a cleaned history while the key still works protects nothing. Revoke in minute one, clean up on day one.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Using <code class="inline">aws/secretsmanager</code> for shared secrets</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The AWS managed key cannot be granted to another account. The cross-account read fails with an <code class="inline">AccessDenied</code> on KMS that looks like a Secrets Manager problem. Use a CMK from the start in prod.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Create the secret in Terraform, set the value elsewhere</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Terraform owns the name, KMS key, policy and rotation. The value comes from the service itself, a rotation Lambda, or a write-only argument. State stays boring.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Encryption context on everything you encrypt yourself</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Passing <code class="inline">service=booking-worker</code> as encryption context binds the ciphertext to its purpose, lets key policies require it, and makes every Decrypt in CloudTrail say why it happened.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="classify"> <span>I classified every value <code class="inline">booking-api</code> uses as config, sensitive config or secret and placed each in the right store with the <code class="inline">/clinic/&lt;env&gt;/&lt;service&gt;</code> naming scheme.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="kms"> <span>I can explain envelope encryption and wrote a customer managed key in Terraform with rotation, <code class="inline">prevent_destroy</code> and a least-privilege key policy.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="inject"> <span>I injected secrets into an ECS task and a GitHub Actions job by reference, and debugged a <code class="inline">ResourceInitializationError</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="state"> <span>I audited a Terraform state for secrets and moved any I found to a managed or write-only alternative.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="leak-drill"> <span class="font-semibold">In gol-dev, created a CMK, an RDS instance with a managed master password, an SSM parameter set and a Stripe test-key secret for booking-api, all wired into its ECS task definition in a Terraform PR with no secret in state. Then ran a timed leak drill on a planted IAM key (deactivate, CloudTrail lookup, write-up) and shared the PR and the drill notes (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html" target="_blank" rel="noopener">AWS — Secrets Manager User Guide</a> — rotation strategies, resource policies and replica secrets.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html" target="_blank" rel="noopener">AWS — Systems Manager Parameter Store</a> — tiers, throughput and SecureString behaviour.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html" target="_blank" rel="noopener">AWS — KMS concepts</a> — envelope encryption, key types and encryption context from the source.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html" target="_blank" rel="noopener">AWS — KMS key policies</a> — the default policy and why the root statement must stay.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/specifying-sensitive-data.html" target="_blank" rel="noopener">AWS — Passing sensitive data to an ECS container</a> — the <code class="inline">secrets</code> syntax and required permissions used in Part III.</li>
+        <li><a class="text-coral underline" href="https://developer.hashicorp.com/terraform/language/manage-sensitive-data" target="_blank" rel="noopener">HashiCorp — Manage sensitive data</a> — ephemeral resources and write-only arguments.</li>
+        <li><a class="text-coral underline" href="https://docs.github.com/en/code-security/secret-scanning/introduction/about-secret-scanning" target="_blank" rel="noopener">GitHub — About secret scanning</a> — push protection and alerts for the org.</li>
+      </ul>

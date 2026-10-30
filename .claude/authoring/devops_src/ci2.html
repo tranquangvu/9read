@@ -1,0 +1,678 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Continuous Delivery &amp; Release Strategies</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          CI (<a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a>) proves that a commit builds and
+          passes its tests. Continuous delivery is everything after that: getting the same artifact through dev, staging
+          and prod with the right gates, choosing how traffic moves to the new version, changing the database without
+          downtime, and getting back to safety fast when a release goes wrong. This module uses the
+          <code class="inline">booking-api</code> release path end to end. By the end you can design a promotion pipeline
+          with GitHub environments, pick a release strategy for a given change and defend it, ship a schema change with
+          expand/contract, and choose between rollback and roll-forward under pressure.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> most outages start with a change. Deploys that were never tested
+          as the exact artifact, a migration that locked the <code class="inline">appointments</code> table for four
+          minutes at 9 a.m., a rollback that failed because the old code could not read the new schema, a "quick fix"
+          shipped straight to prod without staging. Good delivery does not make changes rarer. It makes each one small,
+          observable and reversible, which is why teams that deploy daily have lower change failure rates than teams that
+          deploy monthly.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Delivery pipelines</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Build once, promote the same artifact, gate the last step</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A delivery pipeline takes one immutable artifact (for us, a container image identified by its digest) and moves
+        it through environments, collecting evidence at each step. Nothing is rebuilt along the way. What changes between
+        environments is configuration and the gate in front of each one.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Continuous delivery versus continuous deployment</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The two terms differ by one gate. In <strong>continuous delivery</strong>, every merge produces a release candidate
+        that <em>could</em> go to production, and a person decides when. In <strong>continuous deployment</strong>, every
+        merge that passes the pipeline goes to production with no human step. Both need the same automation; the
+        difference is how much you trust your tests and monitoring. DORA's research
+        (<a href="./fn1.html" class="text-viol underline decoration-viol/40">FN1</a>) favours small, frequent changes
+        either way.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3"></th><th class="px-4 py-3">Continuous delivery</th><th class="px-4 py-3">Continuous deployment</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Prod gate</td><td class="px-4 py-3">Human approval on the <code class="inline">prod</code> environment</td><td class="px-4 py-3">Automated checks only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Needs</td><td class="px-4 py-3">Reliable pipeline, staging that resembles prod</td><td class="px-4 py-3">All of that plus strong tests, canary analysis and automatic rollback</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Typical lead time</td><td class="px-4 py-3">Hours to a day</td><td class="px-4 py-3">Under an hour</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Right for</td><td class="px-4 py-3">Most client projects, regulated clients (the clinic handles patient data)</td><td class="px-4 py-3">Internal tools, mature teams with good SLO alerting (<a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The clinic runs continuous delivery: automatic to dev and staging, one approval for prod. Median lead time from
+        merge to prod is about 3 hours, and the client can see every approval in the GitHub deployment history.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Promote the digest, never rebuild</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A tag like <code class="inline">booking-api:1.9.0</code> can be overwritten; a digest
+        (<code class="inline">sha256:…</code>) cannot. CI builds the image once, pushes it to ECR in
+        <code class="inline">gol-shared</code> (<a href="./ci4.html" class="text-viol underline decoration-viol/40">CI4</a>), and
+        passes the digest forward. Every environment deploys that digest. If staging passed, prod gets exactly the bytes
+        staging tested.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Promotion pipeline: one build produces digest sha256:9f3c; it deploys automatically to dev and staging, then waits for approval before prod; each step adds evidence">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ONE DIGEST, THREE ENVIRONMENTS · booking-api 1.9.0</text>
+          <g class="anim-pulse"><rect x="15" y="80" width="130" height="56" rx="9" fill="#37474F"/>
+            <text x="80" y="102" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">build (CI1)</text>
+            <text x="80" y="118" text-anchor="middle" fill="#ffffffbb" font-size="9">sha256:9f3c…</text></g>
+          <g class="anim-pulse d1"><rect x="195" y="80" width="130" height="56" rx="9" fill="#2563EB"/>
+            <text x="260" y="102" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">gol-dev</text>
+            <text x="260" y="118" text-anchor="middle" fill="#ffffffbb" font-size="9">auto · smoke test</text></g>
+          <g class="anim-pulse d2"><rect x="375" y="80" width="130" height="56" rx="9" fill="#6d5acd"/>
+            <text x="440" y="102" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">gol-staging</text>
+            <text x="440" y="118" text-anchor="middle" fill="#ffffffbb" font-size="9">auto · e2e + 30 min soak</text></g>
+          <g class="anim-pulse d3"><rect x="575" y="80" width="130" height="56" rx="9" fill="#DB2777"/>
+            <text x="640" y="102" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">gol-prod</text>
+            <text x="640" y="118" text-anchor="middle" fill="#ffffffbb" font-size="9">approval · canary</text></g>
+          <line x1="145" y1="108" x2="195" y2="108" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="325" y1="108" x2="375" y2="108" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="505" y1="108" x2="575" y2="108" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="540" y="70" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">human gate</text>
+          <text x="260" y="160" text-anchor="middle" font-size="9" fill="#6E6B64">evidence: /healthz 200</text>
+          <text x="440" y="160" text-anchor="middle" font-size="9" fill="#6E6B64">evidence: 212 e2e pass, p99 OK</text>
+          <text x="640" y="160" text-anchor="middle" font-size="9" fill="#6E6B64">evidence: canary alarms green</text>
+          <text x="360" y="205" text-anchor="middle" font-size="10" fill="#6E6B64">the digest never changes; only config and gates do</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">GitHub environments: gates, scoped config and scoped credentials</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A GitHub <strong>environment</strong> is a named deployment target with protection rules. A job that declares
+        <code class="inline">environment: prod</code> pauses until those rules pass, gets that environment's variables and
+        secrets, and receives an OIDC token whose <code class="inline">sub</code> is
+        <code class="inline">repo:golden-owl/clinic-app:environment:prod</code>. Point the prod deploy role's trust policy
+        at that <code class="inline">sub</code> and the approval becomes a hard requirement for AWS access, not a
+        convention.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Environment</th><th class="px-4 py-3">Protection rules</th><th class="px-4 py-3">AWS role trusted for it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">dev</td><td class="px-4 py-3">Branch: <code class="inline">main</code> only</td><td class="px-4 py-3"><code class="inline">gha-clinic-app-deploy</code> in gol-dev</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">staging</td><td class="px-4 py-3">Branch: <code class="inline">main</code> only</td><td class="px-4 py-3"><code class="inline">gha-clinic-app-deploy</code> in gol-staging</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">prod</td><td class="px-4 py-3">Branch: <code class="inline">main</code>; 1 required reviewer from <code class="inline">@golden-owl/clinic-release</code>; self-review blocked; 10-minute wait timer</td><td class="px-4 py-3"><code class="inline">gha-clinic-app-deploy</code> in gol-prod, <code class="inline">sub</code> = <code class="inline">…:environment:prod</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Click-configured environments drift and leave no history. Manage them with the GitHub Terraform provider in
+        <code class="inline">clinic-infra</code>, next to the IAM roles they unlock.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/live/github/environments.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"github_repository_environment"</span> <span class="st">"prod"</span> {
+  repository          = <span class="st">"clinic-app"</span>
+  environment         = <span class="st">"prod"</span>
+  wait_timer          = 10                      <span class="cm"># minutes to cancel after approval</span>
+  prevent_self_review = true                    <span class="cm"># the author of the change cannot approve it</span>
+  reviewers {
+    teams = [data.github_team.clinic_release.id]
+  }
+  deployment_branch_policy {
+    protected_branches     = true               <span class="cm"># only main (protected) can deploy here</span>
+    custom_branch_policies = false
+  }
+}
+<span class="kw">resource</span> <span class="st">"github_actions_environment_variable"</span> <span class="st">"prod_role"</span> {
+  repository    = <span class="st">"clinic-app"</span>
+  environment   = github_repository_environment.prod.environment
+  variable_name = <span class="st">"DEPLOY_ROLE_ARN"</span>
+  value         = <span class="st">"arn:aws:iam::444455556666:role/gha-clinic-app-deploy"</span>
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.github/workflows/deploy.yml — the promotion chain</span>
+        <pre class="code"><span class="kw">on</span>:
+  workflow_run:
+    workflows: [booking-api]                    <span class="cm"># runs after CI on main succeeds</span>
+    types: [completed]
+    branches: [main]
+<span class="kw">jobs</span>:
+  dev:
+    if: github.event.workflow_run.conclusion == 'success'
+    uses: ./.github/workflows/_deploy-ecs.yml
+    with: { environment: dev, service: booking-api }
+    secrets: inherit
+  staging:
+    needs: dev
+    uses: ./.github/workflows/_deploy-ecs.yml
+    with: { environment: staging, service: booking-api, run-e2e: true }
+    secrets: inherit
+  prod:
+    needs: staging                              <span class="cm"># prod is unreachable unless staging passed</span>
+    uses: ./.github/workflows/_deploy-ecs.yml
+    with: { environment: prod, service: booking-api }
+    secrets: inherit</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Give the approver the evidence, not a button</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The last step of the staging job writes a short release summary to <code class="inline">$GITHUB_STEP_SUMMARY</code>:
+        what is about to reach prod, what changed since the current prod version, and whether the release carries a
+        migration. The prod reviewer reads that page, not 3,000 lines of log.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.github/workflows/_deploy-ecs.yml — staging summary step</span>
+        <pre class="code">      - if: inputs.environment == 'staging'
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          prod_sha=$(gh api "repos/${{ github.repository }}/deployments?environment=prod&amp;per_page=1" --jq '.[0].sha')
+          {
+            echo "### booking-api → prod"
+            echo "- digest: \`${{ steps.digest.outputs.image }}\`"
+            echo "- e2e: ${{ steps.e2e.outputs.passed }} passed, ${{ steps.e2e.outputs.failed }} failed"
+            echo "- migrations: $(git diff --name-only "$prod_sha"..HEAD -- services/booking-api/migrations | wc -l)"
+            echo "#### Commits since prod"
+            git log --oneline "$prod_sha"..HEAD -- services/booking-api | head -20
+          } &gt;&gt; "$GITHUB_STEP_SUMMARY"</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On the clinic, a non-zero migration count is the line reviewers look at first. It decides whether the release
+        needs the expand/contract check in Part III and a snapshot before deploy.
+      </p>
+      <div class="mt-4 callout callout-warn"><strong>An approval is only as good as what the approver can see.</strong> If the
+        prod reviewer gets a bare "Review deployments" button, they approve blind. Have the staging job write a summary
+        (digest, changelog since the current prod version, e2e results, migration yes/no) to the run's job summary, and
+        link it in the release channel. Approving should take one minute of reading, not a click.</div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Release strategies</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Choose the strategy by blast radius and time to undo</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A release strategy decides how traffic moves from the old version to the new one. Every strategy trades three
+        things: how many users a bad version can hurt before you notice, how fast you can undo it, and how much extra
+        capacity it needs while both versions run. Decide per change, not once per team: a copy fix and a new booking
+        engine do not deserve the same release.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The four strategies side by side</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Strategy</th><th class="px-4 py-3">How it works</th><th class="px-4 py-3">Users exposed to a bad version</th><th class="px-4 py-3">Time to undo</th><th class="px-4 py-3">Extra capacity</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Rolling</td><td class="px-4 py-3">Replace tasks a few at a time</td><td class="px-4 py-3">Grows to 100% as the rollout proceeds</td><td class="px-4 py-3">Minutes: another rolling deploy</td><td class="px-4 py-3">0–100% surge, configurable</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Blue/green</td><td class="px-4 py-3">Start a full green fleet, test it, switch the load balancer</td><td class="px-4 py-3">100% at once after the switch</td><td class="px-4 py-3">Seconds: switch back while blue still runs</td><td class="px-4 py-3">100% during the bake</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Canary</td><td class="px-4 py-3">Send a small share (5%) to the new version, watch, then increase</td><td class="px-4 py-3">5% for the canary window</td><td class="px-4 py-3">Seconds: shift the 5% back</td><td class="px-4 py-3">Small</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shadow</td><td class="px-4 py-3">Copy live requests to the new version and discard its responses</td><td class="px-4 py-3">None</td><td class="px-4 py-3">Nothing to undo</td><td class="px-4 py-3">100% for the shadow fleet</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Our defaults for <code class="inline">booking-api</code>: <strong>rolling</strong> with the ECS circuit breaker in dev
+        and staging, <strong>canary</strong> in prod (5% for 10 minutes, then 100%), <strong>shadow</strong> only for
+        read-only rewrites such as a new availability search. How each is configured on the platform lives with the
+        platform: ECS rolling, blue/green and canary in <a href="./cn2.html" class="text-viol underline decoration-viol/40">CN2</a>,
+        Argo Rollouts on EKS in <a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Canary: let a few users find the bug, automatically</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A canary is only useful if something watches it. Define, before the release, which signals mean "bad": the 5xx
+        rate and p99 latency of the canary target group compared with the baseline, plus the booking success rate. Wire
+        them to CloudWatch alarms that the deployment watches. If any alarm fires during the bake, traffic goes back to
+        the old version without anyone being paged first.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Canary release: the ALB sends 95% of traffic to booking-api 1.8.3 and 5% to 1.9.0 for 10 minutes while alarms watch 5xx and p99; if green, shift to 100%; if an alarm fires, shift back to 0%">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">CANARY · api.clinic.example.com · 10-minute bake</text>
+          <g class="anim-pulse"><rect x="15" y="85" width="130" height="56" rx="9" fill="#37474F"/>
+            <text x="80" y="107" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB listener</text>
+            <text x="80" y="123" text-anchor="middle" fill="#ffffffbb" font-size="9">weighted target groups</text></g>
+          <g class="anim-pulse d1"><rect x="235" y="40" width="160" height="50" rx="9" fill="#2563EB"/>
+            <text x="315" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">blue · 1.8.3</text>
+            <text x="315" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">95% of requests</text></g>
+          <g class="anim-pulse d2"><rect x="235" y="140" width="160" height="50" rx="9" fill="#0D9488"/>
+            <text x="315" y="161" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">green · 1.9.0</text>
+            <text x="315" y="176" text-anchor="middle" fill="#ffffffbb" font-size="9">5% of requests</text></g>
+          <g class="anim-pulse d3"><rect x="480" y="140" width="150" height="50" rx="9" fill="#D97757"/>
+            <text x="555" y="161" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">alarms</text>
+            <text x="555" y="176" text-anchor="middle" fill="#ffffffbb" font-size="9">5xx &gt; 1% · p99 &gt; 800 ms</text></g>
+          <g class="anim-pulse d4"><rect x="480" y="40" width="150" height="50" rx="9" fill="#6d5acd"/>
+            <text x="555" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">decision</text>
+            <text x="555" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">green → 100% · red → 0%</text></g>
+          <line x1="145" y1="105" x2="235" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="145" y1="122" x2="235" y2="165" stroke="#D97757" stroke-width="1" class="anim-flow"/>
+          <line x1="395" y1="165" x2="480" y2="165" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="555" y1="140" x2="555" y2="90" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="80" y="170" text-anchor="middle" font-size="9" fill="#6E6B64">~400 req/min peak</text>
+          <text x="360" y="218" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">5% of 400 req/min = 20 req/min: enough to see a 5xx spike within minutes</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Size the canary from traffic, not habit. At 400 requests per minute, 5% is 20 per minute, or 200 requests in a
+        10-minute bake: enough to detect an error rate of a few percent. At 20 requests per minute, a 5% canary sees 10
+        requests and proves nothing. Low-traffic services need a longer bake, a larger share, or synthetic traffic.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The deploy job, with a stability wait and rollback alarms</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Whatever the strategy, the pipeline must not report success until the new version is serving and healthy. For ECS
+        that means rendering the task definition with the promoted digest, deploying it, and waiting for the service to
+        reach a steady state. The alarms named on the service decide whether the deployment rolls back on its own.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.github/workflows/_deploy-ecs.yml — core of the reusable deploy</span>
+        <pre class="code">  deploy:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}        <span class="cm"># gates + scoped vars + OIDC sub</span>
+    permissions: { contents: read, id-token: write }
+    concurrency: { group: "deploy-${{ inputs.environment }}-${{ inputs.service }}", cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v5
+        with: { role-to-assume: "${{ vars.DEPLOY_ROLE_ARN }}", aws-region: ap-southeast-1 }
+      - id: digest                                <span class="cm"># resolve the digest CI pushed for this commit</span>
+        run: |
+          d=$(aws ecr describe-images --registry-id 111122223333 --repository-name clinic/booking-api \
+            --image-ids imageTag=${{ github.event.workflow_run.head_sha }} \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "image=111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-api@$d" &gt;&gt; "$GITHUB_OUTPUT"
+      - id: td
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with: { task-definition: deploy/booking-api.taskdef.json, container-name: booking-api, image: "${{ steps.digest.outputs.image }}" }
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.td.outputs.task-definition }}
+          cluster: clinic-${{ inputs.environment }}
+          service: ${{ inputs.service }}
+          wait-for-service-stability: true        <span class="cm"># red if the circuit breaker rolls back</span>
+          wait-for-minutes: 20</pre>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>Deploy markers pay for themselves.</strong> Post an annotation to
+        Grafana and Datadog (<a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>) with the version and
+        digest at the start and end of every prod deploy. When the error graph jumps, the first question is always "did we
+        just ship something?", and the marker answers it in one glance.</div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Flags and data</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Decouple deploy from release, and schema from code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Two things make releases risky even with a perfect pipeline: new behaviour that turns on the moment the code
+        lands, and database changes that the old code cannot survive. Feature flags fix the first by separating
+        <em>deploying</em> code from <em>releasing</em> behaviour. Expand/contract migrations fix the second by making every
+        schema change compatible with both the old and the new version of the app.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Feature flags as a release control</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A feature flag is a runtime switch the code checks. The new online-payment step for appointments ships to prod
+        "dark" behind <code class="inline">booking.online-payment</code>, gets turned on for clinic staff, then for 10% of
+        patients, then for everyone. If it misbehaves, turning it off takes seconds and needs no deploy. We use AWS
+        AppConfig feature flags, read through the AppConfig Agent sidecar so the app polls a local endpoint rather than
+        calling AWS on every request.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">services/booking-api/src/flags.ts</span>
+        <pre class="code"><span class="kw">const</span> FLAGS_URL =
+  <span class="st">"http://localhost:2772/applications/clinic/environments/prod/configurations/booking-flags"</span>;
+
+<span class="kw">export async function</span> <span class="fn">isEnabled</span>(flag: string, ctx: { clinicId: string }): Promise&lt;boolean&gt; {
+  <span class="kw">try</span> {
+    <span class="kw">const</span> res = <span class="kw">await</span> fetch(<span class="st">`${FLAGS_URL}?flag=${flag}`</span>, { signal: AbortSignal.timeout(200) });
+    <span class="kw">const</span> f = <span class="kw">await</span> res.json();         <span class="cm">// { enabled: true, rolloutClinics: ["c-104", "c-212"] }</span>
+    <span class="kw">return</span> f.enabled &amp;&amp; (f.rolloutClinics?.includes(ctx.clinicId) ?? <span class="kw">true</span>);
+  } <span class="kw">catch</span> {
+    <span class="kw">return false</span>;                             <span class="cm">// flag service down → old, safe behaviour</span>
+  }
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Flag type</th><th class="px-4 py-3">Example</th><th class="px-4 py-3">Lifetime</th><th class="px-4 py-3">Owner</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Release</td><td class="px-4 py-3"><code class="inline">booking.online-payment</code></td><td class="px-4 py-3">Days to weeks; delete after 100%</td><td class="px-4 py-3">Feature team</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Ops kill switch</td><td class="px-4 py-3"><code class="inline">booking.sms-reminders</code> off when the SMS provider degrades</td><td class="px-4 py-3">Permanent, documented in the runbook</td><td class="px-4 py-3">On-call (<a href="./sr2.html" class="text-viol underline decoration-viol/40">SR2</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Experiment</td><td class="px-4 py-3">Two reminder wordings, measured</td><td class="px-4 py-3">Length of the experiment</td><td class="px-4 py-3">Product</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Permission</td><td class="px-4 py-3">Telehealth only for clinics on the premium plan</td><td class="px-4 py-3">Permanent; arguably belongs in the data model</td><td class="px-4 py-3">Product</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Release flags are debt. Every one doubles the code paths to test. Give each an expiry date when it is created and
+        fail a CI check when a release flag is older than 30 days at 100%.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Expand/contract: schema changes in three safe deploys</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        During any rolling or canary deploy, the old and the new app versions run at the same time against the same
+        database. So every migration must work with <em>both</em>. A rename done in one step (rename the column, deploy code
+        that uses the new name) breaks the old tasks for the whole rollout, and makes rollback impossible. Split it into
+        an <strong>expand</strong> phase that only adds, a <strong>migrate</strong> phase, and a <strong>contract</strong>
+        phase that removes, each a separate release.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    subgraph R1["Release 1.9 · expand"]
+      A["ADD COLUMN phone_e164<br/>nullable"] --> B["app writes both<br/>reads old"]
+    end
+    subgraph R2["Release 1.10 · migrate"]
+      C["backfill in batches<br/>of 5,000 rows"] --> D["app reads new<br/>writes both"]
+    end
+    subgraph R3["Release 1.11 · contract"]
+      E["app stops writing old"] --> F["DROP COLUMN phone<br/>after 7 days"]
+    end
+    R1 --> R2 --> R3
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">services/booking-api/migrations/0142_expand_patient_phone.sql</span>
+        <pre class="code"><span class="cm">-- release 1.9 (expand): safe while 1.8 is still running</span>
+<span class="kw">SET</span> lock_timeout = <span class="st">'5s'</span>;                  <span class="cm">-- fail fast instead of queueing behind traffic</span>
+<span class="kw">SET</span> statement_timeout = <span class="st">'60s'</span>;
+<span class="kw">ALTER TABLE</span> patients <span class="kw">ADD COLUMN</span> phone_e164 text;   <span class="cm">-- nullable, no default: metadata-only, instant</span>
+<span class="kw">CREATE INDEX CONCURRENTLY</span> patients_phone_e164_idx <span class="kw">ON</span> patients (phone_e164);  <span class="cm">-- tool must NOT wrap this file in a transaction</span>
+<span class="cm">-- NOT in this release: SET NOT NULL, DROP COLUMN phone, RENAME. Those wait for 1.11.</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Postgres change</th><th class="px-4 py-3">Safe with traffic?</th><th class="px-4 py-3">Safe way</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Add nullable column</td><td class="px-4 py-3">Yes, instant</td><td class="px-4 py-3">As is, with <code class="inline">lock_timeout</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Create index</td><td class="px-4 py-3">No: blocks writes for the whole build</td><td class="px-4 py-3"><code class="inline">CREATE INDEX CONCURRENTLY</code>, outside a transaction</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Add NOT NULL</td><td class="px-4 py-3">No: full table scan under lock</td><td class="px-4 py-3">Add a <code class="inline">CHECK … NOT VALID</code>, then <code class="inline">VALIDATE CONSTRAINT</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rename or drop column</td><td class="px-4 py-3">Breaks the running version</td><td class="px-4 py-3">Expand/contract across three releases</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Change column type</td><td class="px-4 py-3">Usually rewrites the table</td><td class="px-4 py-3">New column, backfill, switch, drop</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Running migrations in the pipeline</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Migrations run once per environment, as their own pipeline step, <em>before</em> the new app version deploys. Never
+        run them from the app's startup: with six tasks starting at once, six processes race for the same migration lock,
+        and a slow migration makes every task fail its health check. We run the migration as a one-off ECS task using the
+        same image digest, and the deploy step only starts if it exits 0.
+      </p>
+      <pre class="code mt-3">task=$(aws ecs run-task --cluster clinic-prod --launch-type FARGATE \
+  --task-definition booking-api-migrate \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG_MIGRATE]}" \
+  --overrides '{"containerOverrides":[{"name":"migrate","command":["npm","run","migrate:up"]}]}' \
+  --query 'tasks[0].taskArn' --output text)
+aws ecs wait tasks-stopped --cluster clinic-prod --tasks "$task"
+aws ecs describe-tasks --cluster clinic-prod --tasks "$task" --query 'tasks[0].containers[0].exitCode'
+<span class="out">0</span>
+<span class="cm"># anything other than 0 fails the job; the app deploy never starts</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>A destructive migration removes your rollback.</strong> Once
+        <code class="inline">DROP COLUMN phone</code> has run, redeploying 1.10 fails, because 1.10 still reads
+        <code class="inline">phone</code>. That is why the contract step ships a week after nothing reads the old column,
+        why it needs its own approval, and why the RDS snapshot taken before it (<a href="./aw5.html" class="text-viol underline decoration-viol/40">AW5</a>)
+        is part of the release checklist.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · When a release goes wrong</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Rollback is a deploy you have already rehearsed</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Every release plan needs an answer to "what do we do if this is bad?", written before the release. The answer is
+        usually rollback, sometimes roll-forward, and occasionally "flip the flag". The worst answer is improvising one at
+        09:05 with patients unable to book.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Rollback or roll forward</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Rollback</strong> redeploys the previous known-good artifact. <strong>Roll-forward</strong> ships a new fix
+        through the pipeline. Rollback is the default because it is fast and the artifact is already proven. Roll forward
+        only when rollback is impossible or more dangerous, and say out loud in the incident channel which one you chose
+        and why.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Situation</th><th class="px-4 py-3">Do</th><th class="px-4 py-3">Typical time to restore</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">New behaviour is behind a flag</td><td class="px-4 py-3">Turn the flag off</td><td class="px-4 py-3">Under 1 minute</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Canary alarms fire during the bake</td><td class="px-4 py-3">Nothing: automatic rollback already happened</td><td class="px-4 py-3">2–5 minutes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Bad release fully rolled out, schema unchanged or expanded only</td><td class="px-4 py-3">Roll back to the previous task definition</td><td class="px-4 py-3">5–10 minutes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">A contract migration already ran</td><td class="px-4 py-3">Roll forward with a fix, or restore data (last resort)</td><td class="px-4 py-3">30+ minutes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Bug is in a downstream service or config, not this release</td><td class="px-4 py-3">Neither: fix the actual cause</td><td class="px-4 py-3">Varies</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># manual rollback on ECS: point the service at the previous revision</span>
+aws ecs describe-services --cluster clinic-prod --services booking-api \
+  --query 'services[0].deployments[].[status,taskDefinition]' --output text
+<span class="out">PRIMARY   arn:aws:ecs:ap-southeast-1:444455556666:task-definition/booking-api:57</span>
+aws ecs update-service --cluster clinic-prod --service booking-api --task-definition booking-api:56
+aws ecs wait services-stable --cluster clinic-prod --services booking-api
+<span class="cm"># on EKS with Argo CD: git revert the image bump in clinic-gitops (KS10); never kubectl set image</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        After a manual rollback, the pipeline's "latest" no longer matches production. Pin it: revert the commit on
+        <code class="inline">main</code> or mark the release bad, or the next unrelated merge will redeploy the broken
+        version.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Automatic rollback: let alarms decide</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Humans are slow at 2 a.m. The deployment itself should roll back when the new version fails health checks (the ECS
+        deployment circuit breaker) or when a business alarm fires during the bake. The alarms must be specific to the new
+        version where possible, otherwise an unrelated blip rolls back a good release.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant P as Pipeline (prod job)
+    participant E as ECS service booking-api
+    participant C as CloudWatch alarms
+    participant S as Slack #clinic-releases
+    P->>E: deploy task def :57 (canary 5%)
+    E->>C: watch booking-api-5xx, booking-api-p99
+    Note over E,C: bake 10 min
+    C-->>E: ALARM booking-api-5xx (2.4% &gt; 1%)
+    E->>E: shift traffic back to :56, stop :57
+    E-->>P: deployment ROLLED_BACK
+    P->>S: release 1.9.0 rolled back automatically<br/>digest, alarm, link to dashboard
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/live/gol-prod/services/booking-api-alarms.tf — one of the rollback alarms</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_cloudwatch_metric_alarm"</span> <span class="st">"booking_api_5xx"</span> {
+  alarm_name          = <span class="st">"booking-api-5xx"</span>
+  namespace           = <span class="st">"AWS/ApplicationELB"</span>
+  metric_name         = <span class="st">"HTTPCode_Target_5XX_Count"</span>
+  dimensions          = { LoadBalancer = var.alb_arn_suffix, TargetGroup = var.green_tg_arn_suffix }
+  statistic           = <span class="st">"Sum"</span>
+  period              = 60
+  evaluation_periods  = 3
+  datapoints_to_alarm = 2                     <span class="cm"># 2 of 3 minutes: ignore a single blip</span>
+  threshold           = 5
+  comparison_operator = <span class="st">"GreaterThanThreshold"</span>
+  treat_missing_data  = <span class="st">"notBreaching"</span>       <span class="cm"># no traffic to green is not an error</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The alarm names are then listed in the service's deployment alarm configuration
+        (<a href="./cn2.html" class="text-viol underline decoration-viol/40">CN2</a>). Test the rollback path on staging once a
+        quarter by deploying a build that returns 500 on purpose. A rollback that has never run is a hope, not a control.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Release versions and changelogs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Commits use Conventional Commits (<a href="./fn4.html" class="text-viol underline decoration-viol/40">FN4</a>), so
+        versions and changelogs can be generated rather than written. <strong>release-please</strong> keeps an open "release
+        PR" that collects merged changes, proposes the next semver version (a <code class="inline">feat</code> bumps the
+        minor, a <code class="inline">fix</code> the patch) and writes the changelog. Merging that PR tags the release.
+        The tag names the release for humans; the digest remains what is deployed.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.github/workflows/release.yml</span>
+        <pre class="code"><span class="kw">on</span>:
+  push:
+    branches: [main]
+<span class="kw">permissions</span>:
+  contents: write                             <span class="cm"># tags and GitHub releases</span>
+  pull-requests: write                        <span class="cm"># the release PR</span>
+<span class="kw">jobs</span>:
+  release-please:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json   <span class="cm"># one package per service in the monorepo</span>
+          manifest-file: .release-please-manifest.json</pre>
+      </div>
+      <pre class="code mt-3">gh release view booking-api-v1.9.0 --json body --jq .body
+<span class="out">## 1.9.0 (2026-10-27)
+### Features
+* booking: online payment step behind booking.online-payment flag (#812)
+### Bug Fixes
+* availability: exclude cancelled slots from search results (#809)
+### Database
+* expand: add patients.phone_e164 (0142)</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Identifier</th><th class="px-4 py-3">Example</th><th class="px-4 py-3">Used for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Git SHA</td><td class="px-4 py-3"><code class="inline">3f9c2ab</code></td><td class="px-4 py-3">Tracing a running build back to code; ECR tag pushed by CI</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Image digest</td><td class="px-4 py-3"><code class="inline">sha256:9f3c…</code></td><td class="px-4 py-3">What deploys; immutable</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Semver tag</td><td class="px-4 py-3"><code class="inline">booking-api-v1.9.0</code></td><td class="px-4 py-3">Humans, changelogs, client release notes, the <code class="inline">version</code> tag in telemetry</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Task definition revision</td><td class="px-4 py-3"><code class="inline">booking-api:57</code></td><td class="px-4 py-3">ECS rollback target</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Measure delivery from the deployment records</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every job with <code class="inline">environment: prod</code> creates a GitHub deployment record with its commit and
+        status. That is enough to compute deployment frequency and lead time for changes without any extra tooling, and
+        to spot the week when the pipeline got slower before anyone complains.
+      </p>
+      <pre class="code mt-3"><span class="cm"># prod deployments of clinic-app in October, with their final status</span>
+gh api "repos/golden-owl/clinic-app/deployments?environment=prod&amp;per_page=100" \
+  --jq '.[] | select(.created_at &gt;= "2026-10-01") | [.created_at, .sha[0:7]] | @tsv' | wc -l
+<span class="out">23</span>
+<span class="cm"># 23 prod deploys in 27 days ≈ 0.85 per day; 2 were rollbacks → change failure rate ≈ 9%</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Turning those numbers into a monthly report for the client, and what "good" looks like, is
+        <a href="./fn1.html" class="text-viol underline decoration-viol/40">FN1</a>'s territory. The point here is that the
+        pipeline you build in this module is also the measurement system, if every prod change goes through it.
+      </p>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> derive the DORA numbers from the pipeline itself.
+        GitHub deployment records give deployment frequency and lead time; tagging rollbacks and hotfix releases gives
+        change failure rate and time to restore. Show the client a monthly chart: on the clinic, change failure rate
+        dropped from 18% to under 10% in the quarter after canaries and expand/contract became the rule.</div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are useful for the tedious, error-prone parts of delivery: splitting a migration into expand/contract
+        steps, writing the promotion workflow, drafting release notes. They are dangerous when they "fix" a failed deploy
+        by changing production directly. Give them read-only access to prod and the pipeline as their only write path.
+      </p>
+      <pre class="code mt-3">This PR renames patients.phone to patients.phone_e164 in one migration. Rewrite it as
+expand/contract across three releases: list each release's SQL (with lock_timeout and
+CREATE INDEX CONCURRENTLY where needed) and the app code change each one needs. Mark which
+step removes our ability to roll back.</pre>
+      <pre class="code mt-3">Write .github/workflows/deploy.yml that promotes the booking-api image digest built for
+the triggering commit through environments dev → staging → prod using a reusable
+_deploy-ecs.yml. No rebuilds, OIDC role from vars.DEPLOY_ROLE_ARN per environment,
+concurrency per environment that never cancels, wait-for-service-stability.</pre>
+      <pre class="code mt-3">Prod 5xx went from 0.2% to 3% after release 1.9.0 (deploy marker 09:02). Here are the
+release notes, the migration list and the ECS deployment events. Recommend rollback or
+roll-forward with reasons. Do not run any command that changes AWS resources.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Split schema changes into expand / migrate / contract with the right Postgres options</li>
+            <li>Write promotion and deploy workflows from a written spec</li>
+            <li>Draft release notes and an approver summary from merged PRs</li>
+            <li>Lay out the rollback-or-roll-forward options from incident data</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Each migration is safe while the <em>previous</em> app version is still running</li>
+            <li>Deploy jobs use the promoted digest, never <code class="inline">docker build</code> or a mutable tag</li>
+            <li>The prod job declares <code class="inline">environment: prod</code> and the role trusts only that <code class="inline">sub</code></li>
+            <li>The final decision on rollback is made by the incident commander, not the agent</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written delivery pipelines:</strong> a deploy job that
+        rebuilds the image; <code class="inline">image: booking-api:latest</code> in a task definition; prod deploy without
+        <code class="inline">environment:</code>; migrations run from the app's entrypoint; <code class="inline">DROP</code>,
+        <code class="inline">RENAME</code> or <code class="inline">SET NOT NULL</code> in the same release as the code change;
+        <code class="inline">cancel-in-progress: true</code> on a deploy; <code class="inline">wait-for-service-stability: false</code>
+        "to speed things up"; and a suggested fix of <code class="inline">aws ecs update-service --force-new-deployment</code>
+        when nothing was diagnosed.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Deploys by running a script or clicking in the console; has no rollback plan.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can name rolling, blue/green and canary and say what a feature flag is, but cannot pick between them for a given change.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Uses the existing promotion pipeline and approvals correctly; needs help splitting a migration or deciding whether to roll back.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Builds a digest-promotion pipeline with environment gates and OIDC, chooses and configures a release strategy per change with rollback alarms, ships schema changes with expand/contract, and makes the rollback call in an incident.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets release policy across client projects (strategy defaults, flag hygiene, migration review), runs rollback drills, and reports DORA metrics from pipeline data.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> given three changes (a CSS fix, a
+        new payment flow, a column rename), write the release plan for each: strategy, flag, migration steps, the alarm
+        that triggers rollback, and the exact rollback command. Then demonstrate one automatic rollback on staging from a
+        deliberately broken build.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Staging that is not like prod</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A staging with an empty database and one task cannot catch a migration that takes 4 minutes on 2 million rows. Restore an anonymised prod snapshot into staging regularly.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Batching a week of changes into one release</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Forty changes in one deploy means forty suspects when it breaks, and rollback drops thirty-nine good changes. Release small and often.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Hotfixes that skip the pipeline</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The fastest path to prod must still be the pipeline, with a smaller gate if needed. A console hotfix is untested, unrecorded and overwritten by the next deploy.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Release during working hours</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Deploy prod between 10:00 and 16:00 on weekdays, when the people who wrote the change are awake. Evening deploys save no one any risk; they only reduce who is around to respond.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Write the rollback line in the PR</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Every PR template has "How to undo this": a flag name, "standard rollback", or "roll-forward only, because…". Reviewers block PRs where it is blank.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="promotion"> <span>I built a pipeline that promotes one image digest through dev, staging and prod with GitHub environments and per-environment OIDC roles.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="strategies"> <span>I can choose between rolling, blue/green, canary and shadow for a given change and size a canary from real traffic.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="flags"> <span>I shipped a change dark behind a feature flag, rolled it out gradually and removed the flag afterwards.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="migrations"> <span>I split a breaking schema change into expand, migrate and contract releases and ran the migration as a pipeline step.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="rollback"> <span>I can explain when to roll back and when to roll forward, and I have performed both a manual and an automatic rollback.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="ci2-lab"> <span class="font-semibold">In a sandbox copy of clinic-app, built the dev → staging → prod promotion with an approval gate, released a version with an expand migration and a flag, then deployed a deliberately failing build and showed the alarm-driven rollback. Shared the PRs, the run links and a one-page release plan (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments" target="_blank" rel="noopener">GitHub — Managing environments for deployment</a>: protection rules, reviewers, wait timers and environment secrets.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-types.html" target="_blank" rel="noopener">AWS — Amazon ECS deployment types</a>: rolling, blue/green and canary options and their rollback behaviour.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-alarm-failure.html" target="_blank" rel="noopener">AWS — ECS deployment failure detection with alarms</a>: wiring CloudWatch alarms to automatic rollback.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/appconfig/latest/userguide/appconfig-creating-configuration-and-profile-feature-flags.html" target="_blank" rel="noopener">AWS — AppConfig feature flags</a>: flag profiles, attributes and the agent used in Part III.</li>
+        <li><a class="text-coral underline" href="https://github.com/googleapis/release-please" target="_blank" rel="noopener">release-please</a>: release PRs, monorepo manifests and changelog configuration.</li>
+        <li><a class="text-coral underline" href="https://dora.dev/capabilities/continuous-delivery/" target="_blank" rel="noopener">DORA — Continuous delivery</a>: the research behind small, frequent, reversible releases.</li>
+        <li><a class="text-coral underline" href="https://sre.google/workbook/canarying-releases/" target="_blank" rel="noopener">Google SRE Workbook — Canarying releases</a>: canary sizing, metric selection and evaluation.</li>
+      </ul>

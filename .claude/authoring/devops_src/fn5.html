@@ -1,0 +1,824 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Bash &amp; Python Automation</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          A script is a small program that runs commands for you, so a task you did by hand once can be done the same way
+          a hundred times. This module teaches the two scripting languages every DevOps engineer uses daily:
+          <strong>Bash</strong> (the language of the Linux shell) for gluing commands together, and <strong>Python</strong>
+          with <strong>boto3</strong> (the official AWS library for Python) for anything that talks to AWS in a loop. You
+          will learn to write scripts that stop safely when something fails, process text and JSON with
+          <code class="inline">grep</code>, <code class="inline">awk</code>, <code class="inline">jq</code> and
+          <code class="inline">yq</code>, run on a schedule, can be run twice without causing damage, and know when the job
+          should be handed to Terraform instead.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> scripts cause outages in a particular way. They do not crash
+          loudly; they carry on after a failed step. A <code class="inline">cd</code> into a directory that does not exist
+          fails, the next line runs <code class="inline">rm -rf ./*</code> in the wrong place, and the script reports
+          success. A cleanup job that worked in <code class="inline">gol-dev</code> runs with the wrong profile and deletes
+          snapshots in <code class="inline">gol-prod</code>. Every one of these is prevented by a handful of habits you can
+          learn in a week: strict mode, quoting, a dry-run default and an explicit account check. Agents write scripts in
+          seconds. Reviewing them for these habits is your job.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Bash safely</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every script fails eventually; decide in advance how it fails</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Bash was designed for people typing commands one at a time, where carrying on after an error is helpful. In a
+        script nobody is watching, carrying on is dangerous. By default Bash ignores a failed command, treats an unset
+        variable as an empty string, and splits any unquoted value on spaces. You fix all three in the first lines of
+        every script. You should already be comfortable in a Linux shell
+        (<a href="./fn2.html" class="text-viol underline decoration-viol/40">FN2</a>); here we turn interactive commands into
+        programs.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Strict mode: the three lines at the top of every script</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every command returns an <strong>exit code</strong> (also called exit status): a number from 0 to 255, where
+        <code class="inline">0</code> means success and anything else means failure. <strong>Strict mode</strong> is the
+        common name for three shell options that make Bash take exit codes and unset variables seriously. Start every
+        script with this header and you remove the most common class of script incidents.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">scripts/_header.sh — copy into every new script</span>
+        <pre class="code"><span class="cm">#!/usr/bin/env bash</span>
+<span class="cm"># the shebang line: run this file with whichever bash is first on PATH</span>
+<span class="kw">set</span> -Eeuo pipefail   <span class="cm"># strict mode; see the table below for each letter</span>
+IFS=$<span class="st">'\n\t'</span>          <span class="cm"># split only on newlines and tabs, never on spaces</span>
+readonly SCRIPT_DIR=<span class="st">"$(cd "$(dirname "${BASH_SOURCE[0]}")" &amp;&amp; pwd)"</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Option</th><th class="px-4 py-3">What it does</th><th class="px-4 py-3">The incident it prevents</th><th class="px-4 py-3">Where it does not help</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">-e</code> (errexit)</td><td class="px-4 py-3">Exit as soon as a command returns non-zero</td><td class="px-4 py-3">A failed <code class="inline">cd</code> followed by <code class="inline">rm</code> in the wrong directory</td><td class="px-4 py-3">Commands inside <code class="inline">if</code>, <code class="inline">while</code>, or on the left of <code class="inline">&amp;&amp;</code> / <code class="inline">||</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">-u</code> (nounset)</td><td class="px-4 py-3">Treat a reference to an unset variable as an error</td><td class="px-4 py-3"><code class="inline">rm -rf "$BUILD_DIR/"</code> becoming <code class="inline">rm -rf "/"</code> because of a typo</td><td class="px-4 py-3">Variables that are set but empty</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">-o pipefail</code></td><td class="px-4 py-3">A pipeline fails if <em>any</em> command in it fails, not just the last</td><td class="px-4 py-3"><code class="inline">aws … | jq …</code> "succeeding" after the AWS call was denied</td><td class="px-4 py-3"><code class="inline">grep -q</code> or <code class="inline">head</code> closing the pipe early (exit 141)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">-E</code> (errtrace)</td><td class="px-4 py-3">Makes an <code class="inline">ERR</code> trap fire inside functions too</td><td class="px-4 py-3">Silent failures deep in a helper function</td><td class="px-4 py-3">Nothing on its own; it is for the trap below</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        See the difference with a two-line test. Without strict mode, the failed command is ignored and the script exits
+        0, so a pipeline or cron job records success:
+      </p>
+      <pre class="code mt-3">bash -c 'cd /does/not/exist; echo "now deleting in $PWD"'; echo "exit=$?"
+<span class="out">bash: line 1: cd: /does/not/exist: No such file or directory
+now deleting in /home/ops
+exit=0</span>
+bash -c 'set -euo pipefail; cd /does/not/exist; echo "now deleting in $PWD"'; echo "exit=$?"
+<span class="out">bash: line 1: cd: /does/not/exist: No such file or directory
+exit=1</span>   <span class="cm"># stopped before the dangerous line</span></pre>
+      <div class="mt-4 callout callout-warn"><strong><code class="inline">set -e</code> has holes.</strong> It does not
+        fire for a command used as a condition, and <code class="inline">local out=$(aws sts get-caller-identity)</code>
+        always succeeds because the exit code you see is the one from <code class="inline">local</code>, not from the AWS
+        call. Declare first, assign second: <code class="inline">local out; out=$(…)</code>. Strict mode lowers the risk;
+        it does not remove the need to check the result of commands that matter.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Quoting: the bug that hides until a filename has a space</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When Bash sees <code class="inline">$var</code> without quotes, it does two things to the value: <strong>word
+        splitting</strong> (breaking it into separate arguments wherever there is whitespace) and <strong>globbing</strong>
+        (expanding <code class="inline">*</code> and <code class="inline">?</code> into matching filenames). That is almost
+        never what you want. The rule is simple: <strong>always double-quote variable and command expansions</strong>
+        (<code class="inline">"$var"</code>, <code class="inline">"$(cmd)"</code>, <code class="inline">"${arr[@]}"</code>)
+        unless you can explain why not.
+      </p>
+      <pre class="code mt-3">file="patient export.csv"
+rm $file               <span class="cm"># runs: rm 'patient' 'export.csv'   (two wrong files)</span>
+<span class="out">rm: cannot remove 'patient': No such file or directory
+rm: cannot remove 'export.csv': No such file or directory</span>
+rm "$file"             <span class="cm"># runs: rm 'patient export.csv'     (one right file)</span>
+
+<span class="cm"># arrays keep each argument separate; this is how to build a command safely</span>
+args=(--profile gol-dev-readonly --region ap-southeast-1)
+aws s3 ls "${args[@]}"</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You do not have to remember every rule, because <strong>ShellCheck</strong> (a free linter for shell scripts) does.
+        It finds unquoted variables (warning <code class="inline">SC2086</code>), the <code class="inline">local</code>
+        trap above (<code class="inline">SC2155</code>) and about 400 other mistakes. Run it locally and in CI
+        (<a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a>); our <code class="inline">clinic-infra</code>
+        repo fails the PR on any ShellCheck warning.
+      </p>
+      <pre class="code mt-3">shellcheck scripts/prune-snapshots.sh
+<span class="out">In scripts/prune-snapshots.sh line 14:
+for id in $(aws ec2 describe-snapshots --query 'Snapshots[].SnapshotId' --output text); do
+          ^-- SC2046 (warning): Quote this to prevent word splitting.</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Exit codes and traps: clean up, and fail loudly</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>trap</strong> tells Bash to run a command when something happens to the script. The two you need are
+        <code class="inline">EXIT</code> (runs when the script ends for any reason, so it is the place to delete temporary
+        files and release locks) and <code class="inline">ERR</code> (runs when a command fails, so it is the place to
+        print <em>which</em> line failed). Your script's own exit code is a contract with whoever calls it: a pipeline, cron
+        or another script. Use it deliberately.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 230" class="w-full min-w-[620px]" role="img" aria-label="Script lifecycle with strict mode: a failing step triggers the ERR trap, then the EXIT trap cleans up, and the script returns a non-zero code">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">A STRICT-MODE SCRIPT · what happens when step 3 fails</text>
+          <g class="anim-pulse"><rect x="10" y="50" width="120" height="50" rx="9" fill="#2563EB"/>
+            <text x="70" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">1 · Header</text>
+            <text x="70" y="87" text-anchor="middle" fill="#ffffffbb" font-size="9">set -Eeuo pipefail</text></g>
+          <g class="anim-pulse d1"><rect x="155" y="50" width="120" height="50" rx="9" fill="#6d5acd"/>
+            <text x="215" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">2 · Preflight</text>
+            <text x="215" y="87" text-anchor="middle" fill="#ffffffbb" font-size="9">account + tools check</text></g>
+          <g class="anim-pulse d2"><rect x="300" y="50" width="120" height="50" rx="9" fill="#DB2777"/>
+            <text x="360" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">3 · Work</text>
+            <text x="360" y="87" text-anchor="middle" fill="#ffffffbb" font-size="9">aws call returns 254</text></g>
+          <g class="anim-pulse d3"><rect x="300" y="150" width="120" height="50" rx="9" fill="#D97757"/>
+            <text x="360" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ERR trap</text>
+            <text x="360" y="187" text-anchor="middle" fill="#ffffffbb" font-size="9">log line + command</text></g>
+          <g class="anim-pulse d4"><rect x="460" y="150" width="120" height="50" rx="9" fill="#0D9488"/>
+            <text x="520" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">EXIT trap</text>
+            <text x="520" y="187" text-anchor="middle" fill="#ffffffbb" font-size="9">rm tmp · release lock</text></g>
+          <g class="anim-pulse d1"><rect x="600" y="150" width="90" height="50" rx="9" fill="#37474F"/>
+            <text x="645" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">exit 254</text>
+            <text x="645" y="187" text-anchor="middle" fill="#ffffffbb" font-size="9">caller sees failure</text></g>
+          <g><rect x="460" y="50" width="120" height="50" rx="9" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+            <text x="520" y="71" text-anchor="middle" fill="#A8A49B" font-size="11" font-weight="700">4 · Report</text>
+            <text x="520" y="87" text-anchor="middle" fill="#A8A49B" font-size="9">never reached</text></g>
+          <line x1="130" y1="75" x2="155" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="275" y1="75" x2="300" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="360" y1="100" x2="360" y2="150" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="420" y1="175" x2="460" y2="175" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="580" y1="175" x2="600" y2="175" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="420" y1="75" x2="460" y2="75" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="200" y="185" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">the EXIT trap runs on success too</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">scripts/lib/traps.sh</span>
+        <pre class="code">tmpdir=<span class="st">"$(mktemp -d)"</span>                    <span class="cm"># private temp dir, unique per run</span>
+
+<span class="fn">on_err</span>() {
+  <span class="kw">local</span> code=$?                          <span class="cm"># capture BEFORE any other command runs</span>
+  echo <span class="st">"ERROR line ${BASH_LINENO[0]}: '${BASH_COMMAND}' exited ${code}"</span> &gt;&amp;2
+  <span class="kw">exit</span> <span class="st">"$code"</span>
+}
+<span class="fn">cleanup</span>() { rm -rf -- <span class="st">"$tmpdir"</span>; }
+<span class="kw">trap</span> on_err ERR
+<span class="kw">trap</span> cleanup EXIT                          <span class="cm"># runs on success, failure and Ctrl-C</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Exit code</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">You will see it when</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">0</td><td class="px-4 py-3">Success</td><td class="px-4 py-3">Everything worked, or <code class="inline">grep</code> found a match</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">1</td><td class="px-4 py-3">General failure</td><td class="px-4 py-3"><code class="inline">grep</code> found nothing (not an error, but <code class="inline">set -e</code> treats it as one)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">2</td><td class="px-4 py-3">Usage error, by convention</td><td class="px-4 py-3">Your script was called with bad arguments; return 2 yourself</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">126 / 127</td><td class="px-4 py-3">Not executable / command not found</td><td class="px-4 py-3">Missing <code class="inline">chmod +x</code>, or a tool missing from cron's PATH</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">128 + N</td><td class="px-4 py-3">Killed by signal N</td><td class="px-4 py-3">130 = Ctrl-C (SIGINT), 137 = SIGKILL (often the OOM killer), 143 = SIGTERM</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">252–255</td><td class="px-4 py-3">AWS CLI v2 errors</td><td class="px-4 py-3">252 bad syntax, 253 bad config, 254 the service returned an error, 255 general CLI failure</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Signals and the processes behind exit codes 130–143 are explained in
+        <a href="./fn2.html" class="text-viol underline decoration-viol/40">FN2</a>. For scripting, the rule is: a
+        <code class="inline">grep</code> that may find nothing needs <code class="inline">|| true</code> or an
+        <code class="inline">if</code>, otherwise strict mode will stop your script on a perfectly normal result.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Preflight: prove where you are before you change anything</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The most expensive script bug is not a syntax error; it is running correct code against the wrong AWS account.
+        Profiles and SSO sign-in are covered in <a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a>.
+        Every script that writes to AWS starts by asking AWS who it is talking to, and refuses to continue if the answer is
+        not what it expected. This costs one API call and has saved more than one production account.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">scripts/lib/preflight.sh</span>
+        <pre class="code"><span class="fn">require_account</span>() {          <span class="cm"># usage: require_account 222233334444</span>
+  <span class="kw">local</span> want=<span class="st">"$1"</span> have
+  have=<span class="st">"$(aws sts get-caller-identity --query Account --output text)"</span>
+  <span class="kw">if</span> [[ <span class="st">"$have"</span> != <span class="st">"$want"</span> ]]; <span class="kw">then</span>
+    echo <span class="st">"refusing: credentials are for ${have}, script expects ${want}"</span> &gt;&amp;2
+    <span class="kw">exit</span> 3
+  <span class="kw">fi</span>
+}
+<span class="fn">require_tools</span>() {             <span class="cm"># fail fast, with a clear message, if a tool is missing</span>
+  <span class="kw">local</span> t
+  <span class="kw">for</span> t <span class="kw">in</span> <span class="st">"$@"</span>; <span class="kw">do</span> command -v <span class="st">"$t"</span> &gt;/dev/null || { echo <span class="st">"missing: $t"</span> &gt;&amp;2; <span class="kw">exit</span> 3; }; <span class="kw">done</span>
+}</pre>
+      </div>
+      <pre class="code mt-3">AWS_PROFILE=gol-prod-readonly ./scripts/prune-snapshots.sh --account 222233334444
+<span class="out">refusing: credentials are for 444455556666, script expects 222233334444</span>
+echo $?
+<span class="out">3</span></pre>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Text and data tools</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Use line tools for logs and structured tools for JSON and YAML</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Most of what a DevOps engineer reads is either <strong>lines of text</strong> (application logs, access logs,
+        <code class="inline">kubectl get</code> tables) or <strong>structured data</strong> (JSON from the AWS CLI, YAML in
+        Kubernetes manifests and GitHub Actions workflows). The Unix habit is to join small tools with a
+        <strong>pipe</strong> (<code class="inline">|</code>), which sends one command's output into the next command's
+        input. Pick the tool by the shape of the data, not by which one you remember.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="A pipeline: aws CLI emits JSON, jq turns it into tab-separated lines, awk filters and sums, sort and head rank the result">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ONE PIPELINE · structured in, lines out</text>
+          <g class="anim-pulse"><rect x="10" y="60" width="130" height="54" rx="9" fill="#37474F"/>
+            <text x="75" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">aws ec2 describe-…</text>
+            <text x="75" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">JSON · 4 MB</text></g>
+          <g class="anim-pulse d1"><rect x="190" y="60" width="130" height="54" rx="9" fill="#6d5acd"/>
+            <text x="255" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">jq -r … @tsv</text>
+            <text x="255" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">JSON → TSV lines</text></g>
+          <g class="anim-pulse d2"><rect x="370" y="60" width="130" height="54" rx="9" fill="#0D9488"/>
+            <text x="435" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">awk</text>
+            <text x="435" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">filter + sum columns</text></g>
+          <g class="anim-pulse d3"><rect x="550" y="60" width="140" height="54" rx="9" fill="#2563EB"/>
+            <text x="620" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">sort -rn | head</text>
+            <text x="620" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">top 10 · 1 screen</text></g>
+          <line x1="140" y1="87" x2="190" y2="87" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="320" y1="87" x2="370" y2="87" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="500" y1="87" x2="550" y2="87" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <circle cx="150" cy="87" r="4" fill="#D97757" class="anim-token t1" style="--slide:30px"/>
+          <circle cx="330" cy="87" r="4" fill="#D97757" class="anim-token t2" style="--slide:30px"/>
+          <circle cx="510" cy="87" r="4" fill="#D97757" class="anim-token t3" style="--slide:30px"/>
+          <text x="165" y="140" text-anchor="middle" font-size="9" fill="#6E6B64">parse JSON with a JSON tool</text>
+          <text x="525" y="140" text-anchor="middle" font-size="9" fill="#6E6B64">then line tools are safe</text>
+          <text x="350" y="180" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">never grep JSON: field order and whitespace are not guaranteed</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">grep, sed and awk: one job each</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">grep</code> <em>selects</em> lines that match a pattern. <code class="inline">sed</code>
+        (stream editor) <em>rewrites</em> text as it flows past. <code class="inline">awk</code> treats each line as
+        <em>columns</em> and lets you filter, count and sum them. A <strong>regular expression</strong> (regex) is the
+        pattern language all three share. Learn the column-oriented one, awk, properly: it replaces most "quick Python
+        scripts" over log files.
+      </p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Data looks like</th><th class="px-4 py-3">Use</th><th class="px-4 py-3">Example task</th><th class="px-4 py-3">Do not use</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Lines, find some</td><td class="px-4 py-3"><code class="inline">grep -E</code>, <code class="inline">grep -c</code></td><td class="px-4 py-3">Count <code class="inline">ERROR</code> lines in the worker log</td><td class="px-4 py-3"><code class="inline">cat file | grep</code> (needless extra process)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Lines, change some</td><td class="px-4 py-3"><code class="inline">sed -E 's/…/…/'</code></td><td class="px-4 py-3">Mask email addresses before sharing a log</td><td class="px-4 py-3"><code class="inline">sed -i</code> on YAML or JSON config</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Columns</td><td class="px-4 py-3"><code class="inline">awk</code></td><td class="px-4 py-3">5xx count per path from an access log</td><td class="px-4 py-3"><code class="inline">cut</code> when columns are separated by varying spaces</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">JSON</td><td class="px-4 py-3"><code class="inline">jq</code>, or <code class="inline">aws --query</code></td><td class="px-4 py-3">Instance ID and Name tag for every dev instance</td><td class="px-4 py-3"><code class="inline">grep</code>, <code class="inline">sed</code> or regex of any kind</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">YAML</td><td class="px-4 py-3"><code class="inline">yq</code></td><td class="px-4 py-3">Bump <code class="inline">image.tag</code> in a Helm values file</td><td class="px-4 py-3"><code class="inline">sed</code>: indentation and quoting break silently</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># access log format: ip - - [time] "METHOD /path HTTP/1.1" status bytes ...</span>
+<span class="cm"># $9 is the status column, $7 the path</span>
+awk '$9 &gt;= 500 { hits[$7]++ } END { for (p in hits) print hits[p], p }' access.log \
+  | sort -rn | head -5
+<span class="out">412 /v1/bookings
+ 37 /v1/slots
+  9 /healthz</span>
+
+<span class="cm"># mask emails before pasting a log into a ticket (clinic data is personal data)</span>
+sed -E 's/[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}/&lt;email&gt;/g' worker.log &gt; worker.masked.log
+
+grep -c 'level=error' worker.log || true   <span class="cm"># grep exits 1 on zero matches; don't let -e kill the script</span>
+<span class="out">0</span></pre>
+      <div class="mt-4 callout callout-info"><strong>macOS vs Linux:</strong> your laptop ships BSD versions of
+        <code class="inline">sed</code>, <code class="inline">date</code> and <code class="inline">grep</code>; CI runners and
+        EC2 use GNU versions. <code class="inline">sed -i 's/a/b/' f</code> works on Linux and fails on macOS (which wants
+        <code class="inline">sed -i '' …</code>). Either install the GNU tools (<code class="inline">brew install gnu-sed coreutils</code>)
+        or test scripts in the same container image CI uses.</div>
+
+      <h3 class="font-semibold text-lg mt-8">jq: the AWS CLI's other half</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The AWS CLI prints JSON. <strong>jq</strong> is a small command-line program for filtering and reshaping JSON.
+        The CLI also has its own filter, <code class="inline">--query</code>, which uses a language called
+        <strong>JMESPath</strong> and runs before output is printed. Our rule: use <code class="inline">--query</code> for
+        simple field picking (one fewer tool to install) and jq when you need conditions, joins, defaults or
+        reformatting. Here is the same question answered both ways: which <code class="inline">gol-dev</code> instances are
+        running, and what are they called?
+      </p>
+      <pre class="code mt-3">aws ec2 describe-instances --profile gol-dev-readonly \
+  --filters Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].[InstanceId, Tags[?Key==`Name`]|[0].Value]' --output text
+<span class="out">i-0a1b2c3d4e5f60718   booking-worker-dev
+i-0f9e8d7c6b5a40312   bastion-legacy</span>
+
+aws ec2 describe-instances --profile gol-dev-readonly --output json \
+  | jq -r '.Reservations[].Instances[]
+           | select(.State.Name == "running")
+           | [.InstanceId, ((.Tags // [])[] | select(.Key == "Name") | .Value) // "-", .InstanceType]
+           | @tsv'
+<span class="out">i-0a1b2c3d4e5f60718   booking-worker-dev   t4g.small
+i-0f9e8d7c6b5a40312   bastion-legacy       t3.micro</span>
+<span class="cm"># (.Tags // []) : an instance with no tags has no Tags key at all; default it or jq errors</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Five jq idioms cover most ops work: <code class="inline">.[]</code> to iterate, <code class="inline">select()</code>
+        to filter, <code class="inline">//</code> for a default when a field is missing, <code class="inline">-r</code> for
+        raw strings without quotes, and <code class="inline">@tsv</code> to produce tab-separated lines that awk and
+        <code class="inline">while read</code> can consume safely. To <em>build</em> JSON, for example a request body, use
+        <code class="inline">jq -n --arg</code> rather than string concatenation, so quotes in values are escaped for you:
+      </p>
+      <pre class="code mt-3">jq -n --arg svc booking-api --arg ver "1.8.3" '{text: "deployed \($svc) \($ver) to gol-staging"}' \
+  | curl -fsS -X POST -H 'Content-Type: application/json' -d @- "$SLACK_WEBHOOK_URL"</pre>
+
+      <h3 class="font-semibold text-lg mt-8">yq: edit YAML without breaking it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        YAML is the configuration format for Kubernetes, Helm, Argo CD and GitHub Actions. Indentation is part of its
+        meaning, so a <code class="inline">sed</code> replacement that changes one space can turn a valid file into a
+        different valid file that means something else. <strong>yq</strong> (we use the Go version by Mike Farah, v4) reads
+        YAML into a tree, changes one node and writes it back. It is how pipelines bump image tags in
+        <code class="inline">clinic-gitops</code> (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-api/values-staging.yaml</span>
+        <pre class="code">image:
+  repository: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-api
+  tag: <span class="st">"1.8.2"</span>          <span class="cm"># the only line a release pipeline should touch</span>
+replicaCount: 2</pre>
+      </div>
+      <pre class="code mt-3">yq '.image.tag' apps/booking-api/values-staging.yaml
+<span class="out">1.8.2</span>
+TAG=1.8.3 yq -i '.image.tag = strenv(TAG)' apps/booking-api/values-staging.yaml   <span class="cm"># strenv keeps it a string</span>
+git diff --stat
+<span class="out"> apps/booking-api/values-staging.yaml | 2 +-</span>
+
+<span class="cm"># yq also converts formats: read a workflow file as JSON and pipe into jq</span>
+yq -o=json '.jobs | keys' .github/workflows/deploy.yml
+<span class="out">["build", "deploy-staging", "deploy-prod"]</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Two different programs are called <code class="inline">yq</code>.</strong>
+        One is a Python wrapper around jq (installed by <code class="inline">pip install yq</code>), the other is the Go
+        program used here. Their syntax differs. Check with <code class="inline">yq --version</code> (you want
+        <code class="inline">mikefarah/yq … version v4.x</code>) and pin the version in CI images, or a script that works
+        on your laptop will fail on the runner.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Reading line by line, safely</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        To act on each line of output, use a <code class="inline">while read</code> loop, never
+        <code class="inline">for x in $(cmd)</code>. The <code class="inline">for</code> version splits on every space and
+        expands any <code class="inline">*</code> it finds. The <code class="inline">while</code> version gets one whole line
+        per iteration, and with <code class="inline">IFS=$'\t'</code> it splits the tab-separated columns jq produced into
+        named variables.
+      </p>
+      <pre class="code mt-3">aws ec2 describe-snapshots --owner-ids self --profile gol-dev-readonly --output json \
+  | jq -r '.Snapshots[] | [.SnapshotId, .StartTime, (.Description // "")] | @tsv' \
+  | <span class="kw">while</span> IFS=$'\t' read -r id started desc; <span class="kw">do</span>     <span class="cm"># -r: keep backslashes literally</span>
+      printf '%s  %s  %s\n' "$id" "${started:0:10}" "$desc"
+    <span class="kw">done</span>
+<span class="out">snap-04c1e2a9d7b3f6501  2026-07-02  nightly booking-db-dev
+snap-0b77ac3e1f0d92a44  2026-10-28  nightly booking-db-dev</span></pre>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Scripts that run unattended</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A script is production code the moment nobody watches it run</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A script you run once at your desk can be rough. A script that runs from cron, a pipeline or a colleague's laptop
+        needs four properties: it can be run twice without harm (<strong>idempotent</strong>), it shows what it would do
+        before doing it (<strong>dry run</strong>), it takes its inputs as clear <strong>arguments</strong>, and it cannot
+        run twice at the same moment (<strong>locking</strong>). These are cheap to add at the start and painful to add
+        after the first incident.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Idempotency: check, then act</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Idempotent</strong> means "running it again gives the same result as running it once". Scripts get re-run
+        all the time: a pipeline retries, a cron job overlaps, someone runs it to "make sure". A script that does
+        <code class="inline">aws s3api create-bucket</code> fails on the second run; a script that does
+        <code class="inline">echo … &gt;&gt; ~/.bashrc</code> adds a duplicate line every time. The fix is always the same
+        shape: look at the current state, and act only on the difference. This is the same reconcile idea that Terraform
+        (<a href="./ia1.html" class="text-viol underline decoration-viol/40">IA1</a>) and Kubernetes
+        (<a href="./ks1.html" class="text-viol underline decoration-viol/40">KS1</a>) are built on.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    A["Desired: tag Owner=clinic<br/>on every dev snapshot"] --> B{"Read current state<br/>describe-snapshots"}
+    B -->|"already tagged"| S["Skip<br/>log: unchanged"]
+    B -->|"missing tag"| D{"--apply given?"}
+    D -->|no| P["Print plan<br/>would tag snap-…"]
+    D -->|yes| W["create-tags<br/>log: changed"]
+    W --> R["Summary<br/>changed=3 unchanged=41"]
+    S --> R
+    P --> R
+        </pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># not idempotent: second run appends a duplicate line, or fails</span>
+echo 'export AWS_PROFILE=gol-dev-admin' &gt;&gt; ~/.bashrc
+mkdir /opt/clinic/reports
+
+<span class="cm"># idempotent: same result on run 1 and run 50</span>
+grep -qxF 'export AWS_PROFILE=gol-dev-admin' ~/.bashrc || echo 'export AWS_PROFILE=gol-dev-admin' &gt;&gt; ~/.bashrc
+mkdir -p /opt/clinic/reports
+aws s3api head-bucket --bucket gol-dev-clinic-reports 2&gt;/dev/null \
+  || aws s3api create-bucket --bucket gol-dev-clinic-reports \
+       --create-bucket-configuration LocationConstraint=ap-southeast-1</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice that the bucket example is already turning into a small, worse version of Terraform: it creates a bucket
+        but will never notice if someone later removes its encryption setting. That is the signal Part IV comes back to.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Arguments, dry run by default, and a usage message</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A script that edits values inside itself before each run will eventually be run with last week's values. Take
+        every input as a command-line argument, print a usage message on <code class="inline">--help</code> or bad input
+        (exit code 2), and make the <strong>safe behaviour the default</strong>: a destructive script only prints what it
+        would do unless you pass <code class="inline">--apply</code>. The built-in <code class="inline">getopts</code>
+        handles only one-letter flags, so we use a <code class="inline">while</code>/<code class="inline">case</code> loop
+        that supports readable long options.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">scripts/prune-snapshots.sh — argument parsing</span>
+        <pre class="code"><span class="fn">usage</span>() {
+  cat &lt;&lt;'EOF'
+Usage: prune-snapshots.sh --account ID --older-than DAYS [--apply]
+Deletes EBS snapshots tagged Environment=dev older than DAYS. Dry run unless --apply.
+EOF
+}
+account=<span class="st">""</span>; days=<span class="st">""</span>; apply=false     <span class="cm"># defaults: nothing destructive</span>
+<span class="kw">while</span> [[ $# -gt 0 ]]; <span class="kw">do</span>
+  <span class="kw">case</span> <span class="st">"$1"</span> <span class="kw">in</span>
+    --account)    account=<span class="st">"${2:?--account needs a value}"</span>; shift 2 ;;
+    --older-than) days=<span class="st">"${2:?--older-than needs a value}"</span>; shift 2 ;;
+    --apply)      apply=true; shift ;;
+    -h|--help)    usage; <span class="kw">exit</span> 0 ;;
+    *)            echo <span class="st">"unknown option: $1"</span> &gt;&amp;2; usage &gt;&amp;2; <span class="kw">exit</span> 2 ;;
+  <span class="kw">esac</span>
+<span class="kw">done</span>
+[[ -n <span class="st">"$account"</span> &amp;&amp; <span class="st">"$days"</span> =~ ^[0-9]+$ ]] || { usage &gt;&amp;2; <span class="kw">exit</span> 2; }
+[[ <span class="st">"$days"</span> -ge 7 ]] || { echo <span class="st">"refusing: --older-than below 7 days"</span> &gt;&amp;2; <span class="kw">exit</span> 2; }</pre>
+      </div>
+      <pre class="code mt-3">./scripts/prune-snapshots.sh --account 222233334444 --older-than 30
+<span class="out">DRY RUN  would delete snap-04c1e2a9d7b3f6501  2026-07-02  nightly booking-db-dev
+DRY RUN  would delete snap-09d3a1b5c8e7f2604  2026-08-14  nightly booking-db-dev
+summary: 2 to delete, 18 kept. Re-run with --apply to delete.</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Print a summary line with counts.</strong> "2 to delete, 18 kept" is
+        something a reviewer can sanity-check in one second. If a dry run against dev says "1,204 to delete", you have
+        found a bug in your filter before it cost anything. Paste the dry-run output into the PR or change ticket.</div>
+
+      <h3 class="font-semibold text-lg mt-8">cron: scheduling, and the environment it does not give you</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>cron</strong> is the Unix scheduler: a background service that runs commands at times you list in a
+        <strong>crontab</strong> (cron table) file. Each line has five time fields and a command. The classic surprise is
+        that cron does not run your login shell: <code class="inline">PATH</code> is only
+        <code class="inline">/usr/bin:/bin</code>, your aliases and profile are not loaded, the working directory is your
+        home directory, and output is emailed into the void unless you redirect it.
+      </p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Schedule</th><th class="px-4 py-3">Meaning</th><th class="px-4 py-3">Typical use</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">*/5 * * * *</code></td><td class="px-4 py-3">Every 5 minutes</td><td class="px-4 py-3">Disk-space check on a legacy box</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">15 2 * * *</code></td><td class="px-4 py-3">02:15 every day</td><td class="px-4 py-3">Nightly snapshot prune (avoid exactly 00:00, everyone uses it)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">0 9 * * 1-5</code></td><td class="px-4 py-3">09:00 Monday to Friday</td><td class="px-4 py-3">Post a cost report to Slack</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">0 3 1 * *</code></td><td class="px-4 py-3">03:00 on the 1st of each month</td><td class="px-4 py-3">Access-key age report</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">/etc/cron.d/clinic-ops — on a legacy EC2 host (times are UTC)</span>
+        <pre class="code">SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin           <span class="cm"># aws, jq live in /usr/local/bin</span>
+MAILTO=<span class="st">""</span>
+<span class="cm"># m  h  dom mon dow  user  command</span>
+15  19  *   *   *    ops   flock -n /run/lock/prune.lock /opt/clinic/scripts/prune-snapshots.sh --account 222233334444 --older-than 30 --apply &gt;&gt; /var/log/clinic/prune.log 2&gt;&amp;1
+<span class="cm"># 19:15 UTC = 02:15 in Vietnam (UTC+7). flock -n: skip this run if the last one is still going</span>
+<span class="cm"># a literal % in a crontab means newline; write date +\%F, not date +%F</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">flock -n</code> takes an exclusive lock on a file and, with <code class="inline">-n</code>,
+        exits immediately if another copy already holds it. Without it, a prune that takes 70 minutes on an hourly
+        schedule ends up as several copies racing over the same snapshots. On servers that use systemd, a
+        <strong>timer</strong> unit is the modern alternative to cron and logs to journald for free
+        (<a href="./fn2.html" class="text-viol underline decoration-viol/40">FN2</a>).
+      </p>
+      <div class="mt-4 callout callout-info"><strong>On AWS, prefer a scheduler that does not live on one machine.</strong>
+        A crontab on an EC2 instance stops when the instance does, and nobody notices. For new jobs we run the script in a
+        container on a schedule with EventBridge Scheduler (<a href="./aw6.html" class="text-viol underline decoration-viol/40">AW6</a>)
+        or as a Kubernetes CronJob (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>), and alarm
+        when it fails. cron is still worth knowing: you will inherit hosts that depend on it.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Logging that a tired person can read at 3 a.m.</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Send progress and errors to <strong>standard error</strong> (stderr, file descriptor 2) and real results to
+        <strong>standard output</strong> (stdout, descriptor 1), so a caller can pipe the results somewhere and still see
+        the messages. Prefix each line with a UTC timestamp and a level. Log every change the script makes with the
+        resource ID, because that log is the only record of what an unattended job did.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">scripts/lib/log.sh</span>
+        <pre class="code"><span class="fn">log</span>() { printf '%s %-5s %s\n' <span class="st">"$(date -u +%Y-%m-%dT%H:%M:%SZ)"</span> <span class="st">"$1"</span> <span class="st">"${*:2}"</span> &gt;&amp;2; }
+<span class="fn">info</span>() { log INFO <span class="st">"$@"</span>; }
+<span class="fn">warn</span>() { log WARN <span class="st">"$@"</span>; }
+<span class="fn">die</span>()  { log ERROR <span class="st">"$@"</span>; <span class="kw">exit</span> 1; }
+
+info <span class="st">"deleted snapshot=snap-04c1e2a9d7b3f6501 age_days=120 account=222233334444"</span></pre>
+      </div>
+      <pre class="code mt-3">tail -3 /var/log/clinic/prune.log
+<span class="out">2026-10-29T19:15:02Z INFO  start older_than=30 apply=true account=222233334444
+2026-10-29T19:15:09Z INFO  deleted snapshot=snap-04c1e2a9d7b3f6501 age_days=120 account=222233334444
+2026-10-29T19:15:10Z INFO  done deleted=1 kept=18 errors=0</span></pre>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Python, boto3 and the exit to Terraform</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Move to Python when it loops over AWS, and to Terraform when it should still exist tomorrow</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Bash is excellent glue and poor at everything else: it has no real data structures, error handling is a set of
+        conventions, and testing it is awkward. Python fixes all three, and <strong>boto3</strong>, the AWS SDK (software
+        development kit) for Python, gives you every AWS API with pagination, retries and credentials handled for you. But
+        the most important skill in this Part is the last one: recognising when a script should not exist at all.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">When Bash stops being the right tool</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Our rule of thumb: once a Bash script passes about 100 lines, needs a dictionary or a list of records, calls AWS in
+        a loop, or needs unit tests, rewrite it in Python. Rewriting at 100 lines takes an afternoon; rewriting at 600
+        lines, after three people have patched it, takes a week.
+      </p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Need</th><th class="px-4 py-3">Bash</th><th class="px-4 py-3">Python + boto3</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Run a few commands in order</td><td class="px-4 py-3">Ideal: a CI step, an entrypoint, a bootstrap</td><td class="px-4 py-3">Overkill</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Process structured data</td><td class="px-4 py-3">Possible with jq, hard to read past 3 filters</td><td class="px-4 py-3">Native dicts and lists</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Call an AWS API 1,000 times</td><td class="px-4 py-3">1,000 CLI processes, roughly 0.5–1 s each</td><td class="px-4 py-3">One process, reused connections, built-in retries</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Handle a specific error</td><td class="px-4 py-3">Parse stderr text, fragile</td><td class="px-4 py-3"><code class="inline">except ClientError</code> and check the error code</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Tests</td><td class="px-4 py-3">bats exists; rarely used</td><td class="px-4 py-3">pytest, with AWS calls stubbed</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Credentials: let the default chain find them</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        boto3 looks for credentials in a fixed order called the <strong>credential provider chain</strong> and uses the
+        first one it finds. That means one script works unchanged on your laptop (SSO profile), in GitHub Actions
+        (temporary credentials from OIDC, <a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a>) and
+        inside an ECS task or EKS Pod (the task role or Pod Identity). It also means you <strong>never</strong> put an
+        access key in a script, an environment file or a <code class="inline">boto3.client(aws_access_key_id=…)</code> call.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart TD
+    S["boto3.Session(profile_name=…)"] --> E{"1 · Environment variables?<br/>AWS_ACCESS_KEY_ID + SESSION_TOKEN"}
+    E -->|"yes: GitHub Actions after OIDC"| OK["Signed API calls<br/>temporary credentials"]
+    E -->|no| W{"2 · Web identity token file?"}
+    W -->|"yes: IRSA on EKS"| OK
+    W -->|no| P{"3 · Profile in ~/.aws/config?"}
+    P -->|"yes: SSO profile on a laptop"| OK
+    P -->|no| C{"4 · Container credentials endpoint?"}
+    C -->|"yes: ECS task role, EKS Pod Identity"| OK
+    C -->|no| I{"5 · EC2 instance metadata?"}
+    I -->|"yes: instance profile"| OK
+    I -->|no| X["NoCredentialsError"]
+        </pre>
+      </div>
+      <pre class="code mt-3">aws sso login --profile gol-dev-admin             <span class="cm"># browser sign-in, see AW1; token cached ~8 h</span>
+python3 -c 'import boto3; print(boto3.Session(profile_name="gol-dev-admin").client("sts").get_caller_identity()["Arn"])'
+<span class="out">arn:aws:sts::222233334444:assumed-role/AWSReservedSSO_DevOpsAdmin_5f2c9a1e7b3d4c60/ops.tran</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">A real boto3 script: pagination, retries and error codes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Here is the snapshot prune from Part III rewritten in Python. Three boto3 features do the heavy lifting.
+        A <strong>paginator</strong> fetches every page of results (AWS list APIs return at most a page at a time; a loop
+        over one call silently sees only the first 1,000 snapshots). The <strong>retry configuration</strong> backs off and
+        retries when AWS throttles you. <strong><code class="inline">ClientError</code></strong> carries a machine-readable
+        error code, so you can treat "snapshot in use by an AMI" differently from "access denied". The header block is
+        <em>inline script metadata</em> (PEP 723): <code class="inline">uv run</code> reads it and installs boto3 in an
+        isolated environment, so there is no <code class="inline">requirements.txt</code> to forget.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">scripts/prune_snapshots.py — setup and arguments</span>
+        <pre class="code"><span class="cm"># /// script</span>
+<span class="cm"># requires-python = "&gt;=3.12"</span>
+<span class="cm"># dependencies = ["boto3&gt;=1.40"]</span>
+<span class="cm"># ///</span>
+<span class="kw">import</span> argparse, datetime <span class="kw">as</span> dt, logging, sys
+<span class="kw">import</span> boto3
+<span class="kw">from</span> botocore.config <span class="kw">import</span> Config
+<span class="kw">from</span> botocore.exceptions <span class="kw">import</span> ClientError
+
+log = logging.getLogger(<span class="st">"prune"</span>)
+CFG = Config(region_name=<span class="st">"ap-southeast-1"</span>,
+             retries={<span class="st">"mode"</span>: <span class="st">"standard"</span>, <span class="st">"max_attempts"</span>: 10})  <span class="cm"># back off on throttling</span>
+
+<span class="kw">def</span> <span class="fn">parse_args</span>() -&gt; argparse.Namespace:
+    p = argparse.ArgumentParser(description=<span class="st">"Delete old dev EBS snapshots. Dry run unless --apply."</span>)
+    p.add_argument(<span class="st">"--profile"</span>, help=<span class="st">"SSO profile; omit in CI/ECS/EKS to use the default chain"</span>)
+    p.add_argument(<span class="st">"--account"</span>, required=True, help=<span class="st">"expected 12-digit account ID"</span>)
+    p.add_argument(<span class="st">"--older-than"</span>, type=int, default=30, metavar=<span class="st">"DAYS"</span>)
+    p.add_argument(<span class="st">"--apply"</span>, action=<span class="st">"store_true"</span>, help=<span class="st">"actually delete"</span>)
+    args = p.parse_args()
+    <span class="kw">if</span> args.older_than &lt; 7:
+        p.error(<span class="st">"--older-than must be at least 7"</span>)          <span class="cm"># exits 2 with usage</span>
+    <span class="kw">return</span> args</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">scripts/prune_snapshots.py — the work</span>
+        <pre class="code"><span class="kw">def</span> <span class="fn">main</span>() -&gt; int:
+    a = parse_args()
+    session = boto3.Session(profile_name=a.profile)
+    account = session.client(<span class="st">"sts"</span>, config=CFG).get_caller_identity()[<span class="st">"Account"</span>]
+    <span class="kw">if</span> account != a.account:                                   <span class="cm"># the preflight, again</span>
+        sys.exit(f<span class="st">"refusing: credentials are for {account}, expected {a.account}"</span>)
+    ec2 = session.client(<span class="st">"ec2"</span>, config=CFG)
+    cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(days=a.older_than)
+    pages = ec2.get_paginator(<span class="st">"describe_snapshots"</span>).paginate(   <span class="cm"># EVERY page, not just the first</span>
+        OwnerIds=[<span class="st">"self"</span>], Filters=[{<span class="st">"Name"</span>: <span class="st">"tag:Environment"</span>, <span class="st">"Values"</span>: [<span class="st">"dev"</span>]}])
+    deleted = kept = errors = 0
+    <span class="kw">for</span> snap <span class="kw">in</span> (s <span class="kw">for</span> page <span class="kw">in</span> pages <span class="kw">for</span> s <span class="kw">in</span> page[<span class="st">"Snapshots"</span>]):
+        sid = snap[<span class="st">"SnapshotId"</span>]
+        <span class="kw">if</span> snap[<span class="st">"StartTime"</span>] &gt;= cutoff:
+            kept += 1; <span class="kw">continue</span>
+        <span class="kw">try</span>:
+            ec2.delete_snapshot(SnapshotId=sid, DryRun=<span class="kw">not</span> a.apply)
+            deleted += 1; log.info(<span class="st">"deleted snapshot=%s"</span>, sid)
+        <span class="kw">except</span> ClientError <span class="kw">as</span> e:
+            code = e.response[<span class="st">"Error"</span>][<span class="st">"Code"</span>]
+            <span class="kw">if</span> code == <span class="st">"DryRunOperation"</span>:                         <span class="cm"># AWS says: you WOULD be allowed</span>
+                deleted += 1; log.info(<span class="st">"DRY RUN would delete snapshot=%s"</span>, sid)
+            <span class="kw">elif</span> code == <span class="st">"InvalidSnapshot.InUse"</span>:                 <span class="cm"># backs an AMI: expected, skip</span>
+                kept += 1; log.warning(<span class="st">"in use, kept snapshot=%s"</span>, sid)
+            <span class="kw">else</span>:
+                errors += 1; log.error(<span class="st">"snapshot=%s %s"</span>, sid, code)
+    log.info(<span class="st">"done deleted=%d kept=%d errors=%d apply=%s"</span>, deleted, kept, errors, a.apply)
+    <span class="kw">return</span> 1 <span class="kw">if</span> errors <span class="kw">else</span> 0
+
+<span class="kw">if</span> __name__ == <span class="st">"__main__"</span>:
+    logging.basicConfig(level=logging.INFO, format=<span class="st">"%(asctime)s %(levelname)-5s %(message)s"</span>)
+    sys.exit(main())</pre>
+      </div>
+      <pre class="code mt-3">uv run scripts/prune_snapshots.py --profile gol-dev-admin --account 222233334444 --older-than 30
+<span class="out">2026-10-30 09:12:01 INFO  DRY RUN would delete snapshot=snap-04c1e2a9d7b3f6501
+2026-10-30 09:12:01 INFO  DRY RUN would delete snapshot=snap-09d3a1b5c8e7f2604
+2026-10-30 09:12:02 WARNING in use, kept snapshot=snap-0e2b6f81c4a7d9035
+2026-10-30 09:12:02 INFO  done deleted=2 kept=19 errors=0 apply=False</span>
+echo $?
+<span class="out">0</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Use AWS's own dry run where it exists.</strong> Many EC2 calls accept
+        <code class="inline">DryRun=True</code>: AWS checks your permissions and parameters and returns
+        <code class="inline">DryRunOperation</code> instead of acting. That proves the real run will be <em>allowed</em>,
+        which a print statement cannot. For services without it, keep the <code class="inline">if not apply</code> branch.
+        When a script must wait for something to finish (a snapshot to complete, an instance to stop), use a
+        <strong>waiter</strong> such as <code class="inline">ec2.get_waiter("snapshot_completed")</code> rather than a
+        hand-written <code class="inline">sleep</code> loop.</div>
+
+      <h3 class="font-semibold text-lg mt-8">When to stop scripting and use Terraform</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A script <em>does</em> something once. Terraform <em>describes</em> something and keeps checking that it is still
+        true: it stores state, shows a plan before changing anything, and detects when someone changed the resource by
+        hand (<a href="./ia1.html" class="text-viol underline decoration-viol/40">IA1</a>). The test is a single question:
+        <strong>should the thing this script creates or configures still exist tomorrow?</strong> If yes, it belongs in
+        Terraform or in a managed AWS feature, not in a script.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 190" class="w-full min-w-[620px]" role="img" aria-label="Automation spectrum from one-off command to script to Terraform or a managed AWS feature, with examples for each">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">THE AUTOMATION SPECTRUM · move right as the job becomes permanent</text>
+          <g class="anim-pulse"><rect x="10" y="45" width="150" height="58" rx="9" fill="#37474F"/>
+            <text x="85" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">One-off command</text>
+            <text x="85" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">investigate · read only</text></g>
+          <g class="anim-pulse d1"><rect x="190" y="45" width="150" height="58" rx="9" fill="#0D9488"/>
+            <text x="265" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Script</text>
+            <text x="265" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">reports · backfills · glue</text></g>
+          <g class="anim-pulse d2"><rect x="370" y="45" width="150" height="58" rx="9" fill="#6d5acd"/>
+            <text x="445" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Terraform</text>
+            <text x="445" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">state · plan · drift</text></g>
+          <g class="anim-pulse d3"><rect x="550" y="45" width="140" height="58" rx="9" fill="#2563EB"/>
+            <text x="620" y="68" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Managed feature</text>
+            <text x="620" y="84" text-anchor="middle" fill="#ffffffbb" font-size="9">configured by Terraform</text></g>
+          <line x1="160" y1="74" x2="190" y2="74" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="340" y1="74" x2="370" y2="74" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="520" y1="74" x2="550" y2="74" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="85" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">jq over describe-instances</text>
+          <text x="265" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">weekly untagged-resource report</text>
+          <text x="445" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">the S3 uploads bucket</text>
+          <text x="620" y="128" text-anchor="middle" font-size="9" fill="#6E6B64">snapshot retention policy</text>
+          <text x="350" y="168" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">more permanent, more reviewed, less code you own</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Job</th><th class="px-4 py-3">Tempting script</th><th class="px-4 py-3">What we actually use</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Delete old EBS snapshots</td><td class="px-4 py-3">This module's prune script</td><td class="px-4 py-3">AWS Backup plan or Data Lifecycle Manager policy, in Terraform (<a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Delete old container images</td><td class="px-4 py-3">Nightly loop over <code class="inline">ecr batch-delete-image</code></td><td class="px-4 py-3">ECR lifecycle policy (<a href="./ci4.html" class="text-viol underline decoration-viol/40">CI4</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Create a bucket, a role, a security group</td><td class="px-4 py-3"><code class="inline">aws … create-*</code> with a "does it exist" check</td><td class="px-4 py-3">Terraform in <code class="inline">clinic-infra</code>, always</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Find untagged or idle resources</td><td class="px-4 py-3">A read-only report script</td><td class="px-4 py-3">The script is fine: it reads, it does not own anything</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Backfill a column after a migration</td><td class="px-4 py-3">A one-off Python script</td><td class="px-4 py-3">The script is fine: reviewed in a PR, run once, then archived</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        So why did this module build a snapshot prune at all? Because it is the ideal practice script: read-heavy, easy to
+        verify, and dangerous enough to make you respect dry runs. In a real account you would write it once, learn from
+        it, and then replace it with a ten-line lifecycle policy that nobody has to maintain.
+      </p>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are very good at scripts: they know every jq idiom and every boto3 paginator name. They are also happy to
+        run what they write. Give them read-only credentials (a <code class="inline">*-readonly</code> profile) and a dev
+        account, ask for a dry-run default, and read the diff before anything runs with <code class="inline">--apply</code>.
+      </p>
+      <pre class="code mt-3">Write scripts/untagged-report.sh: list EC2 instances, EBS volumes and RDS instances in
+the current account with no Owner tag, as TSV. Use set -Eeuo pipefail, an ERR trap,
+jq (not grep) for JSON, a require_account preflight, and make it pass shellcheck.
+Read-only AWS calls only.</pre>
+      <pre class="code mt-3">Rewrite scripts/prune-snapshots.sh in Python with boto3. Keep the same arguments.
+Requirements: paginator for describe_snapshots, standard retry mode, DryRun=True unless
+--apply, ClientError handled by error code, exit 1 if any error. Add a pytest test that
+uses botocore Stubber so no real AWS call is made.</pre>
+      <pre class="code mt-3">Review this script as a senior DevOps engineer. For each line that could cause damage
+if re-run, run against the wrong account, or run concurrently, quote it and explain.
+Then tell me whether this job should be a script at all or a Terraform-managed feature.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Write jq, awk and yq expressions, and explain each part</li>
+            <li>Convert a growing Bash script into Python with argparse and tests</li>
+            <li>Run ShellCheck and fix the warnings it finds</li>
+            <li>Run scripts in dry-run mode against a dev account with a read-only profile</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Strict mode is on and no <code class="inline">|| true</code> hides a failure that matters</li>
+            <li>Every write call is behind <code class="inline">--apply</code>, with an account preflight before it</li>
+            <li>List calls use a paginator; filters match what you meant (read the dry-run counts)</li>
+            <li>The job should not be Terraform, a lifecycle policy or an AWS Backup plan instead</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written scripts:</strong> no
+        <code class="inline">set -euo pipefail</code>; <code class="inline">for x in $(…)</code> over command output;
+        unquoted <code class="inline">$var</code> next to <code class="inline">rm</code>; <code class="inline">grep</code>
+        or <code class="inline">sed</code> on JSON or YAML; <code class="inline">aws_access_key_id=</code> anywhere in code;
+        a single <code class="inline">describe_*</code> call with no paginator; <code class="inline">except Exception: pass</code>;
+        destructive actions with no dry run; a hard-coded <code class="inline">--profile gol-prod-admin</code>; and a script
+        that creates long-lived infrastructure that Terraform does not know about.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Runs commands one at a time and has never written a script file.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can copy a script and change values in it, but cannot say what <code class="inline">set -e</code> does or why quoting matters.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Writes short Bash scripts and jq filters that work on the happy path. Needs review to catch missing strict mode, pagination or a dry run.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Writes strict-mode Bash that passes ShellCheck, uses jq/yq for structured data, adds a preflight, dry-run default and locking to anything unattended, writes boto3 scripts with paginators, retries and error codes, and says when a job belongs in Terraform instead.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Maintains the team's shared script library and CI lint gate, reviews others' scripts for blast radius, and retires scripts by replacing them with managed features.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, explain why
+        <code class="inline">local x=$(false)</code> does not stop a strict-mode script, write a jq filter that prints the
+        Name tag of every instance including untagged ones, and explain what happens to a boto3
+        <code class="inline">describe_snapshots</code> call without a paginator in an account with 3,000 snapshots. Then
+        name two scripts in your current project that should be Terraform.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Trusting the exit code of a pipeline without pipefail</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">aws … | jq …</code> returns jq's status. An <code class="inline">AccessDenied</code> from AWS becomes empty output and exit 0, and the job "succeeds" for weeks while doing nothing.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Reading only the first page</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A single boto3 list or describe call returns one page. The report looks complete in dev with 40 resources and silently misses most of prod. Use a paginator every time.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Scripts that create infrastructure</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A bucket created by a script has no owner in state, no review, and no drift detection. Six months later nobody knows whether it can be deleted. Create it in Terraform, or import it there (IA1).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Keep one shared header and library</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Strict mode, traps, logging and preflight live in <code class="inline">scripts/lib/</code> and every script sources them. New scripts start safe, and a fix lands everywhere at once.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Lint in CI, pin tool versions</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">ShellCheck and <code class="inline">ruff</code> on every PR, and a CI image with fixed jq, yq and AWS CLI versions. "Works on my machine" usually means "different yq".</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Paste the dry run into the PR</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The dry-run summary ("2 to delete, 19 kept") is the script equivalent of a <code class="inline">terraform plan</code>. Reviewers approve the output, not just the code.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="strict"> <span>I can explain each part of <code class="inline">set -Eeuo pipefail</code>, its holes, and why every expansion is quoted.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="text-tools"> <span>I can pick grep, sed, awk, jq or yq for a given input and wrote an awk report over an access log and a jq filter over AWS CLI output.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="unattended"> <span>My scripts have arguments with a usage message, a dry-run default, an account preflight, and a lock when scheduled with cron.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="boto3"> <span>I wrote a boto3 script that uses an SSO profile or the default chain, a paginator, retry config and error-code handling.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="report-pr"> <span class="font-semibold">In gol-dev, wrote an untagged-resource report in Bash (ShellCheck clean) and the snapshot prune in Python with a pytest Stubber test, opened a PR with both dry-run outputs pasted in, and wrote one paragraph naming which job should move to Terraform or a lifecycle policy (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://github.com/koalaman/shellcheck" target="_blank" rel="noopener">ShellCheck — README and wiki</a> — every warning code (SC2086, SC2155…) with an explanation and a fix.</li>
+        <li><a class="text-coral underline" href="https://github.com/jqlang/jq" target="_blank" rel="noopener">jq — project and manual</a> — the filters, <code class="inline">//</code>, <code class="inline">@tsv</code> and <code class="inline">--arg</code> used in Part II.</li>
+        <li><a class="text-coral underline" href="https://github.com/mikefarah/yq" target="_blank" rel="noopener">mikefarah/yq — README</a> — the Go yq v4 we use for editing values files in place.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-filter.html" target="_blank" rel="noopener">AWS — Filtering CLI output with --query</a> · <a class="text-coral underline" href="https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-returncodes.html" target="_blank" rel="noopener">CLI return codes</a> — JMESPath and the 252–255 exit codes.</li>
+        <li><a class="text-coral underline" href="https://github.com/boto/boto3" target="_blank" rel="noopener">boto3 — project README</a> — installation, links to the paginator, waiter and error-handling guides.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html" target="_blank" rel="noopener">AWS — SDK credential providers</a> — the provider chain from Part IV, shared by boto3 and the CLI.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html" target="_blank" rel="noopener">AWS — SDK retry behavior</a> — standard vs adaptive retry modes and <code class="inline">max_attempts</code>.</li>
+      </ul>

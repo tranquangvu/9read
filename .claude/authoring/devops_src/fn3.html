@@ -1,0 +1,763 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Networking for DevOps</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Almost every outage report has a networking sentence in it: "the health check timed out", "DNS returned the
+          old IP", "the certificate expired", "the load balancer returned 502". This module gives you the working model
+          behind those sentences. You will learn how a request from a patient's phone reaches
+          <code class="inline">booking-api</code>: the addresses and ports it uses, the TCP connection it opens, the DNS
+          lookup that comes first, the TLS handshake that protects it, and the load balancer that sits in front. Each
+          layer comes with the one or two commands that prove it is working, so that by the end you can take
+          "the site is down" and narrow it to a single layer in a few minutes.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> when <code class="inline">app.clinic.example.com</code> stops
+          loading, the cause could be DNS, a security group, a full subnet, an expired certificate, a load balancer that
+          thinks every target is unhealthy, or the app itself. Engineers who guess spend an hour restarting things.
+          Engineers who test layer by layer (name, then connection, then TLS, then HTTP) find the broken layer in five
+          minutes, because each layer fails with a different, recognisable symptom. Agents can write security group
+          rules and listener configs quickly. Knowing whether those rules let the right packets through is your job.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Layers, addresses &amp; ports</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Find the broken layer before you touch anything</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A <strong>network</strong> is a set of machines that can send each other data. A <strong>protocol</strong> is an
+        agreed set of rules for that data: what a message looks like, who speaks first, what happens when something is
+        lost. Networking feels hard because many protocols are stacked on top of each other. The good news is that the
+        stack is also the troubleshooting method. Each layer depends only on the one below it, so you test from the
+        bottom up and stop at the first layer that fails.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">OSI and TCP/IP: the layers you will actually use</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You will hear two models. The <strong>OSI model</strong> has seven layers and is mainly a vocabulary: people say
+        "that's a layer 7 problem" to mean "it's in HTTP, not in the network". The <strong>TCP/IP model</strong> has four
+        layers and is what really runs on the wire. You need only the mapping below, and the habit of naming the layer
+        before you start fixing anything.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">OSI layer (number)</th><th class="px-4 py-3">Protocols</th><th class="px-4 py-3">On AWS it is…</th><th class="px-4 py-3">Prove it with</th><th class="px-4 py-3">Typical failure</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Application (7)</td><td class="px-4 py-3">HTTP, DNS, TLS*</td><td class="px-4 py-3">ALB listener rules, CloudFront, Route 53</td><td class="px-4 py-3"><code class="inline">curl -v</code>, <code class="inline">dig</code>, <code class="inline">openssl</code></td><td class="px-4 py-3">404, 502, wrong record, expired cert</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Transport (4)</td><td class="px-4 py-3">TCP, UDP, QUIC</td><td class="px-4 py-3">Security groups, NLB, target group ports</td><td class="px-4 py-3"><code class="inline">nc -zv</code>, <code class="inline">ss</code></td><td class="px-4 py-3">Connection refused, connection timed out</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Network (3)</td><td class="px-4 py-3">IP, ICMP</td><td class="px-4 py-3">VPC, subnets, route tables, NAT gateway, NACLs</td><td class="px-4 py-3"><code class="inline">ip route</code>, <code class="inline">mtr</code></td><td class="px-4 py-3">No route, wrong CIDR, overlapping ranges</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Link (2) / Physical (1)</td><td class="px-4 py-3">Ethernet, ARP</td><td class="px-4 py-3">ENIs; AWS runs the rest</td><td class="px-4 py-3"><code class="inline">ip link</code></td><td class="px-4 py-3">Rare for you on AWS; ENI limits on EKS (<a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        *TLS sits between layers 4 and 7, and textbooks disagree where to put it. In practice, treat it as its own step:
+        TCP connects first, then TLS negotiates, then HTTP talks. Part III covers it.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 230" class="w-full min-w-[620px]" role="img" aria-label="Encapsulation: an HTTP request is wrapped in TLS, then TCP, then IP, then Ethernet">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ENCAPSULATION · each layer wraps the one above in its own header</text>
+          <g class="anim-pulse"><rect x="250" y="38" width="200" height="34" rx="9" fill="#2563EB"/>
+            <text x="350" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">HTTP</text>
+            <text x="350" y="67" text-anchor="middle" fill="#ffffffbb" font-size="9">GET /v1/slots · Host: api.clinic…</text></g>
+          <g class="anim-pulse d1"><rect x="200" y="80" width="300" height="34" rx="9" fill="#6d5acd"/>
+            <text x="350" y="97" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">TLS record</text>
+            <text x="350" y="109" text-anchor="middle" fill="#ffffffbb" font-size="9">HTTP encrypted, nobody in between can read it</text></g>
+          <g class="anim-pulse d2"><rect x="150" y="122" width="400" height="34" rx="9" fill="#0D9488"/>
+            <text x="350" y="139" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">TCP segment</text>
+            <text x="350" y="151" text-anchor="middle" fill="#ffffffbb" font-size="9">src port 52814 → dst port 443 · sequence numbers</text></g>
+          <g class="anim-pulse d3"><rect x="100" y="164" width="500" height="34" rx="9" fill="#D97757"/>
+            <text x="350" y="181" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">IP packet</text>
+            <text x="350" y="193" text-anchor="middle" fill="#ffffffbb" font-size="9">src 113.161.4.20 → dst 13.250.18.7 (the ALB)</text></g>
+          <text x="40" y="60" font-size="10" fill="#6E6B64">L7</text>
+          <text x="40" y="102" font-size="10" fill="#6E6B64">TLS</text>
+          <text x="40" y="144" font-size="10" fill="#6E6B64">L4</text>
+          <text x="40" y="186" font-size="10" fill="#6E6B64">L3</text>
+          <text x="350" y="220" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">a security group sees only L3/L4 (IPs, ports); only an L7 device can see the URL path</text>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">IP addresses and CIDR maths</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An <strong>IPv4 address</strong> is a 32-bit number written as four bytes, such as <code class="inline">10.20.34.17</code>.
+        <strong>CIDR notation</strong> (Classless Inter-Domain Routing) describes a <em>range</em> of addresses:
+        <code class="inline">10.20.0.0/16</code> means "the first 16 bits are fixed, the remaining 16 are free", which
+        is 2<sup>16</sup> = 65,536 addresses. The rule to memorise: <strong>addresses = 2<sup>(32 − prefix)</sup></strong>.
+        Every step of one in the prefix halves the range. Our production VPC is <code class="inline">10.20.0.0/16</code>,
+        dev is <code class="inline">10.10.0.0/16</code> and staging <code class="inline">10.15.0.0/16</code>. They must
+        never overlap, or the networks can't be connected later.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Prefix</th><th class="px-4 py-3">Addresses</th><th class="px-4 py-3">Usable in an AWS subnet</th><th class="px-4 py-3">Where you see it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">/16</td><td class="px-4 py-3">65,536</td><td class="px-4 py-3">n/a (VPC size, the AWS maximum)</td><td class="px-4 py-3"><code class="inline">clinic-prod</code> VPC <code class="inline">10.20.0.0/16</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/19</td><td class="px-4 py-3">8,192</td><td class="px-4 py-3">8,187</td><td class="px-4 py-3">Private subnets for EKS Pods, which each take one IP</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/24</td><td class="px-4 py-3">256</td><td class="px-4 py-3">251</td><td class="px-4 py-3">Public subnets holding only ALB and NAT gateway ENIs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/28</td><td class="px-4 py-3">16</td><td class="px-4 py-3">11</td><td class="px-4 py-3">The smallest subnet AWS allows</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/32</td><td class="px-4 py-3">1</td><td class="px-4 py-3">n/a</td><td class="px-4 py-3">One host in a security group rule, e.g. the office IP</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">/0</td><td class="px-4 py-3">all of them</td><td class="px-4 py-3">n/a</td><td class="px-4 py-3"><code class="inline">0.0.0.0/0</code>: "the whole internet", the default route</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        AWS reserves <strong>5 addresses in every subnet</strong> (network address, VPC router, DNS, one for future use,
+        broadcast), which is why a /24 gives 251 and not 256. Do not do this maths in your head during a review. Python's
+        standard library does it correctly:
+      </p>
+      <pre class="code mt-3">python3 -c '
+<span class="kw">import</span> ipaddress
+vpc = ipaddress.ip_network(<span class="st">"10.20.0.0/16"</span>)
+<span class="kw">for</span> s <span class="kw">in</span> list(vpc.subnets(new_prefix=<span class="st">19</span>))[:3]:      <span class="cm"># three private /19s, one per AZ</span>
+    <span class="fn">print</span>(s, s.num_addresses - <span class="st">5</span>, <span class="st">"usable"</span>)
+<span class="fn">print</span>(ipaddress.ip_address(<span class="st">"10.20.34.17"</span>) <span class="kw">in</span> vpc)        <span class="cm"># is this IP inside the VPC?</span>
+<span class="fn">print</span>(vpc.overlaps(ipaddress.ip_network(<span class="st">"10.15.0.0/16"</span>)))  <span class="cm"># does staging clash with prod?</span>
+'
+<span class="out">10.20.0.0/19 8187 usable
+10.20.32.0/19 8187 usable
+10.20.64.0/19 8187 usable
+True
+False</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three ranges are reserved for private networks by RFC 1918 and are never routed on the internet:
+        <code class="inline">10.0.0.0/8</code>, <code class="inline">172.16.0.0/12</code> and
+        <code class="inline">192.168.0.0/16</code>. Everything inside our VPCs uses <code class="inline">10.x</code>.
+        How to carve a VPC into subnets, and why, is the subject of
+        <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Ports: which program on the machine</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An IP address gets a packet to a machine. A <strong>port</strong> (a number from 0 to 65535) gets it to one
+        program on that machine. A program that waits for connections is <strong>listening</strong> on a port. The
+        combination of IP and port is a <strong>socket</strong>, and one TCP connection is identified by four numbers:
+        source IP, source port, destination IP, destination port. The client's source port is picked at random from the
+        <em>ephemeral range</em> (32768–60999 on Linux), which is why return traffic must be allowed on those ports when a
+        firewall is stateless (NACLs, <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>).
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Port</th><th class="px-4 py-3">Protocol</th><th class="px-4 py-3">In the clinic platform</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">22</td><td class="px-4 py-3">SSH</td><td class="px-4 py-3">Closed. We use SSM Session Manager instead (<a href="./aw3.html" class="text-viol underline decoration-viol/40">AW3</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">53</td><td class="px-4 py-3">DNS (UDP, TCP for big answers)</td><td class="px-4 py-3">VPC resolver at the VPC base + 2, e.g. <code class="inline">10.20.0.2</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">80 / 443</td><td class="px-4 py-3">HTTP / HTTPS</td><td class="px-4 py-3">ALB listeners; 80 only redirects to 443</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">8080</td><td class="px-4 py-3">HTTP</td><td class="px-4 py-3"><code class="inline">booking-api</code> container port, reachable only from the ALB security group</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">5432</td><td class="px-4 py-3">PostgreSQL</td><td class="px-4 py-3">RDS, reachable only from app security groups</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">6379</td><td class="px-4 py-3">Redis</td><td class="px-4 py-3">ElastiCache, same rule as RDS</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># what is listening on this box, and which process owns it? (ss is covered in FN2)</span>
+sudo ss -tlnp
+<span class="out">State   Recv-Q  Send-Q  Local Address:Port   Peer Address:Port  Process
+LISTEN  0       4096          0.0.0.0:8080        0.0.0.0:*      users:(("booking-api",pid=2141,fd=7))
+LISTEN  0       4096        127.0.0.1:9090        0.0.0.0:*      users:(("booking-api",pid=2141,fd=9))</span>
+<span class="cm"># 0.0.0.0:8080 = reachable from other machines; 127.0.0.1:9090 = this machine only</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>"Works on my laptop, unreachable in the container" is often 127.0.0.1.</strong>
+        An app that binds to <code class="inline">127.0.0.1:8080</code> accepts connections only from inside its own
+        network namespace. The load balancer's health check then fails with a timeout, and nothing in the app's logs
+        explains why. Bind servers to <code class="inline">0.0.0.0</code> and let security groups decide who can reach
+        them (<a href="./fn6.html" class="text-viol underline decoration-viol/40">FN6</a> shows the container side).</div>
+
+      <h3 class="font-semibold text-lg mt-8">NAT: how private machines reach the internet</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Private <code class="inline">10.x</code> addresses can't travel on the internet. <strong>NAT</strong> (Network
+        Address Translation) fixes that by rewriting the source address of outgoing packets to a public IP, and
+        remembering the mapping so replies find their way back. It works in one direction only: the
+        <code class="inline">booking-worker</code> task can call a payment provider's API, but nobody on the internet can
+        open a connection to the worker. That one-way property is why our app tiers live in private subnets.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 700 200" class="w-full min-w-[620px]" role="img" aria-label="NAT gateway rewriting a private source IP to a public Elastic IP">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">SOURCE NAT · outbound only, replies come back through the same mapping</text>
+          <g class="anim-pulse"><rect x="20" y="70" width="150" height="56" rx="9" fill="#0D9488"/>
+            <text x="95" y="93" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-worker</text>
+            <text x="95" y="109" text-anchor="middle" fill="#ffffffbb" font-size="9">10.20.40.12 · private subnet</text></g>
+          <g class="anim-pulse d1"><rect x="275" y="70" width="150" height="56" rx="9" fill="#D97757"/>
+            <text x="350" y="93" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">NAT gateway</text>
+            <text x="350" y="109" text-anchor="middle" fill="#ffffffbb" font-size="9">public subnet · EIP 52.77.10.4</text></g>
+          <g class="anim-pulse d2"><rect x="530" y="70" width="150" height="56" rx="9" fill="#37474F"/>
+            <text x="605" y="93" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">api.payments.example</text>
+            <text x="605" y="109" text-anchor="middle" fill="#ffffffbb" font-size="9">sees 52.77.10.4 only</text></g>
+          <line x1="170" y1="98" x2="275" y2="98" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="425" y1="98" x2="530" y2="98" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="222" y="88" text-anchor="middle" font-size="9" fill="#6E6B64">src 10.20.40.12:41022</text>
+          <text x="478" y="88" text-anchor="middle" fill="#6E6B64" font-size="9">src 52.77.10.4:18733</text>
+          <text x="350" y="160" text-anchor="middle" font-size="10" fill="#6E6B64">translation table: 10.20.40.12:41022 ↔ 52.77.10.4:18733</text>
+          <text x="350" y="185" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">a new connection from the internet has no table entry, so it is dropped</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two practical consequences. First, every outbound call from a private subnet shows up at the other end as the NAT
+        gateway's Elastic IP, so that is the address you give a partner for their allow-list. Second, AWS charges
+        about <strong>USD 0.059 per GB</strong> processed by a NAT gateway in Singapore, on top of the hourly charge, so a
+        worker pulling large images through it can cost more than the worker. VPC endpoints avoid that path
+        (<a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>,
+        <a href="./ar2.html" class="text-viol underline decoration-viol/40">AR2</a>).
+      </p>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · TCP &amp; DNS</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Refused, timed out and NXDOMAIN are three different problems</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Before any HTTP request can happen, two things must succeed: the client must turn a name into an IP address
+        (DNS), and it must open a connection to that IP (TCP). Each one fails in a few distinctive ways, and the exact
+        error message tells you which layer and often which component is at fault. Learn to read those messages and
+        you skip most of the guessing.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The TCP handshake and connection states</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>TCP</strong> (Transmission Control Protocol) gives programs a reliable, ordered stream of bytes on top of
+        IP, which itself may lose or reorder packets. It starts every connection with a <strong>three-way
+        handshake</strong> and ends it with a four-step close. <strong>UDP</strong> is the opposite: no handshake, no
+        delivery guarantee, lower overhead. DNS queries and QUIC (HTTP/3) use UDP.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client (patient phone)
+    participant S as ALB :443
+    C->>S: SYN (seq=x) "I want to connect"
+    S->>C: SYN-ACK (seq=y, ack=x+1)
+    C->>S: ACK (ack=y+1)
+    Note over C,S: ESTABLISHED, one round trip spent<br/>TLS and HTTP can start now
+    C->>S: data …
+    C->>S: FIN "I'm done sending"
+    S->>C: ACK, then FIN
+    C->>S: ACK
+    Note over C: TIME_WAIT for ~60 s<br/>catches late packets
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The handshake costs one <strong>round trip</strong> (RTT). From Ho Chi Minh City to <code class="inline">ap-southeast-1</code>
+        that is roughly 25–35 ms; from Europe it is about 160 ms. That is why connection reuse (keep-alive, connection
+        pools) matters so much: a client that opens a new connection for every request pays that round trip, plus TLS,
+        every time. You can see connection states on any Linux box:
+      </p>
+      <pre class="code mt-3">ss -tan state established '( dport = :5432 )' | wc -l   <span class="cm"># open connections to Postgres</span>
+<span class="out">41</span>
+ss -tan | awk 'NR&gt;1 {print $1}' | sort | uniq -c | sort -rn
+<span class="out">    412 TIME-WAIT
+     41 ESTAB
+      6 LISTEN
+     23 CLOSE-WAIT</span>
+<span class="cm"># CLOSE-WAIT that keeps growing = the APP never closes sockets the peer already closed (a bug)</span>
+<span class="cm"># thousands of TIME-WAIT = new connection per request; fix with keep-alive / pooling</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Reading a connection error</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The single most useful distinction in network troubleshooting is <strong>refused</strong> versus
+        <strong>timed out</strong>. A refusal is fast and means a machine answered, but nothing listens on that port.
+        A timeout is slow and means nothing answered at all, which on AWS is almost always a security group, NACL or
+        route that silently drops the packet. Test with <code class="inline">nc</code> (netcat), which only tries the TCP
+        connection and nothing above it:
+      </p>
+      <pre class="code mt-3">nc -zv -w 3 booking-db.c9x2kq.ap-southeast-1.rds.amazonaws.com 5432
+<span class="out">Connection to booking-db.c9x2kq.ap-southeast-1.rds.amazonaws.com (10.20.70.31) 5432 port [tcp/postgresql] succeeded!</span>
+nc -zv -w 3 10.20.34.17 8080
+<span class="out">nc: connect to 10.20.34.17 port 8080 (tcp) failed: Connection refused</span>     <span class="cm"># host up, app not listening</span>
+nc -zv -w 3 10.20.70.31 6379
+<span class="out">nc: connect to 10.20.70.31 port 6379 (tcp) timed out: Operation now in progress</span>  <span class="cm"># dropped: check SGs</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Error</th><th class="px-4 py-3">Layer</th><th class="px-4 py-3">What happened</th><th class="px-4 py-3">First thing to check</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Could not resolve host / NXDOMAIN</td><td class="px-4 py-3">DNS</td><td class="px-4 py-3">The name does not exist (or not in this resolver's view)</td><td class="px-4 py-3">Spelling, private vs public hosted zone, <code class="inline">dig</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Connection refused</td><td class="px-4 py-3">L4</td><td class="px-4 py-3">Host replied with RST: nothing listening on the port</td><td class="px-4 py-3">Is the app running? Port and bind address right?</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Connection timed out</td><td class="px-4 py-3">L3/L4</td><td class="px-4 py-3">No reply at all: packet dropped</td><td class="px-4 py-3">Security groups, NACLs, route tables, wrong IP</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Connection reset by peer</td><td class="px-4 py-3">L4</td><td class="px-4 py-3">Connection was open, then the other side aborted it</td><td class="px-4 py-3">App crash, idle timeout on a load balancer or NAT (350 s)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SSL certificate problem</td><td class="px-4 py-3">TLS</td><td class="px-4 py-3">TCP worked; the certificate is wrong, expired or untrusted</td><td class="px-4 py-3"><code class="inline">openssl s_client</code> (Part III)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>Security groups drop, they never refuse.</strong> A security group
+        that does not allow a packet throws it away without telling the sender, so the client waits until its own
+        timeout. If you see "connection refused" from inside the VPC, the security group let you through and the
+        problem is on the host. That one fact rules out half the possible causes immediately.</div>
+
+      <h3 class="font-semibold text-lg mt-8">DNS: the resolution chain</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>DNS</strong> (Domain Name System) is a distributed database that turns names into addresses. Nobody holds
+        the whole database. Instead, each level of a name is <em>delegated</em> to the servers below it: the root servers
+        know who runs <code class="inline">.com</code>, the <code class="inline">.com</code> servers know who runs
+        <code class="inline">example.com</code>, and our Route 53 hosted zone answers for
+        <code class="inline">clinic.example.com</code>. Your laptop never walks that chain itself. It asks a
+        <strong>recursive resolver</strong>, which does the walking and caches the results.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 250" class="w-full min-w-[640px]" role="img" aria-label="DNS resolution: client asks recursive resolver, which asks root, .com TLD and the Route 53 authoritative servers">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">RESOLVING api.clinic.example.com · cold cache</text>
+          <g class="anim-pulse"><rect x="20" y="100" width="120" height="52" rx="9" fill="#2563EB"/>
+            <text x="80" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Client</text>
+            <text x="80" y="138" text-anchor="middle" fill="#ffffffbb" font-size="9">stub resolver</text></g>
+          <g class="anim-pulse d1"><rect x="200" y="100" width="140" height="52" rx="9" fill="#6d5acd"/>
+            <text x="270" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Recursive resolver</text>
+            <text x="270" y="138" text-anchor="middle" fill="#ffffffbb" font-size="9">ISP · 1.1.1.1 · VPC .2</text></g>
+          <g class="anim-pulse d2"><rect x="440" y="36" width="130" height="44" rx="9" fill="#37474F"/>
+            <text x="505" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Root servers</text>
+            <text x="505" y="69" text-anchor="middle" fill="#ffffffbb" font-size="9">"ask .com"</text></g>
+          <g class="anim-pulse d3"><rect x="440" y="104" width="130" height="44" rx="9" fill="#0D9488"/>
+            <text x="505" y="123" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">.com TLD</text>
+            <text x="505" y="137" text-anchor="middle" fill="#ffffffbb" font-size="9">"ask example.com NS"</text></g>
+          <g class="anim-pulse d4"><rect x="440" y="172" width="130" height="44" rx="9" fill="#D97757"/>
+            <text x="505" y="191" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Route 53 zone</text>
+            <text x="505" y="205" text-anchor="middle" fill="#ffffffbb" font-size="9">authoritative: the answer</text></g>
+          <line x1="140" y1="126" x2="200" y2="126" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="340" y1="116" x2="440" y2="58" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="340" y1="126" x2="440" y2="126" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="340" y1="136" x2="440" y2="194" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="600" y="62" font-size="9" fill="#6E6B64">① referral</text>
+          <text x="600" y="130" font-size="9" fill="#6E6B64">② referral</text>
+          <text x="600" y="198" font-size="9" fill="#6E6B64">③ A 13.250.18.7, TTL 60</text>
+          <text x="170" y="175" text-anchor="middle" font-size="9" fill="#6E6B64">④ cached for TTL</text>
+          <text x="360" y="240" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">every cache on the path keeps the answer until its TTL runs out, including the old one</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">dig</code> is the tool for DNS. Use plain <code class="inline">dig</code> to see what your
+        resolver says, <code class="inline">@server</code> to ask a specific server, and
+        <code class="inline">+trace</code> to walk the chain yourself and see exactly where it breaks:
+      </p>
+      <pre class="code mt-3">dig +noall +answer api.clinic.example.com
+<span class="out">api.clinic.example.com.  60  IN  A  13.250.18.7
+api.clinic.example.com.  60  IN  A  52.74.201.66</span>          <span class="cm"># two IPs: the ALB has a node per AZ</span>
+dig +short NS clinic.example.com                 <span class="cm"># who is authoritative?</span>
+<span class="out">ns-1201.awsdns-22.org.
+ns-412.awsdns-51.com.</span>
+dig @ns-412.awsdns-51.com api.clinic.example.com +short   <span class="cm"># bypass every cache: the source of truth</span>
+dig +trace app.clinic.example.com | tail -4      <span class="cm"># walk root → .com → example.com → clinic</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Record types and TTLs</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A DNS zone holds <strong>records</strong>. You need about eight types. The one AWS adds is the
+        <strong>alias</strong> record, a Route 53 feature that points a name at an AWS resource (an ALB, CloudFront)
+        and follows its changing IPs for free. Zones, routing policies and cross-account delegation are in
+        <a href="./aw7.html" class="text-viol underline decoration-viol/40">AW7</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Type</th><th class="px-4 py-3">Maps</th><th class="px-4 py-3">Clinic example</th><th class="px-4 py-3">Watch out for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">A / AAAA</td><td class="px-4 py-3">Name → IPv4 / IPv6</td><td class="px-4 py-3"><code class="inline">api</code> → ALB (as an alias)</td><td class="px-4 py-3">Never hard-code an ALB IP: it changes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CNAME</td><td class="px-4 py-3">Name → another name</td><td class="px-4 py-3"><code class="inline">_abc123.api</code> → ACM validation target</td><td class="px-4 py-3">Not allowed at the zone apex; no other records on the same name</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Alias (Route 53)</td><td class="px-4 py-3">Name → AWS resource</td><td class="px-4 py-3"><code class="inline">app</code> → CloudFront distribution</td><td class="px-4 py-3">Works at the apex; free queries; TTL comes from the target</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">MX</td><td class="px-4 py-3">Domain → mail servers</td><td class="px-4 py-3">Appointment reminder email</td><td class="px-4 py-3">Breaking it silently stops inbound mail</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">TXT</td><td class="px-4 py-3">Free text</td><td class="px-4 py-3">SPF, DKIM, domain verification</td><td class="px-4 py-3">Duplicate SPF records invalidate both</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">NS / SOA</td><td class="px-4 py-3">Delegation / zone metadata</td><td class="px-4 py-3"><code class="inline">clinic</code> delegated to the prod account zone</td><td class="px-4 py-3">NS at the parent must match the child zone exactly</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CAA</td><td class="px-4 py-3">Which CAs may issue certs</td><td class="px-4 py-3"><code class="inline">0 issue "amazon.com"</code></td><td class="px-4 py-3">A CAA without Amazon blocks ACM renewals</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Every record has a <strong>TTL</strong> (time to live) in seconds: how long resolvers may cache it. TTL is a
+        trade-off between speed of change and load. The operational rule is to <strong>lower the TTL before a planned
+        change</strong>, not during it. If <code class="inline">api</code> has a TTL of 3600 and you switch it, some
+        clients keep the old IP for up to an hour. Drop it to 60 a day ahead (one old TTL plus margin), make the change,
+        then raise it again.
+      </p>
+      <div class="mt-4 callout callout-danger"><strong>"I changed the record but nothing happened" is usually caching, not
+        failure.</strong> Check the authoritative server directly with <code class="inline">dig @ns-…</code>. If it shows
+        the new value, the change worked and you are waiting for TTLs to expire elsewhere. Do not "fix" it by changing the
+        record again; every extra change restarts the clock. Java apps and some SDKs also cache DNS inside the process,
+        sometimes forever, so a deploy may be needed to pick up a new IP.</div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · HTTP &amp; TLS</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Read the request and the certificate, not just the status code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Once a TCP connection exists, two more protocols run on it. <strong>TLS</strong> (Transport Layer Security)
+        proves the server is who it claims to be and encrypts everything after that. <strong>HTTP</strong> (Hypertext
+        Transfer Protocol) carries the actual request and response. Most of the errors users report are HTTP status
+        codes, and most of the confusing ones come from a proxy or load balancer, not from the app.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">An HTTP request, line by line</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        HTTP is a request/response protocol. The client sends a <strong>method</strong> (GET, POST…), a
+        <strong>path</strong>, and <strong>headers</strong> (key: value metadata). The server answers with a
+        <strong>status code</strong>, headers and a body. <code class="inline">curl -v</code> prints every step,
+        including DNS, TCP and TLS, so one command shows you all four layers working:
+      </p>
+      <pre class="code mt-3">curl -v https://api.clinic.example.com/healthz
+<span class="out">* Host api.clinic.example.com:443 was resolved.
+* IPv4: 13.250.18.7, 52.74.201.66</span>                       <span class="cm"># ① DNS worked</span>
+<span class="out">*   Trying 13.250.18.7:443...
+* Connected to api.clinic.example.com (13.250.18.7) port 443</span>   <span class="cm"># ② TCP worked</span>
+<span class="out">* SSL connection using TLSv1.3 / TLS_AES_128_GCM_SHA256
+* Server certificate:
+*  subject: CN=api.clinic.example.com
+*  expire date: Mar 14 23:59:59 2027 GMT
+*  issuer: C=US; O=Amazon; CN=Amazon RSA 2048 M02</span>          <span class="cm"># ③ TLS worked</span>
+<span class="out">&gt; GET /healthz HTTP/2
+&gt; Host: api.clinic.example.com
+&gt; User-Agent: curl/8.10.1
+&lt; HTTP/2 200
+&lt; content-type: application/json
+{"status":"ok","db":"ok","redis":"ok"}</span>                <span class="cm"># ④ HTTP worked</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">Host</code> header deserves special attention. One ALB serves both
+        <code class="inline">api.</code> and <code class="inline">app.clinic.example.com</code> on the same IPs, and it
+        picks the target by reading <code class="inline">Host</code>. When you test a service by IP or before DNS is
+        switched, send the header yourself:
+        <code class="inline">curl --resolve api.clinic.example.com:443:13.250.18.7 https://api.clinic.example.com/healthz</code>
+        does this and keeps TLS name checks honest.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Status codes, and who generated them</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The first digit tells you the class: 2xx success, 3xx redirect, 4xx the client did something wrong, 5xx the
+        server side failed. For operators the most important skill is telling an <em>app</em> 5xx from a <em>load
+        balancer</em> 5xx. ALB access logs and CloudWatch report them separately
+        (<code class="inline">HTTPCode_Target_5XX_Count</code> vs <code class="inline">HTTPCode_ELB_5XX_Count</code>),
+        and the fix is completely different.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Code</th><th class="px-4 py-3">Usually generated by</th><th class="px-4 py-3">Meaning in our stack</th><th class="px-4 py-3">Look at</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">301 / 308</td><td class="px-4 py-3">ALB</td><td class="px-4 py-3">Port 80 listener redirecting to HTTPS (expected)</td><td class="px-4 py-3">A redirect loop means the app also redirects</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">403</td><td class="px-4 py-3">WAF, CloudFront, S3, or app</td><td class="px-4 py-3">Blocked by a rule or missing permission</td><td class="px-4 py-3">Response headers: <code class="inline">server</code>, <code class="inline">x-amz-cf-id</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">500</td><td class="px-4 py-3">App</td><td class="px-4 py-3">Unhandled exception in <code class="inline">booking-api</code></td><td class="px-4 py-3">App logs and traces</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">502 Bad Gateway</td><td class="px-4 py-3">ALB</td><td class="px-4 py-3">Target closed the connection or sent a malformed response</td><td class="px-4 py-3">Target crashing, keep-alive shorter than the ALB's idle timeout</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">503</td><td class="px-4 py-3">ALB</td><td class="px-4 py-3">No healthy targets registered at all</td><td class="px-4 py-3">Target group health checks (<a href="./aw3.html" class="text-viol underline decoration-viol/40">AW3</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">504 Gateway Timeout</td><td class="px-4 py-3">ALB</td><td class="px-4 py-3">Target did not answer within the idle timeout (60 s default)</td><td class="px-4 py-3">Slow queries, SG blocking ALB → task traffic</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">HTTP/1.1, HTTP/2 and HTTP/3</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        All three versions carry the same methods, headers and status codes. What changes is how they use the
+        connection. You rarely choose one in code, but you do choose them on load balancers and CDNs, and they explain
+        some odd performance behaviour.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Version</th><th class="px-4 py-3">Transport</th><th class="px-4 py-3">Key idea</th><th class="px-4 py-3">Where we use it</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">HTTP/1.1</td><td class="px-4 py-3">TCP</td><td class="px-4 py-3">Text, one request at a time per connection; browsers open ~6 in parallel</td><td class="px-4 py-3">ALB → target by default; health checks; internal calls</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">HTTP/2</td><td class="px-4 py-3">TCP + TLS</td><td class="px-4 py-3">Binary, many streams multiplexed on one connection, header compression</td><td class="px-4 py-3">Browser → ALB and CloudFront; gRPC needs it end to end</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">HTTP/3</td><td class="px-4 py-3">QUIC over UDP</td><td class="px-4 py-3">TLS built in, faster setup, no head-of-line blocking when packets drop</td><td class="px-4 py-3">CloudFront for <code class="inline">app.</code> (mobile users on lossy networks benefit most)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">curl --http1.1</code>, <code class="inline">--http2</code> and <code class="inline">--http3</code>
+        force a version, which is handy when a bug appears only for one class of client.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The TLS handshake and certificates</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        TLS solves two problems at once: <strong>authentication</strong> (am I really talking to
+        <code class="inline">api.clinic.example.com</code>?) and <strong>encryption</strong> (can anyone in between
+        read this?). Authentication uses a <strong>certificate</strong>: a file that binds a public key to one or more
+        names, signed by a <strong>certificate authority</strong> (CA) that browsers already trust. The server sends its
+        certificate plus any <strong>intermediate</strong> certificates that link it to a trusted <strong>root</strong>.
+        TLS 1.3 needs one round trip on top of TCP.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as ALB (cert from ACM)
+    Note over C,S: TCP handshake already done
+    C->>S: ClientHello: TLS 1.3, ciphers, SNI = api.clinic.example.com, key share
+    S->>C: ServerHello + key share
+    S->>C: Certificate chain (leaf → intermediate), signature, Finished
+    Note over C: verify: chain ends at a trusted root?<br/>name matches SNI? not expired?
+    C->>S: Finished
+    Note over C,S: encrypted HTTP from here on
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>SNI</strong> (Server Name Indication) is the name the client sends in its first message, so a load
+        balancer holding several certificates can pick the right one. When a certificate looks wrong, ask the server
+        directly with <code class="inline">openssl s_client</code>, which shows the exact chain and dates without any
+        browser cache in the way:
+      </p>
+      <pre class="code mt-3">openssl s_client -connect api.clinic.example.com:443 -servername api.clinic.example.com \
+  &lt;/dev/null 2&gt;/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+<span class="out">subject=CN=api.clinic.example.com
+issuer=C=US, O=Amazon, CN=Amazon RSA 2048 M02
+notBefore=Feb 13 00:00:00 2026 GMT
+notAfter=Mar 14 23:59:59 2027 GMT
+X509v3 Subject Alternative Name:
+    DNS:api.clinic.example.com, DNS:*.api.clinic.example.com</span>
+<span class="cm"># days until expiry, the number to alert on for any cert you do NOT get from ACM</span>
+echo $(( ( $(date -d "Mar 14 23:59:59 2027 GMT" +%s) - $(date +%s) ) / 86400 ))
+<span class="out">135</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On AWS we use <strong>ACM</strong> (AWS Certificate Manager) public certificates on ALBs and CloudFront. They are
+        free and renew automatically as long as their DNS validation record stays in place. Issuing them, DNS validation,
+        and the rule that CloudFront certificates must live in <code class="inline">us-east-1</code> are covered in
+        <a href="./aw7.html" class="text-viol underline decoration-viol/40">AW7</a>. Certificates <em>inside</em> an EKS
+        cluster (cert-manager) are in <a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>.
+      </p>
+      <div class="mt-4 callout callout-warn"><strong>Never "fix" a TLS error with <code class="inline">curl -k</code> or
+        <code class="inline">verify=False</code> in code.</strong> These flags turn off authentication, so the connection
+        is encrypted to whoever answers, including an attacker. The real causes are almost always one of three: the
+        name is not in the certificate's SAN list, the server sends no intermediate certificate, or the certificate has
+        expired. <code class="inline">openssl s_client</code> shows which in one command.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Load balancers, proxies &amp; tools</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every hop in the middle rewrites something; know what</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A request to <code class="inline">booking-api</code> never goes straight from the patient's phone to the
+        container. It passes through CloudFront or an ALB, possibly a NAT gateway, and on EKS a Service rule. Each hop can
+        end the connection and open a new one, change addresses, add headers, or time out on its own clock. This Part
+        explains those middle boxes and gives you the tools to see through them.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">L4 versus L7 load balancing</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>load balancer</strong> spreads connections or requests across several <strong>targets</strong> and
+        stops sending to targets that fail a health check. A <strong>layer 4</strong> balancer forwards TCP or UDP
+        connections and never looks inside them. A <strong>layer 7</strong> balancer ends the client's connection,
+        decrypts TLS, reads the HTTP request, and opens its own connection to the target it chooses. On AWS, the NLB is
+        L4 and the ALB is L7. How to configure them (listeners, target groups, health checks) is
+        <a href="./aw3.html" class="text-viol underline decoration-viol/40">AW3</a>.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 250" class="w-full min-w-[640px]" role="img" aria-label="L7 ALB terminates TLS and routes by host and path; L4 NLB passes the TCP connection through">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">L7 · ALB: two connections, routing on HTTP content</text>
+          <g class="anim-pulse"><rect x="20" y="38" width="120" height="48" rx="9" fill="#2563EB"/>
+            <text x="80" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Browser</text>
+            <text x="80" y="73" text-anchor="middle" fill="#ffffffbb" font-size="9">HTTPS :443</text></g>
+          <g class="anim-pulse d1"><rect x="250" y="38" width="160" height="48" rx="9" fill="#6d5acd"/>
+            <text x="330" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB</text>
+            <text x="330" y="73" text-anchor="middle" fill="#ffffffbb" font-size="9">TLS ends · reads Host + path</text></g>
+          <g class="anim-pulse d2"><rect x="530" y="32" width="170" height="28" rx="9" fill="#0D9488"/>
+            <text x="615" y="51" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">api.* → booking-api :8080</text></g>
+          <g class="anim-pulse d3"><rect x="530" y="66" width="170" height="28" rx="9" fill="#0D9488"/>
+            <text x="615" y="85" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">app.* → booking-web :3000</text></g>
+          <line x1="140" y1="62" x2="250" y2="62" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="410" y1="56" x2="530" y2="46" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="410" y1="68" x2="530" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="195" y="100" text-anchor="middle" font-size="9" fill="#6E6B64">connection 1</text>
+          <text x="470" y="108" text-anchor="middle" font-size="9" fill="#6E6B64">connection 2 · src = ALB IP</text>
+          <text x="12" y="140" font-size="11" font-weight="700" fill="#6E6B64">L4 · NLB: one connection passed through, no HTTP awareness</text>
+          <g class="anim-pulse d1"><rect x="20" y="156" width="120" height="48" rx="9" fill="#2563EB"/>
+            <text x="80" y="176" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Partner system</text>
+            <text x="80" y="191" text-anchor="middle" fill="#ffffffbb" font-size="9">TCP :5671</text></g>
+          <g class="anim-pulse d2"><rect x="250" y="156" width="160" height="48" rx="9" fill="#37474F"/>
+            <text x="330" y="176" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">NLB</text>
+            <text x="330" y="191" text-anchor="middle" fill="#ffffffbb" font-size="9">static IP per AZ · keeps client IP</text></g>
+          <g class="anim-pulse d3"><rect x="530" y="156" width="170" height="48" rx="9" fill="#D97757"/>
+            <text x="615" y="176" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">target :5671</text>
+            <text x="615" y="191" text-anchor="middle" fill="#ffffffbb" font-size="9">sees partner's real IP</text></g>
+          <line x1="140" y1="180" x2="250" y2="180" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="410" y1="180" x2="530" y2="180" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="360" y="238" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">ALB for HTTP(S) services · NLB for non-HTTP protocols, static IPs or extreme connection counts</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Question</th><th class="px-4 py-3">L4 (NLB)</th><th class="px-4 py-3">L7 (ALB)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Routes on</td><td class="px-4 py-3">IP and port only</td><td class="px-4 py-3">Host, path, headers, query string, method</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">TLS</td><td class="px-4 py-3">Pass through, or terminate with a TLS listener</td><td class="px-4 py-3">Terminates; can re-encrypt to targets</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Target sees client IP</td><td class="px-4 py-3">Yes (client IP preservation)</td><td class="px-4 py-3">No: reads it from <code class="inline">X-Forwarded-For</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Health check</td><td class="px-4 py-3">TCP connect, or HTTP</td><td class="px-4 py-3">HTTP path, e.g. <code class="inline">/healthz</code> expecting 200</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Clinic use</td><td class="px-4 py-3">None today</td><td class="px-4 py-3"><code class="inline">api.</code> and <code class="inline">app.clinic.example.com</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Proxies and the headers they add</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>reverse proxy</strong> sits in front of servers and accepts requests on their behalf: the ALB,
+        CloudFront, nginx and an Ingress controller are all reverse proxies. A <strong>forward proxy</strong> sits in
+        front of <em>clients</em> and makes requests on their behalf, for example an egress proxy that only allows calls to
+        approved domains. Because a reverse proxy opens a new connection, the app sees the proxy's IP as the source. The
+        proxy passes the original details in headers instead:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api access log line, behind CloudFront → ALB</span>
+        <pre class="code">X-Forwarded-For:   113.161.4.20, 130.176.212.14   <span class="cm"># patient (added by CloudFront), then the edge IP (appended by the ALB)</span>
+X-Forwarded-Proto: https                           <span class="cm"># the scheme the CLIENT used (the ALB → task hop is plain HTTP)</span>
+X-Forwarded-Port:  443
+X-Amzn-Trace-Id:   Root=1-6720c1f3-5b2c9d4e7a1f0b3c8d9e2f10   <span class="cm"># follow one request through ALB logs</span>
+remote_addr:       10.20.1.87                      <span class="cm"># the ALB node's private IP, not the patient</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two rules follow. Trust <code class="inline">X-Forwarded-For</code> only from your own proxies, and take the
+        client IP as the right-most address added by a proxy you control: anything to its left can be forged by the
+        client. And make the app use <code class="inline">X-Forwarded-Proto</code> when building redirect URLs, or it will
+        redirect HTTPS users to <code class="inline">http://</code> and the ALB will send them back, forever.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Timeouts stack up across hops</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every hop has its own idle timeout, and the shortest one wins. The classic bug is a target whose keep-alive
+        timeout is <em>shorter</em> than the ALB's: the app closes an idle connection at the same moment the ALB reuses
+        it, and the user gets a random 502. Write the chain down for every service and make each timeout longer than the
+        one in front of it.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Hop</th><th class="px-4 py-3">Timeout</th><th class="px-4 py-3">Default</th><th class="px-4 py-3">Clinic setting</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">CloudFront → ALB</td><td class="px-4 py-3">Origin response timeout</td><td class="px-4 py-3">30 s</td><td class="px-4 py-3">30 s</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ALB</td><td class="px-4 py-3">Connection idle timeout</td><td class="px-4 py-3">60 s</td><td class="px-4 py-3">60 s</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">booking-api (Node.js)</td><td class="px-4 py-3"><code class="inline">server.keepAliveTimeout</code></td><td class="px-4 py-3">5 s (too short!)</td><td class="px-4 py-3">65 s, greater than the ALB's 60</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">NAT gateway</td><td class="px-4 py-3">Idle TCP timeout</td><td class="px-4 py-3">350 s, not configurable</td><td class="px-4 py-3">Enable TCP keep-alive on long-lived outbound connections</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The toolkit: curl timings, mtr and tcpdump</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When a request is <em>slow</em> rather than broken, find out which phase eats the time. <code class="inline">curl -w</code>
+        prints timings for each layer. Subtract neighbouring numbers to get the cost of each phase:
+      </p>
+      <pre class="code mt-3">curl -o /dev/null -s -w 'dns %{time_namelookup}  tcp %{time_connect}  tls %{time_appconnect}  ttfb %{time_starttransfer}  total %{time_total}\n' \
+  https://api.clinic.example.com/v1/slots?clinic=hcm-01
+<span class="out">dns 0.004  tcp 0.031  tls 0.062  ttfb 1.840  total 1.846</span>
+<span class="cm"># DNS 4 ms, TCP 27 ms, TLS 31 ms: the network is fine.</span>
+<span class="cm"># 1.78 s between TLS done and first byte = the app (or its database) is slow</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">mtr</code> combines <code class="inline">ping</code> and <code class="inline">traceroute</code>:
+        it shows every router on the path with loss and latency, which tells you whether a slow or lossy path is your
+        problem or your ISP's. Loss that appears at one hop but not the hops after it is usually a router that
+        de-prioritises ICMP, not real loss.
+      </p>
+      <pre class="code mt-3">mtr -rwc 50 api.clinic.example.com
+<span class="out">HOST                                   Loss%   Snt   Last   Avg  Best  Wrst StDev
+  1.|-- 192.168.1.1                      0.0%    50    1.2   1.4   0.9   3.1   0.4
+  2.|-- 100.104.0.1                      0.0%    50    3.8   4.2   3.1   9.7   1.1
+  6.|-- 52.93.11.14                      0.0%    50   27.9  28.3  27.1  31.0   0.8
+ 10.|-- ???                             100.0    50    0.0   0.0   0.0   0.0   0.0</span>
+<span class="cm"># "???" at the end is normal for AWS: the ALB doesn't answer traceroute probes</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        When everything else disagrees, look at the packets. <code class="inline">tcpdump</code> shows what really
+        arrives at a host, and settles arguments like "the ALB never sends the health check":
+      </p>
+      <pre class="code mt-3">sudo tcpdump -ni any 'tcp port 8080 and tcp[tcpflags] &amp; tcp-syn != 0' -c 4
+<span class="out">10:42:01.118 IP 10.20.1.87.31544 &gt; 10.20.34.17.8080: Flags [S], seq 2918...
+10:42:01.118 IP 10.20.34.17.8080 &gt; 10.20.1.87.31544: Flags [S.], seq 7731..., ack 2918...
+10:42:31.120 IP 10.20.2.142.40112 &gt; 10.20.34.17.8080: Flags [S], seq 5512...
+10:42:31.120 IP 10.20.34.17.8080 &gt; 10.20.2.142.40112: Flags [R.], seq 0, ack 5512...</span>
+<span class="cm"># SYN answered by SYN-ACK = healthy. SYN answered by R (reset) = app stopped listening</span>
+<span class="cm"># SYN with no answer at all on the host = it never arrived: security group / NACL</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>The bottom-up checklist, in order:</strong> (1)
+        <code class="inline">dig</code> the name, then <code class="inline">dig @authoritative</code>; (2)
+        <code class="inline">nc -zv</code> the IP and port; (3) <code class="inline">openssl s_client</code> for name,
+        chain and expiry; (4) <code class="inline">curl -v</code> with the right <code class="inline">Host</code>; (5)
+        <code class="inline">curl -w</code> for timing. Stop at the first failure. On Fargate there is no host to
+        <code class="inline">tcpdump</code>, so use ECS Exec (<a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>)
+        and VPC Flow Logs (<a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>) instead.</div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code is a patient tutor for networking. It is good at CIDR maths, at explaining the output of
+        <code class="inline">dig</code>, <code class="inline">curl -v</code> or <code class="inline">tcpdump</code>, and at
+        ranking likely causes for a symptom. Give it the raw output rather than your summary of it, and ask it to name the
+        layer before it proposes a fix.
+      </p>
+      <pre class="code mt-3">Here is the output of `curl -v` and `dig +trace` for app.clinic.example.com, which some
+users say is down. Go through it layer by layer (DNS, TCP, TLS, HTTP) and tell me the first
+layer that fails and the evidence for that. Suggest only read-only commands for next steps.</pre>
+      <pre class="code mt-3">Split 10.20.0.0/16 into 3 public /24s and 3 private /19s across 3 AZs, with no overlap and
+room left for 3 isolated /22s. Show your working with Python's ipaddress module and print the
+usable IP count per subnet, remembering AWS reserves 5 addresses.</pre>
+      <pre class="code mt-3">Write a bash script `netcheck.sh HOST PORT PATH` that runs dig, nc -zv, openssl s_client
+(printing subject, SAN and days to expiry) and curl -w timings, then prints one PASS/FAIL line
+per layer. It must not modify anything and must exit non-zero on the first failure.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>CIDR planning and overlap checks, with the code to prove them</li>
+            <li>Explain <code class="inline">tcpdump</code>, <code class="inline">mtr</code> and <code class="inline">curl -v</code> output line by line</li>
+            <li>Turn a symptom into a ranked list of layers and causes</li>
+            <li>Write read-only diagnostic scripts like <code class="inline">netcheck.sh</code></li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every CIDR it proposes, with <code class="inline">ipaddress</code>, against all existing VPCs</li>
+            <li>That a "fix" opens the narrowest rule: one port, one source security group</li>
+            <li>That it diagnosed refused vs timeout correctly before blaming the app</li>
+            <li>That it asked the authoritative DNS server, not a cache, before calling a record wrong</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written network config:</strong> an ingress rule from
+        <code class="inline">0.0.0.0/0</code> on anything other than the ALB's 80/443; port 22 opened "for debugging";
+        <code class="inline">curl -k</code>, <code class="inline">--insecure</code> or <code class="inline">verify=False</code>
+        in scripts; a hard-coded ALB or RDS IP instead of its DNS name; a CNAME at the zone apex; CIDRs that overlap
+        another environment; and a TTL lowered at the moment of a cutover instead of a day before.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Knows that websites have IP addresses but cannot say what a port, a CIDR block or a DNS record is.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can name the layers and run <code class="inline">ping</code> and <code class="inline">curl</code>, but treats "the site is down" as one problem and restarts things to fix it.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Uses <code class="inline">dig</code>, <code class="inline">nc</code> and <code class="inline">curl -v</code> when told which to run, and can calculate subnet sizes with a tool.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Diagnoses a broken endpoint bottom-up and names the failing layer with evidence; tells refused from timeout and ELB 5xx from target 5xx; reads a certificate chain; plans non-overlapping CIDRs; explains every hop and timeout from browser to container.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the address plan across all accounts, writes the team's network troubleshooting runbook, and reviews security group and DNS changes for the whole team.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, explain what
+        happens between typing <code class="inline">https://app.clinic.example.com</code> and seeing the page, naming every
+        protocol and hop. Then let a mentor break one thing on a test endpoint (a security group, a record, a
+        certificate name, the app port) and find which one in under ten minutes using only read-only commands.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Using ping to decide a server is down</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Security groups block ICMP by default, and ALBs never answer ping. A silent ping proves nothing. Test the real port with <code class="inline">nc -zv</code> or <code class="inline">curl</code>.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Picking VPC ranges without a plan</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Two VPCs both on <code class="inline">10.0.0.0/16</code> can never be peered or joined to a Transit Gateway. Re-addressing later means rebuilding. Keep one address plan for every account (<a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Blaming the app for every 5xx</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A 502, 503 or 504 with nothing in the app logs was generated by the load balancer. Check <code class="inline">HTTPCode_ELB_5XX_Count</code> and target health before you open the application code.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Always ask the authoritative server</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">dig @ns-…awsdns…</code> shows what Route 53 really serves. It separates "the record is wrong" from "a cache somewhere is stale" in one command.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Reference security groups, not IPs</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Allow the RDS port from the <code class="inline">booking-api</code> security group, not from a CIDR. The rule keeps working as tasks get new IPs, and it says exactly who may connect.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="layers"> <span>I can map a failure to its layer and name the tool that proves each layer works.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cidr"> <span>I planned subnets for <code class="inline">10.20.0.0/16</code> across three AZs and verified sizes and overlaps with Python.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tcp-dns"> <span>I can explain refused vs timed out vs NXDOMAIN, and traced a name with <code class="inline">dig +trace</code> to its authoritative server.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tls-http"> <span>I read a certificate chain, SAN list and expiry with <code class="inline">openssl s_client</code>, and can say who generated a given 502, 503 or 504.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="netcheck"> <span class="font-semibold">Wrote <code class="inline">netcheck.sh</code> (DNS, TCP, TLS, HTTP and timing checks with one PASS/FAIL line per layer), ran it against a staging endpoint before and after a mentor broke one layer, and shared the script plus both outputs with a one-paragraph diagnosis (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/vpc/latest/userguide/subnet-sizing.html" target="_blank" rel="noopener">AWS — Subnet CIDR blocks</a>: the five reserved addresses and the size limits used in Part I.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html" target="_blank" rel="noopener">AWS — NAT gateways</a>: how source NAT works in a VPC, its idle timeout and its pricing.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/ResourceRecordTypes.html" target="_blank" rel="noopener">AWS — Route 53 supported record types</a>: every record type from Part II, with alias records explained.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html" target="_blank" rel="noopener">AWS — Troubleshoot your Application Load Balancers</a>: the official meaning of every ELB-generated 4xx and 5xx.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/x-forwarded-headers.html" target="_blank" rel="noopener">AWS — ALB X-Forwarded headers</a>: how the ALB fills in client IP, protocol and port.</li>
+        <li><a class="text-coral underline" href="https://aws.amazon.com/blogs/networking-and-content-delivery/" target="_blank" rel="noopener">AWS — Networking &amp; Content Delivery blog</a>: worked designs for load balancers, DNS and CloudFront once the basics are solid.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/concepts/services-networking/" target="_blank" rel="noopener">Kubernetes — Services, load balancing and networking</a>: where these ideas reappear inside a cluster (<a class="text-coral underline" href="./ks3.html">KS3</a>).</li>
+      </ul>

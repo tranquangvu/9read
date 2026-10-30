@@ -1,0 +1,795 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">FinOps: Cost Visibility &amp; Optimisation</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          At L2 you knew what your own resources cost. At L3 you own the bill for the whole clinic platform: five accounts,
+          ECS and EKS, RDS, Redis, S3, CloudFront and a lot of NAT traffic nobody asked for. This module runs the FinOps
+          lifecycle (inform, optimise, operate) the way a senior engineer does it. You make every dollar attributable to a
+          service and a team, query the Cost and Usage Report with Athena, choose commitments and Spot with numbers rather
+          than vibes, find the data-transfer traps, and turn it into a unit cost that the client's CFO and your engineers
+          both understand: <strong>dollars per 1,000 bookings</strong>.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> cost incidents are real incidents, they just page finance instead
+          of you. A debug log level left on in prod pushes CloudWatch Logs ingestion to USD 2,400 in a week. A worker that
+          downloads uploads through a NAT gateway turns into a four-figure line item. A Savings Plan bought on a spiky month
+          sits 40% unused for three years. None of these show up in a latency graph. The engineer who can explain the bill
+          line by line, and cut it without touching reliability, is the one a client trusts with the platform.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · The FinOps lifecycle</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Cost is an engineering metric that finance happens to read</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        FinOps is not a quarterly cost-cutting sprint. It is a loop, run by engineers, with finance and product as
+        stakeholders. The FinOps Foundation calls the phases <strong>Inform</strong> (see and attribute spend),
+        <strong>Optimise</strong> (change rates and usage) and <strong>Operate</strong> (make it continuous: budgets,
+        alerts, reviews, ownership). Teams fail when they jump straight to optimise. Without attribution you cut the wrong
+        thing, and without operate the savings drift back within two quarters.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Inform, optimise, operate: a loop, not a project</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each phase produces an artifact the next one depends on. Inform produces an allocated bill: every dollar has a
+        <code class="inline">service</code> and an <code class="inline">env</code>. Optimise produces a ranked list of
+        changes with expected savings. Operate produces the guardrails that keep the savings: budgets, anomaly alerts, a
+        monthly review and a unit-cost trend line. You go round the loop monthly, and each turn should be cheaper to run
+        than the last.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 240" class="w-full min-w-[640px]" role="img" aria-label="FinOps lifecycle: inform produces an allocated bill, optimise produces ranked savings, operate produces guardrails, then the loop repeats">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">THE FINOPS LOOP · one turn per month for the clinic platform</text>
+          <g class="anim-pulse"><rect x="20" y="70" width="190" height="70" rx="9" fill="#2563EB"/>
+            <text x="115" y="96" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Inform</text>
+            <text x="115" y="112" text-anchor="middle" fill="#ffffffbb" font-size="9">tags · CUR 2.0 · Athena</text>
+            <text x="115" y="126" text-anchor="middle" fill="#ffffffbb" font-size="9">output: allocated bill</text></g>
+          <g class="anim-pulse d1"><rect x="265" y="70" width="190" height="70" rx="9" fill="#0D9488"/>
+            <text x="360" y="96" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Optimise</text>
+            <text x="360" y="112" text-anchor="middle" fill="#ffffffbb" font-size="9">rightsize · commit · Spot · traffic</text>
+            <text x="360" y="126" text-anchor="middle" fill="#ffffffbb" font-size="9">output: ranked savings list</text></g>
+          <g class="anim-pulse d2"><rect x="510" y="70" width="190" height="70" rx="9" fill="#D97757"/>
+            <text x="605" y="96" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Operate</text>
+            <text x="605" y="112" text-anchor="middle" fill="#ffffffbb" font-size="9">budgets · anomalies · review</text>
+            <text x="605" y="126" text-anchor="middle" fill="#ffffffbb" font-size="9">output: guardrails + unit cost</text></g>
+          <line x1="210" y1="105" x2="265" y2="105" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="455" y1="105" x2="510" y2="105" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <path d="M605 140 Q605 200 360 200 Q115 200 115 140" fill="none" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="360" y="192" text-anchor="middle" font-size="10" fill="#6E6B64">next month: new services, new tags, new anomalies</text>
+          <text x="360" y="228" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">skipping Inform means you optimise the wrong line item</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Phase</th><th class="px-4 py-3">Crawl</th><th class="px-4 py-3">Walk</th><th class="px-4 py-3">Run (our target)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Inform</td><td class="px-4 py-3">Cost Explorer by account</td><td class="px-4 py-3">Tags activated, 70% of spend allocated</td><td class="px-4 py-3">CUR 2.0 in Athena, ≥ 95% allocated, shared costs split by rule</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Optimise</td><td class="px-4 py-3">Delete obvious idle resources</td><td class="px-4 py-3">Rightsizing from Compute Optimizer, first Savings Plan</td><td class="px-4 py-3">Commitment coverage 70–80% of baseline, Spot for every interruptible workload</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Operate</td><td class="px-4 py-3">One account-level budget</td><td class="px-4 py-3">Budgets per account, anomaly alerts to email</td><td class="px-4 py-3">Per-service budgets in Terraform, anomalies to Slack, monthly review, unit cost on the team dashboard</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Be honest about where a client is. Most clients we inherit are at crawl in all three rows. Moving Inform to walk
+        is usually a week of work and pays for everything else.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Who owns which dollar</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The senior job is not to approve every spend. It is to make sure every dollar has an owner who can see it and
+        change it. Centralised cost-cutting by the DevOps team does not scale: you will never know whether
+        <code class="inline">booking-worker</code> really needs 4 vCPU. The team that runs the service does. Your job is
+        the system around them.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Decision</th><th class="px-4 py-3">Owner</th><th class="px-4 py-3">Senior DevOps role</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Service sizing (tasks, requests, instance class)</td><td class="px-4 py-3">Service team</td><td class="px-4 py-3">Give them per-service cost and rightsizing data; review big changes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Commitments (Savings Plans, RIs)</td><td class="px-4 py-3">Platform / DevOps, signed off by the client's finance</td><td class="px-4 py-3">Model coverage and break-even, buy centrally in the management account</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shared platform (EKS control plane, NAT, TGW, logging)</td><td class="px-4 py-3">Platform / DevOps</td><td class="px-4 py-3">Own it, and split it back to services by an agreed rule</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Budget numbers</td><td class="px-4 py-3">Client product owner + finance</td><td class="px-4 py-3">Translate their number into per-account and per-service budgets with alerts</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Architecture with cost impact</td><td class="px-4 py-3">Whoever writes the RFC</td><td class="px-4 py-3">Require a cost section in every RFC (<a href="./ar5.html" class="text-viol underline decoration-viol/40">AR5</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The clinic bill, before anyone looked at it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Here is the starting point we will work from for the rest of the module: the September 2026 bill for the clinic
+        platform, grouped by service across all five accounts. Read it as a senior would: which lines are proportional to
+        traffic (fine), which are fixed overhead (question them), and which are surprises (investigate first).
+      </p>
+      <pre class="code mt-3">aws ce get-cost-and-usage --profile gol-management \
+  --time-period Start=2026-09-01,End=2026-10-01 --granularity MONTHLY \
+  --metrics NetAmortizedCost --group-by Type=DIMENSION,Key=SERVICE \
+  --query 'ResultsByTime[0].Groups[].[Keys[0],Metrics.NetAmortizedCost.Amount]' --output text \
+  | sort -t$'\t' -k2 -nr | head -8
+<span class="out">Amazon Elastic Compute Cloud - Compute        4112.37
+Amazon Relational Database Service           2876.10
+EC2 - Other                                  2241.85
+Amazon CloudWatch                            1388.42
+Amazon Elastic Container Service (Fargate)   1104.66
+Amazon ElastiCache                            612.30
+Amazon Elastic Kubernetes Service             438.00
+Amazon Simple Storage Service                 401.19</span>
+<span class="cm"># "EC2 - Other" hides NAT gateway hours + bytes, EBS and data transfer: always break it down</span></pre>
+      <div class="mt-4 callout callout-info"><strong>Use amortised cost, not unblended, for decisions.</strong> Unblended
+        cost shows a one-year upfront Savings Plan as a spike in the month you bought it and zero afterwards. Amortised
+        (and net amortised, after credits and discounts) spreads the commitment over its term, so a service's cost does
+        not jump just because finance paid an invoice.</div>
+
+      <h3 class="font-semibold text-lg mt-8">What you decline to build</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A senior engineer protects the team from FinOps theatre. Every one of these has been proposed to us by a client,
+        and every one cost more in engineering time than it saved:
+      </p>
+      <ul class="mt-4 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>A custom cost dashboard app.</strong> Athena plus a Grafana or QuickSight dashboard covers it. AWS's
+          own Cloud Intelligence Dashboards are free templates. Build the queries, not a product.</li>
+        <li><strong>Per-request cost attribution in application code.</strong> Allocate by service and divide by business
+          volume. Accuracy beyond ±10% does not change any decision you will make.</li>
+        <li><strong>A lambda that stops dev every night</strong> when dev costs USD 600 a month. Two engineer-days to
+          build and maintain is worth more than the saving. Do it with an ECS scheduled scaling action or Karpenter
+          limits instead, or not at all.</li>
+        <li><strong>Chargeback invoices between internal teams.</strong> Showback (visible, not billed) gets 90% of the
+          behaviour change with none of the accounting disputes.</li>
+      </ul>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Inform — visibility and allocation</div>
+      <h2 class="font-display text-2xl font-bold mt-2">If a dollar has no owner tag, it has no owner</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Allocation is built from three layers: <strong>accounts</strong> (the cheapest, most reliable split, from
+        <a href="./ar1.html" class="text-viol underline decoration-viol/40">AR1</a>), <strong>tags</strong> (split inside
+        an account by service and team) and <strong>rules</strong> for what cannot be tagged (support fees, shared NAT,
+        the EKS control plane). Get the first two right in Terraform and the third becomes a short SQL view.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">A tag schema small enough to enforce</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every client wants fifteen tags. Enforce four. A tag that is optional is a tag that is missing on 40% of
+        resources, and a 60%-tagged bill is not much better than an untagged one. These four answer every allocation
+        question we have been asked. Exact casing is enforced by the tag policy below.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tag key</th><th class="px-4 py-3">Allowed values</th><th class="px-4 py-3">Answers</th><th class="px-4 py-3">Set by</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">service</code></td><td class="px-4 py-3"><code class="inline">booking-api</code>, <code class="inline">booking-web</code>, <code class="inline">booking-worker</code>, <code class="inline">platform</code></td><td class="px-4 py-3">What does each service cost?</td><td class="px-4 py-3">Module input, required</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">env</code></td><td class="px-4 py-3"><code class="inline">dev</code>, <code class="inline">staging</code>, <code class="inline">prod</code>, <code class="inline">shared</code></td><td class="px-4 py-3">How much is non-prod overhead?</td><td class="px-4 py-3">Provider <code class="inline">default_tags</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">team</code></td><td class="px-4 py-3"><code class="inline">clinic</code>, <code class="inline">platform</code></td><td class="px-4 py-3">Whose budget is it?</td><td class="px-4 py-3">Provider <code class="inline">default_tags</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">cost-center</code></td><td class="px-4 py-3">The client's finance code, e.g. <code class="inline">CC-4410</code></td><td class="px-4 py-3">Which invoice line?</td><td class="px-4 py-3">Provider <code class="inline">default_tags</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Put three of them in the provider so nobody can forget them, and make <code class="inline">service</code> a
+        required variable of every internal module (module design is in
+        <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>):
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/providers.tf</span>
+        <pre class="code"><span class="kw">provider</span> <span class="st">"aws"</span> {
+  region = <span class="st">"ap-southeast-1"</span>
+  <span class="kw">default_tags</span> {                     <span class="cm"># applied to every taggable resource this provider creates</span>
+    tags = {
+      env           = <span class="st">"prod"</span>
+      team          = <span class="st">"clinic"</span>
+      <span class="st">"cost-center"</span> = <span class="st">"CC-4410"</span>
+      managed-by    = <span class="st">"terraform"</span>
+    }
+  }
+}
+
+<span class="kw">module</span> <span class="st">"booking_worker"</span> {
+  source  = <span class="st">"git::https://github.com/golden-owl/tf-modules.git//ecs-service?ref=v3.4.0"</span>
+  service = <span class="st">"booking-worker"</span>        <span class="cm"># required input; the module adds tags = { service = var.service }</span>
+  <span class="cm"># ...</span>
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong><code class="inline">default_tags</code> do not reach everything.</strong>
+        Resources created by AWS on your behalf are not tagged by Terraform: EBS volumes and ENIs that Karpenter or ECS
+        create, Fargate tasks, Auto Scaling instances unless <code class="inline">propagate_at_launch</code> is set. Set
+        <code class="inline">propagateTags = SERVICE</code> on ECS services, <code class="inline">tags</code> in the
+        Karpenter <code class="inline">EC2NodeClass</code>, and <code class="inline">tag_specifications</code> in launch
+        templates. Then check: the untagged-spend query below must trend towards zero.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Enforce in the organisation, then activate for billing</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Two steps people forget. An <strong>Organizations tag policy</strong> standardises keys and values (so you never
+        get <code class="inline">Service</code>, <code class="inline">service</code> and <code class="inline">svc</code>)
+        and can block non-compliant tagging for listed resource types. Then the tag must be
+        <strong>activated as a cost allocation tag</strong> in the management account, or it never appears in Cost
+        Explorer or the CUR. Activation is not retroactive, so do it on day one.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/org/tag-policy.json — attached to the Workloads OU</span>
+        <pre class="code">{
+  <span class="st">"tags"</span>: {
+    <span class="st">"service"</span>: {
+      <span class="st">"tag_key"</span>:   { <span class="st">"@@assign"</span>: <span class="st">"service"</span> },
+      <span class="st">"tag_value"</span>: { <span class="st">"@@assign"</span>: [<span class="st">"booking-api"</span>, <span class="st">"booking-web"</span>, <span class="st">"booking-worker"</span>, <span class="st">"platform"</span>] },
+      <span class="st">"enforced_for"</span>: { <span class="st">"@@assign"</span>: [<span class="st">"ec2:instance"</span>, <span class="st">"rds:db"</span>, <span class="st">"elasticache:cluster"</span>, <span class="st">"s3:bucket"</span>] }
+    },
+    <span class="st">"env"</span>: {
+      <span class="st">"tag_key"</span>:   { <span class="st">"@@assign"</span>: <span class="st">"env"</span> },
+      <span class="st">"tag_value"</span>: { <span class="st">"@@assign"</span>: [<span class="st">"dev"</span>, <span class="st">"staging"</span>, <span class="st">"prod"</span>, <span class="st">"shared"</span>] }
+    }
+  }
+}</pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># in gol-management: activate the four keys (the Terraform equivalent is aws_ce_cost_allocation_tag)</span>
+aws ce update-cost-allocation-tags-status --profile gol-management \
+  --cost-allocation-tags-status TagKey=service,Status=Active TagKey=env,Status=Active \
+                                TagKey=team,Status=Active TagKey=cost-center,Status=Active
+<span class="out">{ "Errors": [] }</span>
+aws ce get-cost-and-usage --profile gol-management \
+  --time-period Start=2026-10-01,End=2026-10-29 --granularity MONTHLY \
+  --metrics NetAmortizedCost --group-by Type=TAG,Key=service --output text \
+  --query 'ResultsByTime[0].Groups[].[Keys[0],Metrics.NetAmortizedCost.Amount]'
+<span class="out">service$                 1912.40    <span class="cm">&lt;- empty value: untagged, your first job</span>
+service$booking-api      3387.15
+service$booking-web       702.88
+service$booking-worker   2410.62
+service$platform         3655.03</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        In this example 15% of spend is untagged. That is normal for a first pass, and almost all of it will turn out to be
+        Karpenter-created EBS volumes, NAT gateways and CloudWatch Logs. Your target is under 5%.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Cost Explorer for questions, CUR 2.0 for answers</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Cost Explorer is fine for "what went up last month". It cannot join to your business data, cannot apply your
+        shared-cost rules and cannot show you which NAT gateway moved the bytes. For that you need the line-item data:
+        <strong>CUR 2.0</strong>, delivered by AWS Data Exports as Parquet into S3 and queried with Athena.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tool</th><th class="px-4 py-3">Granularity</th><th class="px-4 py-3">Good for</th><th class="px-4 py-3">Not good for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Cost Explorer</td><td class="px-4 py-3">Daily, by service / account / tag</td><td class="px-4 py-3">Trends, quick filters, SP/RI recommendations</td><td class="px-4 py-3">Resource-level history, custom allocation, joins</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CUR 2.0 + Athena</td><td class="px-4 py-3">Hourly, per resource ID, per usage type</td><td class="px-4 py-3">Allocation rules, unit cost, NAT/transfer forensics, audit</td><td class="px-4 py-3">People who will not write SQL (give them a dashboard)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Split cost allocation data</td><td class="px-4 py-3">Per ECS task / per EKS pod, inside CUR</td><td class="px-4 py-3">Splitting a shared EKS node bill by namespace and workload</td><td class="px-4 py-3">Nothing extra to build; just enable it (deeper in <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost Optimization Hub</td><td class="px-4 py-3">Recommendations, de-duplicated</td><td class="px-4 py-3">One ranked list across Compute Optimizer, SPs, idle resources</td><td class="px-4 py-3">Explaining <em>why</em> the bill moved</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    subgraph MGMT["gol-management (payer)"]
+      DE["AWS Data Exports<br/>CUR 2.0 · hourly · resource IDs<br/>split cost allocation on"]
+    end
+    subgraph LOG["gol-log-archive"]
+      S3[("S3 gol-cur-exports<br/>Parquet, BILLING_PERIOD=YYYY-MM")]
+      GL["Glue crawler<br/>table cur2.clinic"]
+      AT["Athena workgroup finops<br/>bytes-scanned limit 10 GB"]
+    end
+    DE -->|"refreshes up to 3x/day"| S3
+    S3 --> GL --> AT
+    AT --> V["views: allocated_cost,<br/>unit_cost"]
+    V --> D["Grafana / QuickSight<br/>FinOps dashboard"]
+    V --> R["Monthly FinOps report"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/finops/cur.tf — applied in gol-management, provider in us-east-1</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_bcmdataexports_export"</span> <span class="st">"cur2"</span> {
+  export {
+    name = <span class="st">"clinic-cur2"</span>
+    data_query {
+      query_statement = <span class="st">"SELECT * FROM COST_AND_USAGE_REPORT"</span>   <span class="cm"># all columns; prune later in views</span>
+      table_configurations = {
+        COST_AND_USAGE_REPORT = {
+          TIME_GRANULARITY                      = <span class="st">"HOURLY"</span>
+          INCLUDE_RESOURCES                     = <span class="st">"TRUE"</span>   <span class="cm"># resource IDs: needed for NAT/EBS forensics</span>
+          INCLUDE_SPLIT_COST_ALLOCATION_DATA    = <span class="st">"TRUE"</span>   <span class="cm"># per-pod and per-task cost</span>
+          INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY = <span class="st">"FALSE"</span>
+        }
+      }
+    }
+    destination_configurations {
+      s3_destination {
+        s3_bucket = <span class="st">"gol-cur-exports"</span>             <span class="cm"># in gol-log-archive; bucket policy allows billingreports + bcm-data-exports</span>
+        s3_prefix = <span class="st">"cur2"</span>
+        s3_region = <span class="st">"ap-southeast-1"</span>
+        s3_output_configurations {
+          format      = <span class="st">"PARQUET"</span>
+          compression = <span class="st">"PARQUET"</span>
+          output_type = <span class="st">"CUSTOM"</span>
+          overwrite   = <span class="st">"OVERWRITE_REPORT"</span>
+        }
+      }
+    }
+    refresh_cadence { frequency = <span class="st">"SYNCHRONOUS"</span> }
+  }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Five queries that explain any bill</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You do not need a hundred queries. You need a handful you trust, saved as Athena named queries in Terraform. The
+        first one gives you allocated cost by service with amortised commitments, which is the number every other report
+        builds on. Always filter on the <code class="inline">billing_period</code> partition: a query without it scans
+        every month and costs real money on a large CUR.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">finops/queries/01_cost_by_service.sql</span>
+        <pre class="code"><span class="kw">SELECT</span>
+  <span class="fn">coalesce</span>(<span class="fn">nullif</span>(resource_tags[<span class="st">'user_service'</span>], <span class="st">''</span>), <span class="st">'UNTAGGED'</span>) <span class="kw">AS</span> service,
+  <span class="fn">round</span>(<span class="fn">sum</span>(<span class="kw">CASE</span> line_item_line_item_type
+    <span class="kw">WHEN</span> <span class="st">'SavingsPlanCoveredUsage'</span> <span class="kw">THEN</span> savings_plan_savings_plan_effective_cost
+    <span class="kw">WHEN</span> <span class="st">'DiscountedUsage'</span>         <span class="kw">THEN</span> reservation_effective_cost
+    <span class="kw">WHEN</span> <span class="st">'SavingsPlanNegation'</span>     <span class="kw">THEN</span> 0       <span class="cm">-- already counted above</span>
+    <span class="kw">ELSE</span> line_item_unblended_cost <span class="kw">END</span>), 2) <span class="kw">AS</span> amortised_usd
+<span class="kw">FROM</span> cur2.clinic
+<span class="kw">WHERE</span> billing_period = <span class="st">'2026-09'</span>              <span class="cm">-- partition filter: never omit</span>
+  <span class="kw">AND</span> line_item_line_item_type <span class="kw">NOT IN</span> (<span class="st">'Tax'</span>, <span class="st">'Credit'</span>, <span class="st">'Refund'</span>)
+<span class="kw">GROUP BY</span> 1 <span class="kw">ORDER BY</span> 2 <span class="kw">DESC</span>;
+<span class="out">service          amortised_usd
+platform               3790.12
+booking-api            3355.40
+booking-worker         2398.77
+UNTAGGED               1921.04
+booking-web             711.25
+(Run time: 2.8 sec, Data scanned: 41.2 MB)</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The other four you save next to it: <strong>02</strong> untagged spend by <code class="inline">line_item_resource_id</code>
+        (fix list for tagging), <strong>03</strong> month-on-month delta by usage type (what moved), <strong>04</strong>
+        data transfer and NAT bytes (Part III), and <strong>05</strong> unit cost (Part IV). Share costs such as
+        <code class="inline">platform</code> are then split back to services in a view, using a rule the client agrees to
+        in writing, for example proportional to each service's vCPU-hours.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Optimise — usage first, then rate</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Shrink what you run, then commit to what is left</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        There are two levers. <strong>Usage</strong> levers change how much you run: rightsizing, scheduling, deleting idle
+        resources, fixing traffic paths. <strong>Rate</strong> levers change what you pay per unit: Savings Plans,
+        Reserved Instances, Spot, Graviton. The order matters. Commit first and you lock in a discount on capacity you were
+        about to delete. Rightsize first, measure the new floor for two to four weeks, then commit to it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Rightsizing with Compute Optimizer, read sceptically</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Compute Optimizer looks at 14 days of CloudWatch metrics (up to 93 with enhanced infrastructure metrics, worth
+        enabling for prod) and recommends sizes for EC2, Auto Scaling groups, EBS, Lambda, ECS on Fargate and RDS. It is a
+        good first pass and a bad final answer: it does not see memory unless the CloudWatch agent publishes it, it does
+        not know about your Black Monday booking spike, and it cannot see that a task is CPU-bound only during startup.
+      </p>
+      <pre class="code mt-3">aws compute-optimizer get-ecs-service-recommendations --profile gol-prod --region ap-southeast-1 \
+  --query 'ecsServiceRecommendations[].[finding,
+           currentServiceConfiguration.cpu, currentServiceConfiguration.memory,
+           serviceRecommendationOptions[0].cpu, serviceRecommendationOptions[0].memory,
+           serviceRecommendationOptions[0].savingsOpportunity.estimatedMonthlySavings.value, serviceArn]' --output text
+<span class="out">OVERPROVISIONED   2048  4096   1024  3072   211.40   .../service/clinic-prod/booking-worker
+OPTIMIZED         1024  2048   1024  2048     0.00   .../service/clinic-prod/booking-web
+OVERPROVISIONED   1024  2048    512  2048    38.10   .../service/clinic-prod/booking-api</span>
+<span class="cm"># sanity-check booking-worker against p99 CPU and peak queue depth before you accept 1 vCPU</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        For EKS, rightsizing means requests, not instances: Karpenter picks instances to fit the requests you declare, so
+        over-requested pods are the waste (method in <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>).
+        For RDS, the biggest wins are usually a stale <code class="inline">db.r6g.2xlarge</code> from the launch week, and
+        <strong>gp2 to gp3</strong> storage (about 20% cheaper per GB with 3,000 baseline IOPS included). A senior review
+        of the clinic platform typically finds 15–25% in usage savings before any commitment is bought.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Savings Plans vs Reserved Instances: buy the floor, not the average</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A commitment is a bet that you will use at least this much for one or three years. The safe size is the
+        <strong>floor</strong> of your steady hourly spend after rightsizing (the lowest hour of the last month, roughly),
+        not the average. Buying to the average means part of the commitment goes unused in every quiet hour, and unused
+        commitment is pure loss.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Instrument</th><th class="px-4 py-3">Covers</th><th class="px-4 py-3">Flexibility</th><th class="px-4 py-3">Typical 1-yr no-upfront discount</th><th class="px-4 py-3">Use it for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Compute Savings Plan</td><td class="px-4 py-3">EC2 any family/region, Fargate, Lambda</td><td class="px-4 py-3">Highest: survives Graviton moves and ECS→EKS</td><td class="px-4 py-3">~20% Fargate, ~25–30% EC2</td><td class="px-4 py-3">Our default for compute</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EC2 Instance Savings Plan</td><td class="px-4 py-3">One family in one region (e.g. m7g, Singapore)</td><td class="px-4 py-3">Size and OS flexible, family locked</td><td class="px-4 py-3">~30–40%</td><td class="px-4 py-3">A family you are sure of for the full term</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Database Savings Plan</td><td class="px-4 py-3">RDS, Aurora, ElastiCache and other managed databases (check eligible families)</td><td class="px-4 py-3">Engine and size flexible within the region</td><td class="px-4 py-3">Varies by engine; compare with RIs</td><td class="px-4 py-3">RDS + Valkey when you expect engine or size changes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Reserved Instances (RDS, ElastiCache)</td><td class="px-4 py-3">One instance family, engine, region</td><td class="px-4 py-3">Size-flexible within family; engine locked</td><td class="px-4 py-3">~30–40%</td><td class="px-4 py-3">A database you will not change for the term</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># the floor, not the average: what the recommendation engine suggests for 30 days of usage</span>
+aws ce get-savings-plans-purchase-recommendation --profile gol-management \
+  --savings-plans-type COMPUTE_SP --term-in-years ONE_YEAR --payment-option NO_UPFRONT \
+  --lookback-period-in-days THIRTY_DAYS --account-scope PAYER \
+  --query 'SavingsPlansPurchaseRecommendation.SavingsPlansPurchaseRecommendationSummary.
+           [HourlyCommitmentToPurchase,EstimatedSavingsPercentage,EstimatedMonthlySavingsAmount]'
+<span class="out">[ "4.21", "22.6", "689.12" ]</span>
+<span class="cm"># we bought USD 3.40/h: ~80% of the recommendation, because booking-worker moves to Spot next quarter</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>A commitment is a three-year decision someone else pays for.</strong>
+        Never buy one from a single month of data, never buy three-year terms for a client whose contract with us is
+        one year, and never buy before a migration (ECS→EKS, x86→Graviton) unless it is a Compute Savings Plan. Write the
+        purchase as a short RFC with the coverage model, the break-even, and the client's written approval.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Spot: an architecture decision, not a checkbox</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Spot is 60–90% cheaper and can be taken back with two minutes' notice. Whether a workload belongs on Spot depends
+        on how it behaves when interrupted, not on how much you want the saving. Diversify across many instance types and
+        all three AZs so one capacity pool running dry does not take the service down.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Workload</th><th class="px-4 py-3">Spot?</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">booking-worker</code> (SQS consumer)</td><td class="px-4 py-3">Yes, 100%</td><td class="px-4 py-3">Idempotent jobs, visibility timeout returns an interrupted message to the queue</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">CI runners, dev and staging nodes</td><td class="px-4 py-3">Yes</td><td class="px-4 py-3">A retried job costs minutes, not patients</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">booking-api</code></td><td class="px-4 py-3">Partly: on-demand base, Spot above it</td><td class="px-4 py-3">Keep enough on-demand to serve the SLO if all Spot vanishes; ECS capacity provider <code class="inline">base</code> or a Karpenter on-demand NodePool</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Postgres, Redis, Argo CD, Karpenter itself</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Stateful or control plane: an interruption is an outage</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Moving <code class="inline">booking-worker</code> to Fargate Spot (<a href="./cn2.html" class="text-viol underline decoration-viol/40">CN2</a>)
+        saved USD 640 a month on the clinic bill. Interruptions in the first month: 11, every one absorbed by the queue
+        with zero failed bookings. That last number is the one to put in the report.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The NAT gateway trap and other data-transfer surprises</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Data transfer is the line that grows without anyone deploying anything. The worst offender is the NAT gateway: in
+        <code class="inline">ap-southeast-1</code> it costs about <strong>USD 0.059 per hour plus USD 0.059 per GB
+        processed</strong>, and every byte from a private subnet to S3, ECR or any AWS public endpoint goes through it
+        unless a VPC endpoint gives it a shorter path (endpoint design is in
+        <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>).
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 260" class="w-full min-w-[640px]" role="img" aria-label="NAT gateway trap: booking-worker traffic to S3 and ECR through NAT costs per GB; the gateway endpoint path is free">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">SAME BYTES, TWO PATHS · gol-prod, 18 TB/month from booking-worker to S3</text>
+          <rect x="10" y="36" width="300" height="210" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="22" y="56" font-size="10" font-weight="700" fill="#6E6B64">PRIVATE SUBNETS · 10.20.0.0/16</text>
+          <g class="anim-pulse"><rect x="30" y="110" width="140" height="56" rx="9" fill="#2563EB"/>
+            <text x="100" y="133" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-worker</text>
+            <text x="100" y="149" text-anchor="middle" fill="#ffffffbb" font-size="9">reads uploads, pulls images</text></g>
+          <g class="anim-pulse d1"><rect x="200" y="60" width="96" height="50" rx="9" fill="#DB2777"/>
+            <text x="248" y="81" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">NAT GW</text>
+            <text x="248" y="96" text-anchor="middle" fill="#ffffffbb" font-size="9">$0.059 / GB</text></g>
+          <g class="anim-pulse d2"><rect x="200" y="170" width="96" height="50" rx="9" fill="#0D9488"/>
+            <text x="248" y="191" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">S3 gateway EP</text>
+            <text x="248" y="206" text-anchor="middle" fill="#ffffffbb" font-size="9">$0 / GB</text></g>
+          <g class="anim-pulse d3"><rect x="470" y="110" width="140" height="56" rx="9" fill="#37474F"/>
+            <text x="540" y="133" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">S3 · ECR</text>
+            <text x="540" y="149" text-anchor="middle" fill="#ffffffbb" font-size="9">same region</text></g>
+          <line x1="170" y1="128" x2="200" y2="90" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+          <line x1="296" y1="85" x2="470" y2="128" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+          <line x1="170" y1="150" x2="200" y2="192" stroke="#0D9488" stroke-width="2" class="anim-flow"/>
+          <line x1="296" y1="195" x2="470" y2="150" stroke="#0D9488" stroke-width="2" class="anim-flow"/>
+          <text x="400" y="80" font-size="10" fill="#DB2777">before: 18,000 GB × 0.059 ≈ $1,062/mo</text>
+          <text x="400" y="205" font-size="10" fill="#0D9488">after: route-table entry, $0/mo</text>
+          <text x="360" y="252" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">ECR layers live in S3, so the gateway endpoint fixes most image-pull bytes too</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">finops/queries/04_nat_and_transfer.sql</span>
+        <pre class="code"><span class="kw">SELECT</span> line_item_usage_account_id <span class="kw">AS</span> account,
+       line_item_usage_type          <span class="kw">AS</span> usage_type,
+       line_item_resource_id         <span class="kw">AS</span> resource,
+       <span class="fn">round</span>(<span class="fn">sum</span>(line_item_usage_amount), 0)   <span class="kw">AS</span> gb,
+       <span class="fn">round</span>(<span class="fn">sum</span>(line_item_unblended_cost), 2) <span class="kw">AS</span> usd
+<span class="kw">FROM</span> cur2.clinic
+<span class="kw">WHERE</span> billing_period = <span class="st">'2026-09'</span>
+  <span class="kw">AND</span> (line_item_usage_type <span class="kw">LIKE</span> <span class="st">'%NatGateway-Bytes'</span>             <span class="cm">-- NAT processing</span>
+       <span class="kw">OR</span> line_item_usage_type <span class="kw">LIKE</span> <span class="st">'%DataTransfer-Regional-Bytes'</span>  <span class="cm">-- cross-AZ, both directions</span>
+       <span class="kw">OR</span> line_item_usage_type <span class="kw">LIKE</span> <span class="st">'%DataTransfer-Out-Bytes'</span>)      <span class="cm">-- to the internet</span>
+<span class="kw">GROUP BY</span> 1, 2, 3 <span class="kw">ORDER BY</span> usd <span class="kw">DESC</span> <span class="kw">LIMIT</span> 5;
+<span class="out">account       usage_type                        resource                  gb      usd
+444455556666  APS1-NatGateway-Bytes             nat-0a1b2c3d4e5f60718     18412   1086.31
+444455556666  APS1-DataTransfer-Regional-Bytes  i-0f9e8d7c6b5a43210        9870     98.70
+444455556666  APS1-DataTransfer-Out-Bytes       arn:...:distribution/E2X   6105    512.82
+444455556666  APS1-NatGateway-Bytes             nat-0b2c3d4e5f6071829      2215    130.69</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The query tells you <em>which</em> NAT gateway; VPC Flow Logs tell you <em>which destination</em>. In this case it
+        was S3 (uploads re-read for thumbnailing) and ECR. An S3 gateway endpoint is free. ECR also needs the
+        <code class="inline">ecr.api</code> and <code class="inline">ecr.dkr</code> interface endpoints, at roughly
+        USD 0.013 per hour per AZ each plus USD 0.01 per GB, which is only worth it above a few hundred GB a month.
+        Other traps to check every quarter: cross-AZ chatter between pods and Redis (USD 0.01 per GB each way), CloudWatch
+        Logs ingestion from debug logging, and internet egress that should have been served from CloudFront.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Storage: the cost that only ever grows</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Compute scales down at night. Storage never does on its own. Each of these is a one-line Terraform change that
+        nobody makes until someone runs the query:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Finding</th><th class="px-4 py-3">Fix</th><th class="px-4 py-3">Clinic saving / month</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">CloudWatch log groups with "Never expire"</td><td class="px-4 py-3"><code class="inline">retention_in_days = 30</code> in prod (90 for audit groups), archive to S3 if needed (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>)</td><td class="px-4 py-3">USD 310</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">gp2 EBS and RDS storage</td><td class="px-4 py-3">Migrate to gp3, online, no downtime</td><td class="px-4 py-3">USD 95</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Unattached EBS volumes and old snapshots</td><td class="px-4 py-3">Delete, then an AWS Backup policy instead of ad-hoc snapshots</td><td class="px-4 py-3">USD 140</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Uploads bucket all in S3 Standard</td><td class="px-4 py-3">Intelligent-Tiering; lifecycle on noncurrent versions (<a href="./aw4.html" class="text-viol underline decoration-viol/40">AW4</a>)</td><td class="px-4 py-3">USD 120</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ECR keeping every image ever built</td><td class="px-4 py-3">Lifecycle policy: keep last 30 tagged, expire untagged after 7 days (<a href="./ci4.html" class="text-viol underline decoration-viol/40">CI4</a>)</td><td class="px-4 py-3">USD 45</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Operate — make it stick</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Savings you do not guard are savings you lose by next quarter</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Every optimisation decays. New services launch untagged, a load test leaves 20 tasks running, someone turns on
+        debug logging "for an hour". Operate is the set of cheap, automatic checks that catch this within a day instead of
+        on next month's invoice, plus the one number that tells the client whether the platform is getting more efficient.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Budgets in Terraform, alerting on forecast</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A budget that alerts on <em>actual</em> spend tells you on the 28th that the month went wrong. Alert on the
+        <strong>forecast</strong> at 80% and on actual at 100%, send it to the team that owns the service, and keep the
+        budgets in <code class="inline">clinic-infra</code> next to the services they watch. Budgets without actions cost
+        nothing; budgets with actions are free for the first two and about USD 0.10 a day each after that.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/finops/budgets.tf — gol-management</span>
+        <pre class="code"><span class="kw">locals</span> {
+  service_budgets = { <span class="st">"booking-api"</span> = 3500, <span class="st">"booking-worker"</span> = 2000, <span class="st">"platform"</span> = 3900 }  <span class="cm"># USD/month, agreed with the client</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_budgets_budget"</span> <span class="st">"service"</span> {
+  for_each     = local.service_budgets
+  name         = <span class="st">"clinic-${each.key}-monthly"</span>
+  budget_type  = <span class="st">"COST"</span>
+  limit_amount = each.value
+  limit_unit   = <span class="st">"USD"</span>
+  time_unit    = <span class="st">"MONTHLY"</span>
+  cost_filter {
+    name   = <span class="st">"TagKeyValue"</span>
+    values = [<span class="fn">format</span>(<span class="st">"user:service$%s"</span>, each.key)]  <span class="cm"># API wants "user:&lt;key&gt;$&lt;value&gt;"</span>
+  }
+  notification {
+    comparison_operator       = <span class="st">"GREATER_THAN"</span>
+    threshold                 = 80
+    threshold_type            = <span class="st">"PERCENTAGE"</span>
+    notification_type         = <span class="st">"FORECASTED"</span>   <span class="cm"># early warning, not a post-mortem</span>
+    subscriber_sns_topic_arns = [aws_sns_topic.finops_alerts.arn]
+  }
+  notification {
+    comparison_operator       = <span class="st">"GREATER_THAN"</span>
+    threshold                 = 100
+    threshold_type            = <span class="st">"PERCENTAGE"</span>
+    notification_type         = <span class="st">"ACTUAL"</span>
+    subscriber_sns_topic_arns = [aws_sns_topic.finops_alerts.arn]
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Route the SNS topic to Slack through AWS Chatbot (now Amazon Q Developer in chat applications), into the
+        <code class="inline">#clinic-cost</code> channel the service team reads, not a DevOps inbox. Dev and staging get
+        one account-level budget each, with a <strong>budget action</strong> that applies a deny-launch SCP at 120% in
+        <code class="inline">gol-dev</code> only. Never attach automatic actions to prod.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Anomaly detection for what budgets miss</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Budgets catch a month going over. Cost Anomaly Detection catches a <em>rate</em> change: CloudWatch Logs jumping
+        from USD 40 to USD 340 a day is well within a monthly budget for the first week, and an anomaly on day one. It is
+        free and uses machine-learned baselines per service, so give it a sensible absolute threshold or it will alert on
+        USD 3 wobbles and get muted.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/finops/anomaly.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_ce_anomaly_monitor"</span> <span class="st">"by_service"</span> {
+  name              = <span class="st">"clinic-aws-services"</span>
+  monitor_type      = <span class="st">"DIMENSIONAL"</span>
+  monitor_dimension = <span class="st">"SERVICE"</span>                 <span class="cm"># one baseline per AWS service, all linked accounts</span>
+}
+
+<span class="kw">resource</span> <span class="st">"aws_ce_anomaly_subscription"</span> <span class="st">"slack"</span> {
+  name             = <span class="st">"clinic-anomalies-immediate"</span>
+  frequency        = <span class="st">"IMMEDIATE"</span>              <span class="cm"># IMMEDIATE requires an SNS subscriber</span>
+  monitor_arn_list = [aws_ce_anomaly_monitor.by_service.arn]
+  subscriber {
+    type    = <span class="st">"SNS"</span>
+    address = aws_sns_topic.finops_alerts.arn
+  }
+  threshold_expression {
+    dimension {
+      key           = <span class="st">"ANOMALY_TOTAL_IMPACT_ABSOLUTE"</span>
+      match_options = [<span class="st">"GREATER_THAN_OR_EQUAL"</span>]
+      values        = [<span class="st">"75"</span>]                <span class="cm"># USD of impact; below this, nobody acts anyway</span>
+    }
+  }
+}</pre>
+      </div>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant CAD as Cost Anomaly Detection
+    participant SNS as SNS finops-alerts
+    participant Q as Slack #clinic-cost
+    participant ON as Service owner
+    participant CUR as Athena (CUR 2.0)
+    CAD->>SNS: CloudWatch +USD 290/day vs baseline, account gol-prod
+    SNS->>Q: anomaly card with root-cause hints (usage type, account)
+    Q->>ON: ack within one working day
+    ON->>CUR: query 03: delta by usage type and resource
+    CUR-->>ON: APS1-DataProcessing-Bytes, log group /ecs/booking-api
+    ON->>ON: revert LOG_LEVEL=debug, PR merged
+    Note over CAD,ON: cost incident closed in 4 h<br/>vs USD 2,400 if found on the invoice
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Unit economics: dollars per 1,000 bookings</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A total bill that goes up is not bad news if bookings went up faster. A unit cost turns the bill into a metric
+        the client's product owner can reason about and your engineers can move. Pick a unit that tracks value (confirmed
+        bookings, not HTTP requests), take the allocated cost from CUR, and divide by the count from the application
+        database or analytics, exported daily to S3.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">finops/queries/05_unit_cost.sql</span>
+        <pre class="code"><span class="kw">WITH</span> cost <span class="kw">AS</span> (
+  <span class="kw">SELECT</span> billing_period, <span class="fn">sum</span>(amortised_usd) <span class="kw">AS</span> usd
+  <span class="kw">FROM</span> finops.allocated_cost                  <span class="cm">-- view from query 01 + shared-cost split</span>
+  <span class="kw">WHERE</span> env = <span class="st">'prod'</span> <span class="kw">AND</span> billing_period <span class="kw">BETWEEN</span> <span class="st">'2026-04'</span> <span class="kw">AND</span> <span class="st">'2026-09'</span>
+  <span class="kw">GROUP BY</span> 1
+), volume <span class="kw">AS</span> (
+  <span class="kw">SELECT</span> <span class="fn">date_format</span>(booked_at, <span class="st">'%Y-%m'</span>) <span class="kw">AS</span> billing_period, <span class="fn">count</span>(*) <span class="kw">AS</span> bookings
+  <span class="kw">FROM</span> analytics.confirmed_bookings           <span class="cm">-- daily export from booking-api, no PII</span>
+  <span class="kw">GROUP BY</span> 1
+)
+<span class="kw">SELECT</span> c.billing_period, c.usd, v.bookings,
+       <span class="fn">round</span>(1000 * c.usd / v.bookings, 2) <span class="kw">AS</span> usd_per_1k_bookings
+<span class="kw">FROM</span> cost c <span class="kw">JOIN</span> volume v <span class="kw">USING</span> (billing_period) <span class="kw">ORDER BY</span> 1;
+<span class="out">billing_period   usd       bookings   usd_per_1k_bookings
+2026-04          8920.10   301204     29.61
+2026-06          9455.88   352870     26.80
+2026-08          9810.45   398115     24.64
+2026-09          8102.30   412560     19.64   <span class="cm">&lt;- after NAT endpoint, Spot worker, SP</span></span></pre>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> put the unit cost next to the SLOs on the
+        service dashboard (<a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a>). Reliability and
+        cost are the same conversation: a change that drops cost per 1,000 bookings from 24.64 to 19.64 while the
+        availability SLO holds at 99.9% is the strongest argument a platform team can make in a renewal meeting.</div>
+
+      <h3 class="font-semibold text-lg mt-8">The monthly FinOps report and review</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The L3 capstone asks for a FinOps report that cuts the bill by a measured amount. "Measured" means before and
+        after, from CUR, with the reliability impact stated. One page, the same structure every month, reviewed in a
+        30-minute meeting with the client's product owner and the service leads:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">finops/reports/2026-09.md — template</span>
+        <pre class="code"># Clinic platform FinOps report: September 2026
+## 1. Headline
+Total net amortised: USD 13,766 (-12.4% MoM) · prod unit cost USD 19.64 / 1k bookings (-20%)
+Allocated: 96.1% (target ≥ 95%) · Commitment coverage: 74% · SP utilisation: 99.2%
+## 2. What changed (from CUR query 03)
+| Change                          | Owner          | Saving/mo | Reliability impact      |
+|---------------------------------|----------------|-----------|-------------------------|
+| S3 gateway endpoint in gol-prod | platform       | USD 1,050 | none                    |
+| booking-worker on Fargate Spot  | clinic         | USD   640 | 11 interruptions, 0 failed jobs |
+| Compute SP USD 3.40/h, 1 yr     | platform+client| USD   590 | none                    |
+## 3. Anomalies this month
+2026-09-14 CloudWatch Logs +USD 290/day, debug logging, fixed in 4 h
+## 4. Next month (ranked by saving / effort)
+1. RDS gp2 → gp3 (USD 95, 1 h)   2. Log retention 30 d (USD 310, 2 h)
+## 5. Decisions needed from the client
+- Approve 1-yr RDS reserved instance for db.r7g.large (USD 210/mo saving)</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Keep the "decisions needed" section short and explicit. A senior engineer does not wait for finance to discover a
+        saving: you bring the number, the risk and the ask, and you record the answer. Writing that kind of proposal is
+        covered in <a href="./ar5.html" class="text-viol underline decoration-viol/40">AR5</a>.
+      </p>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are good at FinOps grunt work: writing Athena SQL against the CUR 2.0 schema, reading a Cost Explorer dump,
+        finding untagged resources in Terraform. Give them read-only billing access (a role with
+        <code class="inline">ce:Get*</code>, <code class="inline">athena:*</code> on the <code class="inline">finops</code>
+        workgroup and S3 read on the CUR bucket), never the ability to buy commitments or change budgets. Guardrails for
+        agents in general are in <a href="./ar6.html" class="text-viol underline decoration-viol/40">AR6</a>.
+      </p>
+      <pre class="code mt-3">Here is the column list of our CUR 2.0 table cur2.clinic. Write an Athena query for
+billing_period '2026-09' that returns the top 10 resources by amortised cost where
+resource_tags['user_service'] is empty. Always filter on the billing_period partition,
+and explain how you handled Savings Plan negation lines.</pre>
+      <pre class="code mt-3">Scan clinic-infra/ for every resource that can carry tags but will not receive our
+service tag (resources outside modules, launch templates without tag_specifications,
+ECS services without propagate_tags). Output a table: file, resource, fix. Do not edit.</pre>
+      <pre class="code mt-3">Given this 90-day hourly Fargate + EC2 spend CSV, compute the 5th-percentile hourly
+spend after excluding the load-test window 2026-08-12..14. Recommend a Compute Savings
+Plan hourly commitment as a range, and show the break-even utilisation.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft and explain Athena queries against CUR 2.0</li>
+            <li>Find tagging gaps and missing lifecycle/retention settings in Terraform</li>
+            <li>Turn a CUR delta into a first draft of the monthly report</li>
+            <li>Model commitment sizes from exported usage data</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every query filters on <code class="inline">billing_period</code> and handles SP/RI line types</li>
+            <li>Savings claims use amortised cost and compare like-for-like months</li>
+            <li>Rightsizing advice is checked against p99 and peak, not the average</li>
+            <li>Any commitment number goes into an RFC with human sign-off</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written FinOps work:</strong> queries summing
+        <code class="inline">line_item_unblended_cost</code> across Savings Plan lines (double counting or a negative
+        bill); <code class="inline">SELECT *</code> without a partition filter; legacy CUR column names
+        (<code class="inline">resource_tags_user_service</code>) against a CUR 2.0 table; recommending three-year
+        all-upfront commitments by default; "delete unattached volumes" scripts with no snapshot or owner check; and NAT
+        "fixes" that remove the NAT gateway while private subnets still need internet egress.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has never opened the billing console and cannot say what the platform costs per month.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Reads Cost Explorer by service, knows Savings Plans and Spot exist, but cannot attribute spend to a service or explain "EC2 - Other".</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds tags and budgets for their own service, applies Compute Optimizer suggestions, and runs CUR queries someone else wrote.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Gets the platform to ≥ 95% allocated spend, writes CUR 2.0 queries with amortised cost, finds and fixes data-transfer traps, sizes a commitment from the usage floor with a written break-even, keeps budgets and anomaly alerts in Terraform, and reports a unit cost monthly.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Runs the monthly FinOps review with the client, makes cost a required section of every RFC, teaches service teams to own their numbers, and declines FinOps tooling that costs more than it saves.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, take last month's
+        clinic bill and explain the top five line items, including what is inside "EC2 - Other". Write the Athena query for
+        untagged spend from memory, and defend a Savings Plan number to a mentor playing the client's finance lead: floor,
+        coverage, utilisation, break-even and what happens if the worker moves to Spot.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Buying commitments before rightsizing</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">You lock a discount onto waste for a year. Shrink first, wait two to four weeks for the new floor, then commit to about 70–80% of it.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Reporting unblended cost</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Upfront payments and SP negation lines make unblended numbers swing wildly. Use net amortised for every trend and every "we saved X" claim.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Cutting cost by cutting redundancy</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Dropping RDS Multi-AZ or going to one NAT gateway saves a few hundred dollars and spends your error budget. Cost changes that touch availability go through the same RFC as any reliability change (<a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a>).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Fix the tag at the source</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Never patch tags by hand in the console. Fix the module, the Karpenter EC2NodeClass or the ECS <code class="inline">propagate_tags</code>, and the untagged query will stay clean.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Start with Flow Logs on the NAT gateway</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">On any inherited account, the NAT and data-transfer query is the highest-return hour you will spend. It routinely finds four figures a month that one endpoint removes.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tagging"> <span>I enforced a four-key tag schema with <code class="inline">default_tags</code>, a tag policy and activated cost allocation tags, and got untagged spend below 5%.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="cur-athena"> <span>I set up CUR 2.0 with Data Exports in Terraform and wrote saved Athena queries for cost by service, untagged spend and NAT/data transfer.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="commitment"> <span>I sized a Savings Plan from the usage floor and wrote the coverage, utilisation and break-even into a short RFC.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="guardrails"> <span>I put per-service budgets (forecast alerts) and Cost Anomaly Detection in Terraform, routed to the owning team's channel.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="finops-report"> <span class="font-semibold">Produced a one-page FinOps report for the clinic platform (or a sandbox copy) that shows allocated spend, at least two implemented savings measured before and after from CUR, their reliability impact, and a unit cost trend in USD per 1,000 bookings, and presented it to a mentor acting as the client (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/cur/latest/userguide/what-is-data-exports.html" target="_blank" rel="noopener">AWS — Data Exports and CUR 2.0</a> — export setup, the column dictionary and split cost allocation data.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/cost-management/latest/userguide/getting-started-ad.html" target="_blank" rel="noopener">AWS — Cost Anomaly Detection</a> — monitors, subscriptions and thresholds used in Part IV.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/savingsplans/latest/userguide/what-is-savings-plans.html" target="_blank" rel="noopener">AWS — Savings Plans user guide</a> — plan types, coverage and utilisation reports.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/compute-optimizer/latest/ug/what-is-compute-optimizer.html" target="_blank" rel="noopener">AWS — Compute Optimizer</a> — supported resources, enhanced metrics and how findings are computed.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_tag-policies.html" target="_blank" rel="noopener">AWS — Organizations tag policies</a> · <a class="text-coral underline" href="https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/cost-alloc-tags.html" target="_blank" rel="noopener">cost allocation tags</a> — enforcing and activating the schema.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html" target="_blank" rel="noopener">AWS — Well-Architected Cost Optimization Pillar</a> — the review questions behind this module (<a class="text-coral underline" href="./ar1.html">AR1</a>).</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bcmdataexports_export" target="_blank" rel="noopener">Terraform — aws_bcmdataexports_export</a> · <a class="text-coral underline" href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/budgets_budget" target="_blank" rel="noopener">aws_budgets_budget</a> — the resources used in the code above.</li>
+      </ul>

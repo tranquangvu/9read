@@ -1,0 +1,776 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Monitoring on AWS with CloudWatch</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          CloudWatch is the observability layer every AWS account already has. Every ALB, RDS instance, SQS queue and
+          Fargate task publishes metrics into it, and every ECS task and Lambda writes its logs there by default. This module
+          opens the observability block of the track: what observability is and how it differs from monitoring, where
+          CloudWatch sits next to Prometheus, Datadog and OpenTelemetry in our stack, and how to use CloudWatch well:
+          metrics and dimensions, alarms that page for the right reasons, Logs Insights queries, metric filters, Container
+          Insights, X-Ray and Application Signals, and the log bill that surprises every team once.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> the first sign of most clinic-platform incidents is an AWS signal.
+          The ALB starts returning 5xx, RDS free storage drops to zero, the SQS queue's oldest message is 40 minutes old.
+          If those alarms don't exist, the first alert comes from a clinic receptionist on the phone. If they exist but are
+          noisy, on-call learns to ignore them. And if nobody set log retention, the account quietly keeps every debug line
+          forever at about USD 0.03 per GB-month, on top of the USD 0.70 per GB it already paid to ingest it. Agents write
+          alarms easily. Whether an alarm wakes the right person at the right moment is your decision.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Observability fundamentals</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Monitoring tells you it broke; observability tells you why</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        You have deployed <code class="inline">booking-api</code> on ECS (<a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>)
+        and on EKS (<a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>). Running it is half the job.
+        The other half is knowing, at 3 a.m., whether it is healthy, and if not, where the problem is. That needs
+        telemetry: numbers, events and request paths that the system emits about itself. This Part sets up the vocabulary
+        that OB1–OB4 share, and the rule for which tool receives which signal.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Known questions vs new questions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Monitoring</strong> is checking a list of questions you wrote in advance: is the 5xx rate above 2%? Is the
+        disk above 85%? It is cheap, and alarms are built from it. <strong>Observability</strong> is the property of a
+        system that lets you answer a question you did <em>not</em> write in advance, such as "why are bookings slow only
+        for clinics in Da Nang, and only since 14:05?", without shipping new code. You need both. Monitoring finds that
+        something is wrong; observability lets you find the cause quickly.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Aspect</th><th class="px-4 py-3">Monitoring</th><th class="px-4 py-3">Observability</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Question type</td><td class="px-4 py-3">Predefined: "is X above threshold?"</td><td class="px-4 py-3">Ad hoc: "what do the slow requests have in common?"</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Data shape</td><td class="px-4 py-3">Aggregated time series, low cardinality</td><td class="px-4 py-3">High-cardinality events and traces: clinic ID, request ID, version</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Output</td><td class="px-4 py-3">Alarms and dashboards</td><td class="px-4 py-3">Queries, trace views, correlation between signals</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost profile</td><td class="px-4 py-3">Predictable: USD 0.10 per alarm per month</td><td class="px-4 py-3">Grows with volume: per GB of logs, per span, per GB scanned</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Failure mode</td><td class="px-4 py-3">Blind to failures nobody predicted</td><td class="px-4 py-3">A bill nobody predicted, and data nobody queries</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Which questions deserve an alarm (symptoms that users feel, not every cause) is the subject of
+        <a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a>. This module gives you the mechanics.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The three pillars, and the thread that ties them together</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The three classic signal types answer different questions at different costs. <strong>Metrics</strong> are numbers
+        aggregated over time: cheap to store, fast to alarm on, but they lose detail. <strong>Logs</strong> are individual
+        events with context: rich, but expensive at volume. <strong>Traces</strong> follow one request across services and
+        show where time went. On their own each one is a partial view. The useful skill is moving between them: an alarm on
+        a metric, then the logs for that minute, then one slow trace, all joined by a shared <code class="inline">trace_id</code>
+        and the same <code class="inline">service</code>/<code class="inline">env</code> labels.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Signal</th><th class="px-4 py-3">Answers</th><th class="px-4 py-3">booking-api example</th><th class="px-4 py-3">Rough CloudWatch cost (ap-southeast-1)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Metric</td><td class="px-4 py-3">How much, how fast, how many errors?</td><td class="px-4 py-3"><code class="inline">HTTPCode_Target_5XX_Count</code> = 41 in the last minute</td><td class="px-4 py-3">AWS metrics free; custom USD 0.30 per metric-month</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Log</td><td class="px-4 py-3">What exactly happened to this request?</td><td class="px-4 py-3"><code class="inline">{"level":"error","path":"/v1/bookings","err":"pq: too many connections"}</code></td><td class="px-4 py-3">About USD 0.70 per GB ingested + USD 0.03 per GB-month stored</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Trace</td><td class="px-4 py-3">Where did the 2.4 s go?</td><td class="px-4 py-3">API 40 ms → Redis miss 2 ms → Postgres 2,310 ms</td><td class="px-4 py-3">Billed per span ingested; sample it (<a href="./ob4.html" class="text-viol underline decoration-viol/40">OB4</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>Profiles are the fourth signal.</strong> Continuous profiling (CPU and
+        memory per function) is now an OpenTelemetry signal too. We treat it as an elective tool for performance work, not
+        part of the default stack, so it doesn't appear in alarms or runbooks.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Who receives which signal in our stack</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The company uses three backends, and that only works if everyone routes signals the same way. This rule is shared by
+        OB1–OB4. Use it in design reviews and quote it when an agent proposes something different.
+        <strong>CloudWatch</strong> receives AWS-native signals, the alarms on AWS resources, and logs by default.
+        <strong>Prometheus, Grafana and Loki</strong> (self-run or Amazon Managed Prometheus/Grafana) receive Kubernetes-native
+        metrics and logs on EKS (<a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>).
+        <strong>Datadog</strong> is used when a client buys it, as one place for APM, infrastructure and logs
+        (<a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>). <strong>OpenTelemetry</strong> is how
+        our code is instrumented in every case, and the Collector (or ADOT, the AWS distribution) routes the data to whichever
+        backend the project uses (<a href="./ob4.html" class="text-viol underline decoration-viol/40">OB4</a>).
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 270" class="w-full min-w-[640px]" role="img" aria-label="Signal routing: AWS services and apps emit telemetry; OpenTelemetry Collector routes app telemetry to CloudWatch, Prometheus/Grafana/Loki or Datadog">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">SIGNAL ROUTING · one rule for OB1–OB4</text>
+          <g class="anim-pulse"><rect x="15" y="45" width="150" height="50" rx="9" fill="#37474F"/>
+            <text x="90" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">AWS services</text>
+            <text x="90" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">ALB · RDS · SQS · Lambda</text></g>
+          <g class="anim-pulse d1"><rect x="15" y="125" width="150" height="50" rx="9" fill="#2563EB"/>
+            <text x="90" y="146" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-* apps</text>
+            <text x="90" y="161" text-anchor="middle" fill="#ffffffbb" font-size="9">OTel SDK · stdout logs</text></g>
+          <g class="anim-pulse d2"><rect x="15" y="205" width="150" height="50" rx="9" fill="#0D9488"/>
+            <text x="90" y="226" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">EKS cluster</text>
+            <text x="90" y="241" text-anchor="middle" fill="#ffffffbb" font-size="9">kubelet · kube-state</text></g>
+          <g class="anim-pulse d3"><rect x="255" y="125" width="150" height="50" rx="9" fill="#6d5acd"/>
+            <text x="330" y="146" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">OTel Collector / ADOT</text>
+            <text x="330" y="161" text-anchor="middle" fill="#ffffffbb" font-size="9">receive · process · route</text></g>
+          <g class="anim-pulse"><rect x="510" y="45" width="195" height="50" rx="9" fill="#D97757"/>
+            <text x="607" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">CloudWatch</text>
+            <text x="607" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">AWS metrics · alarms · default logs</text></g>
+          <g class="anim-pulse d1"><rect x="510" y="125" width="195" height="50" rx="9" fill="#DB2777"/>
+            <text x="607" y="146" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Prometheus · Grafana · Loki</text>
+            <text x="607" y="161" text-anchor="middle" fill="#ffffffbb" font-size="9">K8s-native on EKS · AMP / AMG</text></g>
+          <g class="anim-pulse d2"><rect x="510" y="205" width="195" height="50" rx="9" fill="#37474F"/>
+            <text x="607" y="226" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Datadog</text>
+            <text x="607" y="241" text-anchor="middle" fill="#ffffffbb" font-size="9">when the client buys it</text></g>
+          <line x1="165" y1="70" x2="510" y2="70" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="165" y1="150" x2="255" y2="150" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="165" y1="230" x2="255" y2="160" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="405" y1="140" x2="510" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="405" y1="150" x2="510" y2="150" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="405" y1="160" x2="510" y2="220" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="330" y="62" text-anchor="middle" font-size="9" fill="#6E6B64">published automatically, no agent needed</text>
+          <text x="330" y="205" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">instrument once, route anywhere</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Signal</th><th class="px-4 py-3">ECS / Lambda project</th><th class="px-4 py-3">EKS project (OSS stack)</th><th class="px-4 py-3">Client bought Datadog</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">AWS resource metrics + alarms</td><td class="px-4 py-3">CloudWatch</td><td class="px-4 py-3">CloudWatch</td><td class="px-4 py-3">CloudWatch, read by Datadog's AWS integration</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">App and container metrics</td><td class="px-4 py-3">CloudWatch (Container Insights, EMF)</td><td class="px-4 py-3">Prometheus / AMP</td><td class="px-4 py-3">Datadog</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Logs</td><td class="px-4 py-3">CloudWatch Logs</td><td class="px-4 py-3">Loki (CloudWatch for AWS service logs)</td><td class="px-4 py-3">Datadog (CloudWatch for AWS service logs)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Traces</td><td class="px-4 py-3">X-Ray / Application Signals</td><td class="px-4 py-3">Grafana Tempo</td><td class="px-4 py-3">Datadog APM</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Instrumentation</td><td class="px-4 py-3" colspan="3">OpenTelemetry SDKs everywhere; the Collector's exporters decide the destination</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Note the first row: whatever else the project uses, <strong>alarms on AWS resources stay in CloudWatch</strong>,
+        defined in Terraform next to the resource. They cost USD 0.10 each, they work when the cluster is down, and they need
+        no agent. A Datadog or Grafana outage must never leave the RDS free-storage alarm without a home.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">CloudWatch in one picture: namespaces, metrics, dimensions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A CloudWatch <strong>metric</strong> is identified by a <strong>namespace</strong> (<code class="inline">AWS/ApplicationELB</code>,
+        or your own like <code class="inline">Clinic/Booking</code>), a <strong>metric name</strong>, and up to 30
+        <strong>dimensions</strong> (name/value pairs). Every unique combination is a separate metric. That is the most
+        important fact about CloudWatch cost: a custom metric with a <code class="inline">clinic_id</code> dimension across
+        800 clinics is 800 metrics, or USD 240 a month for one chart.
+      </p>
+      <pre class="code mt-3"><span class="cm"># what does the prod ALB publish? (run with your gol-prod read-only profile)</span>
+aws cloudwatch list-metrics --namespace AWS/ApplicationELB \
+  --dimensions Name=LoadBalancer,Value=app/clinic-prod-alb/50dc6c495c0c9188 \
+  --query 'Metrics[].MetricName' --output text | tr '\t' '\n' | sort -u | head -6
+<span class="out">ActiveConnectionCount
+HTTPCode_ELB_5XX_Count
+HTTPCode_Target_5XX_Count
+HealthyHostCount
+RequestCount
+TargetResponseTime</span>
+<span class="cm"># the same metric name with a TargetGroup dimension is a DIFFERENT metric</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Learn the handful of AWS metrics that matter for each building block of the clinic platform. These become the
+        alarms in Part II.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Resource</th><th class="px-4 py-3">Namespace · key dimension</th><th class="px-4 py-3">Metrics worth an alarm</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">ALB</td><td class="px-4 py-3"><code class="inline">AWS/ApplicationELB</code> · LoadBalancer, TargetGroup</td><td class="px-4 py-3"><code class="inline">HTTPCode_Target_5XX_Count</code> / <code class="inline">RequestCount</code>, <code class="inline">TargetResponseTime</code> p99, <code class="inline">HealthyHostCount</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">RDS Postgres</td><td class="px-4 py-3"><code class="inline">AWS/RDS</code> · DBInstanceIdentifier</td><td class="px-4 py-3"><code class="inline">FreeStorageSpace</code>, <code class="inline">DatabaseConnections</code>, <code class="inline">CPUUtilization</code>, <code class="inline">ReplicaLag</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">SQS</td><td class="px-4 py-3"><code class="inline">AWS/SQS</code> · QueueName</td><td class="px-4 py-3"><code class="inline">ApproximateAgeOfOldestMessage</code> (not queue depth), DLQ <code class="inline">ApproximateNumberOfMessagesVisible</code> &gt; 0</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ElastiCache</td><td class="px-4 py-3"><code class="inline">AWS/ElastiCache</code> · CacheClusterId</td><td class="px-4 py-3"><code class="inline">DatabaseMemoryUsagePercentage</code>, <code class="inline">Evictions</code>, <code class="inline">EngineCPUUtilization</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ECS service</td><td class="px-4 py-3"><code class="inline">AWS/ECS</code> · ClusterName, ServiceName</td><td class="px-4 py-3"><code class="inline">CPUUtilization</code>, <code class="inline">MemoryUtilization</code>; running task count from Container Insights</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Metrics and alarms</div>
+      <h2 class="font-display text-2xl font-bold mt-2">An alarm is a contract: this symptom, this person, this action</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        CloudWatch alarms are cheap and reliable, so teams create too many of them. Every alarm that pages should satisfy
+        three tests: a user would notice the problem, someone can act on it now, and the runbook linked in its description
+        says what to do. Everything else goes to a dashboard or a ticket queue. This Part covers how metrics are stored, how
+        an alarm decides to fire, and how to write alarms in Terraform that survive review.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Resolution, statistics and retention</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        AWS services publish most metrics at 60-second resolution (some at 5 minutes, such as basic EC2 monitoring and S3
+        storage metrics). You never alarm on raw data points. You alarm on a <strong>statistic</strong> over a
+        <strong>period</strong>: <code class="inline">Sum</code> of 5xx per minute, <code class="inline">p99</code> of
+        <code class="inline">TargetResponseTime</code> per minute, <code class="inline">Maximum</code> of queue age. CloudWatch
+        then rolls old data up to coarser resolution automatically, which is why a graph of last year looks smoother than a
+        graph of last hour.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Data point period</th><th class="px-4 py-3">Kept for</th><th class="px-4 py-3">Consequence</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">&lt; 60 s (high resolution)</td><td class="px-4 py-3">3 hours</td><td class="px-4 py-3">Costs more (USD 0.30 per high-res alarm); only for sub-minute reactions</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">60 s</td><td class="px-4 py-3">15 days</td><td class="px-4 py-3">Per-minute detail for incident reviews is gone after two weeks</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">5 min</td><td class="px-4 py-3">63 days</td><td class="px-4 py-3">Good enough for month-over-month comparisons</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">1 hour</td><td class="px-4 py-3">455 days (15 months)</td><td class="px-4 py-3">Capacity trends and year-over-year; nothing older exists</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <strong>Use percentiles for latency, never Average.</strong> An average of 180 ms can hide 3% of booking requests
+        taking 4 seconds. Ask for p50, p90 and p99 side by side:
+      </p>
+      <pre class="code mt-3">aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+  --metric-name TargetResponseTime \
+  --dimensions Name=LoadBalancer,Value=app/clinic-prod-alb/50dc6c495c0c9188 \
+  --start-time 2026-10-29T07:00:00Z --end-time 2026-10-29T07:05:00Z --period 300 \
+  --extended-statistics p50 p99 --statistics Average
+<span class="out">Average: 0.182   p50: 0.091   p99: 3.870</span>
+<span class="cm"># average looks fine; 1 in 100 patients waits almost 4 seconds to book</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">How an alarm decides: periods, datapoints and missing data</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An alarm evaluates the last <code class="inline">evaluation_periods</code> periods and goes to ALARM when
+        <code class="inline">datapoints_to_alarm</code> of them breach the threshold ("M out of N"). Requiring 3 out of 5
+        one-minute periods ignores a single bad minute but still pages within about 5 minutes of a real problem. The setting
+        people forget is <code class="inline">treat_missing_data</code>: a metric like <code class="inline">HTTPCode_Target_5XX_Count</code>
+        publishes <em>nothing</em> when there are no errors, so the default (<code class="inline">missing</code>) leaves the
+        alarm in INSUFFICIENT_DATA all night.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> INSUFFICIENT_DATA: alarm created
+    INSUFFICIENT_DATA --> OK: enough datapoints, none breaching
+    INSUFFICIENT_DATA --> ALARM: M of N datapoints breach
+    OK --> ALARM: M of N breach<br/>alarm_actions → SNS → on-call
+    ALARM --> OK: back under threshold<br/>ok_actions → resolve the page
+    OK --> INSUFFICIENT_DATA: metric stops publishing<br/>(missing data = "missing")
+    note right of ALARM
+        actions fire only on a state CHANGE,
+        not on every breaching minute
+    end note
+        </pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">treat_missing_data</th><th class="px-4 py-3">Missing points count as</th><th class="px-4 py-3">Use for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">notBreaching</td><td class="px-4 py-3">Good</td><td class="px-4 py-3">Error counts that are absent when zero: 5xx, DLQ messages, metric-filter counts</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">breaching</td><td class="px-4 py-3">Bad</td><td class="px-4 py-3">Heartbeats: a <code class="inline">booking-worker</code> "jobs processed" metric that must always exist</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ignore</td><td class="px-4 py-3">Skipped; current state kept</td><td class="px-4 py-3">Sparse metrics where silence means nothing</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">missing (default)</td><td class="px-4 py-3">Moves towards INSUFFICIENT_DATA</td><td class="px-4 py-3">Rarely what you want; set it explicitly every time</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The 5xx-rate alarm in Terraform</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Alarm on the <em>rate</em> of errors, not the count: 20 errors is a disaster at 50 requests per minute and noise at
+        20,000. CloudWatch <strong>metric math</strong> computes the ratio inside the alarm. Add a minimum-traffic guard, or
+        one failed request at 4 a.m. (1 of 1 = 100%) will page someone. Alarms live in <code class="inline">clinic-infra</code>
+        next to the ALB they watch, so they are created and destroyed with it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/booking-alarms/alb.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_cloudwatch_metric_alarm"</span> <span class="st">"api_5xx_rate"</span> {
+  alarm_name          = <span class="st">"clinic-prod-booking-api-5xx-rate"</span>
+  alarm_description   = <span class="st">"Target 5xx above 2% for 3 of 5 min. Runbook: https://wiki/runbooks/booking-api-5xx"</span>
+  comparison_operator = <span class="st">"GreaterThanThreshold"</span>
+  threshold           = 2                    <span class="cm"># percent</span>
+  evaluation_periods  = 5
+  datapoints_to_alarm = 3                    <span class="cm"># M of N: one bad minute is not a page</span>
+  treat_missing_data  = <span class="st">"notBreaching"</span>
+  alarm_actions       = [var.oncall_sns_arn]
+  ok_actions          = [var.oncall_sns_arn] <span class="cm"># auto-resolve the page</span>
+
+  metric_query {
+    id          = <span class="st">"rate"</span>
+    expression  = <span class="st">"IF(req &gt; 100, 100 * FILL(err, 0) / req, 0)"</span>  <span class="cm"># guard: ignore &lt;100 req/min</span>
+    label       = <span class="st">"5xx %"</span>
+    return_data = true
+  }
+  metric_query {
+    id = <span class="st">"err"</span>
+    metric {
+      namespace   = <span class="st">"AWS/ApplicationELB"</span>
+      metric_name = <span class="st">"HTTPCode_Target_5XX_Count"</span>
+      dimensions  = { LoadBalancer = var.alb_arn_suffix, TargetGroup = var.api_tg_arn_suffix }
+      period      = 60
+      stat        = <span class="st">"Sum"</span>
+    }
+  }
+  metric_query {
+    id = <span class="st">"req"</span>
+    metric {
+      namespace   = <span class="st">"AWS/ApplicationELB"</span>
+      metric_name = <span class="st">"RequestCount"</span>
+      dimensions  = { LoadBalancer = var.alb_arn_suffix, TargetGroup = var.api_tg_arn_suffix }
+      period      = 60
+      stat        = <span class="st">"Sum"</span>
+    }
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Never trust an alarm you have not seen fire. Force its state once after every change and confirm the page arrives
+        in the on-call channel. CloudWatch re-evaluates on the next period and puts it back:
+      </p>
+      <pre class="code mt-3">aws cloudwatch set-alarm-state --alarm-name clinic-prod-booking-api-5xx-rate \
+  --state-value ALARM --state-reason "drill: verifying SNS to on-call routing"
+aws cloudwatch describe-alarm-history --alarm-name clinic-prod-booking-api-5xx-rate \
+  --history-item-type Action --max-items 1 --query 'AlarmHistoryItems[0].HistorySummary'
+<span class="out">"Successfully executed action arn:aws:sns:ap-southeast-1:444455556666:clinic-prod-oncall"</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Static thresholds on burn rates belong to SR1.</strong> A 2% threshold
+        is a starting point. Once <code class="inline">booking-api</code> has an SLO, replace it with multi-window burn-rate
+        alarms (<a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a> teaches the maths; CloudWatch
+        Application Signals can create them for you). Don't invent your own burn-rate thresholds here.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Composite alarms: page once, not five times</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        When RDS falls over, the 5xx alarm, the latency alarm, the healthy-host alarm and the worker heartbeat all fire
+        within two minutes. Four pages for one problem trains people to silence the phone. A <strong>composite alarm</strong>
+        combines child alarms with <code class="inline">AND</code>/<code class="inline">OR</code>/<code class="inline">NOT</code>.
+        Children keep no actions and only feed dashboards; the composite is the single thing that pages. The
+        <code class="inline">actions_suppressor</code> mutes it during a known maintenance window.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    A["5xx rate &gt; 2%<br/>(no actions)"] --> OR{{"OR"}}
+    B["p99 latency &gt; 1.5 s<br/>(no actions)"] --> OR
+    C["HealthyHostCount &lt; 2<br/>(no actions)"] --> OR
+    OR --> AND{{"AND NOT"}}
+    M["maintenance-window alarm<br/>(set during RDS upgrades)"] --> AND
+    AND --> P["clinic-prod-booking-user-impact<br/>→ SNS → one page"]
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/booking-alarms/composite.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_cloudwatch_composite_alarm"</span> <span class="st">"user_impact"</span> {
+  alarm_name        = <span class="st">"clinic-prod-booking-user-impact"</span>
+  alarm_description = <span class="st">"Patients cannot book reliably. Runbook: https://wiki/runbooks/booking-user-impact"</span>
+  alarm_rule = join(<span class="st">" OR "</span>, [
+    <span class="st">"ALARM(${aws_cloudwatch_metric_alarm.api_5xx_rate.alarm_name})"</span>,
+    <span class="st">"ALARM(${aws_cloudwatch_metric_alarm.api_p99.alarm_name})"</span>,
+    <span class="st">"ALARM(${aws_cloudwatch_metric_alarm.api_healthy_hosts.alarm_name})"</span>,
+  ])
+  alarm_actions = [var.oncall_sns_arn]
+  ok_actions    = [var.oncall_sns_arn]
+
+  actions_suppressor {
+    alarm            = aws_cloudwatch_metric_alarm.maintenance.alarm_name
+    extension_period = 300   <span class="cm"># stay quiet 5 min after maintenance ends</span>
+    wait_period      = 120
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Cost check: three child alarms at USD 0.10 plus one composite at USD 0.50 is USD 0.80 a month. A full alarm set for
+        the clinic platform (ALB, RDS, Redis, SQS, ECS, around 25 alarms) costs under USD 5 a month. Alarms are never the
+        line item to optimise; logs are.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · CloudWatch Logs</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Structured logs, explicit retention, and queries instead of grep</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        CloudWatch Logs is the default destination for every ECS task using the <code class="inline">awslogs</code> driver
+        (<a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>), every Lambda, VPC Flow Logs, RDS
+        Postgres logs and EKS control-plane logs. On EKS projects with the OSS stack, application logs go to Loki instead
+        (<a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>), but the AWS service logs still land
+        here. Three habits make CloudWatch Logs useful and affordable: log JSON, set retention on every group, and query
+        with Logs Insights instead of scrolling.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Log groups, streams, retention and log classes</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A <strong>log group</strong> holds the logs of one thing (<code class="inline">/ecs/clinic-prod/booking-api</code>);
+        a <strong>log stream</strong> inside it holds one source (one task). Retention is set per group and
+        <strong>the default is "never expire"</strong>. A log group created implicitly by a service, instead of by
+        Terraform, keeps everything for ever. Create every log group in Terraform before the service that writes to it.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/ecs-service/logs.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_cloudwatch_log_group"</span> <span class="st">"app"</span> {
+  name              = <span class="st">"/ecs/${var.cluster}/${var.service}"</span>
+  retention_in_days = var.env == <span class="st">"prod"</span> ? 30 : 7   <span class="cm"># long-term copies live in gol-log-archive</span>
+  log_group_class   = <span class="st">"STANDARD"</span>                    <span class="cm"># INFREQUENT_ACCESS: ~half price, but no metric filters</span>
+  kms_key_id        = var.logs_kms_key_arn
+  tags              = { service = var.service, env = var.env }
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Log class</th><th class="px-4 py-3">Ingestion (ap-southeast-1, approx.)</th><th class="px-4 py-3">You keep</th><th class="px-4 py-3">You lose</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Standard</td><td class="px-4 py-3">USD 0.70 / GB</td><td class="px-4 py-3">Everything: Logs Insights, metric filters, subscription filters, Live Tail</td><td class="px-4 py-3">Nothing</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Infrequent Access</td><td class="px-4 py-3">About USD 0.35 / GB</td><td class="px-4 py-3">Logs Insights queries, encryption, export</td><td class="px-4 py-3">Metric filters, subscription filters, Live Tail</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Use Infrequent Access for logs you keep "in case": VPC Flow Logs, debug logs in dev, audit-style application logs.
+        Choose the class at creation time; you can't change it on an existing group. Retention and archive requirements for
+        compliance are covered in <a href="./se3.html" class="text-viol underline decoration-viol/40">SE3</a>, and the
+        org-wide log archive account in <a href="./ar1.html" class="text-viol underline decoration-viol/40">AR1</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The log bill, worked out</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Ingestion, not storage, is the expensive part, and it grows with traffic. Do the arithmetic before production does
+        it for you. <code class="inline">booking-api</code> at a peak of 200 requests per second, logging one 1.2 KB JSON
+        line per request plus a 0.8 KB debug line:
+      </p>
+      <pre class="code mt-3">200 req/s × 2.0 KB             = 400 KB/s
+× 86,400 s/day                 ≈ 34.6 GB/day   (assume ~60% of peak on average → ~21 GB/day)
+× 30 days                      ≈ 620 GB/month
+× USD 0.70/GB ingestion        ≈ USD 434/month  <span class="cm"># one service, before storage and queries</span>
+
+<span class="cm"># drop the debug line in prod and stop logging /healthz (ALB checks every 15 s per target)</span>
+200 req/s × 1.2 KB → ~372 GB/month → ≈ USD 260/month   <span class="cm"># 40% cut from two config lines</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Find out who is writing the most before you decide what to cut. The <code class="inline">IncomingBytes</code> metric
+        per log group tells you:
+      </p>
+      <pre class="code mt-3">aws cloudwatch get-metric-data --start-time 2026-10-01T00:00:00Z --end-time 2026-10-29T00:00:00Z \
+  --metric-data-queries '[{"Id":"top","Expression":"SELECT SUM(IncomingBytes) FROM SCHEMA(\"AWS/Logs\", LogGroupName) GROUP BY LogGroupName ORDER BY SUM() DESC LIMIT 3","Period":2419200}]' \
+  --query 'MetricDataResults[].[Label,Values[0]]' --output text
+<span class="out">/ecs/clinic-prod/booking-api      402113220198
+/aws/vpc/flowlogs/clinic-prod     188420019311
+/ecs/clinic-prod/booking-worker    41022918820</span>
+<span class="cm"># ~402 GB for booking-api over 28 days: the debug line is still on</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Logs Insights: the queries you will run every week</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Logs Insights discovers JSON fields automatically, so structured logs become queryable columns with no setup. It is
+        billed per GB <em>scanned</em> (about USD 0.005–0.007 depending on region), so narrow the time range first and select
+        only the log groups you need. A query over 30 days of <code class="inline">booking-api</code> scans about 400 GB
+        and costs USD 2–3. A query over the last hour costs less than a cent.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">Logs Insights — top failing endpoints in 5-minute buckets</span>
+        <pre class="code">fields @timestamp, path, status, duration_ms
+| filter service = "booking-api" and status &gt;= 500
+| stats count(*) as errors by bin(5m), path
+| sort errors desc
+| limit 10
+<span class="out">bin(5m)              path                    errors
+2026-10-29 07:15     /v1/bookings            214
+2026-10-29 07:10     /v1/bookings            187
+2026-10-29 07:15     /v1/clinics/:id/slots    12</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">Logs Insights — latency percentiles and the error that explains them</span>
+        <pre class="code">fields duration_ms, err
+| filter path = "/v1/bookings"
+| stats pct(duration_ms, 50) as p50, pct(duration_ms, 99) as p99,
+        count_distinct(trace_id) as requests by bin(1m)
+<span class="cm"># second query, same time range: pivot from the spike to its cause</span>
+filter path = "/v1/bookings" and ispresent(err)
+| stats count(*) as n by err | sort n desc
+<span class="out">err                                          n
+pq: sorry, too many clients already          1,904
+context deadline exceeded                      211</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The same queries run from the CLI, which is how runbooks and agents use them. Save the ones you rerun as
+        <strong>saved queries</strong> in Terraform (<code class="inline">aws_cloudwatch_query_definition</code>) so the
+        whole team has them during an incident:
+      </p>
+      <pre class="code mt-3">QID=$(aws logs start-query --log-group-name /ecs/clinic-prod/booking-api \
+  --start-time $(( $(date +%s) - 3600 )) --end-time $(date +%s) \
+  --query-string 'filter status &gt;= 500 | stats count(*) by path' --query queryId --output text)
+sleep 5 &amp;&amp; aws logs get-query-results --query-id "$QID" --query 'statistics'
+<span class="out">{ "recordsMatched": 401.0, "recordsScanned": 702114.0, "bytesScanned": 1093012344.0 }</span>
+aws logs tail /ecs/clinic-prod/booking-api --follow --filter-pattern '{ $.level = "error" }'</pre>
+
+      <h3 class="font-semibold text-lg mt-8">Metric filters and EMF: turning log events into metrics</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Some business events only exist in logs, such as "payment failed". A <strong>metric filter</strong> matches a pattern
+        on every incoming event and increments a custom metric that you can alarm on. It works only on Standard-class groups
+        and only for events ingested after you create it. For new code, the <strong>Embedded Metric Format (EMF)</strong> is
+        better: the app writes one JSON line that is both a log event and a metric, with no filter to maintain.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/booking-alarms/payments.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_cloudwatch_log_metric_filter"</span> <span class="st">"payment_failed"</span> {
+  name           = <span class="st">"booking-payment-failed"</span>
+  log_group_name = <span class="st">"/ecs/clinic-prod/booking-api"</span>
+  pattern        = <span class="st">"{ $.event = \"payment_failed\" }"</span>   <span class="cm"># JSON filter pattern</span>
+  metric_transformation {
+    namespace     = <span class="st">"Clinic/Booking"</span>
+    name          = <span class="st">"PaymentFailed"</span>
+    value         = <span class="st">"1"</span>
+    default_value = <span class="st">"0"</span>         <span class="cm"># publish 0 when nothing matches: no missing data</span>
+    unit          = <span class="st">"Count"</span>
+  }
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">one EMF log line from booking-api (pretty-printed)</span>
+        <pre class="code">{ <span class="st">"_aws"</span>: { <span class="st">"Timestamp"</span>: 1761721800000,
+    <span class="st">"CloudWatchMetrics"</span>: [{ <span class="st">"Namespace"</span>: <span class="st">"Clinic/Booking"</span>,
+      <span class="st">"Dimensions"</span>: [[<span class="st">"service"</span>, <span class="st">"env"</span>]],         <span class="cm"># low cardinality ONLY</span>
+      <span class="st">"Metrics"</span>: [{ <span class="st">"Name"</span>: <span class="st">"BookingCreated"</span>, <span class="st">"Unit"</span>: <span class="st">"Count"</span> }] }] },
+  <span class="st">"service"</span>: <span class="st">"booking-api"</span>, <span class="st">"env"</span>: <span class="st">"prod"</span>, <span class="st">"BookingCreated"</span>: 1,
+  <span class="st">"clinic_id"</span>: <span class="st">"c-0042"</span>, <span class="st">"trace_id"</span>: <span class="st">"4bf92f3577b34da6a3ce929d0e0e4736"</span> }
+<span class="cm"># clinic_id and trace_id are NOT dimensions: searchable in Logs Insights, free as metrics</span></pre>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>A high-cardinality dimension is a billing incident.</strong> An agent
+        "helpfully" adds <code class="inline">clinic_id</code> and <code class="inline">patient_id</code> to the EMF
+        dimensions. With 800 clinics and 50,000 patients active per month, that creates tens of thousands of custom metrics
+        at USD 0.30 each, and the bill only shows up at the end of the month. Keep dimensions to things you would put on a
+        dashboard axis (<code class="inline">service</code>, <code class="inline">env</code>, <code class="inline">endpoint</code>),
+        and keep identifiers in the log body.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Containers, traces and dashboards</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Turn on the managed layers deliberately, and price them first</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        CloudWatch has managed features that save weeks of setup: Container Insights for ECS and EKS, X-Ray and Application
+        Signals for traces and service health, and dashboards. Each has a switch, and each switch has a monthly price. On an
+        ECS project these are our default observability stack. On an EKS project that runs Prometheus and Grafana, most of
+        them are optional, and you turn them on only when they answer a question the OSS stack doesn't.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Container Insights on ECS and EKS</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">AWS/ECS</code> gives you only service-level CPU and memory. <strong>Container Insights</strong>
+        adds task- and container-level metrics (running task count, restarts, network, storage) and a curated console view.
+        The <strong>enhanced observability</strong> mode goes down to individual tasks and containers, which is what you need
+        to find the one task that is leaking memory. On ECS it is a cluster setting. On EKS it comes as the
+        <code class="inline">amazon-cloudwatch-observability</code> add-on, which installs the CloudWatch agent and Fluent Bit
+        as DaemonSets.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/ecs.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_ecs_cluster"</span> <span class="st">"clinic"</span> {
+  name = <span class="st">"clinic-prod"</span>
+  setting {
+    name  = <span class="st">"containerInsights"</span>
+    value = <span class="st">"enhanced"</span>   <span class="cm"># "enabled" = cluster/service level only; "disabled" = none</span>
+  }
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Platform</th><th class="px-4 py-3">Default for us</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">ECS on Fargate (<code class="inline">clinic-prod</code>)</td><td class="px-4 py-3">Enhanced, always on</td><td class="px-4 py-3">The only per-task view without running our own agent; tens of dollars a month for a cluster of this size</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EKS with Prometheus stack</td><td class="px-4 py-3">Off, or the add-on with only control-plane and node metrics</td><td class="px-4 py-3">kube-prometheus-stack already gives pod and node metrics (<a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>); paying twice for the same data is waste</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">EKS for a small AWS-native client</td><td class="px-4 py-3">The add-on, enhanced</td><td class="px-4 py-3">No Grafana to run; the client's team already lives in the AWS console</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3"><span class="cm"># which booking-api task is using the most memory right now? (enhanced mode)</span>
+aws cloudwatch get-metric-data --start-time $(( $(date +%s) - 600 )) --end-time $(date +%s) \
+  --metric-data-queries '[{"Id":"m","Expression":"SELECT MAX(MemoryUtilized) FROM SCHEMA(\"ECS/ContainerInsights\", ClusterName, ServiceName, TaskId) WHERE ServiceName = '\''booking-api'\'' GROUP BY TaskId ORDER BY MAX() DESC LIMIT 1","Period":300}]' \
+  --query 'MetricDataResults[0].[Label,Values[0]]' --output text
+<span class="out">5f1c0a9e2d7b4c13a8e6f0b2d9c4e711   1843</span>
+<span class="cm"># 1,843 MiB of a 2,048 MiB task: this one will be OOM-killed soon</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">X-Ray and Application Signals for traces and service health</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        On ECS and Lambda projects, traces go to <strong>AWS X-Ray</strong>, and <strong>CloudWatch Application
+        Signals</strong> builds on them: it auto-instruments services, draws the service map, publishes request rate,
+        errors and latency per operation, and lets you define SLOs in the console. The instrumentation is OpenTelemetry:
+        the X-Ray SDKs and the X-Ray daemon are in maintenance mode, so new services use the OTel SDK or the ADOT
+        auto-instrumentation agent and send spans over OTLP. How to wire the SDK and the Collector is
+        <a href="./ob4.html" class="text-viol underline decoration-viol/40">OB4</a>; here is what you turn on in the account.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 220" class="w-full min-w-[640px]" role="img" aria-label="Traces on ECS: booking-api with ADOT sidecar sends OTLP spans to X-Ray; Application Signals derives RED metrics and SLOs; Transaction Search stores spans as logs">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">TRACES ON AN ECS PROJECT · OTel in, X-Ray and Application Signals out</text>
+          <rect x="10" y="38" width="250" height="120" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="22" y="56" font-size="10" font-weight="700" fill="#6E6B64">ECS TASK · booking-api</text>
+          <g class="anim-pulse"><rect x="22" y="68" width="105" height="70" rx="9" fill="#2563EB"/>
+            <text x="74" y="98" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">app container</text>
+            <text x="74" y="113" text-anchor="middle" fill="#ffffffbb" font-size="9">OTel / ADOT agent</text></g>
+          <g class="anim-pulse d1"><rect x="142" y="68" width="105" height="70" rx="9" fill="#6d5acd"/>
+            <text x="194" y="98" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">CW agent</text>
+            <text x="194" y="113" text-anchor="middle" fill="#ffffffbb" font-size="9">sidecar · OTLP :4317</text></g>
+          <g class="anim-pulse d2"><rect x="340" y="40" width="160" height="50" rx="9" fill="#D97757"/>
+            <text x="420" y="61" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">X-Ray</text>
+            <text x="420" y="76" text-anchor="middle" fill="#ffffffbb" font-size="9">trace map · segments</text></g>
+          <g class="anim-pulse d3"><rect x="340" y="120" width="160" height="50" rx="9" fill="#0D9488"/>
+            <text x="420" y="141" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Transaction Search</text>
+            <text x="420" y="156" text-anchor="middle" fill="#ffffffbb" font-size="9">spans as logs · aws/spans</text></g>
+          <g class="anim-pulse d4"><rect x="560" y="80" width="150" height="50" rx="9" fill="#DB2777"/>
+            <text x="635" y="101" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Application Signals</text>
+            <text x="635" y="116" text-anchor="middle" fill="#ffffffbb" font-size="9">RED per operation · SLOs</text></g>
+          <line x1="127" y1="103" x2="142" y2="103" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="247" y1="95" x2="340" y2="65" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="247" y1="112" x2="340" y2="145" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="500" y1="65" x2="560" y2="100" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="500" y1="145" x2="560" y2="112" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="360" y="205" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">SLO objects and burn-rate alerts on top of this → SR1</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/tracing.tf</span>
+        <pre class="code"><span class="cm"># sample 5% of requests, but always keep bookings that hit an error (rule order = priority)</span>
+<span class="kw">resource</span> <span class="st">"aws_xray_sampling_rule"</span> <span class="st">"booking_api"</span> {
+  rule_name      = <span class="st">"booking-api-default"</span>
+  priority       = 100
+  reservoir_size = 1          <span class="cm"># at least 1 trace/s per service, even at low traffic</span>
+  fixed_rate     = 0.05       <span class="cm"># then 5% of the rest</span>
+  service_name   = <span class="st">"booking-api"</span>
+  service_type   = <span class="st">"*"</span>
+  host           = <span class="st">"*"</span>
+  http_method    = <span class="st">"*"</span>
+  url_path       = <span class="st">"*"</span>
+  resource_arn   = <span class="st">"*"</span>
+  version        = 1
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Sampling is where the money is. At 200 requests per second and around 8 spans per request, tracing everything is
+        about 4 billion spans a month. At 5% it is about 200 million. Application Signals computes its RED metrics before
+        sampling, so the error-rate graphs stay accurate while you keep only a sample of the traces. Head vs tail sampling,
+        and why "always keep errors" needs tail sampling in the Collector, is covered in
+        <a href="./ob4.html" class="text-viol underline decoration-viol/40">OB4</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Dashboards as code, and the cost review</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A dashboard someone built by clicking in the console disappears when that account is rebuilt, and nobody reviews
+        changes to it. Define dashboards in Terraform with <code class="inline">jsonencode</code>, one per service, laid out
+        top-down the way people read during an incident: user-facing symptoms first (request rate, 5xx rate, p99), then
+        saturation (CPU, memory, DB connections), then dependencies. The first three dashboards are free, and after that
+        each costs USD 3 a month.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/modules/booking-alarms/dashboard.tf</span>
+        <pre class="code"><span class="kw">resource</span> <span class="st">"aws_cloudwatch_dashboard"</span> <span class="st">"booking"</span> {
+  dashboard_name = <span class="st">"clinic-prod-booking"</span>
+  dashboard_body = jsonencode({
+    widgets = [
+      { type = <span class="st">"alarm"</span>, x = 0, y = 0, width = 24, height = 3,
+        properties = { title = <span class="st">"Paging alarms"</span>, alarms = [aws_cloudwatch_composite_alarm.user_impact.arn] } },
+      { type = <span class="st">"metric"</span>, x = 0, y = 3, width = 12, height = 6,
+        properties = { title = <span class="st">"p50 / p99 latency"</span>, region = <span class="st">"ap-southeast-1"</span>, period = 60,
+          metrics = [
+            [<span class="st">"AWS/ApplicationELB"</span>, <span class="st">"TargetResponseTime"</span>, <span class="st">"LoadBalancer"</span>, var.alb_arn_suffix, { stat = <span class="st">"p50"</span> }],
+            [<span class="st">"..."</span>, { stat = <span class="st">"p99"</span> }],    <span class="cm"># "..." repeats the previous metric's identity</span>
+          ] } },
+      { type = <span class="st">"log"</span>, x = 12, y = 3, width = 12, height = 6,
+        properties = { title = <span class="st">"Top errors"</span>, region = <span class="st">"ap-southeast-1"</span>,
+          query = <span class="st">"SOURCE '/ecs/clinic-prod/booking-api' | filter level = 'error' | stats count(*) by err | sort count(*) desc | limit 5"</span> } },
+    ]
+  })
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Once a month, look at the CloudWatch line in Cost Explorer grouped by usage type. On the clinic platform the order
+        is almost always the same: log ingestion (around 70%), custom metrics, Logs Insights scans, then everything else.
+        The fixes are the ones from Part III: retention on every group, no debug logs in prod, Infrequent Access for flow
+        logs, and no identifiers as metric dimensions. Cost allocation by tag is in
+        <a href="./ar2.html" class="text-viol underline decoration-viol/40">AR2</a>.
+      </p>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> add a Config rule or a scheduled script to
+        <code class="inline">clinic-infra</code> CI that lists log groups with no retention
+        (<code class="inline">aws logs describe-log-groups --query 'logGroups[?!retentionInDays].logGroupName'</code>) and
+        fails the nightly check if the list is not empty. It catches every group that a new service or Lambda creates
+        implicitly.</div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code is good at writing alarm Terraform, Logs Insights queries and dashboard JSON. Give it read-only
+        CloudWatch access in <code class="inline">gol-prod</code> (never <code class="inline">PutMetricAlarm</code>), let
+        it query and draft, and land every change through a <code class="inline">clinic-infra</code> PR.
+      </p>
+      <pre class="code mt-3">Write Terraform alarms for the clinic-prod RDS instance clinic-prod-pg: FreeStorageSpace below
+10 GB, DatabaseConnections above 80% of max_connections (max is 400), and ReplicaLag above 30 s.
+Use M-of-N evaluation, set treat_missing_data explicitly on each, and explain every choice.</pre>
+      <pre class="code mt-3">Using `aws logs start-query` against /ecs/clinic-prod/booking-api for the last hour only,
+find the top 5 error messages and the endpoints they come from. Show me bytesScanned for
+every query you ran. Do not query a range longer than 6 hours.</pre>
+      <pre class="code mt-3">List every log group in this account with no retention or with STANDARD class and more than
+50 GB IncomingBytes last month. Produce a table and a Terraform change that fixes them.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft alarms, composite rules and dashboard JSON from a list of symptoms</li>
+            <li>Write and run Logs Insights queries over short time ranges</li>
+            <li>Audit log groups for retention, class and volume</li>
+            <li>Turn an incident's queries into saved query definitions</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li><code class="inline">treat_missing_data</code> matches how the metric behaves when healthy</li>
+            <li>Rates have a minimum-traffic guard; latency uses percentiles</li>
+            <li>Only the composite alarm (or the SLO alarm) has paging actions</li>
+            <li>No identifier appears as a metric dimension, and every log group has retention</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written CloudWatch config:</strong>
+        <code class="inline">statistic = "Average"</code> on latency; <code class="inline">evaluation_periods = 1</code> on
+        a paging alarm; an error-count alarm with the default missing-data setting; alarm actions on every child of a
+        composite; <code class="inline">retention_in_days</code> omitted or set to 0; EMF or <code class="inline">put-metric-data</code>
+        with <code class="inline">user_id</code>, <code class="inline">clinic_id</code> or request IDs as dimensions; a Logs
+        Insights query over 30 days run in a loop; and new code using the X-Ray SDK instead of OpenTelemetry.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has opened the CloudWatch console but cannot say what a dimension is or why an alarm sits in INSUFFICIENT_DATA.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can find a metric graph and read logs for a task, and knows the three pillars by name, but alarms by clicking in the console.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Writes a threshold alarm in Terraform and a basic Logs Insights query, but misses missing-data behaviour, percentiles or retention without review.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Builds a service's alarm set (rate-based, M of N, composite, verified by a drill), dashboards and log groups in Terraform; finds incident causes with Logs Insights; estimates and cuts the log bill; and states which signals go to CloudWatch vs Prometheus vs Datadog.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the shared alarm module that every project uses, runs the monthly observability cost review, and coaches teams to move from static thresholds to SLO-based alerting with SR1.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> without notes, explain why a
+        5xx-count alarm sits in INSUFFICIENT_DATA overnight and fix it. Then estimate the monthly log ingestion cost of a
+        service from its request rate and log line size, within 20% of what Cost Explorer shows, and name the two changes
+        that would cut it most.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Alarming on causes instead of symptoms</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">CPU at 80% pages someone, and patients can still book fine. Page on what users feel (errors, latency, stuck queue) and send CPU to a dashboard. SR1 covers how to choose.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Letting services create their own log groups</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Implicit groups never expire and aren't in Terraform. Create the group first with retention, KMS and tags; then the service writes to it.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Averages for latency</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An average of 180 ms hid a p99 of 3.9 s in Part II. Alarm and graph on p99 (and show p50 next to it); averages only make sense for counts and utilisation.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Drill every new alarm</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">set-alarm-state</code> proves the SNS topic, subscription and on-call routing work. An alarm that has never been seen firing is an assumption, not a control.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Put the runbook link in the alarm description</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The description travels with the page into Slack and the phone notification. A link to the runbook (SR2) saves the first five minutes of every incident.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="routing"> <span>I can explain monitoring vs observability, the three pillars, and which signals go to CloudWatch, Prometheus/Loki, Datadog and OTel in our stack.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="alarms"> <span>I wrote a rate-based ALB alarm with metric math, M-of-N evaluation and explicit missing-data handling, and drilled it with <code class="inline">set-alarm-state</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="insights"> <span>I found the cause of an error spike with Logs Insights (errors by endpoint, then by message) and know what the query cost.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="log-cost"> <span>I estimated a service's monthly log ingestion cost and set retention and log class on every log group it uses.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="alarm-module"> <span class="font-semibold">In gol-dev, opened a clinic-infra PR with a booking-alarms module: rate-based 5xx and p99 alarms, an SQS oldest-message alarm, one composite alarm that pages, a Terraform dashboard and log groups with retention. Attached the plan, a screenshot of the drilled composite alarm reaching the on-call channel, and a Logs Insights query with its bytes scanned (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch_concepts.html" target="_blank" rel="noopener">AWS — CloudWatch concepts</a>: namespaces, dimensions, resolution and retention from Part I and II.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html" target="_blank" rel="noopener">AWS — Using CloudWatch alarms</a>: evaluation, missing data and composite alarms in full.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html" target="_blank" rel="noopener">AWS — Logs Insights query syntax</a>: every command and function used in Part III.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html" target="_blank" rel="noopener">AWS — Embedded Metric Format specification</a>: the exact JSON shape for metrics from logs.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html" target="_blank" rel="noopener">AWS — Container Insights</a>: enhanced observability for ECS and the EKS add-on.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Application-Monitoring-Sections.html" target="_blank" rel="noopener">AWS — Application Signals</a>: service map, RED metrics and SLOs on top of OpenTelemetry traces.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm" target="_blank" rel="noopener">Terraform — aws_cloudwatch_metric_alarm</a>: every argument, including metric_query for metric math.</li>
+      </ul>

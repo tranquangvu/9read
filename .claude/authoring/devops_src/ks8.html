@@ -1,0 +1,814 @@
+<!-- meta: days=5 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Autoscaling &amp; Cost: HPA, KEDA &amp; Karpenter</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          A cluster that never scales is either too small at 9 a.m. on Monday, when every clinic opens its booking page, or
+          too expensive at 3 a.m. Kubernetes autoscaling happens in two layers that have to cooperate. Pod autoscalers (HPA
+          and KEDA) change replica counts, and the node autoscaler (Karpenter) adds and removes EC2 capacity to fit those
+          Pods. Resource requests are what connect the two layers. This module covers both layers and the cost work that
+          follows: consolidation, Spot, Graviton and right-sizing requests based on measured usage.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> autoscaling failures are expensive both ways. An HPA with a
+          five-minute reaction time lets the Monday spike turn into timeouts. A Karpenter NodePool with no CPU limit turns
+          a bug that creates Pods in a loop into a USD 4,000 bill over a weekend. Requests copied from a template ("1 CPU,
+          1 GiB") make the cluster look full at 15% real use. EKS compute is usually the biggest line on a client's AWS
+          bill, and the settings in this module decide most of it.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Pod autoscaling</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Scale Pods on the signal that predicts saturation</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Requests and limits, QoS classes and PodDisruptionBudgets are in
+        <a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>. This module assumes them and asks the
+        next question: how many replicas, and how many nodes, right now? The answer comes from a chain of controllers,
+        and a fault in any link shows up as Pods that do not scale or nodes that never go away.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Three layers, one currency</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The HPA (or KEDA, which drives an HPA) watches a metric and changes <code class="inline">replicas</code>. New Pods
+        that do not fit stay <code class="inline">Pending</code>. Karpenter sees the Pending Pods, adds up their
+        <strong>requests</strong>, and launches the cheapest instance that fits them. When load drops, the process runs in
+        reverse. Requests are the currency throughout: the HPA measures CPU <em>as a percentage of requests</em>, the
+        scheduler places Pods by requests, and Karpenter buys nodes by requests. Actual usage matters to none of them.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 240" class="w-full min-w-[640px]" role="img" aria-label="Autoscaling layers: metric drives HPA or KEDA, which changes replicas; Pending Pods trigger Karpenter to launch nodes">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">THE AUTOSCALING CHAIN · clinic-prod-eks</text>
+          <g class="anim-pulse"><rect x="10" y="50" width="120" height="56" rx="9" fill="#37474F"/>
+            <text x="70" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Signal</text>
+            <text x="70" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">CPU % · SQS depth</text></g>
+          <g class="anim-pulse d1"><rect x="160" y="50" width="120" height="56" rx="9" fill="#2563EB"/>
+            <text x="220" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">HPA / KEDA</text>
+            <text x="220" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">replicas 3 → 9</text></g>
+          <g class="anim-pulse d2"><rect x="310" y="50" width="120" height="56" rx="9" fill="#6d5acd"/>
+            <text x="370" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Scheduler</text>
+            <text x="370" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">4 Pods Pending</text></g>
+          <g class="anim-pulse d3"><rect x="460" y="50" width="120" height="56" rx="9" fill="#D97757"/>
+            <text x="520" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Karpenter</text>
+            <text x="520" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">sum requests → EC2</text></g>
+          <g class="anim-pulse d4"><rect x="610" y="50" width="100" height="56" rx="9" fill="#0D9488"/>
+            <text x="660" y="73" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">New node</text>
+            <text x="660" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">~50 s to Ready</text></g>
+          <line x1="130" y1="78" x2="160" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="280" y1="78" x2="310" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="430" y1="78" x2="460" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="580" y1="78" x2="610" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <rect x="160" y="140" width="420" height="44" rx="9" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="370" y="159" text-anchor="middle" font-size="11" font-weight="700" fill="#6E6B64">resources.requests</text>
+          <text x="370" y="174" text-anchor="middle" font-size="9" fill="#6E6B64">the HPA's denominator · the scheduler's fit · Karpenter's shopping list</text>
+          <line x1="220" y1="106" x2="220" y2="140" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <line x1="370" y1="106" x2="370" y2="140" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <line x1="520" y1="106" x2="520" y2="140" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="360" y="222" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">end to end, metric spike to serving Pod: about 60–90 s when a node must be added</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tool</th><th class="px-4 py-3">Changes</th><th class="px-4 py-3">Right for</th><th class="px-4 py-3">On clinic-prod-eks</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">HPA</td><td class="px-4 py-3">Replica count</td><td class="px-4 py-3">Stateless HTTP services where CPU tracks load</td><td class="px-4 py-3"><code class="inline">booking-web</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">KEDA</td><td class="px-4 py-3">Replica count (through an HPA it manages), including to and from zero</td><td class="px-4 py-3">Queues, schedules, Prometheus queries, anything that is not CPU</td><td class="px-4 py-3"><code class="inline">booking-worker</code> (SQS), <code class="inline">booking-api</code> (CPU + clinic-hours schedule)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">VPA</td><td class="px-4 py-3">Requests per Pod</td><td class="px-4 py-3">Recommendations for right-sizing; rarely auto mode</td><td class="px-4 py-3">Recommendation mode only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Karpenter</td><td class="px-4 py-3">Nodes</td><td class="px-4 py-3">Every EKS cluster with self-managed capacity</td><td class="px-4 py-3">All worker capacity except its own 2 nodes</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">HPA on CPU: the formula and the behaviour block</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The HPA controller runs every 15 seconds and calculates
+        <code class="inline">desired = ceil(current × currentMetric / target)</code>, ignoring changes within a 10%
+        tolerance. With 4 <code class="inline">booking-web</code> Pods at 90% average CPU and a 60% target, it asks for
+        ceil(4 × 90 / 60) = <strong>6</strong>. CPU metrics come from <strong>metrics-server</strong> (installed as an EKS
+        add-on). Without it, the HPA reports <code class="inline">&lt;unknown&gt;</code> and never scales.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-web/hpa.yaml</span>
+        <pre class="code">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: booking-web
+  namespace: booking
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: booking-web }
+  minReplicas: 3                            <span class="cm"># one per AZ, always</span>
+  maxReplicas: 30                           <span class="cm"># a ceiling you can afford, not "infinity"</span>
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 60 } }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0         <span class="cm"># react immediately to the 9 a.m. spike</span>
+      selectPolicy: Max
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }   <span class="cm"># double every 30 s…</span>
+        - { type: Pods, value: 4, periodSeconds: 30 }        <span class="cm"># …or +4, whichever is more</span>
+    scaleDown:
+      stabilizationWindowSeconds: 300       <span class="cm"># wait 5 min before trusting a dip</span>
+      policies:
+        - { type: Percent, value: 20, periodSeconds: 60 }</pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking get hpa booking-web
+<span class="out">NAME          REFERENCE                TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+booking-web   Deployment/booking-web   cpu: 72%/60%  3         30        6          12d</span>
+kubectl -n booking describe hpa booking-web | grep -A3 Events
+<span class="out">  Normal  SuccessfulRescale  41s  horizontal-pod-autoscaler  New size: 6; reason: cpu resource utilization (percentage of request) above target</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>Remove <code class="inline">replicas</code> from the Deployment once an
+        HPA owns it.</strong> If Git says <code class="inline">replicas: 3</code> and the HPA has scaled to 12, every
+        Argo CD sync (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>) sets it back to 3 in
+        the middle of the peak, and the HPA scales up again a minute later. The Helm chart should leave out
+        <code class="inline">replicas</code> whenever autoscaling is enabled (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>).</div>
+
+      <h3 class="font-semibold text-lg mt-8">When CPU is the wrong signal</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        CPU works when CPU is what runs out first. For many services it is not. A Node.js API waiting on Postgres sits at
+        20% CPU while latency climbs. A queue worker's CPU says nothing about how many messages are waiting. Memory is
+        almost always wrong as an HPA metric, because runtimes like the JVM and V8 keep memory after load drops, so the
+        HPA scales up and never scales back down. Choose the metric that rises <em>before</em> users notice.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Workload</th><th class="px-4 py-3">Good signal</th><th class="px-4 py-3">Bad signal</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">CPU-bound API (rendering, crypto)</td><td class="px-4 py-3">CPU utilisation at 60–70%</td><td class="px-4 py-3">Memory</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">I/O-bound API (<code class="inline">booking-api</code>)</td><td class="px-4 py-3">Requests per second per Pod, or in-flight requests (Prometheus via KEDA)</td><td class="px-4 py-3">CPU alone: it stays low while the DB pool saturates</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Queue consumer (<code class="inline">booking-worker</code>)</td><td class="px-4 py-3">Messages waiting per replica</td><td class="px-4 py-3">CPU: the backlog grows while workers idle-wait on SMS APIs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Predictable daily curve</td><td class="px-4 py-3">A schedule (cron) as a floor, plus a reactive metric</td><td class="px-4 py-3">Reactive metric only: always 1–2 minutes behind</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        We do not install prometheus-adapter for custom HPA metrics. KEDA's <code class="inline">prometheus</code> trigger
+        does the same job with less configuration, and we already run KEDA for queues (Part II). The PromQL behind those
+        metrics is <a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">VPA: use it for recommendations</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The Vertical Pod Autoscaler watches real usage and recommends requests. In <code class="inline">Auto</code> mode it
+        applies them, historically by evicting Pods. Kubernetes 1.33 turned on in-place Pod resize by default (beta), and
+        newer VPA releases can use it, but we still run VPA with <code class="inline">updateMode: "Off"</code> in production.
+        It gives us the numbers, and a human changes the chart. Never let VPA and HPA act on the same resource metric,
+        because they will fight: VPA raises requests, CPU percentage drops, and the HPA scales in.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-api/vpa.yaml</span>
+        <pre class="code">apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: booking-api
+  namespace: booking
+spec:
+  targetRef: { apiVersion: apps/v1, kind: Deployment, name: booking-api }
+  updatePolicy:
+    updateMode: "Off"                       <span class="cm"># recommend only; Part IV turns this into a PR</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking get vpa booking-api -o jsonpath='{.status.recommendation.containerRecommendations[0]}' | jq
+<span class="out">{ "containerName": "api",
+  "lowerBound":  { "cpu": "120m", "memory": "380Mi" },
+  "target":      { "cpu": "210m", "memory": "440Mi" },
+  "upperBound":  { "cpu": "690m", "memory": "910Mi" } }</span>
+<span class="cm"># the chart requests 1 CPU / 1Gi: almost 5× the target. Part IV fixes it.</span></pre>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Event-driven scaling with KEDA</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Queue depth, not CPU, tells you when booking-worker is behind</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <code class="inline">booking-worker</code> consumes the <code class="inline">clinic-prod-bookings</code> SQS queue
+        (queue semantics are in <a href="./aw6.html" class="text-viol underline decoration-viol/40">AW6</a>) and sends
+        confirmation emails and SMS. Its CPU is low whether the queue holds 5 messages or 5,000. <strong>KEDA</strong>
+        (Kubernetes Event-Driven Autoscaling) reads the queue depth directly and scales on that, including down to zero
+        replicas when there is nothing to do.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">How KEDA plugs into the HPA</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        KEDA does not replace the HPA. You create a <code class="inline">ScaledObject</code>, and KEDA creates and owns an
+        HPA for it, serving the external metric through its own metrics adapter. KEDA itself handles only the step between
+        zero and one replica (<em>activation</em>), which an HPA cannot do. Everything from 1 to N is the normal HPA
+        algorithm from Part I, including the <code class="inline">behavior</code> block.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    SQS["SQS clinic-prod-bookings<br/>visible + in-flight: 600"] -->|GetQueueAttributes<br/>every 15 s| OP["keda-operator<br/>Pod Identity role"]
+    SO["ScaledObject<br/>booking-worker<br/>queueLength 20"] --> OP
+    OP -->|0 ↔ 1 activation| D["Deployment<br/>booking-worker"]
+    OP -->|creates + owns| HPA["HPA keda-hpa-booking-worker<br/>external metric"]
+    MA["keda-operator-metrics-apiserver"] -->|600 / 20 = 30| HPA
+    HPA -->|1 → 30 replicas| D
+        </pre>
+      </div>
+      <pre class="code mt-3">helm repo add kedacore https://kedacore.github.io/charts
+helm upgrade --install keda kedacore/keda -n keda --create-namespace --version 2.17.2
+kubectl -n keda get deploy
+<span class="out">NAME                              READY   UP-TO-DATE   AVAILABLE   AGE
+keda-admission-webhooks           1/1     1            1           2m
+keda-operator                     1/1     1            1           2m
+keda-operator-metrics-apiserver   1/1     1            1           2m</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">A ScaledObject for booking-worker on SQS</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The key number is <code class="inline">queueLength</code>: how many waiting messages one replica should be
+        responsible for. Work it out from the processing rate instead of guessing. One worker Pod handles 4 messages at a
+        time, each taking about 1.5 s (mostly waiting on the SMS provider), so about <strong>2.7 messages per second</strong>.
+        A target of 20 messages per replica means any backlog drains in about 20 / 2.7 ≈ <strong>7.5 seconds</strong> once
+        the replicas are running, which is well inside our 60-second confirmation SLO.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-worker/scaledobject.yaml</span>
+        <pre class="code">apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: booking-worker
+  namespace: booking
+spec:
+  scaleTargetRef: { name: booking-worker }
+  minReplicaCount: 1                        <span class="cm"># prod: no cold start on the first booking; dev uses 0</span>
+  maxReplicaCount: 30                       <span class="cm"># also caps load on the SMS provider (rate limit 100/s)</span>
+  pollingInterval: 15
+  cooldownPeriod: 300                       <span class="cm"># only applies to the 1 → 0 step</span>
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef: { name: keda-aws }
+      metadata:
+        queueURL: https://sqs.ap-southeast-1.amazonaws.com/444455556666/clinic-prod-bookings
+        awsRegion: ap-southeast-1
+        queueLength: "20"                   <span class="cm"># target messages per replica</span>
+        activationQueueLength: "0"          <span class="cm"># wake from 0 on the first message</span>
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-aws
+  namespace: booking
+spec:
+  podIdentity:
+    provider: aws                           <span class="cm"># keda-operator's Pod Identity role reads queue attributes</span></pre>
+      </div>
+      <pre class="code mt-3">kubectl -n booking get scaledobject booking-worker
+<span class="out">NAME             SCALETARGETKIND      SCALETARGETNAME   MIN   MAX   READY   ACTIVE   FALLBACK   PAUSED   AGE
+booking-worker   apps/v1.Deployment   booking-worker    1     30    True    True     False      False    9d</span>
+kubectl -n booking get hpa keda-hpa-booking-worker
+<span class="out">NAME                      REFERENCE                   TARGETS              MINPODS   MAXPODS   REPLICAS
+keda-hpa-booking-worker   Deployment/booking-worker   20/20 (avg)          1         30        30</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The KEDA operator's IAM role needs only <code class="inline">sqs:GetQueueAttributes</code> on that queue. The
+        worker's own role (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>) does the
+        receive and delete. Also set the SQS visibility timeout to at least six times the processing time. During
+        scale-in, a Pod that is killed mid-message returns it to the queue only after the timeout, and the graceful
+        shutdown in KS2 should finish the in-flight batch before that happens.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Combining triggers: a clinic-hours floor plus CPU</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Clinics in Vietnam open between 07:00 and 07:30, and bookings jump within minutes. A purely reactive autoscaler is
+        always a minute or two behind that jump. A <code class="inline">cron</code> trigger sets a floor ahead of the
+        known peak, and a <code class="inline">cpu</code> trigger handles everything above it. KEDA uses the
+        <strong>highest</strong> replica count any trigger asks for. Put both triggers in one ScaledObject: a separate
+        HPA on the same Deployment would fight KEDA's.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/apps/booking-api/scaledobject.yaml — triggers</span>
+        <pre class="code">  minReplicaCount: 3
+  maxReplicaCount: 40
+  triggers:
+    - type: cron
+      metadata:
+        timezone: Asia/Ho_Chi_Minh
+        start: "45 6 * * 1-6"               <span class="cm"># 15 min before opening, Mon–Sat</span>
+        end: "0 20 * * 1-6"
+        desiredReplicas: "8"                <span class="cm"># last month's p50 replicas during opening hours</span>
+    - type: cpu
+      metricType: Utilization
+      metadata: { value: "60" }</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">KEDA scaler</th><th class="px-4 py-3">Use it for</th><th class="px-4 py-3">Watch out for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">aws-sqs-queue</td><td class="px-4 py-3">Workers on SQS</td><td class="px-4 py-3">Counts in-flight messages by default; FIFO queues limit parallelism per message group</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">cron</td><td class="px-4 py-3">Known daily or weekly peaks</td><td class="px-4 py-3">Holidays: Tết traffic looks nothing like a normal Monday</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">prometheus</td><td class="px-4 py-3">RPS, in-flight requests, latency-driven scaling</td><td class="px-4 py-3">If Prometheus is down, set a <code class="inline">fallback</code> replica count</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">cpu / memory</td><td class="px-4 py-3">Mixing with other triggers in one ScaledObject</td><td class="px-4 py-3">Cannot scale to zero on its own</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ScaledJob (any trigger)</td><td class="px-4 py-3">One Job per message for long tasks (report generation)</td><td class="px-4 py-3">Job clean-up history limits, or thousands of finished Jobs pile up</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Always set a <code class="inline">fallback</code> for external
+        metrics.</strong> If KEDA cannot read the metric (IAM change, Prometheus restart), the ScaledObject should hold a
+        safe count rather than freeze or drop. <code class="inline">fallback: { failureThreshold: 3, replicas: 10 }</code>
+        on <code class="inline">booking-worker</code> means three failed reads in a row pin it to 10 replicas until the
+        metric comes back. Fallback applies to external triggers such as SQS and Prometheus, not to cpu or memory.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Scale to zero in dev and preview environments</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In <code class="inline">gol-dev</code> nobody books appointments at night or at the weekend, yet a default
+        deployment keeps every Pod running for all 168 hours of the week. With <code class="inline">minReplicaCount: 0</code>
+        on workers, and a cron trigger that keeps APIs at 1 replica only during office hours (08:00–19:00 ICT, Monday to
+        Friday, 55 hours), dev Pods run about a third of the week. Karpenter then consolidates the empty nodes away. On a
+        dev cluster with 14 services, that took the average node count from 6 to just under 2.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/envs/dev/booking-api/scaledobject-patch.yaml</span>
+        <pre class="code">spec:
+  minReplicaCount: 0                        <span class="cm"># dev only: nothing runs outside office hours</span>
+  maxReplicaCount: 2
+  triggers:
+    - type: cron
+      metadata:
+        timezone: Asia/Ho_Chi_Minh
+        start: "0 8 * * 1-5"
+        end: "0 19 * * 1-5"
+        desiredReplicas: "1"</pre>
+      </div>
+      <pre class="code mt-3"><span class="cm"># need it outside office hours? pause autoscaling at a fixed count, then remove the annotation</span>
+kubectl -n booking annotate scaledobject booking-api autoscaling.keda.sh/paused-replicas="1" --overwrite
+<span class="out">scaledobject.keda.sh/booking-api annotated</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Do not do this in production for anything on the request path. The first request after a scale-from-zero waits
+        for KEDA's polling interval, a Pod start and possibly a new node: 30–90 seconds, which is a timeout for a user.
+        Scale to zero is a cost tool for non-production environments and for asynchronous workers whose SLO allows a
+        minute's delay.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Node autoscaling with Karpenter</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Karpenter picks the instance; you set the constraints and the ceiling</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Pod autoscaling only helps if there is room for the new Pods. In
+        <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a> you chose between managed node groups,
+        Karpenter and EKS Auto Mode (which runs a managed Karpenter for you). This Part is about running Karpenter
+        yourself: the v1 APIs, how it decides what to launch, and the limits that stop it from spending without bound.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Cluster Autoscaler vs Karpenter</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <strong>Cluster Autoscaler</strong> scales existing Auto Scaling groups up and down. Every group has one
+        instance shape, so you end up pre-defining a group for each combination of size, architecture and Spot/On-Demand,
+        and it can only choose among those. <strong>Karpenter</strong> skips Auto Scaling groups. It reads the requirements
+        of Pending Pods, considers every instance type you allow, and calls EC2 Fleet directly for the cheapest one that
+        fits.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Concern</th><th class="px-4 py-3">Cluster Autoscaler</th><th class="px-4 py-3">Karpenter v1</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Unit of scaling</td><td class="px-4 py-3">ASG desired count</td><td class="px-4 py-3">Individual NodeClaims (one EC2 instance each)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Instance choice</td><td class="px-4 py-3">Fixed per node group</td><td class="px-4 py-3">Any allowed type, chosen per batch of Pods</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time to Ready node</td><td class="px-4 py-3">2–4 min (ASG + polling)</td><td class="px-4 py-3">About 45–60 s</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scale-down</td><td class="px-4 py-3">Removes underused nodes, one group at a time</td><td class="px-4 py-3">Consolidation: deletes <em>or replaces</em> nodes with cheaper ones</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Spot handling</td><td class="px-4 py-3">Separate Spot ASGs, mixed-instances policies</td><td class="px-4 py-3">One requirement line; interruption queue built in</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">When we still use it</td><td class="px-4 py-3">Client clusters that already run it and are stable</td><td class="px-4 py-3">Default for every new cluster</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Installing Karpenter: the AWS side first</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Karpenter needs a controller IAM role (Pod Identity), a node IAM role with an access entry so new nodes can join,
+        and an SQS queue fed by EventBridge rules for Spot interruptions, rebalance recommendations and instance state
+        changes. The <code class="inline">karpenter</code> submodule of the EKS module creates all of that. The controller
+        must not run on nodes that it manages, so it runs on a small managed node group of two
+        <code class="inline">m7g.large</code> instances.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/karpenter.tf</span>
+        <pre class="code">module "karpenter" {
+  source  = "terraform-aws-modules/eks/aws//modules/karpenter"
+  version = "~&gt; 21.0"
+
+  cluster_name                    = module.eks.cluster_name
+  create_pod_identity_association = true        <span class="cm"># controller role via Pod Identity (KS7)</span>
+  node_iam_role_use_name_prefix   = false
+  node_iam_role_name              = "KarpenterNode-clinic-prod-eks"
+  node_iam_role_additional_policies = {
+    ssm = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"   <span class="cm"># Session Manager, no SSH</span>
+  }
+}
+<span class="cm"># outputs used by Helm: module.karpenter.queue_name, module.karpenter.node_iam_role_name</span></pre>
+      </div>
+      <pre class="code mt-3">helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+  --version 1.6.0 -n kube-system \
+  --set settings.clusterName=clinic-prod-eks \
+  --set settings.interruptionQueue=Karpenter-clinic-prod-eks \
+  --set replicas=2 \
+  --set nodeSelector."eks\.amazonaws\.com/nodegroup"=system   <span class="cm"># never on its own nodes</span>
+<span class="cm"># pin the chart; check karpenter.sh compatibility for EKS 1.33 before every bump</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">EC2NodeClass and NodePool: the two objects you write</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <strong>EC2NodeClass</strong> (<code class="inline">karpenter.k8s.aws/v1</code>) describes <em>how</em> a node is
+        built on AWS: AMI, subnets, security groups, IAM role, disks, metadata options. The <strong>NodePool</strong>
+        (<code class="inline">karpenter.sh/v1</code>) describes <em>which</em> instances are allowed, how much capacity
+        in total, and when nodes may be disrupted. Keep the requirements wide. Karpenter can only save money when it has
+        choices.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/platform/karpenter/ec2nodeclass-default.yaml</span>
+        <pre class="code">apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  role: KarpenterNode-clinic-prod-eks
+  amiSelectorTerms:
+    - alias: al2023@v20251015               <span class="cm"># pinned AMI version; bumped by PR (KS11), never @latest in prod</span>
+  subnetSelectorTerms:
+    - tags: { karpenter.sh/discovery: clinic-prod-eks }
+  securityGroupSelectorTerms:
+    - tags: { karpenter.sh/discovery: clinic-prod-eks }
+  kubelet:
+    maxPods: 110                            <span class="cm"># prefix delegation is on (KS6)</span>
+  metadataOptions: { httpTokens: required, httpPutResponseHopLimit: 1 }   <span class="cm"># KS7</span>
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs: { volumeSize: 60Gi, volumeType: gp3, encrypted: true }</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/platform/karpenter/nodepool-general.yaml</span>
+        <pre class="code">apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: general
+spec:
+  template:
+    spec:
+      nodeClassRef: { group: karpenter.k8s.aws, kind: EC2NodeClass, name: default }
+      expireAfter: 720h                     <span class="cm"># every node replaced within 30 days: fresh AMIs</span>
+      requirements:
+        - { key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r] }
+        - { key: karpenter.k8s.aws/instance-generation, operator: Gt, values: ["5"] }
+        - { key: karpenter.k8s.aws/instance-size, operator: NotIn, values: [nano, micro, small, metal] }
+        - { key: kubernetes.io/arch, operator: In, values: [arm64, amd64] }
+        - { key: karpenter.sh/capacity-type, operator: In, values: [spot, on-demand] }
+  limits:
+    cpu: "200"                              <span class="cm"># hard ceiling: ~USD 7k/month on-demand. Runaway loops stop here</span>
+    memory: 800Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 2m
+    budgets: [{ nodes: "10%" }]             <span class="cm"># Part IV adds a clinic-hours budget</span></pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">What happens when Pods go Pending</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Karpenter waits about a second to batch Pending Pods, simulates scheduling them (requests, node selectors,
+        affinity, topology spread, tolerations), and picks the cheapest set of instance types that can host them. It then
+        creates a <strong>NodeClaim</strong> and launches the instance. When a Pod stays Pending despite Karpenter, the
+        answer is almost always in its events or in Karpenter's logs. Often the requirements cannot be met, or the
+        NodePool limit has been reached.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant S as kube-scheduler
+    participant K as Karpenter
+    participant E as EC2 Fleet
+    participant N as New node (kubelet)
+    S-->>K: 6 booking-worker Pods unschedulable
+    K->>K: batch 1 s, simulate: 6 × 500m / 512Mi
+    K->>K: cheapest fit: m7g.xlarge spot, ap-southeast-1b
+    K->>E: CreateFleet (price-capacity-optimized)
+    E-->>K: i-0c4e… launched
+    N-->>S: node Ready (~50 s), joined via access entry
+    S->>N: bind 6 Pods
+    Note over K: NodeClaim general-x7k2p tracks this instance
+        </pre>
+      </div>
+      <pre class="code mt-3">kubectl get nodeclaims
+<span class="out">NAME            TYPE         CAPACITY    ZONE              NODE                                             READY   AGE
+general-4m9qd   m6i.xlarge   on-demand   ap-southeast-1a   ip-10-20-41-12.ap-southeast-1.compute.internal   True    6d
+general-x7k2p   m7g.xlarge   spot        ap-southeast-1b   ip-10-20-77-90.ap-southeast-1.compute.internal   True    52s</span>
+kubectl -n kube-system logs deploy/karpenter | grep -E 'found provisionable|launched nodeclaim' | tail -2
+<span class="out">{"level":"INFO","message":"found provisionable pod(s)","Pods":"booking/booking-worker-6d8f…, … and 4 other(s)","duration":"38ms"}
+{"level":"INFO","message":"launched nodeclaim","NodeClaim":{"name":"general-x7k2p"},"instance-type":"m7g.xlarge","zone":"ap-southeast-1b","capacity-type":"spot"}</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>Limits are your only spending brake.</strong> A NodePool without
+        <code class="inline">limits</code> will keep launching nodes for as long as Pods are Pending. A KEDA trigger
+        misconfigured to <code class="inline">maxReplicaCount: 500</code>, or a CronJob without a concurrency policy, will
+        quietly buy a fleet. Set limits per NodePool at about twice your normal peak, and alert when usage passes 80% of
+        the limit.</div>
+
+      <h3 class="font-semibold text-lg mt-8">More than one NodePool, only when the constraints differ</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Start with one general NodePool. Add another only when a group of Pods needs constraints the general pool must not
+        have: dedicated nodes for a noisy batch workload, On-Demand only for a component that cannot be interrupted, or GPU
+        instances. Taints keep other Pods off the special pool, and <code class="inline">weight</code> decides which pool
+        Karpenter tries first when several could fit.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/platform/karpenter/nodepool-batch.yaml</span>
+        <pre class="code">apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: batch
+spec:
+  weight: 10                                <span class="cm"># higher weight is tried first by Pods that tolerate the taint</span>
+  template:
+    metadata:
+      labels: { workload-class: batch }
+    spec:
+      nodeClassRef: { group: karpenter.k8s.aws, kind: EC2NodeClass, name: default }
+      taints:
+        - { key: workload-class, value: batch, effect: NoSchedule }   <span class="cm"># only tolerating Pods land here</span>
+      requirements:
+        - { key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m] }
+        - { key: karpenter.sh/capacity-type, operator: In, values: [spot] }
+        - { key: kubernetes.io/arch, operator: In, values: [arm64] }
+  limits: { cpu: "64" }                     <span class="cm"># the nightly report job can never starve the API</span>
+  disruption:
+    consolidationPolicy: WhenEmpty          <span class="cm"># don't move half-finished Jobs; just remove empty nodes</span>
+    consolidateAfter: 30s</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">NodePool</th><th class="px-4 py-3">Capacity</th><th class="px-4 py-3">Taint</th><th class="px-4 py-3">Limit</th><th class="px-4 py-3">Who runs there</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">general</td><td class="px-4 py-3">Spot + On-Demand, arm64 + amd64</td><td class="px-4 py-3">none</td><td class="px-4 py-3">200 vCPU</td><td class="px-4 py-3">booking-api, booking-web, booking-worker, most add-ons</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">on-demand</td><td class="px-4 py-3">On-Demand only</td><td class="px-4 py-3">none (selected by nodeSelector)</td><td class="px-4 py-3">32 vCPU</td><td class="px-4 py-3">Prometheus, Argo CD repo server</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">batch</td><td class="px-4 py-3">Spot, arm64</td><td class="px-4 py-3"><code class="inline">workload-class=batch</code></td><td class="px-4 py-3">64 vCPU</td><td class="px-4 py-3">Nightly reports, KEDA ScaledJobs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">managed node group <code class="inline">system</code></td><td class="px-4 py-3">2 × m7g.large On-Demand</td><td class="px-4 py-3"><code class="inline">CriticalAddonsOnly</code></td><td class="px-4 py-3">fixed</td><td class="px-4 py-3">Karpenter itself, CoreDNS</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Cost</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Every unused millicore you request is money: measure before you cut</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Karpenter buys nodes for requests, so the cluster bill is roughly the sum of all requests, rounded up to whole
+        instances, at whatever price per vCPU you negotiated with EC2. Four levers change that bill: consolidation (fewer,
+        fuller nodes), Spot (a cheaper price), Graviton (a cheaper price per unit of work) and right-sizing (smaller
+        requests). The organisation-wide FinOps practice is <a href="./ar2.html" class="text-viol underline decoration-viol/40">AR2</a>.
+        These are the EKS levers.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Consolidation and disruption budgets</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        With <code class="inline">WhenEmptyOrUnderutilized</code>, Karpenter continuously checks whether it could delete a
+        node and fit its Pods elsewhere, or replace two half-empty nodes with one cheaper node. Each consolidation evicts
+        Pods, respecting PodDisruptionBudgets (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>).
+        Disruption budgets limit how much of that churn happens at once, and when. We allow none of the
+        cost-driven kind during clinic opening hours.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Consolidation: three half-empty nodes replaced by one fuller node and one smaller node">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">BEFORE · 03:00, after the evening scale-in</text>
+          <g class="anim-pulse"><rect x="15" y="40" width="100" height="70" rx="9" fill="#A8A49B"/>
+            <text x="65" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">m6i.xlarge</text>
+            <text x="65" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">CPU req 35%</text>
+            <text x="65" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">on-demand</text></g>
+          <g class="anim-pulse d1"><rect x="130" y="40" width="100" height="70" rx="9" fill="#A8A49B"/>
+            <text x="180" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">m6i.xlarge</text>
+            <text x="180" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">CPU req 30%</text>
+            <text x="180" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">on-demand</text></g>
+          <g class="anim-pulse d2"><rect x="245" y="40" width="100" height="70" rx="9" fill="#A8A49B"/>
+            <text x="295" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">c6i.2xlarge</text>
+            <text x="295" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">CPU req 20%</text>
+            <text x="295" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">spot</text></g>
+          <line x1="350" y1="75" x2="410" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="380" y="65" text-anchor="middle" font-size="9" fill="#6E6B64">replace</text>
+          <text x="420" y="22" font-size="11" font-weight="700" fill="#6E6B64">AFTER · same Pods, same PDBs respected</text>
+          <g class="anim-pulse d3"><rect x="420" y="40" width="120" height="70" rx="9" fill="#0D9488"/>
+            <text x="480" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">m7g.xlarge</text>
+            <text x="480" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">CPU req 78%</text>
+            <text x="480" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">on-demand</text></g>
+          <g class="anim-pulse d4"><rect x="555" y="40" width="120" height="70" rx="9" fill="#0D9488"/>
+            <text x="615" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">m7g.large</text>
+            <text x="615" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">CPU req 70%</text>
+            <text x="615" y="92" text-anchor="middle" fill="#ffffffbb" font-size="9">spot</text></g>
+          <text x="180" y="140" text-anchor="middle" font-size="11" font-weight="700" fill="#6E6B64">16 vCPU · ~USD 0.73/h</text>
+          <text x="550" y="140" text-anchor="middle" font-size="11" font-weight="700" fill="#6E6B64">6 vCPU · ~USD 0.25/h</text>
+          <text x="360" y="200" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">budgets decide when this may happen; PDBs decide how fast Pods move</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">nodepool-general.yaml — disruption with a clinic-hours freeze</span>
+        <pre class="code">  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 2m
+    budgets:
+      - nodes: "10%"                        <span class="cm"># at most 10% of nodes disrupted at once</span>
+      - nodes: "0"                          <span class="cm"># no cost-driven moves during clinic hours…</span>
+        reasons: [Underutilized]
+        schedule: "45 23 * * sun-fri"       <span class="cm"># …cron is UTC: 06:45 ICT, Mon–Sat</span>
+        duration: 13h15m                    <span class="cm"># until 20:00 ICT</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Control</th><th class="px-4 py-3">Scope</th><th class="px-4 py-3">Use it to</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">NodePool budgets</td><td class="px-4 py-3">How many nodes, when, for which reason (Empty, Underutilized, Drifted)</td><td class="px-4 py-3">Freeze consolidation in business hours; still allow empty nodes to go</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">PodDisruptionBudget</td><td class="px-4 py-3">How many Pods of one app may be down</td><td class="px-4 py-3">Keep 2 of 3 <code class="inline">booking-api</code> replicas during every eviction</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">karpenter.sh/do-not-disrupt: "true"</code></td><td class="px-4 py-3">One Pod (or node)</td><td class="px-4 py-3">Long batch Jobs that cannot restart; use sparingly, it blocks node rotation</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">expireAfter</code></td><td class="px-4 py-3">NodePool</td><td class="px-4 py-3">Force rotation for patching, even when nodes are full</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Spot, without betting the booking flow on it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Spot instances cost about 60–70% less than On-Demand in ap-southeast-1 for the m, c and r families, and AWS can
+        reclaim them with two minutes' notice. Karpenter receives the notice through the interruption queue, cordons the
+        node, and launches a replacement before the instance disappears. Spot is safe when two things are true: the
+        workload tolerates losing a Pod at short notice, and you allow <strong>many instance types</strong> (at least 15,
+        which our requirements give), so a shortage of one type does not leave you with no capacity.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api/deployment.yaml — spread across capacity types</span>
+        <pre class="code">      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: { matchLabels: { app: booking-api } }
+        - maxSkew: 1
+          topologyKey: karpenter.sh/capacity-type     <span class="cm"># roughly half spot, half on-demand</span>
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app: booking-api } }</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Our split: <code class="inline">booking-worker</code> runs fully on Spot (a lost message is redelivered by SQS),
+        <code class="inline">booking-api</code> and <code class="inline">booking-web</code> are spread across Spot and
+        On-Demand, and stateful or singleton platform components (Argo CD repo server, Prometheus) stay on On-Demand
+        through a node selector on <code class="inline">karpenter.sh/capacity-type: on-demand</code>. Steady On-Demand
+        usage is then covered by a Compute Savings Plan (AR2).
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Check that interruption handling actually works before you rely on it. When AWS reclaims a Spot node, the events
+        should show Karpenter tainting and draining it within seconds of the notice, and a replacement NodeClaim
+        launching before the two minutes are up:
+      </p>
+      <pre class="code mt-3">kubectl get events -A --field-selector source=karpenter --sort-by=.lastTimestamp | tail -4
+<span class="out">default   0s    Warning   SpotInterrupted   node/ip-10-20-77-90…   Spot interruption warning was triggered
+default   0s    Normal    TerminatingOnInterruption   node/ip-10-20-77-90…   Interruption triggered termination for the Node
+default   1s    Normal    Launched          nodeclaim/general-q2r8t   Status condition transitioned, Type: Launched, Status: True
+default   48s   Normal    Ready             nodeclaim/general-q2r8t   Status condition transitioned, Type: Ready, Status: True</span>
+<span class="cm"># replacement Ready at 49 s: Pods moved with ~70 s to spare. Test this with AWS FIS (SR3).</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Graviton: cheaper per hour if your images are multi-arch</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Graviton (arm64) instances such as <code class="inline">m7g</code> cost about 20% less per hour than comparable
+        <code class="inline">m7i</code> instances, and Node.js and Go services usually run as fast or faster on them. Because
+        the NodePool allows both architectures and Karpenter picks the cheapest fit, Graviton wins by default, provided
+        every image has an arm64 variant. Multi-arch builds are covered in
+        <a href="./fn6.html" class="text-viol underline decoration-viol/40">FN6</a> and
+        <a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a>.
+      </p>
+      <pre class="code mt-3"><span class="cm"># before allowing arm64 in a NodePool: is every running image multi-arch?</span>
+for img in $(kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | tr ' ' '\n' | sort -u); do
+  echo "$img $(docker manifest inspect "$img" 2&gt;/dev/null | jq -r '[.manifests[]?.platform.architecture] | join(",")')"
+done
+<span class="out">111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-api:1.8.3     amd64,arm64
+111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-worker:2.4.0  amd64,arm64
+partner-registry.example.com/sms-sidecar:0.9                           </span>
+<span class="cm"># empty = single-arch: that Pod needs nodeSelector kubernetes.io/arch: amd64, or it hits "exec format error"</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">Right-sizing requests and seeing the bill per team</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The biggest saving is usually not Spot or Graviton. It is requests that were copied from a template and never
+        revisited. Measure the p95 of real usage over at least a week that includes a Monday peak, using the VPA
+        recommendation from Part I or this query (<a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>),
+        then set the CPU request near p95 and the memory request and limit above the observed maximum.
+      </p>
+      <pre class="code mt-3">quantile_over_time(0.95,
+  sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="booking", container="api"}[5m]))[7d:5m]
+)
+<span class="out">{pod="booking-api-7c9f8d6b5-x2lqp"}  0.181
+{pod="booking-api-7c9f8d6b5-m8tzr"}  0.176</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">booking-api (8 replicas at peak)</th><th class="px-4 py-3">Before</th><th class="px-4 py-3">After</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">CPU request per Pod</td><td class="px-4 py-3">1000m</td><td class="px-4 py-3">250m (p95 181m + headroom)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Memory request / limit</td><td class="px-4 py-3">1Gi / 1Gi</td><td class="px-4 py-3">512Mi / 768Mi (max seen 455Mi)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Requested at peak</td><td class="px-4 py-3">8 vCPU, 8 GiB</td><td class="px-4 py-3">2 vCPU, 4 GiB</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">HPA target</td><td class="px-4 py-3">60% of 1000m (never reached)</td><td class="px-4 py-3">60% of 250m: scales on real load for the first time</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Nodes needed (m7g.xlarge)</td><td class="px-4 py-3">≈ 2 for this service alone</td><td class="px-4 py-3">≈ 0.5: about USD 150/month saved for one service</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice the HPA row. Over-requesting does not only waste money. It also hides load from the autoscaler, because
+        CPU is measured against the request. To show each team its share, turn on <strong>split cost allocation data for
+        EKS</strong> in the Cost and Usage Report. It splits each node's cost across Pods by requests and usage, and
+        can import Kubernetes labels such as <code class="inline">team</code> and <code class="inline">app</code> as cost
+        allocation tags. Kubecost (or the open-source OpenCost) gives the same view in-cluster in real time, and is worth
+        installing when teams want daily feedback rather than a monthly report.
+      </p>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Autoscaling config is mostly arithmetic and constraint-checking, which agents do well when you give them real
+        numbers. Paste measured usage, processing rates and prices, and ask for the calculation behind every value it
+        proposes. Never let it pick <code class="inline">maxReplicaCount</code> or NodePool limits without a cost estimate.
+      </p>
+      <pre class="code mt-3">booking-worker processes 4 messages concurrently, ~1.5 s each. Peak inflow is 1,800 messages
+in 5 minutes on Monday 07:00 ICT. Our SLO is 95% of confirmations sent within 60 s. Propose a
+KEDA ScaledObject (queueLength, min/max, cooldown) and show the drain-time maths. Also tell me
+the SMS provider request rate at maxReplicaCount.</pre>
+      <pre class="code mt-3">Here are 7 days of p50/p95/max CPU and memory per container for the booking namespace (CSV
+below) and the current requests from our Helm values. Propose new requests and memory limits,
+flag any container where the HPA target becomes unreachable or too easy, and estimate the change
+in requested vCPU across the namespace.</pre>
+      <pre class="code mt-3">Review this Karpenter NodePool and EC2NodeClass for: missing limits, too few instance types for
+Spot, an unpinned AMI alias, IMDS hop limit, disruption budgets in UTC vs ICT, and anything that
+uses the old v1beta1 API. Output a table of findings. Do not apply anything.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Queue-drain, replica and node-count maths from numbers you provide</li>
+            <li>Turning VPA recommendations and PromQL output into a requests PR</li>
+            <li>Converting Karpenter v1beta1 manifests to v1</li>
+            <li>Translating clinic hours into UTC cron expressions for budgets and KEDA</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Every NodePool has <code class="inline">limits</code>, and every scaler has a sane max</li>
+            <li><code class="inline">replicas</code> is gone from Deployments that an HPA or KEDA owns</li>
+            <li>Downstream limits (DB connections, SMS rate) at max replicas</li>
+            <li>Memory requests are not cut below observed maximum (OOMKills)</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written autoscaling:</strong>
+        <code class="inline">karpenter.sh/v1beta1</code> or <code class="inline">v1alpha5</code> APIs and fields such as
+        <code class="inline">ttlSecondsAfterEmpty</code>; a NodePool with no <code class="inline">limits</code>;
+        <code class="inline">amiSelectorTerms</code> with <code class="inline">@latest</code> in prod; an HPA on memory for a
+        Node.js or JVM service; an HPA and a KEDA ScaledObject on the same Deployment; KEDA's removed
+        <code class="inline">aws-eks</code> identity provider; Spot allowed with a single instance type; and requests
+        "optimised" without any usage data behind them.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Scales by editing <code class="inline">replicas</code> and adding nodes by hand.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows the HPA and Karpenter exist; cannot explain why an HPA at 20% CPU does not scale or why a node never goes away.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds a CPU HPA from a template and reads <code class="inline">kubectl get hpa</code>; needs help with KEDA triggers, NodePool requirements and disruption.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses the scaling signal per workload and justifies the numbers; writes KEDA ScaledObjects and Karpenter v1 NodePools with limits, Spot diversity and clinic-hours budgets; right-sizes requests from measured data and quantifies the saving.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Owns the cluster's cost model, runs a monthly right-sizing review with app teams using split cost allocation data, and sets the Spot/On-Demand/Savings Plans policy across client clusters.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> push 2,000 messages into a dev
+        SQS queue and record replicas, Pending Pods, NodeClaims and queue depth until the queue is empty and the cluster
+        has consolidated back. Explain every step in the timeline, and predict the drain time before you run it. Your
+        prediction should be within 30% of the result.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Scaling on CPU because it is the default</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">I/O-bound services and queue workers hit their limits long before CPU moves. Pick the signal that rises before users notice, and test it under load (<a href="./sr4.html" class="text-viol underline decoration-viol/40">SR4</a>).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Scaling past what the database can take</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">40 replicas × a pool of 20 connections is 800 connections to an RDS instance that allows 400. Set max replicas from downstream limits, or put RDS Proxy in front (<a href="./aw5.html" class="text-viol underline decoration-viol/40">AW5</a>).</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Consolidation with no PDBs</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Karpenter respects PDBs, so without them it can evict all replicas of a service on one node at once. Every multi-replica workload needs a PDB before consolidation is turned on.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Schedule the floor, react above it</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">For a business with opening hours, a cron trigger slightly above last month's median removes the morning lag entirely, and the reactive trigger handles everything else.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Make cost visible per team</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Teams right-size when they see their own number. A monthly report from split cost allocation data, grouped by the <code class="inline">team</code> label, does more than any policy.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="hpa"> <span>I configured an HPA with a behaviour block and can calculate its desired replicas by hand from the formula.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="keda"> <span>I scaled a queue worker on SQS depth with KEDA and Pod Identity, with <code class="inline">queueLength</code> derived from the processing rate.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="karpenter"> <span>I wrote a Karpenter v1 EC2NodeClass and NodePool with limits, Spot diversity and a disruption budget, and traced a NodeClaim from Pending Pod to Ready node.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="spot-arm"> <span>I can explain which workloads go on Spot and Graviton, and I verified that every image in a namespace is multi-arch.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="rightsize-lab"> <span class="font-semibold">Right-sized one namespace on a dev or staging cluster: collected 7 days of usage, opened a PR changing requests and limits with a before/after table, ran a KEDA burst test, and reported the change in requested vCPU and estimated monthly cost (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/" target="_blank" rel="noopener">Kubernetes — Horizontal Pod Autoscaling</a>: the algorithm, tolerance and the behavior field.</li>
+        <li><a class="text-coral underline" href="https://github.com/kedacore/keda" target="_blank" rel="noopener">KEDA — README and scaler docs</a>: ScaledObject, the AWS SQS and cron scalers, fallback and AWS identity providers.</li>
+        <li><a class="text-coral underline" href="https://karpenter.sh/docs/concepts/nodepools/" target="_blank" rel="noopener">Karpenter — NodePools</a> · <a class="text-coral underline" href="https://karpenter.sh/docs/concepts/disruption/" target="_blank" rel="noopener">Disruption</a>: requirements, limits, consolidation and budgets.</li>
+        <li><a class="text-coral underline" href="https://karpenter.sh/docs/concepts/nodeclasses/" target="_blank" rel="noopener">Karpenter — EC2NodeClass</a>: AMI aliases, selectors, kubelet and metadata options.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/best-practices/cost-opt.html" target="_blank" rel="noopener">AWS — EKS Best Practices: Cost optimisation</a>: compute, Spot and right-sizing guidance for EKS.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/cur/latest/userguide/split-cost-allocation-data.html" target="_blank" rel="noopener">AWS — Split cost allocation data</a>: per-Pod cost in the CUR, including Kubernetes labels.</li>
+        <li><a class="text-coral underline" href="https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler" target="_blank" rel="noopener">Kubernetes autoscaler — VPA README</a>: recommendation mode and the update modes.</li>
+      </ul>

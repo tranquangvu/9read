@@ -1,0 +1,737 @@
+<!-- meta: days=5 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Terraform at Scale: Modules, Environments &amp; Testing</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          In IA1 you wrote Terraform for one stack in one account. The clinic platform has four accounts, three
+          environments, a dozen stacks and several people changing them in the same week. This module covers what changes
+          at that size: designing and versioning modules, laying out environments so dev and prod cannot drift apart,
+          splitting state so one bad apply cannot take everything with it, testing modules with
+          <code class="inline">terraform test</code>, gating plans with policy, and running all of it from GitHub Actions
+          with plan on every PR and apply on merge. By the end you can own <code class="inline">clinic-infra</code> as a
+          repo, not just a folder of <code class="inline">.tf</code> files.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> Terraform incidents at scale are rarely syntax errors. They are
+          a prod apply run from someone's laptop with a dev variable file, one state file holding the VPC and the database
+          so a refactor plans to destroy both, a module bumped from <code class="inline">main</code> that silently changed
+          a default, or a console hotfix that the next apply quietly reverts. Structure, versioning, tests and a pipeline
+          are what make a 40-resource plan safe to approve on a Friday.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Module design</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A module is an API; design it like one</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A module is any directory of <code class="inline">.tf</code> files called with a <code class="inline">module</code>
+        block. Its variables are the parameters, its outputs are the return values, and every caller depends on both.
+        Good modules hide decisions you have already made (encryption on, a DLQ always attached, our tags applied) and
+        expose only the choices that genuinely differ between callers. Bad modules are a thin wrapper around one
+        resource with 60 pass-through variables.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Encode the decision, expose the variation</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Take the SQS queue that <code class="inline">booking-worker</code> consumes. Every queue we create needs a
+        dead-letter queue, server-side encryption, a redrive policy and an alarm on DLQ depth. Those are not options. The
+        name, the visibility timeout and the retry count are. So the module takes four inputs and makes the rest
+        non-negotiable.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terraform-modules/sqs-queue/variables.tf</span>
+        <pre class="code"><span class="kw">variable</span> <span class="st">"name"</span> {
+  type        = string
+  description = <span class="st">"Queue name without environment prefix, e.g. booking-events"</span>
+  validation {
+    condition     = can(regex(<span class="st">"^[a-z0-9-]{3,60}$"</span>, var.name))
+    error_message = <span class="st">"name must be lowercase letters, digits and hyphens, 3-60 chars."</span>
+  }
+}
+<span class="kw">variable</span> <span class="st">"environment"</span> {
+  type = string
+  validation {
+    condition     = contains([<span class="st">"dev"</span>, <span class="st">"staging"</span>, <span class="st">"prod"</span>], var.environment)
+    error_message = <span class="st">"environment must be dev, staging or prod."</span>
+  }
+}
+<span class="kw">variable</span> <span class="st">"visibility_timeout_seconds"</span> {
+  type    = number
+  default = 60                    <span class="cm"># must exceed the worker's longest job (AW6)</span>
+}
+<span class="kw">variable</span> <span class="st">"max_receive_count"</span> {
+  type    = number
+  default = 5                     <span class="cm"># retries before a message lands in the DLQ</span>
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">terraform-modules/sqs-queue/main.tf</span>
+        <pre class="code"><span class="kw">locals</span> {
+  full_name = <span class="st">"${var.environment}-${var.name}"</span>
+}
+<span class="kw">resource</span> <span class="st">"aws_sqs_queue"</span> <span class="st">"dlq"</span> {
+  name                      = <span class="st">"${local.full_name}-dlq"</span>
+  message_retention_seconds = 1209600            <span class="cm"># 14 days to investigate</span>
+  sqs_managed_sse_enabled   = true
+}
+<span class="kw">resource</span> <span class="st">"aws_sqs_queue"</span> <span class="st">"this"</span> {
+  name                       = local.full_name
+  visibility_timeout_seconds = var.visibility_timeout_seconds
+  sqs_managed_sse_enabled    = true               <span class="cm"># not a variable: always on</span>
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = var.max_receive_count
+  })
+}
+<span class="kw">output</span> <span class="st">"queue_url"</span> { value = aws_sqs_queue.this.url }
+<span class="kw">output</span> <span class="st">"queue_arn"</span> { value = aws_sqs_queue.this.arn }
+<span class="kw">output</span> <span class="st">"dlq_arn"</span>   { value = aws_sqs_queue.dlq.arn }</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Module rule</th><th class="px-4 py-3">Why</th><th class="px-4 py-3">Review smell</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">No <code class="inline">provider</code> blocks inside</td><td class="px-4 py-3">The caller decides account, region and assumed role</td><td class="px-4 py-3">A module that hard-codes <code class="inline">region = "ap-southeast-1"</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Declare <code class="inline">required_providers</code></td><td class="px-4 py-3">States the provider range the module was tested with</td><td class="px-4 py-3">No <code class="inline">versions.tf</code> at all</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Validate inputs</td><td class="px-4 py-3">Fails at plan with a clear message instead of at AWS with an obscure one</td><td class="px-4 py-3"><code class="inline">type = any</code> everywhere</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Output IDs and ARNs callers need</td><td class="px-4 py-3">Callers should never reach inside with data sources</td><td class="px-4 py-3">The whole resource object as one output</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">One concern per module</td><td class="px-4 py-3">Keeps plans readable and versions independent</td><td class="px-4 py-3">A <code class="inline">platform</code> module that builds VPC, EKS and RDS</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The caller for <code class="inline">booking-worker</code> is now five lines. It cannot forget the DLQ, and a reviewer
+        reads one block instead of three resources.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Registry modules: use them, pin them, read their changelog</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        For large, well-understood building blocks we use the community modules from
+        <code class="inline">terraform-aws-modules</code>: <code class="inline">vpc</code> for networking and
+        <code class="inline">eks</code> for clusters (<a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>).
+        They encode years of edge cases, and writing our own VPC module would be worse. The price is that a major version
+        can rename inputs and move resources, so pin to a major and upgrade deliberately.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/live/gol-prod/network/main.tf</span>
+        <pre class="code"><span class="kw">module</span> <span class="st">"vpc"</span> {
+  source  = <span class="st">"terraform-aws-modules/vpc/aws"</span>
+  version = <span class="st">"~&gt; 6.0"</span>                      <span class="cm"># 6.x only: matches AWS provider ~&gt; 6.0</span>
+
+  name = <span class="st">"clinic-prod"</span>
+  cidr = <span class="st">"10.20.0.0/16"</span>
+  azs  = [<span class="st">"ap-southeast-1a"</span>, <span class="st">"ap-southeast-1b"</span>, <span class="st">"ap-southeast-1c"</span>]
+
+  private_subnets  = [<span class="st">"10.20.32.0/19"</span>, <span class="st">"10.20.64.0/19"</span>, <span class="st">"10.20.96.0/19"</span>]
+  public_subnets   = [<span class="st">"10.20.0.0/22"</span>, <span class="st">"10.20.4.0/22"</span>, <span class="st">"10.20.8.0/22"</span>]
+  database_subnets = [<span class="st">"10.20.12.0/24"</span>, <span class="st">"10.20.13.0/24"</span>, <span class="st">"10.20.14.0/24"</span>]
+
+  enable_nat_gateway     = true
+  one_nat_gateway_per_az = true                  <span class="cm"># prod only; dev uses single_nat_gateway (AW2)</span>
+}</pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Constraint</th><th class="px-4 py-3">Accepts</th><th class="px-4 py-3">Use for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">= 6.4.0</td><td class="px-4 py-3">Exactly one version</td><td class="px-4 py-3">Our own modules in prod, where any change must be a PR</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">~&gt; 6.4</td><td class="px-4 py-3">6.4 up to, not including, 7.0</td><td class="px-4 py-3">Registry modules: minor and patch fixes flow in</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">~&gt; 6.4.0</td><td class="px-4 py-3">6.4.x patches only</td><td class="px-4 py-3">A module whose minors have surprised you before</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">&gt;= 6.0</td><td class="px-4 py-3">Anything, including 7, 8…</td><td class="px-4 py-3">Never in a root module</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">(none)</td><td class="px-4 py-3">Latest on every <code class="inline">init -upgrade</code></td><td class="px-4 py-3">Reject in review</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">.terraform.lock.hcl</code> file pins <em>provider</em> versions and hashes; it does not pin
+        modules. Commit it, and regenerate it for all the platforms your team and CI use with
+        <code class="inline">terraform providers lock -platform=linux_amd64 -platform=linux_arm64 -platform=darwin_arm64</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Versioning your own modules</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Our shared modules live in <code class="inline">golden-owl/terraform-modules</code>, one directory per module,
+        released with semver git tags per module (<code class="inline">sqs-queue/v1.3.0</code>). Callers reference a tag,
+        never a branch. A breaking change (renamed variable, new required input, a resource address that moves) is a new
+        major with a <code class="inline">moved</code> block (<a href="./ia1.html" class="text-viol underline decoration-viol/40">IA1</a>)
+        and an upgrade note in the changelog.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/live/gol-prod/services/queues.tf</span>
+        <pre class="code"><span class="kw">module</span> <span class="st">"booking_events"</span> {
+  source = <span class="st">"git::https://github.com/golden-owl/terraform-modules.git//sqs-queue?ref=sqs-queue/v1.3.0"</span>
+  <span class="cm"># the // separates the repo from the subdirectory; ?ref pins the tag</span>
+
+  name                       = <span class="st">"booking-events"</span>
+  environment                = <span class="st">"prod"</span>
+  visibility_timeout_seconds = 120
+}</pre>
+      </div>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 220" class="w-full min-w-[640px]" role="img" aria-label="Module versions flow: terraform-modules repo tags sqs-queue v1.3.0 and v2.0.0; dev and staging adopt v2.0.0 first while prod stays on v1.3.0 until staging has run it for a week">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ONE MODULE, THREE ENVIRONMENTS, TWO VERSIONS IN FLIGHT</text>
+          <g class="anim-pulse"><rect x="15" y="80" width="170" height="60" rx="9" fill="#37474F"/>
+            <text x="100" y="104" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">terraform-modules</text>
+            <text x="100" y="120" text-anchor="middle" fill="#ffffffbb" font-size="9">tags v1.3.0 · v2.0.0</text></g>
+          <g class="anim-pulse d1"><rect x="290" y="40" width="160" height="46" rx="9" fill="#2563EB"/>
+            <text x="370" y="60" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">live/gol-dev</text>
+            <text x="370" y="75" text-anchor="middle" fill="#ffffffbb" font-size="9">ref=v2.0.0 · day 0</text></g>
+          <g class="anim-pulse d2"><rect x="290" y="100" width="160" height="46" rx="9" fill="#6d5acd"/>
+            <text x="370" y="120" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">live/gol-staging</text>
+            <text x="370" y="135" text-anchor="middle" fill="#ffffffbb" font-size="9">ref=v2.0.0 · day 1</text></g>
+          <g class="anim-pulse d3"><rect x="290" y="160" width="160" height="46" rx="9" fill="#DB2777"/>
+            <text x="370" y="180" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">live/gol-prod</text>
+            <text x="370" y="195" text-anchor="middle" fill="#ffffffbb" font-size="9">ref=v1.3.0 → v2.0.0 · day 8</text></g>
+          <line x1="185" y1="100" x2="290" y2="63" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="185" y1="110" x2="290" y2="123" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="185" y1="120" x2="290" y2="183" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d4"><rect x="540" y="95" width="165" height="56" rx="9" fill="#0D9488"/>
+            <text x="622" y="117" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">same diff, 3 plans</text>
+            <text x="622" y="133" text-anchor="middle" fill="#ffffffbb" font-size="9">each reviewed in its own PR</text></g>
+          <line x1="450" y1="123" x2="540" y2="123" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="622" y="180" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">prod moves last, never first</text>
+        </svg>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Environments and state</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Split state by blast radius and rate of change</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        One state file is one unit of risk. Everything in it is locked together, planned together and can be damaged
+        together. A state holding the VPC, the RDS instance and twelve ECS services takes four minutes to plan, blocks
+        every engineer while one person applies, and turns a typo in a service into a plan that touches the database. The
+        fix is a layout where each environment and each layer has its own state.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Directories per environment, not workspaces</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Terraform CLI workspaces give one configuration several state files, selected with
+        <code class="inline">terraform workspace select</code>. They look like the answer to "dev, staging, prod" and are
+        the wrong one for us: the environment you are about to change is invisible in the code and in the PR, all
+        environments share one backend and one set of credentials, and prod differences end up as
+        <code class="inline">terraform.workspace == "prod" ? … : …</code> scattered through the files.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3"></th><th class="px-4 py-3">Directory per env (our default)</th><th class="px-4 py-3">CLI workspaces</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Which env a PR changes</td><td class="px-4 py-3">Obvious from the file path</td><td class="px-4 py-3">Invisible; depends on local CLI state</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Backend and credentials</td><td class="px-4 py-3">Separate bucket and role per account</td><td class="px-4 py-3">One backend; prod state sits next to dev</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Env differences</td><td class="px-4 py-3">Explicit inputs in each env's files</td><td class="px-4 py-3">Conditionals on <code class="inline">terraform.workspace</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Duplication</td><td class="px-4 py-3">Small: each env is a few module calls</td><td class="px-4 py-3">None</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Right for</td><td class="px-4 py-3">Long-lived environments in separate accounts</td><td class="px-4 py-3">Short-lived copies of one stack, e.g. per-PR preview environments</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra — repository layout</span>
+        <pre class="code">clinic-infra/
+├── live/
+│   ├── gol-shared/
+│   │   ├── ecr/                 <span class="cm"># repos, lifecycle policies (CI4)</span>
+│   │   └── github-oidc/         <span class="cm"># OIDC provider + CI roles (CI1)</span>
+│   ├── gol-dev/
+│   │   ├── network/  data/  services/
+│   ├── gol-staging/
+│   │   ├── network/  data/  services/
+│   └── gol-prod/
+│       ├── network/             <span class="cm"># VPC, subnets, endpoints: changes monthly</span>
+│       ├── data/                <span class="cm"># RDS, ElastiCache, S3: changes rarely, hurts most</span>
+│       └── services/            <span class="cm"># ECS services, queues, alarms: changes daily</span>
+├── policy/                      <span class="cm"># Conftest rules (Part III)</span>
+└── .github/workflows/           <span class="cm"># plan + apply (Part IV)</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Each leaf directory is a <strong>root module</strong> with its own backend, provider config and state: 11 states
+        for the clinic, each planning in under 40 seconds. Terragrunt can generate the repeated backend and provider
+        blocks for you; we accept the few duplicated lines in exchange for plain Terraform that every engineer can read.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Layers: separate what changes often from what hurts most</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Split each environment along two axes: how often it changes and how bad it is to break. Network changes monthly
+        and breaks everything. Data changes rarely and loses customer records. Services change many times a day and are
+        easy to redeploy. Putting them in separate states means the daily change never plans against the database, and
+        the data layer can have stricter rules (two approvers, <code class="inline">prevent_destroy</code>).
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 230" class="w-full min-w-[640px]" role="img" aria-label="Three state layers in gol-prod: network, data and services; each layer reads outputs of the layer below through SSM parameters; services changes daily, data rarely">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">gol-prod · THREE STATES, ONE DIRECTION OF DEPENDENCY</text>
+          <g class="anim-pulse"><rect x="20" y="160" width="200" height="54" rx="9" fill="#37474F"/>
+            <text x="120" y="182" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">network/</text>
+            <text x="120" y="198" text-anchor="middle" fill="#ffffffbb" font-size="9">VPC 10.20.0.0/16 · ~40 resources</text></g>
+          <g class="anim-pulse d1"><rect x="260" y="100" width="200" height="54" rx="9" fill="#DB2777"/>
+            <text x="360" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">data/</text>
+            <text x="360" y="138" text-anchor="middle" fill="#ffffffbb" font-size="9">RDS · Redis · S3 · prevent_destroy</text></g>
+          <g class="anim-pulse d2"><rect x="500" y="40" width="200" height="54" rx="9" fill="#2563EB"/>
+            <text x="600" y="62" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">services/</text>
+            <text x="600" y="78" text-anchor="middle" fill="#ffffffbb" font-size="9">ECS · SQS · alarms · ~90 resources</text></g>
+          <line x1="220" y1="175" x2="260" y2="140" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="460" y1="115" x2="500" y2="80" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="220" y1="165" x2="500" y2="90" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="120" y="150" text-anchor="middle" font-size="9" fill="#6E6B64">changes ~monthly</text>
+          <text x="360" y="90" text-anchor="middle" font-size="9" fill="#6E6B64">changes ~quarterly</text>
+          <text x="600" y="30" text-anchor="middle" font-size="9" fill="#6E6B64">changes ~daily</text>
+          <text x="560" y="180" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">outputs flow up through SSM, never down</text>
+        </svg>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/live/gol-prod/data/backend.tf</span>
+        <pre class="code"><span class="kw">terraform</span> {
+  required_version = <span class="st">"&gt;= 1.10"</span>
+  required_providers {
+    aws = { source = <span class="st">"hashicorp/aws"</span>, version = <span class="st">"~&gt; 6.0"</span> }
+  }
+  backend <span class="st">"s3"</span> {
+    bucket       = <span class="st">"gol-prod-tfstate"</span>          <span class="cm"># one bucket per account</span>
+    key          = <span class="st">"clinic/data/terraform.tfstate"</span>   <span class="cm"># one key per layer</span>
+    region       = <span class="st">"ap-southeast-1"</span>
+    encrypt      = true
+    use_lockfile = true                         <span class="cm"># S3-native lock, no DynamoDB table</span>
+  }
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Passing values between states</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Split states still need each other's outputs: services need the VPC's subnet IDs and the database endpoint.
+        <code class="inline">terraform_remote_state</code> works but needs read access to the <em>whole</em> state file of
+        the other layer, including every secret value in it. We publish the few values other layers need as SSM
+        parameters and read them with a data source. The contract is explicit and access is per parameter.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">network/outputs-ssm.tf and services/network.tf</span>
+        <pre class="code"><span class="cm"># in network/: publish</span>
+<span class="kw">resource</span> <span class="st">"aws_ssm_parameter"</span> <span class="st">"private_subnets"</span> {
+  name  = <span class="st">"/clinic/prod/network/private_subnet_ids"</span>
+  type  = <span class="st">"StringList"</span>
+  value = join(<span class="st">","</span>, module.vpc.private_subnets)
+}
+
+<span class="cm"># in services/: consume</span>
+<span class="kw">data</span> <span class="st">"aws_ssm_parameter"</span> <span class="st">"private_subnets"</span> {
+  name = <span class="st">"/clinic/prod/network/private_subnet_ids"</span>
+}
+<span class="kw">locals</span> {
+  private_subnet_ids = split(<span class="st">","</span>, data.aws_ssm_parameter.private_subnets.value)
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Splitting an existing state is a migration, not a refactor.</strong>
+        Move resources with <code class="inline">removed</code> blocks (<code class="inline">lifecycle { destroy = false }</code>)
+        in the old root and <code class="inline">import</code> blocks in the new one, in one PR per layer. Both plans must
+        show <strong>0 to destroy</strong> before anyone applies. If the plan in either root shows a destroy for a moved
+        resource, stop.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Keep environments the same shape</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Directories per environment invite drift between them: someone adds an alarm in prod by hand-editing
+        <code class="inline">gol-prod/services</code> and forgets staging. Prevent it by making each environment's root
+        module a thin list of module calls with the <em>same</em> modules, and putting every difference in one
+        <code class="inline">env.auto.tfvars</code> file you can diff across environments.
+      </p>
+      <pre class="code mt-3">diff live/gol-staging/services/env.auto.tfvars live/gol-prod/services/env.auto.tfvars
+<span class="out">&lt; environment         = "staging"
+&lt; booking_api_desired = 2
+&lt; rds_instance_class  = "db.t4g.medium"
+---
+&gt; environment         = "prod"
+&gt; booking_api_desired = 6
+&gt; rds_instance_class  = "db.r7g.large"</span>
+<span class="cm"># three lines of difference is healthy; thirty means staging no longer tests prod</span></pre>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Testing and policy</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Catch it before the plan reaches a human</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A human reviewing a 60-line plan catches the things that need judgement. Machines should catch everything else
+        first: formatting, invalid references, deprecated arguments, a module that breaks its own contract, a plan that
+        deletes a database. Each layer of checking is cheaper and faster than the one after it, so run them in order and
+        fail early.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The checking ladder</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    A["fmt -check<br/>~1 s"] --> B["validate<br/>~5 s"]
+    B --> C["tflint<br/>~10 s"]
+    C --> D["terraform test<br/>module PRs, ~40 s"]
+    D --> E["plan<br/>~30 s per root"]
+    E --> F["conftest on plan JSON<br/>~2 s"]
+    F --> G["human review<br/>minutes"]
+    E -.-> H["checkov / trivy config<br/>owned by SE2"]
+        </pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Check</th><th class="px-4 py-3">Catches</th><th class="px-4 py-3">Needs AWS credentials</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">terraform fmt -check -recursive</td><td class="px-4 py-3">Style noise that hides real diffs</td><td class="px-4 py-3">No</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">terraform validate</td><td class="px-4 py-3">Bad references, wrong types, missing required arguments</td><td class="px-4 py-3">No (<code class="inline">init -backend=false</code>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">tflint + AWS ruleset</td><td class="px-4 py-3">Invalid instance types, deprecated arguments, unused variables, naming rules</td><td class="px-4 py-3">No</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">terraform test</td><td class="px-4 py-3">A module breaking its own contract (outputs, defaults, validation)</td><td class="px-4 py-3">No with mocks; yes for apply tests</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Conftest on the plan</td><td class="px-4 py-3">Our rules about <em>changes</em>: no destroys in data/, required tags, no public buckets</td><td class="px-4 py-3">Yes (needs a plan)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Checkov / Trivy config</td><td class="px-4 py-3">Known security misconfigurations; owned by <a href="./se2.html" class="text-viol underline decoration-viol/40">SE2</a></td><td class="px-4 py-3">No</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/.tflint.hcl</span>
+        <pre class="code"><span class="kw">plugin</span> <span class="st">"aws"</span> {
+  enabled = true
+  version = <span class="st">"0.40.0"</span>                       <span class="cm"># pin the ruleset like any dependency</span>
+  source  = <span class="st">"github.com/terraform-linters/tflint-ruleset-aws"</span>
+}
+<span class="kw">rule</span> <span class="st">"terraform_naming_convention"</span> { enabled = true }
+<span class="kw">rule</span> <span class="st">"terraform_unused_declarations"</span> { enabled = true }</pre>
+      </div>
+      <pre class="code mt-3">tflint --init &amp;&amp; tflint --recursive
+<span class="out">live/gol-dev/services/worker.tf:14:19: Error: "t3.mirco" is an invalid value as instance_type (aws_instance_invalid_type)
+live/gol-dev/services/variables.tf:22:1: Warning: variable "legacy_port" is declared but not used (terraform_unused_declarations)
+
+2 issue(s) found</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">terraform test: unit tests for modules</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">terraform test</code> runs <code class="inline">.tftest.hcl</code> files in a module's
+        <code class="inline">tests/</code> directory. Each <code class="inline">run</code> block plans (or applies) the
+        module with given variables and checks <code class="inline">assert</code> conditions. With
+        <code class="inline">mock_provider</code>, plan-mode tests need no AWS account at all, so they run on every module
+        PR in seconds. Test the contract: the defaults you promised, the validation you wrote, the values you compute.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">terraform-modules/sqs-queue/tests/defaults.tftest.hcl</span>
+        <pre class="code"><span class="kw">mock_provider</span> <span class="st">"aws"</span> {}                    <span class="cm"># fake AWS: no credentials, no cost</span>
+
+<span class="kw">variables</span> {
+  name        = <span class="st">"booking-events"</span>
+  environment = <span class="st">"dev"</span>
+}
+
+<span class="kw">run</span> <span class="st">"names_are_prefixed_and_dlq_attached"</span> {
+  command = plan
+  assert {
+    condition     = aws_sqs_queue.this.name == <span class="st">"dev-booking-events"</span>
+    error_message = <span class="st">"queue name must be prefixed with the environment"</span>
+  }
+  assert {
+    condition     = jsondecode(aws_sqs_queue.this.redrive_policy).maxReceiveCount == 5
+    error_message = <span class="st">"default maxReceiveCount must stay 5"</span>
+  }
+}
+
+<span class="kw">run</span> <span class="st">"rejects_unknown_environment"</span> {
+  command   = plan
+  variables { environment = <span class="st">"production"</span> }
+  expect_failures = [var.environment]          <span class="cm"># the validation block must fire</span>
+}</pre>
+      </div>
+      <pre class="code mt-3">cd terraform-modules/sqs-queue &amp;&amp; terraform init -backend=false &amp;&amp; terraform test
+<span class="out">tests/defaults.tftest.hcl... in progress
+  run "names_are_prefixed_and_dlq_attached"... pass
+  run "rejects_unknown_environment"... pass
+tests/defaults.tftest.hcl... tearing down
+tests/defaults.tftest.hcl... pass
+
+Success! 2 passed, 0 failed.</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Add one <code class="inline">command = apply</code> test per module that creates real resources in the
+        <code class="inline">gol-dev</code> sandbox and destroys them afterwards. Run it nightly, not on every PR: it is
+        slower (minutes) and costs money, but it is the only test that proves AWS accepts what you generate.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Policy as code on the plan</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Linters read the code. Some rules are about the <em>change</em>: "nothing in <code class="inline">data/</code> may
+        be destroyed without an explicit label", "every resource carries <code class="inline">owner</code> and
+        <code class="inline">env</code> tags". Those need the plan. Export it as JSON and test it with
+        <strong>Conftest</strong>, which runs OPA Rego policies against any structured file.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/policy/terraform/no_data_destroy.rego</span>
+        <pre class="code"><span class="kw">package</span> main
+
+protected := {<span class="st">"aws_db_instance"</span>, <span class="st">"aws_rds_cluster"</span>, <span class="st">"aws_elasticache_replication_group"</span>, <span class="st">"aws_s3_bucket"</span>}
+
+<span class="fn">deny</span> contains msg <span class="kw">if</span> {
+	some rc in input.resource_changes
+	rc.type in protected
+	<span class="st">"delete"</span> in rc.change.actions             <span class="cm"># also matches replace: ["delete","create"]</span>
+	msg := sprintf(<span class="st">"%s would be destroyed; data resources need a manual, approved runbook"</span>, [rc.address])
+}
+
+<span class="fn">deny</span> contains msg <span class="kw">if</span> {
+	some rc in input.resource_changes
+	<span class="st">"create"</span> in rc.change.actions
+	not rc.change.after.tags_all.owner         <span class="cm"># default_tags land in tags_all</span>
+	msg := sprintf(<span class="st">"%s has no owner tag"</span>, [rc.address])
+}</pre>
+      </div>
+      <pre class="code mt-3">terraform plan -out=tfplan &amp;&amp; terraform show -json tfplan &gt; plan.json
+conftest test plan.json --policy ../../../policy/terraform
+<span class="out">FAIL - plan.json - main - module.rds.aws_db_instance.booking would be destroyed; data resources need a manual, approved runbook
+
+2 tests, 1 passed, 0 warnings, 1 failure, 0 exceptions</span></pre>
+      <div class="mt-4 callout callout-info"><strong>Where the line sits:</strong> Conftest holds <em>our</em> rules about
+        changes to <em>our</em> estate. Generic security scanning (Checkov, Trivy config, their rule catalogues, the
+        exception process) belongs to <a href="./se2.html" class="text-viol underline decoration-viol/40">SE2</a>, and both
+        run in the same pipeline. Write a Conftest rule after every Terraform incident: it is the cheapest permanent fix.</div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Terraform in GitHub Actions</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Plan on every PR, apply the reviewed plan on merge, and nobody applies from a laptop</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The pipeline is where everything above comes together. Every PR to <code class="inline">clinic-infra</code> gets a
+        plan per changed root, posted on the PR, with a read-only role. Merging to <code class="inline">main</code> plans
+        again with the apply role, waits for approval on protected environments, and applies exactly that saved plan.
+        Human AWS roles in staging and prod are read-only, so the pipeline is the only path to change.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The flow from PR to applied change</h3>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant D as Engineer
+    participant GH as GitHub Actions
+    participant P as role tf-plan (read-only)
+    participant A as role tf-apply (env prod)
+    D->>GH: open PR touching live/gol-prod/services
+    GH->>P: OIDC, sub = clinic-infra:pull_request
+    GH-->>D: plan + conftest result as PR comment
+    D->>GH: approve + merge to main
+    GH->>A: OIDC, sub = clinic-infra:environment:prod
+    Note over GH: plan -out=tfplan on main<br/>wait for environment approval (CI2)
+    GH->>A: terraform apply tfplan
+    GH-->>D: summary: 3 to add, 1 to change, 0 to destroy
+        </pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Role (per account)</th><th class="px-4 py-3">Trusted <code class="inline">sub</code></th><th class="px-4 py-3">Permissions</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">gha-clinic-infra-plan</td><td class="px-4 py-3"><code class="inline">repo:golden-owl/clinic-infra:pull_request</code></td><td class="px-4 py-3"><code class="inline">ReadOnlyAccess</code>, read state, write only <code class="inline">*.tflock</code> objects</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">gha-clinic-infra-apply</td><td class="px-4 py-3"><code class="inline">repo:golden-owl/clinic-infra:environment:prod</code></td><td class="px-4 py-3">Broad, bounded by a permission boundary and the account's SCPs (<a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">gha-clinic-infra-drift</td><td class="px-4 py-3"><code class="inline">repo:golden-owl/clinic-infra:ref:refs/heads/main</code></td><td class="px-4 py-3">Same as plan; used by the nightly schedule</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The plan role needs write access to the lock object: with <code class="inline">use_lockfile = true</code>, even a
+        plan creates <code class="inline">terraform.tfstate.tflock</code> next to the state. Grant
+        <code class="inline">s3:PutObject</code> and <code class="inline">s3:DeleteObject</code> on
+        <code class="inline">*.tflock</code> only, so a PR can lock but never overwrite state.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Plan only the roots that changed</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Planning all 11 roots on every PR takes 6 minutes and buries the one plan that matters among ten "No changes".
+        Compute the changed root directories first, then fan out with a matrix built from that list.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/.github/workflows/terraform.yml — detect + plan</span>
+        <pre class="code">  detect:
+    runs-on: ubuntu-24.04
+    outputs:
+      roots: ${{ steps.roots.outputs.roots }}
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 0 }
+      - id: roots
+        run: |
+          roots=$(git diff --name-only origin/${{ github.base_ref || 'main' }}...HEAD -- live/ \
+            | cut -d/ -f1-3 | sort -u | jq -R . | jq -sc .)
+          echo "roots=$roots" &gt;&gt; "$GITHUB_OUTPUT"      <span class="cm"># e.g. ["live/gol-prod/services"]</span>
+  plan:
+    needs: detect
+    if: needs.detect.outputs.roots != '[]'
+    runs-on: ubuntu-24.04
+    permissions: { contents: read, id-token: write, pull-requests: write }
+    strategy:
+      fail-fast: false
+      matrix:
+        root: ${{ fromJSON(needs.detect.outputs.roots) }}
+    concurrency: { group: "tf-${{ matrix.root }}", cancel-in-progress: false }   <span class="cm"># queue, never cancel</span>
+    defaults:
+      run: { working-directory: "${{ matrix.root }}" }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.13.4, terraform_wrapper: false }
+      - uses: aws-actions/configure-aws-credentials@v5
+        with: { role-to-assume: "${{ vars.TF_PLAN_ROLE }}", aws-region: ap-southeast-1 }
+      - run: terraform init -input=false &amp;&amp; terraform plan -input=false -no-color -out=tfplan</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A sharper version of <code class="inline">detect</code> also maps a change in a local module directory to every root
+        that calls it. Without that, a module change plans nothing and merges untested.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Apply the exact plan that was approved</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The PR plan is evidence for the review, not the thing you apply: by the time you merge, <code class="inline">main</code>
+        may have moved. On merge, plan again, save the plan file as an artifact, and apply that file in a job that is
+        gated by the environment's approval. If state changed in between, Terraform refuses with
+        <code class="inline">Saved plan is stale</code>, which is exactly the behaviour you want.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/.github/workflows/terraform.yml — apply on main</span>
+        <pre class="code">  apply:
+    needs: plan-main                         <span class="cm"># the plan job on push to main uploaded tfplan-&lt;root&gt;</span>
+    runs-on: ubuntu-24.04
+    environment: prod                        <span class="cm"># required reviewers + OIDC sub (CI2)</span>
+    permissions: { contents: read, id-token: write }
+    concurrency: { group: "tf-live/gol-prod/services", cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.13.4, terraform_wrapper: false }
+      - uses: aws-actions/configure-aws-credentials@v5
+        with: { role-to-assume: "${{ vars.TF_APPLY_ROLE }}", aws-region: ap-southeast-1 }
+      - uses: actions/download-artifact@v4
+        with: { name: tfplan-gol-prod-services, path: live/gol-prod/services }
+      - working-directory: live/gol-prod/services
+        run: terraform init -input=false &amp;&amp; terraform apply -input=false tfplan
+<span class="out">Apply complete! Resources: 3 added, 1 changed, 0 destroyed.</span></pre>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>A plan file contains secrets.</strong> Anything sensitive in the
+        configuration (a generated DB password, a token passed as a variable) is stored in clear text inside
+        <code class="inline">tfplan</code>. Upload it with <code class="inline">retention-days: 1</code>, never print it
+        with <code class="inline">terraform show</code> into public logs, and keep the repo private. Better still, keep
+        secrets out of Terraform variables entirely (<a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a>).</div>
+
+      <h3 class="font-semibold text-lg mt-8">Drift detection: find the console changes before the next apply does</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Drift is any difference between the real AWS resources and the last applied configuration: a security group rule
+        added during an incident, an instance resized by hand. Undetected, the next unrelated apply silently reverts it.
+        A nightly job plans every root with <code class="inline">-detailed-exitcode</code>, which returns
+        <strong>0</strong> for no changes, <strong>1</strong> for an error and <strong>2</strong> for changes, and opens an
+        issue for every 2.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/.github/workflows/drift.yml — core step</span>
+        <pre class="code"><span class="kw">on</span>:
+  schedule: [{ cron: <span class="st">"0 22 * * *"</span> }]      <span class="cm"># 05:00 in Vietnam, before anyone deploys</span>
+<span class="cm"># … matrix over all 11 roots, plan role via OIDC …</span>
+      - id: plan
+        run: |
+          set +e
+          terraform plan -input=false -lock=false -detailed-exitcode -no-color &gt; plan.txt
+          echo "code=$?" &gt;&gt; "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.code == '2'
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh issue create --title "Drift in ${{ matrix.root }}" --label drift --body-file plan.txt</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Every drift issue ends one of two ways: codify the change in a PR, or apply to remove it. Track the count. On the
+        clinic estate it went from 9 open drift issues in the first week to 0–1 a month once human prod roles became
+        read-only, which is the number to show a client.
+      </p>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Agents are good at the mechanical parts of Terraform at scale: extracting a module, writing tests, porting a root
+        to a new layout. Give them plan-only credentials in <code class="inline">gol-dev</code> at most, and make
+        "<code class="inline">terraform plan</code> shows 0 to destroy" a stated acceptance criterion.
+      </p>
+      <pre class="code mt-3">Extract the SQS queue + DLQ + alarm in live/gol-dev/services/queues.tf into a module at
+terraform-modules/sqs-queue. Inputs: name, environment, visibility_timeout_seconds,
+max_receive_count, with validation. No provider blocks. Add `moved` blocks in the caller
+so `terraform plan` shows 0 to add, 0 to destroy. Show me the plan output.</pre>
+      <pre class="code mt-3">Write terraform test files for terraform-modules/sqs-queue using mock_provider "aws".
+Cover: name prefixing, DLQ redrive defaults, and each validation rule with expect_failures.
+Run `terraform test` and paste the result.</pre>
+      <pre class="code mt-3">Write a Conftest Rego (v1 syntax) policy that denies any plan where a resource in
+live/*/data is deleted or replaced, and any create without tags_all.owner. Add two
+fixture plan.json files (one passing, one failing) and a `conftest verify` test.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Extract modules and write the <code class="inline">moved</code> blocks</li>
+            <li>Write <code class="inline">.tftest.hcl</code> files and Rego policies with fixtures</li>
+            <li>Generate the matrix and drift workflows from a written spec</li>
+            <li>Summarise a long plan into adds, changes, replaces and destroys per resource type</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The plan summary line yourself, especially every <code class="inline">-/+</code> replace</li>
+            <li>Module sources point at a tag, and version constraints are bounded</li>
+            <li>No <code class="inline">provider</code> block or hard-coded account ID inside a module</li>
+            <li>Backend <code class="inline">key</code> is unique per root: two roots sharing a key overwrite each other</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written Terraform at scale:</strong> a
+        <code class="inline">dynamodb_table</code> in the backend (pre-1.10 habit); <code class="inline">terraform.workspace</code>
+        conditionals for prod; <code class="inline">source = "git::…"</code> with no <code class="inline">?ref=</code>;
+        <code class="inline">version = "&gt;= 5.0"</code> on the AWS provider; <code class="inline">terraform_remote_state</code>
+        reading a whole data-layer state; <code class="inline">-auto-approve</code> on a plan nobody saved; tests that only
+        assert values copied straight from the inputs; and a "fix" for a failing Conftest rule that edits the policy.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has written Terraform only in a single directory with local state.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Uses existing modules and environment directories, but cannot say why state is split the way it is.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Adds resources to the right layer and calls modules at pinned versions. Needs help extracting a module without a destroy, or debugging the pipeline.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Designs and releases a versioned module with tests, places it in the layered layout, splits a state with zero destroys, and runs plan-on-PR / apply-on-merge with Conftest gates and drift detection.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Sets the module catalogue and versioning policy for all client repos, writes the Conftest rules after incidents, and reviews other teams' layouts for blast radius.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> given a single-state repo with
+        VPC, RDS and ECS together, write the plan to split it into three layers, carry it out in a sandbox with
+        <code class="inline">removed</code>/<code class="inline">import</code> blocks showing 0 destroys, and explain to a
+        reviewer which approvals each layer now needs and why.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ The everything module</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A <code class="inline">clinic-platform</code> module that creates the VPC, cluster and database ties their versions and their blast radius together. Compose small modules in the root instead.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Applying from a laptop "just this once"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Local applies skip policy, leave no review trail and use whatever provider version is on that laptop. Make human prod roles read-only so the question never comes up.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Ignoring drift issues</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Ten open drift issues means the next apply will revert ten changes nobody remembers. Treat each one as a ticket with an owner and a deadline.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ prevent_destroy on the data layer</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">lifecycle { prevent_destroy = true }</code> on RDS, buckets and Redis makes a destroy fail at plan time. Combined with the Conftest rule, deleting a database takes two deliberate steps.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Read the plan summary first</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Post <code class="inline">N to add, N to change, N to destroy</code> at the top of the PR comment. A reviewer who sees "1 to destroy" on a tag change stops before reading 400 lines.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="module"> <span>I designed a module with validated inputs, no provider block and useful outputs, and released it with a semver tag.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="layout"> <span>I can explain our directory-per-environment layout and the network / data / services split, and why we do not use workspaces for environments.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tests"> <span>I wrote <code class="inline">terraform test</code> files with a mock provider, including <code class="inline">expect_failures</code> for validation.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="policy"> <span>I wrote a Conftest policy on plan JSON and showed it failing a plan that destroys a data resource.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="pipeline"> <span>I can walk through the plan-on-PR / apply-on-merge workflow, its OIDC roles and its concurrency settings.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="ia2-lab"> <span class="font-semibold">In a sandbox clinic-infra fork, extracted the SQS module with tests, split a combined root into network/data/services with 0 destroys, and wired plan-on-PR, apply-on-merge and nightly drift with Conftest. Shared the PRs, a PR plan comment and one drift issue (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://developer.hashicorp.com/terraform/language/modules/develop" target="_blank" rel="noopener">HashiCorp — Creating modules</a>: structure, composition and when to write a module at all.</li>
+        <li><a class="text-coral underline" href="https://developer.hashicorp.com/terraform/language/tests" target="_blank" rel="noopener">HashiCorp — Tests</a> · <a class="text-coral underline" href="https://developer.hashicorp.com/terraform/language/tests/mocking" target="_blank" rel="noopener">Mocks</a>: the full <code class="inline">.tftest.hcl</code> syntax used in Part III.</li>
+        <li><a class="text-coral underline" href="https://developer.hashicorp.com/terraform/language/backend/s3" target="_blank" rel="noopener">HashiCorp — S3 backend</a>: <code class="inline">use_lockfile</code>, keys and the IAM permissions each operation needs.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws/latest" target="_blank" rel="noopener">Terraform Registry — terraform-aws-modules/vpc</a>: inputs, outputs and the upgrade notes for each major.</li>
+        <li><a class="text-coral underline" href="https://github.com/terraform-linters/tflint-ruleset-aws" target="_blank" rel="noopener">tflint-ruleset-aws</a>: the AWS rules catalogue and how to configure it.</li>
+        <li><a class="text-coral underline" href="https://github.com/open-policy-agent/conftest" target="_blank" rel="noopener">Conftest</a>: testing plan JSON with Rego, including <code class="inline">conftest verify</code> for policy unit tests.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/prescriptive-guidance/latest/terraform-aws-provider-best-practices/introduction.html" target="_blank" rel="noopener">AWS — Terraform AWS Provider best practices</a>: AWS's guidance on layout, state and CI for Terraform.</li>
+      </ul>

@@ -1,0 +1,971 @@
+<!-- meta: days=5 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">GitOps &amp; Progressive Delivery with Argo CD</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          Up to now you have applied manifests yourself, or rendered them with Helm and Kustomize
+          (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>). This module removes you from the
+          deploy path. Git becomes the only way into the cluster, and Argo CD is the controller that keeps the cluster
+          equal to Git. You will lay out <code class="inline">clinic-gitops</code>, write Applications, AppProjects and
+          ApplicationSets for three environments, order a sync with waves and hooks, and then ship
+          <code class="inline">booking-api</code> as an Argo Rollouts canary that promotes or aborts itself based on
+          Prometheus metrics.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> the riskiest moment for <code class="inline">booking-api</code>
+          is not a node failure. It is a deploy. Without GitOps, nobody can say with confidence what is running in
+          <code class="inline">clinic-prod-eks</code>, who changed it, or how to put it back. With GitOps the answer to all
+          three is <code class="inline">git log</code>. With progressive delivery, a bad release reaches 10% of patients for
+          five minutes instead of 100% of them until someone notices. Agents write Argo CD YAML fluently. Whether that YAML
+          prunes your database secret on the next sync is the thing you have to catch.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · GitOps principles</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Git is the only door into the cluster; Argo CD keeps it shut</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        GitOps is the control loop from <a href="./ks1.html" class="text-viol underline decoration-viol/40">KS1</a>
+        applied one level up. A Deployment controller makes Pods match a Deployment. Argo CD makes the whole cluster match
+        a Git repository. The release process (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>)
+        stays the same; what changes is the mechanism: nobody and nothing outside the cluster holds credentials to change
+        it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The four principles, and how teams quietly break them</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The OpenGitOps project defines four principles. They sound obvious. Every one of them gets broken in real teams,
+        usually during an incident, and the breakage is what turns GitOps back into "kubectl with extra steps".
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Principle</th><th class="px-4 py-3">What it means for clinic-prod-eks</th><th class="px-4 py-3">How it gets broken</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Declarative</td><td class="px-4 py-3">Every object in <code class="inline">booking</code> is described as YAML (or Helm/Kustomize that renders to YAML)</td><td class="px-4 py-3">A runbook step says "run <code class="inline">kubectl create secret</code>" and the secret never reaches Git</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Versioned and immutable</td><td class="px-4 py-3"><code class="inline">clinic-gitops</code> history is the deploy log; a release is a commit SHA</td><td class="px-4 py-3">Image tags like <code class="inline">:prod</code> that move under the same commit, so Git no longer says what runs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Pulled automatically</td><td class="px-4 py-3">Argo CD inside the cluster fetches desired state; CI never touches the API server</td><td class="px-4 py-3">A "quick" GitHub Actions job with a prod kubeconfig for hotfixes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Continuously reconciled</td><td class="px-4 py-3">Drift is detected within ~3 minutes and corrected (self-heal)</td><td class="px-4 py-3">Auto-sync turned off "temporarily" in March and still off in September</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The audit question a client's SOC 2 assessor asks (<a href="./se3.html" class="text-viol underline decoration-viol/40">SE3</a>)
+        is "show me every production change in the last quarter and who approved it". With all four principles intact the
+        answer is a filtered list of merged PRs in <code class="inline">clinic-gitops</code>. With one broken, the answer is
+        an afternoon of CloudTrail archaeology.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Pull beats push: CI builds, Argo CD deploys</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        In a push model, the pipeline runs <code class="inline">helm upgrade</code> against the cluster. That means the
+        pipeline holds cluster-admin-ish credentials, the cluster has to accept connections from CI, and the pipeline only
+        corrects drift when someone happens to deploy. In the pull model the pipeline's job ends at a Git commit. The
+        cluster reaches out, never the other way round.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 240" class="w-full min-w-[640px]" role="img" aria-label="Pull-based GitOps: CI builds image and commits a tag to clinic-gitops; Argo CD in the cluster pulls and applies">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">PULL-BASED DELIVERY · CI never holds cluster credentials</text>
+          <g class="anim-pulse"><rect x="15" y="50" width="120" height="50" rx="9" fill="#37474F"/>
+            <text x="75" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">clinic-app</text>
+            <text x="75" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">PR merged to main</text></g>
+          <g class="anim-pulse d1"><rect x="170" y="50" width="130" height="50" rx="9" fill="#2563EB"/>
+            <text x="235" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">GitHub Actions</text>
+            <text x="235" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">build · scan · push 1.8.3</text></g>
+          <g class="anim-pulse d2"><rect x="170" y="150" width="130" height="50" rx="9" fill="#DB2777"/>
+            <text x="235" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ECR (gol-shared)</text>
+            <text x="235" y="186" text-anchor="middle" fill="#ffffffbb" font-size="9">immutable tag</text></g>
+          <g class="anim-pulse d3"><rect x="335" y="50" width="130" height="50" rx="9" fill="#6d5acd"/>
+            <text x="400" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">clinic-gitops</text>
+            <text x="400" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">PR: bump tag → merge</text></g>
+          <rect x="495" y="35" width="215" height="190" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="507" y="54" font-size="11" font-weight="700" fill="#6E6B64">clinic-prod-eks</text>
+          <g class="anim-pulse d4"><rect x="525" y="65" width="155" height="50" rx="9" fill="#D97757"/>
+            <text x="602" y="86" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Argo CD</text>
+            <text x="602" y="101" text-anchor="middle" fill="#ffffffbb" font-size="9">poll 3 min · or webhook</text></g>
+          <g class="anim-pulse d1"><rect x="525" y="155" width="155" height="50" rx="9" fill="#0D9488"/>
+            <text x="602" y="176" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">namespace booking</text>
+            <text x="602" y="191" text-anchor="middle" fill="#ffffffbb" font-size="9">Rollout · Service · HPA</text></g>
+          <line x1="135" y1="75" x2="170" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="235" y1="100" x2="235" y2="150" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="300" y1="75" x2="335" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="525" y1="80" x2="465" y2="78" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="602" y1="115" x2="602" y2="155" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="525" y1="185" x2="300" y2="178" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="415" y="196" text-anchor="middle" font-size="9" fill="#6E6B64">kubelet pulls image</text>
+          <text x="360" y="232" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">every arrow into the cluster starts inside the cluster</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Concern</th><th class="px-4 py-3">Push (CI runs helm/kubectl)</th><th class="px-4 py-3">Pull (Argo CD)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Credentials</td><td class="px-4 py-3">CI role in an access entry with write on the cluster</td><td class="px-4 py-3">CI can only push to <code class="inline">clinic-gitops</code>; no cluster access at all</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Network</td><td class="px-4 py-3">Public endpoint, or self-hosted runners inside the VPC</td><td class="px-4 py-3">Cluster needs outbound HTTPS to GitHub and ECR only</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Drift</td><td class="px-4 py-3">Fixed only on the next deploy</td><td class="px-4 py-3">Detected every 3 minutes, reverted if self-heal is on</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Rollback</td><td class="px-4 py-3">Re-run an old pipeline and hope it is still green</td><td class="px-4 py-3"><code class="inline">git revert</code>; the cluster follows</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Disaster recovery</td><td class="px-4 py-3">Replay many pipelines in the right order</td><td class="px-4 py-3">Terraform installs Argo CD and one root Application; wait ~10 minutes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        That last row is the one to remember. Rebuilding <code class="inline">clinic-prod-eks</code> from nothing during a
+        DR exercise (<a href="./sr3.html" class="text-viol underline decoration-viol/40">SR3</a>) is one Terraform apply:
+        the cluster module in <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a> installs Argo CD
+        and a single root Application pointing at <code class="inline">bootstrap/clinic-prod-eks.yaml</code>, and from
+        that moment everything else comes from <code class="inline">clinic-gitops</code>. Flux is the other mature GitOps
+        controller and works on the same principles; we standardise on Argo CD for its UI and ApplicationSets.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The two-repo split and the <code class="inline">clinic-gitops</code> layout</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Keep application code (<code class="inline">clinic-app</code>) and deployment config
+        (<code class="inline">clinic-gitops</code>) in separate repositories. They change at different rates, need different
+        reviewers (CODEOWNERS, <a href="./fn4.html" class="text-viol underline decoration-viol/40">FN4</a>), and you do not
+        want every README typo fix to trigger a prod reconcile. Inside the GitOps repo, separate <em>what the platform
+        installs</em> from <em>what the app team ships</em>. Our services all deploy the shared
+        <code class="inline">clinic-service</code> Helm chart from ECR (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>),
+        so a service directory holds only values files per environment plus the few manifests the chart does not render.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/ — repository layout</span>
+        <pre class="code">clinic-gitops/
+├── bootstrap/                      <span class="cm"># one root Application per cluster (app-of-apps)</span>
+│   ├── clinic-dev-eks.yaml
+│   ├── clinic-staging-eks.yaml
+│   └── clinic-prod-eks.yaml
+├── projects/                       <span class="cm"># AppProjects: who may deploy what, where</span>
+│   ├── platform.yaml
+│   └── booking.yaml
+├── platform/                       <span class="cm"># add-ons, CODEOWNERS = @golden-owl/platform</span>
+│   ├── argo-rollouts/  external-secrets/  karpenter/  aws-load-balancer-controller/
+├── appsets/
+│   └── booking.yaml                <span class="cm"># ApplicationSet: every service × this cluster's env</span>
+└── apps/                           <span class="cm"># CODEOWNERS = @golden-owl/clinic</span>
+    ├── booking-api/
+    │   ├── values-dev.yaml  values-staging.yaml
+    │   ├── values-prod.yaml        <span class="cm"># input to charts/clinic-service: image tag, resources, route</span>
+    │   └── manifests/{dev,staging,prod}/   <span class="cm"># rollout, analysis, externalsecret, migrate job</span>
+    ├── booking-web/
+    └── booking-worker/</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Three rules keep this layout healthy. Environments are directories on <code class="inline">main</code>, never
+        branches: branch-per-env repos drift apart and merges between them become unreviewable. Promotion is a PR that
+        copies a tag from <code class="inline">values-staging.yaml</code> to <code class="inline">values-prod.yaml</code>. And
+        <code class="inline">main</code> has branch protection with one required reviewer from the owning team, so
+        "who approved this prod change" is answered by GitHub, not by memory.
+      </p>
+      <div class="mt-4 callout callout-info"><strong>Render, don't template at sync time if you can avoid it.</strong> Argo
+        CD renders Helm and Kustomize itself, and for platform add-ons from public charts that is enough. For our own
+        services, CI also runs <code class="inline">helm template</code> with the pinned chart version and
+        <code class="inline">values-prod.yaml</code>, pipes it through <code class="inline">kubeconform</code> on every
+        <code class="inline">clinic-gitops</code> PR and posts the rendered diff as a comment. Reviewers approve the YAML
+        that will actually be applied, not a values file whose effect they have to imagine.</div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Argo CD architecture</div>
+      <h2 class="font-display text-2xl font-bold mt-2">An Application is a pointer from a Git path to a namespace</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Argo CD is a set of controllers and three CRDs: <code class="inline">Application</code>,
+        <code class="inline">AppProject</code> and <code class="inline">ApplicationSet</code>. Everything you configure,
+        including Argo CD's own settings, is a Kubernetes object, so Argo CD can manage itself from the same repo.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The components and what breaks when each one struggles</h3>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 250" class="w-full min-w-[640px]" role="img" aria-label="Argo CD components: repo-server renders manifests, application-controller diffs and syncs, API server serves UI and CLI, ApplicationSet controller generates Applications">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">ARGO CD · namespace argocd</text>
+          <g class="anim-pulse"><rect x="15" y="45" width="120" height="50" rx="9" fill="#37474F"/>
+            <text x="75" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">GitHub</text>
+            <text x="75" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">clinic-gitops</text></g>
+          <g class="anim-pulse d1"><rect x="175" y="45" width="140" height="50" rx="9" fill="#2563EB"/>
+            <text x="245" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">repo-server</text>
+            <text x="245" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">clone · kustomize · helm</text></g>
+          <g class="anim-pulse d2"><rect x="355" y="45" width="160" height="50" rx="9" fill="#D97757"/>
+            <text x="435" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">application-controller</text>
+            <text x="435" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">diff · sync · health</text></g>
+          <g class="anim-pulse d3"><rect x="560" y="45" width="145" height="50" rx="9" fill="#0D9488"/>
+            <text x="632" y="66" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Kubernetes API</text>
+            <text x="632" y="81" text-anchor="middle" fill="#ffffffbb" font-size="9">live state via watch</text></g>
+          <g class="anim-pulse d4"><rect x="175" y="150" width="140" height="50" rx="9" fill="#6d5acd"/>
+            <text x="245" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">applicationset-ctrl</text>
+            <text x="245" y="186" text-anchor="middle" fill="#ffffffbb" font-size="9">generators → Applications</text></g>
+          <g class="anim-pulse d1"><rect x="355" y="150" width="160" height="50" rx="9" fill="#DB2777"/>
+            <text x="435" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">argocd-server</text>
+            <text x="435" y="186" text-anchor="middle" fill="#ffffffbb" font-size="9">UI · CLI · SSO · RBAC</text></g>
+          <g class="anim-pulse d2"><rect x="560" y="150" width="145" height="50" rx="9" fill="#37474F"/>
+            <text x="632" y="171" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">redis</text>
+            <text x="632" y="186" text-anchor="middle" fill="#ffffffbb" font-size="9">cache, not state</text></g>
+          <line x1="135" y1="70" x2="175" y2="70" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="315" y1="70" x2="355" y2="70" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="515" y1="70" x2="560" y2="70" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="245" y1="150" x2="245" y2="95" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <line x1="435" y1="150" x2="435" y2="95" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <line x1="515" y1="175" x2="560" y2="175" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="360" y="235" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">desired state = rendered Git · live state = API watch · the diff between them is the whole product</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Component</th><th class="px-4 py-3">Its job</th><th class="px-4 py-3">Symptom when it struggles</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">argocd-repo-server</td><td class="px-4 py-3">Clones repos, runs Kustomize/Helm, caches rendered manifests</td><td class="px-4 py-3"><code class="inline">ComparisonError: rpc error … context deadline exceeded</code> on big Helm charts; OOMKilled with many apps</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">argocd-application-controller</td><td class="px-4 py-3">Watches live objects, computes diff and health, runs syncs (a StatefulSet, shardable)</td><td class="px-4 py-3">Apps stuck "Refreshing", reconcile queue growing, high CPU with 300+ apps</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">argocd-applicationset-controller</td><td class="px-4 py-3">Turns generators into Application objects</td><td class="px-4 py-3">New service directory appears in Git but no Application is created</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">argocd-server</td><td class="px-4 py-3">UI, CLI and API; SSO via Dex or OIDC; enforces Argo CD RBAC</td><td class="px-4 py-3">UI down, but syncs keep working, because the controller does not depend on it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">redis</td><td class="px-4 py-3">Cache for manifests and app state</td><td class="px-4 py-3">Slow UI after a restart; nothing is lost, it rebuilds from Git and the API</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The bootstrap boundary is fixed: Terraform (<a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>)
+        installs the Argo CD Helm chart and one root Application, and nothing else. The root app-of-apps then installs
+        <code class="inline">platform/argocd</code>, which adopts Argo CD's own release (HA in prod: 2 repo-server replicas,
+        Redis HA), along with every other add-on and the ApplicationSets. After day one, Argo CD upgrades are
+        <code class="inline">clinic-gitops</code> PRs, never Terraform changes; Terraform ignores the chart version after
+        the first install so the two never fight. On a new client, AWS's
+        managed Argo CD capability for EKS is worth evaluating if they want to avoid running it themselves; the
+        Applications you write are identical either way.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">One Argo CD per cluster, or one hub for all of them</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The first design decision on a client is where Argo CD runs. Our default for the clinic platform is <strong>one
+        Argo CD per environment cluster</strong>: <code class="inline">clinic-prod-eks</code> manages only itself, so no
+        credential outside the prod account can change prod. Once a client passes about five clusters, a hub in a
+        management cluster becomes cheaper to operate. The multi-cluster topologies themselves are in
+        <a href="./ks13.html" class="text-viol underline decoration-viol/40">KS13</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Topology</th><th class="px-4 py-3">Right when</th><th class="px-4 py-3">Cost</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Per cluster (our default)</td><td class="px-4 py-3">2–5 clusters, separate AWS accounts per env, strict prod isolation</td><td class="px-4 py-3">N installs to upgrade; ~1.5 GiB memory per install; no single pane of glass</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hub and spoke</td><td class="px-4 py-3">Many clusters, a platform team, a single UI for developers</td><td class="px-4 py-3">The hub's IAM role is effectively admin on every spoke; hub outage freezes all deploys</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Hybrid</td><td class="px-4 py-3">Hub for dev/staging, dedicated Argo CD in prod</td><td class="px-4 py-3">Two patterns to explain; usually the best compromise at 6+ clusters</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>A hub is a high-value target.</strong> In hub-and-spoke, the hub
+        registers each spoke with an IAM role that has an EKS access entry bound to
+        <code class="inline">AmazonEKSClusterAdminPolicy</code>. Anyone who can create an Application in the hub can
+        deploy a privileged Pod to every spoke. If you go hub, AppProjects with tight destinations and SSO-backed Argo CD
+        RBAC are not optional.</div>
+
+      <h3 class="font-semibold text-lg mt-8">The Application: source, destination, policy</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        An Application says three things: <em>where</em> the desired state lives (repos, revisions, paths),
+        <em>where</em> it goes (cluster, namespace), and <em>how</em> to keep them equal (sync policy). Here is the
+        production Application for <code class="inline">booking-api</code>. In practice the ApplicationSet in Part III
+        generates it, but you must be able to read every field of the result. It is a <strong>multi-source</strong>
+        Application: the chart comes from ECR, the values and extra manifests from <code class="inline">clinic-gitops</code>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">booking-api-prod Application (as generated)</span>
+        <pre class="code">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: booking-api-prod
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]   <span class="cm"># delete app = delete its objects</span>
+spec:
+  project: booking                     <span class="cm"># the AppProject guardrails apply</span>
+  sources:
+    - repoURL: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/charts   <span class="cm"># OCI, no oci:// prefix</span>
+      chart: clinic-service
+      targetRevision: 1.5.0            <span class="cm"># chart version pinned per environment</span>
+      helm:
+        releaseName: booking-api
+        valueFiles: [$values/apps/booking-api/values-prod.yaml]
+    - repoURL: https://github.com/golden-owl/clinic-gitops.git
+      targetRevision: main             <span class="cm"># a branch; the SHA it resolves to is recorded per sync</span>
+      ref: values                      <span class="cm"># provides $values above, renders nothing itself</span>
+    - repoURL: https://github.com/golden-owl/clinic-gitops.git
+      targetRevision: main
+      path: apps/booking-api/manifests/prod
+  destination:
+    server: https://kubernetes.default.svc   <span class="cm"># this cluster</span>
+    namespace: booking
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - ServerSideApply=true           <span class="cm"># large CRDs, fewer annotation-size errors</span>
+      - PruneLast=true                 <span class="cm"># delete removed objects only after the rest is healthy</span>
+    retry: { limit: 3, backoff: { duration: 10s, factor: 2, maxDuration: 2m } }
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers: [/spec/replicas]   <span class="cm"># Argo Rollouts scales it to 0 (Part IV)</span></pre>
+      </div>
+      <pre class="code mt-3">argocd app get booking-api-prod
+<span class="out">Name:               argocd/booking-api-prod
+Project:            booking
+Server:             https://kubernetes.default.svc
+Namespace:          booking
+Sources:
+- Repo:             111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/charts
+  Target:           1.5.0
+- Repo:             https://github.com/golden-owl/clinic-gitops.git
+  Target:           main
+  Path:             apps/booking-api/manifests/prod
+Sync Policy:        Automated (Prune)
+Sync Status:        Synced to main (3f9c2ab)
+Health Status:      Healthy</span>
+argocd app diff booking-api-prod --revision 8d41e07     <span class="cm"># preview what a PR head would change</span></pre>
+      <div class="mt-4 callout callout-danger"><strong>Prune deletes what Git no longer mentions.</strong> If a PR
+        renames <code class="inline">manifests/prod</code>, or a chart upgrade stops rendering an object that used to be
+        there, the next sync deletes it. If that object is the <code class="inline">booking-db</code> ExternalSecret, the
+        live Secret goes and
+        <code class="inline">booking-api</code> crash-loops on its next restart. Review the rendered diff for
+        <em>removed</em> objects on every prod PR, and annotate objects that must never be pruned (the namespace, PVCs)
+        with <code class="inline">argocd.argoproj.io/sync-options: Prune=false</code>.</div>
+
+
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The chart source needs credentials. ECR tokens expire after 12 hours, so a static repository Secret works until
+        the next morning and then every sync fails with <code class="inline">401 Unauthorized</code>. We let External
+        Secrets Operator mint a fresh token every 6 hours with its Pod Identity role (allowed to pull from
+        <code class="inline">gol-shared</code>) and write it in the shape Argo CD expects for a repository:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">platform/argocd/repo-ecr-charts.yaml</span>
+        <pre class="code">apiVersion: generators.external-secrets.io/v1alpha1
+kind: ECRAuthorizationToken
+metadata: { name: ecr-gol-shared, namespace: argocd }
+spec: { region: ap-southeast-1 }                 <span class="cm"># caller = ESO's Pod Identity role</span>
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata: { name: repo-ecr-charts, namespace: argocd }
+spec:
+  refreshInterval: 6h                            <span class="cm"># token lives 12 h: refresh at half-life</span>
+  dataFrom:
+    - sourceRef:
+        generatorRef: { apiVersion: generators.external-secrets.io/v1alpha1, kind: ECRAuthorizationToken, name: ecr-gol-shared }
+  target:
+    name: repo-ecr-charts
+    template:
+      metadata: { labels: { argocd.argoproj.io/secret-type: repository } }
+      data:
+        type: helm
+        enableOCI: "true"
+        url: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/charts
+        username: "{{ .username }}"
+        password: "{{ .password }}"</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">AppProject: the guardrail around a team's Applications</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The <code class="inline">default</code> project allows any repo, any cluster, any namespace and any kind,
+        including ClusterRoles. Never use it for workloads. An AppProject per team restricts where its Applications may
+        pull from and deploy to, which cluster-scoped kinds they may create, and when they may sync. This is where the
+        app team's freedom ends and the platform team's begins.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">projects/booking.yaml</span>
+        <pre class="code">apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: { name: booking, namespace: argocd }
+spec:
+  sourceRepos:
+    - https://github.com/golden-owl/clinic-gitops.git
+    - 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/charts     <span class="cm"># the clinic-service chart</span>
+  destinations:
+    - { server: https://kubernetes.default.svc, namespace: booking }   <span class="cm"># one namespace, nothing else</span>
+  clusterResourceWhitelist: []          <span class="cm"># no Namespaces, ClusterRoles, CRDs, webhooks</span>
+  namespaceResourceBlacklist:
+    - { group: "", kind: ResourceQuota } <span class="cm"># the platform sets quotas, not the app team</span>
+  syncWindows:
+    - kind: deny                        <span class="cm"># no automated prod syncs during Friday-evening peak</span>
+      schedule: "0 17 * * 5"
+      duration: 4h
+      applications: ["*-prod"]
+      manualSync: true                  <span class="cm"># humans can still sync a hotfix</span>
+  roles:
+    - name: deployer
+      policies: ["p, proj:booking:deployer, applications, sync, booking/*, allow"]
+      groups: [golden-owl:clinic-oncall] <span class="cm"># SSO group from IAM Identity Center</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Test the guardrail rather than trusting it. Add a ClusterRole to a booking overlay on a branch, point a test
+        Application at it, and confirm the sync fails with
+        <span class="out">resource rbac.authorization.k8s.io:ClusterRole is not permitted in project booking</span>.
+        Argo CD 3.x also tightened defaults that 2.x users relied on: <code class="inline">update</code> and
+        <code class="inline">delete</code> permissions no longer imply the same on an Application's child resources, and
+        tracking now uses the <code class="inline">argocd.argoproj.io/tracking-id</code> annotation instead of a label.
+        Read the 2.x→3.x upgrade notes before migrating a client.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Sync status and health status are two different questions</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Sync status</strong> answers "does live equal Git?". <strong>Health status</strong> answers "is what is
+        live actually working?". An app can be Synced and Degraded (Git says image 1.8.3, and 1.8.3 crash-loops), or
+        OutOfSync and Healthy (someone scaled it by hand). Alerts and pipelines need both.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">State</th><th class="px-4 py-3">Means</th><th class="px-4 py-3">First thing to check</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">OutOfSync</td><td class="px-4 py-3">Live differs from rendered Git</td><td class="px-4 py-3"><code class="inline">argocd app diff</code>: a pending commit, or drift from a manual change or a mutating webhook</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Unknown + ComparisonError</td><td class="px-4 py-3">Argo CD could not render or compare</td><td class="px-4 py-3">The app's conditions: Kustomize error, Helm error, repo auth</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Progressing</td><td class="px-4 py-3">A rollout is under way, or a Rollout is paused at a canary step</td><td class="px-4 py-3">Normal for minutes; alert if it lasts longer than <code class="inline">progressDeadlineSeconds</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Degraded</td><td class="px-4 py-3">A resource reports failure: crash-looping Pods, failed Job, aborted Rollout</td><td class="px-4 py-3">The KS11 ladder on the degraded resource</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Missing</td><td class="px-4 py-3">In Git, not in the cluster</td><td class="px-4 py-3">Sync never ran: auto-sync off, a sync window, or an RBAC denial</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Suspended</td><td class="px-4 py-3">Intentionally paused (CronJob suspended, Rollout paused)</td><td class="px-4 py-3">Who paused it and whether they meant to leave it</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Argo CD exports <code class="inline">argocd_app_info{sync_status, health_status}</code> to Prometheus. Our standard
+        alert fires when any <code class="inline">*-prod</code> app is not Healthy for 15 minutes, or OutOfSync for 30
+        minutes with auto-sync enabled, which almost always means a sync is failing on every retry.
+      </p>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Sync mechanics at scale</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Order the sync with waves, then stop writing Applications by hand</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        One Application for one service is easy. Three services in three environments, plus a dozen platform add-ons that
+        must install in order, is where teams either build a clean structure or drown in copy-pasted YAML. This Part covers
+        how a single sync is ordered, how many Applications are generated, and how new image tags reach Git.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Choose sync policy per environment, on purpose</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Automated sync is not all-or-nothing. Three switches matter: <code class="inline">automated</code> (sync when Git
+        changes), <code class="inline">prune</code> (delete objects removed from Git) and
+        <code class="inline">selfHeal</code> (revert live changes nobody committed). Our defaults:
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Environment</th><th class="px-4 py-3">automated</th><th class="px-4 py-3">prune</th><th class="px-4 py-3">selfHeal</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">dev</td><td class="px-4 py-3">yes</td><td class="px-4 py-3">yes</td><td class="px-4 py-3">no</td><td class="px-4 py-3">Engineers may experiment live for an hour; Git wins at the next commit</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">staging</td><td class="px-4 py-3">yes</td><td class="px-4 py-3">yes</td><td class="px-4 py-3">yes</td><td class="px-4 py-3">Must behave exactly like prod so promotion tests mean something</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">prod</td><td class="px-4 py-3">yes</td><td class="px-4 py-3">yes, with <code class="inline">PruneLast</code></td><td class="px-4 py-3">yes</td><td class="px-4 py-3">The PR review is the approval; a human clicking Sync adds delay, not safety</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">platform add-ons</td><td class="px-4 py-3">yes</td><td class="px-4 py-3">no</td><td class="px-4 py-3">yes</td><td class="px-4 py-3">Pruning a CRD deletes every custom resource of that kind (KS12)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        "Manual sync in prod for safety" is the most common objection from clients. The answer: the safety is in the PR
+        review, the rendered diff and the canary in Part IV. Manual sync adds a step that people skip at 2 a.m., and the
+        hotfix then lands as a <code class="inline">kubectl edit</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Sync waves and hooks: migrations before code</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Inside one sync, Argo CD applies objects in <strong>phases</strong> (PreSync → Sync → PostSync) and, within a
+        phase, in <strong>waves</strong> ordered by the <code class="inline">argocd.argoproj.io/sync-wave</code> annotation
+        (default 0, negatives allowed). It waits for each wave to be healthy before starting the next. For
+        <code class="inline">booking-api</code> that gives us: secrets first, then the database migration, then the new
+        code, then a smoke test.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant G as Git commit 3f9c2ab
+    participant A as Argo CD controller
+    participant K as clinic-prod-eks
+    G->>A: tag 1.8.3 in values-prod.yaml
+    A->>K: wave -1: ExternalSecret booking-db
+    K-->>A: Secret synced (healthy)
+    A->>K: PreSync hook: Job migrate-1-8-3
+    K-->>A: Job Complete (expand-only migration)
+    A->>K: wave 0: ConfigMap, Service, Rollout booking-api
+    K-->>A: Rollout Progressing → canary steps (Part IV)
+    A->>K: PostSync hook: Job smoke-test
+    Note over A,K: a failed hook stops the sync<br/>later waves never apply
+        </pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">apps/booking-api/manifests/prod/migrate-job.yaml</span>
+        <pre class="code">apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: migrate-                <span class="cm"># a new Job name per sync</span>
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  backoffLimit: 0                        <span class="cm"># a failed migration must not retry blindly</span>
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: booking-migrate    <span class="cm"># Pod Identity role with DB access only (KS7)</span>
+      containers:
+        - name: migrate
+          image: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-api:1.8.3
+          command: ["./bin/migrate", "up"]
+          envFrom: [{ secretRef: { name: booking-db } }]</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>The migration runs before the canary, so it runs for 100% of
+        traffic.</strong> A PreSync migration that drops a column breaks the <em>stable</em> version still serving 90% of
+        requests. Migrations in a GitOps pipeline must be expand-only, with the contract step shipped in a later release
+        (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>). A canary protects you from bad
+        code, never from a bad schema change.</div>
+
+      <h3 class="font-semibold text-lg mt-8">App-of-apps for the platform, ApplicationSets for the services</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>App-of-apps</strong> is an Application whose path contains other Application manifests. It is ideal for
+        bootstrapping: one root per cluster that installs the platform add-ons in waves (CRDs, then controllers, then
+        configuration). <strong>ApplicationSet</strong> is a template plus generators that stamps out Applications. It is
+        ideal for "every service, in this environment" because adding a service becomes adding a values file.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">appsets/booking.yaml — in clinic-prod-eks</span>
+        <pre class="code">apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata: { name: booking, namespace: argocd }
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]   <span class="cm"># a typo fails loudly instead of rendering ""</span>
+  generators:
+    - git:
+        repoURL: https://github.com/golden-owl/clinic-gitops.git
+        revision: main
+        files:
+          - path: apps/*/values-prod.yaml     <span class="cm"># one Application per service with a prod values file</span>
+  syncPolicy:
+    preserveResourcesOnDeletion: true       <span class="cm"># deleting the AppSet must not delete workloads</span>
+  template:
+    metadata:
+      name: '{{ .path.basename }}-prod'          <span class="cm"># booking-api-prod</span>
+    spec:
+      project: booking
+      sources:
+        - { repoURL: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/charts, chart: clinic-service,
+            targetRevision: 1.5.0, helm: { releaseName: '{{ .path.basename }}',
+            valueFiles: ['$values/{{ .path.path }}/values-prod.yaml'] } }
+        - { repoURL: https://github.com/golden-owl/clinic-gitops.git, targetRevision: main, ref: values }
+        - { repoURL: https://github.com/golden-owl/clinic-gitops.git, targetRevision: main,
+            path: '{{ .path.path }}/manifests/prod' }
+      destination: { server: https://kubernetes.default.svc, namespace: booking }
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }
+        syncOptions: [ServerSideApply=true, PruneLast=true]</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On a hub, the same template becomes a <code class="inline">matrix</code> of a <code class="inline">clusters</code>
+        generator (selecting spokes by an <code class="inline">env</code> label on the cluster Secret) and the Git files
+        generator. The structure below is what the hub variant produces for the clinic platform:
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    AS["ApplicationSet booking<br/>matrix generator"] --> C["clusters: env in<br/>dev · staging · prod"]
+    AS --> D["git files:<br/>apps/*/values-ENV.yaml"]
+    C --> X(("3 × 3"))
+    D --> X
+    X --> A1["booking-api-dev"]
+    X --> A2["booking-web-dev"]
+    X --> A3["…"]
+    X --> A9["booking-worker-prod"]
+    A9 --> P["clinic-prod-eks<br/>namespace booking"]
+        </pre>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>An ApplicationSet edit is a change to every Application it owns, at
+        once.</strong> A bad template change (wrong <code class="inline">path</code>, wrong
+        <code class="inline">destination</code>) can make nine Applications prune their resources in the same minute.
+        Keep <code class="inline">preserveResourcesOnDeletion: true</code>, consider the
+        <code class="inline">RollingSync</code> strategy so dev updates before prod, and review AppSet PRs with
+        <code class="inline">argocd appset generate appsets/booking.yaml</code> to see the Applications it would render.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Getting new image tags into Git</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Something has to write <code class="inline">booking-api:1.8.3</code> into <code class="inline">clinic-gitops</code>.
+        There are two mature options. <strong>Argo CD Image Updater</strong> watches ECR and commits new tags matching a
+        rule back to Git; it is convenient for dev, where every merge should deploy. For staging and prod we prefer the
+        <strong>CI opens a PR</strong> pattern: the commit is created by the pipeline that built and scanned the image
+        (<a href="./ci4.html" class="text-viol underline decoration-viol/40">CI4</a>), so the PR links back to the build,
+        and the prod bump gets a human review.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/.github/workflows/release.yml — promote step</span>
+        <pre class="code">  promote-staging:
+    needs: build                                <span class="cm"># image pushed, scanned, signed</span>
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2  <span class="cm"># short-lived token, scoped to one repo</span>
+        id: app
+        with:
+          app-id: ${{ vars.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_KEY }}
+          owner: golden-owl
+          repositories: clinic-gitops
+      - uses: actions/checkout@v5
+        with: { repository: golden-owl/clinic-gitops, token: "${{ steps.app.outputs.token }}" }
+      - name: Bump tag and open PR
+        env: { GH_TOKEN: "${{ steps.app.outputs.token }}", TAG: "${{ needs.build.outputs.tag }}" }
+        run: |
+          yq -i '.image.tag = strenv(TAG)' apps/booking-api/values-staging.yaml
+          git switch -c "promote/booking-api-$TAG"
+          git commit -am "deploy(booking-api): $TAG to staging"
+          git push -u origin HEAD
+          gh pr create --fill --label auto-merge     <span class="cm"># staging auto-merges; prod PRs need review</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two details matter. Tags are immutable semver tags (the chart's values schema rejects anything else, KS9), with ECR
+        tag immutability on <code class="inline">clinic/*</code>, so a commit in
+        Git always means the same bytes. And the token comes from a GitHub App scoped to <code class="inline">clinic-gitops</code>,
+        not a personal access token that leaves with the engineer who created it.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Secrets in GitOps: commit the reference, never the value</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "Everything in Git" stops at secret values. The standard pattern is to commit an <code class="inline">ExternalSecret</code>
+        that names a Secrets Manager entry, and let External Secrets Operator create the Kubernetes Secret in the cluster.
+        The operator's install and Pod Identity wiring are in <a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>;
+        rotation and Secrets Manager itself are in <a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">apps/booking-api/manifests/prod/externalsecret.yaml</span>
+        <pre class="code">apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: booking-db
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"          <span class="cm"># exists before the migration hook runs</span>
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { kind: ClusterSecretStore, name: aws-secrets-manager }
+  target: { name: booking-db, creationPolicy: Owner }
+  dataFrom:
+    - extract: { key: clinic/prod/booking-db }   <span class="cm"># JSON keys become Secret keys</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Approach</th><th class="px-4 py-3">What is in Git</th><th class="px-4 py-3">Verdict</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">External Secrets Operator</td><td class="px-4 py-3">A pointer to Secrets Manager</td><td class="px-4 py-3">Our default: rotation and audit stay in AWS</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Secrets Store CSI driver</td><td class="px-4 py-3">A SecretProviderClass</td><td class="px-4 py-3">Fine when the app reads files and must avoid K8s Secrets entirely</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Sealed Secrets / SOPS</td><td class="px-4 py-3">Encrypted ciphertext</td><td class="px-4 py-3">Acceptable for non-AWS clients; key management and rotation become your problem</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Argo CD Helm values / plugins injecting values</td><td class="px-4 py-3">Nothing, but the rendered Secret sits in the repo-server cache</td><td class="px-4 py-3">Avoid: Argo CD's own docs discourage it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Base64 in a Secret manifest</td><td class="px-4 py-3">The secret, encoded, not encrypted</td><td class="px-4 py-3">Never. Treat it as a leaked credential and rotate</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Progressive delivery</div>
+      <h2 class="font-display text-2xl font-bold mt-2">A canary is only safe if a metric can stop it</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        A Deployment rolling update (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>) checks
+        one thing: are the new Pods Ready? A release that is Ready but returns 500 on <code class="inline">POST /bookings</code>
+        rolls out to every replica within a minute. <strong>Argo Rollouts</strong> takes over the Deployment with a
+        <code class="inline">Rollout</code> that shifts traffic in steps and queries your metrics between them. The release
+        strategies themselves (canary, blue/green, shadow) are compared in
+        <a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>; here we implement them.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">A canary with real traffic splitting at the Gateway</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Without a traffic router, a canary's weight is approximated by replica count: 1 canary Pod out of 10 is "10%".
+        <code class="inline">booking-api</code> is exposed through an HTTPRoute on the shared
+        <code class="inline">clinic-public</code> Gateway, which the AWS Load Balancer Controller turns into ALB rules
+        (<a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>). The Rollouts Gateway API plugin
+        edits the weights on that HTTPRoute's two backends, so the ALB sends an exact share to the canary target group
+        however many Pods each side has. Rollouts adds a hash selector to the stable and canary Services so each sees only
+        its own Pods.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Because the chart renders a Deployment, the Rollout uses <code class="inline">workloadRef</code>: it borrows the
+        Deployment's Pod template and scales the Deployment to zero as it takes over. Two chart values in
+        <code class="inline">values-prod.yaml</code> wire it up (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>):
+        <code class="inline">autoscaling.targetKind: Rollout</code> points the HPA at the Rollout instead of the
+        Deployment, and <code class="inline">route.canaryService: booking-api-canary</code> adds the canary Service as a
+        second HTTPRoute backend at weight 0.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">apps/booking-api/manifests/prod/rollout.yaml</span>
+        <pre class="code">apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: { name: booking-api }
+spec:
+  workloadRef:                              <span class="cm"># Pod template from the chart's Deployment</span>
+    apiVersion: apps/v1
+    kind: Deployment
+    name: booking-api
+    scaleDown: progressively                <span class="cm"># Deployment shrinks as the Rollout becomes ready</span>
+  revisionHistoryLimit: 5
+  strategy:
+    canary:
+      stableService: booking-api-stable
+      canaryService: booking-api-canary
+      trafficRouting:
+        plugins:
+          argoproj-labs/gateway-api:
+            httpRoute: booking-api          <span class="cm"># rendered by clinic-service, parent Gateway clinic-public</span>
+            namespace: booking
+      analysis:                             <span class="cm"># background analysis for the whole rollout</span>
+        templates: [{ templateName: booking-api-success-rate }]
+        startingStep: 1
+        args: [{ name: canary-svc, value: booking-api-canary }]
+      steps:
+        - setWeight: 5
+        - pause: { duration: 5m }
+        - setWeight: 25
+        - pause: { duration: 10m }
+        - setWeight: 50
+        - pause: { duration: 10m }          <span class="cm"># then 100% and the old ReplicaSet scales down</span></pre>
+      </div>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 220" class="w-full min-w-[640px]" role="img" aria-label="Canary timeline: 5 percent, 25 percent, 50 percent, 100 percent with analysis running throughout and abort path back to stable">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">CANARY booking-api 1.8.2 → 1.8.3 · ~25 minutes · analysis every 1 min</text>
+          <g class="anim-pulse"><rect x="20" y="50" width="120" height="50" rx="9" fill="#2563EB"/>
+            <text x="80" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">5% · 5 min</text>
+            <text x="80" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">~3 req/s to canary</text></g>
+          <g class="anim-pulse d1"><rect x="195" y="50" width="120" height="50" rx="9" fill="#6d5acd"/>
+            <text x="255" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">25% · 10 min</text>
+            <text x="255" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">enough for p99</text></g>
+          <g class="anim-pulse d2"><rect x="370" y="50" width="120" height="50" rx="9" fill="#0D9488"/>
+            <text x="430" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">50% · 10 min</text>
+            <text x="430" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">peak-hour shape</text></g>
+          <g class="anim-pulse d3"><rect x="545" y="50" width="150" height="50" rx="9" fill="#37474F"/>
+            <text x="620" y="71" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">100% · promoted</text>
+            <text x="620" y="86" text-anchor="middle" fill="#ffffffbb" font-size="9">1.8.3 becomes stable</text></g>
+          <line x1="140" y1="75" x2="195" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="315" y1="75" x2="370" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="490" y1="75" x2="545" y2="75" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <rect x="20" y="125" width="470" height="26" rx="6" fill="none" stroke="#D97757" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <text x="255" y="142" text-anchor="middle" font-size="10" fill="#6E6B64">AnalysisRun: success rate ≥ 99% and p99 &lt; 400 ms, failureLimit 2</text>
+          <g class="anim-pulse d4"><rect x="195" y="168" width="200" height="40" rx="9" fill="#DB2777"/>
+            <text x="295" y="186" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Abort → 0% canary</text>
+            <text x="295" y="199" text-anchor="middle" fill="#ffffffbb" font-size="9">within one analysis interval</text></g>
+          <line x1="255" y1="151" x2="275" y2="168" stroke="#DB2777" stroke-width="2" class="anim-flow"/>
+          <text x="600" y="190" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">worst case: 5% of traffic, ~2 minutes</text>
+        </svg>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Size the first step from your traffic, not by habit. At about 60 requests per second in peak hours, 5% sends the
+        canary roughly 3 requests per second, which gives an AnalysisRun around 180 samples per minute: enough to see a
+        2% error rate. A low-traffic internal service at 2 req/s would need minutes at 25% to say anything at all, and a
+        blue/green with a manual smoke test is often the better choice there.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">AnalysisTemplate: turning an SLI into a gate</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The analysis is the part that makes progressive delivery worth its complexity. It should measure the same SLI your
+        SLO measures (<a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a>), scoped to the canary's
+        traffic only. PromQL itself is taught in <a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">apps/booking-api/manifests/prod/analysis-template.yaml</span>
+        <pre class="code">apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata: { name: booking-api-success-rate }
+spec:
+  args: [{ name: canary-svc }]
+  metrics:
+    - name: success-rate
+      interval: 1m
+      count: 0                         <span class="cm"># keep measuring until the rollout ends</span>
+      failureLimit: 2                  <span class="cm"># 3 bad minutes = abort; 1 blip is tolerated</span>
+      successCondition: result[0] &gt;= 0.99
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring:9090
+          query: |
+            sum(rate(http_server_requests_total{service="{{args.canary-svc}}",code!~"5.."}[2m]))
+            /
+            sum(rate(http_server_requests_total{service="{{args.canary-svc}}"}[2m]))
+    - name: p99-latency
+      interval: 1m
+      failureLimit: 2
+      successCondition: result[0] &lt; 0.4
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring:9090
+          query: |
+            histogram_quantile(0.99, sum by (le) (rate(
+              http_server_request_duration_seconds_bucket{service="{{args.canary-svc}}"}[2m])))</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>An empty query result is not a pass.</strong> If the metric name is
+        wrong or the canary has no traffic yet, Prometheus returns an empty vector and the measurement errors out. After
+        <code class="inline">consecutiveErrorLimit</code> (default 4) errors the run fails, which is what you want, but
+        only if someone has actually tested it. Break the query on purpose in staging once and confirm the rollout
+        aborts. An analysis that has never failed has never been tested.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Blue/green for the frontend</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">booking-web</code> serves Next.js assets whose hashed filenames change between versions. A
+        user whose HTML came from v2 and whose JavaScript request lands on v1 gets a broken page, so a mixed-version canary
+        is a bad fit. Blue/green runs the full new version beside the old one, exposes it on a preview Service for
+        checks, then switches all traffic at once.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">apps/booking-web/manifests/prod/rollout.yaml — strategy only</span>
+        <pre class="code">  strategy:
+    blueGreen:
+      activeService: booking-web            <span class="cm"># what app.clinic.example.com points at</span>
+      previewService: booking-web-preview   <span class="cm"># preview.app.clinic.example.com, VPN only</span>
+      autoPromotionEnabled: false           <span class="cm"># prod: a human promotes after the smoke test</span>
+      prePromotionAnalysis:
+        templates: [{ templateName: web-smoke }]   <span class="cm"># a Job running Playwright against preview</span>
+      scaleDownDelaySeconds: 600            <span class="cm"># keep blue 10 min for instant switch-back</span></pre>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Service</th><th class="px-4 py-3">Strategy</th><th class="px-4 py-3">Reason</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">booking-api</td><td class="px-4 py-3">Canary, ALB weights, Prometheus analysis</td><td class="px-4 py-3">Stateless HTTP, enough traffic for statistics, versions are wire-compatible</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">booking-web</td><td class="px-4 py-3">Blue/green, pre-promotion smoke test</td><td class="px-4 py-3">Asset hashes make mixed versions break pages</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">booking-worker</td><td class="px-4 py-3">Plain Deployment rolling update</td><td class="px-4 py-3">No HTTP traffic to split; queue consumers are idempotent (SQS DLQ catches poison messages)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Operating a rollout, and rolling back the GitOps way</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Install the <code class="inline">kubectl argo rollouts</code> plugin and learn four verbs: get, promote, abort,
+        retry. Remember that Argo CD shows a paused Rollout as <em>Suspended</em> and a running canary as
+        <em>Progressing</em>; both are normal.
+      </p>
+      <pre class="code mt-3">kubectl argo rollouts get rollout booking-api -n booking
+<span class="out">Name:            booking-api
+Namespace:       booking
+Status:          ॥ Paused
+Message:         CanaryPauseStep
+Strategy:        Canary
+  Step:          3/6
+  SetWeight:     25
+  ActualWeight:  25
+Images:          …/clinic/booking-api:1.8.2 (stable)
+                 …/clinic/booking-api:1.8.3 (canary)
+Replicas:
+  Desired:       6
+  Current:       8
+  Updated:       2
+  Ready:         8</span>
+kubectl argo rollouts abort booking-api -n booking     <span class="cm"># 0% canary now; Rollout shows Degraded</span>
+kubectl argo rollouts promote booking-api -n booking   <span class="cm"># skip the current pause</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Situation</th><th class="px-4 py-3">Do this</th><th class="px-4 py-3">Not this</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Canary in progress looks bad</td><td class="px-4 py-3"><code class="inline">rollouts abort</code>, then <code class="inline">git revert</code> the tag bump</td><td class="px-4 py-3">Leaving the abort in place; the next sync retries the same bad tag</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Fully promoted release is bad</td><td class="px-4 py-3"><code class="inline">git revert</code> → a new canary of the old version (or <code class="inline">rollouts undo</code> plus revert, if minutes matter)</td><td class="px-4 py-3"><code class="inline">argocd app rollback</code>: it disables auto-sync and leaves Git lying</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Analysis aborted a good release</td><td class="px-4 py-3">Fix the query or threshold in Git, then <code class="inline">rollouts retry</code></td><td class="px-4 py-3">Deleting the AnalysisTemplate "for now"</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The rule underneath all three rows: the cluster may be put right by hand in an emergency, but Git must say the same
+        thing within minutes. If Git and the cluster disagree after an incident, the next unrelated commit redeploys the
+        bad version.
+      </p>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Claude Code is fast at writing Applications, ApplicationSets and Rollouts, and at reading a rendered diff. Run it
+        inside a clone of <code class="inline">clinic-gitops</code> with no cluster credentials at all: its output is a PR,
+        and Argo CD does the deploying. That is the GitOps guardrail working in your favour.
+      </p>
+      <pre class="code mt-3">In clinic-gitops, add an Argo Rollouts canary for booking-api in apps/booking-api/manifests/prod:
+workloadRef to the clinic-service Deployment, Gateway API plugin on HTTPRoute booking-api,
+stable/canary Services. Do not change the chart or values except the two rollout values. Add an
+AnalysisTemplate for success rate &gt;= 99% using the
+metric http_server_requests_total. Show me the `argocd app diff booking-api-prod` output only.</pre>
+      <pre class="code mt-3">Run `argocd appset generate appsets/booking.yaml` output (pasted below) against the
+current Application list. List every Application that would be created, changed or
+deleted, and flag any change to destination, project or prune settings.</pre>
+      <pre class="code mt-3">Review this clinic-gitops PR diff. For every Kubernetes object that disappears from the
+rendered output, tell me whether prune will delete it in prod and what depends on it.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft Applications, AppProjects and ApplicationSets from the repo layout</li>
+            <li>Wrap chart Deployments in Rollouts and write AnalysisTemplates</li>
+            <li>Summarise rendered diffs, especially removed objects</li>
+            <li>Write the CI step that bumps tags and opens PRs</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The <code class="inline">project</code> is never <code class="inline">default</code> and destinations are narrow</li>
+            <li>Which objects prune would delete, in every environment</li>
+            <li>The analysis query returns data for the canary Service, and fails when broken</li>
+            <li>Migrations in PreSync hooks are expand-only</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written GitOps:</strong>
+        <code class="inline">project: default</code>; <code class="inline">targetRevision: HEAD</code> on a repo with
+        several branches; <code class="inline">clusterResourceWhitelist: [{group: '*', kind: '*'}]</code>; a
+        <code class="inline">kind: Secret</code> with <code class="inline">data:</code> committed; image tags like
+        <code class="inline">latest</code> or <code class="inline">main</code>; an ApplicationSet without
+        <code class="inline">preserveResourcesOnDeletion</code>; an AnalysisTemplate whose metric name does not exist; a
+        CI job that runs <code class="inline">argocd app sync</code> or <code class="inline">kubectl apply</code> against
+        prod; and "fix by <code class="inline">argocd app rollback</code>" advice.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Deploys by running <code class="inline">helm upgrade</code> or <code class="inline">kubectl apply</code> from a laptop or pipeline.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can explain pull vs push and find an app in the Argo CD UI, but cannot say why it is OutOfSync.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Ships changes through <code class="inline">clinic-gitops</code> PRs and reads sync and health status. Needs help with waves, ApplicationSets and a stuck canary.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Writes Applications, AppProjects and ApplicationSets for a new service across three environments, orders a sync with waves and hooks, runs a canary with a tested analysis gate, and rolls back by Git without leaving drift.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Designs the GitOps topology for a client (per-cluster vs hub), sets the repo and promotion conventions, owns Argo CD upgrades, and talks a client out of manual prod syncs with evidence.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> starting from an empty
+        cluster that Terraform has just bootstrapped with Argo CD and the root Application, have <code class="inline">booking-api</code> running from
+        <code class="inline">clinic-gitops</code> without any other manual apply. Then ship a release whose error rate is
+        5% and show the AnalysisRun aborting it, followed by the revert commit that returned Git to the stable tag.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Branch per environment</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">dev</code>, <code class="inline">staging</code> and <code class="inline">prod</code> branches drift within weeks, and promotion becomes a merge nobody can review. Use overlay directories on one branch and promote by PR.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Fighting the HPA</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A <code class="inline">replicas:</code> field in Git plus an HPA plus self-heal means Argo CD and the HPA take turns resizing the workload. Drop <code class="inline">replicas</code> from the manifest or add it to <code class="inline">ignoreDifferences</code>.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Rollback with the Argo CD button</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">argocd app rollback</code> turns auto-sync off and leaves Git pointing at the bad version. The next person to re-enable sync redeploys it. Revert in Git instead.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Webhooks instead of polling</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A GitHub webhook to <code class="inline">argocd-server</code> cuts the time from merge to sync from up to 3 minutes to a few seconds, and lowers GitHub API usage when you have many apps.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Notifications on health, not on sync</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Configure Argo CD Notifications to post to Slack on <code class="inline">on-health-degraded</code> and <code class="inline">on-sync-failed</code> for prod apps. "Sync succeeded" messages train people to ignore the channel.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="principles"> <span>I can explain the four GitOps principles and the push vs pull trade-off, including what credentials each model puts where.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="app-project"> <span>I wrote an Application and an AppProject that rejects a ClusterRole, and showed the rejected sync.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="waves"> <span>I ordered a sync with an ExternalSecret in wave -1 and a PreSync migration Job, and can explain why the migration must be expand-only.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="appset"> <span>I generated Applications for three services in one environment with an ApplicationSet and reviewed its output with <code class="inline">argocd appset generate</code>.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="canary-lab"> <span class="font-semibold">On a dev cluster, bootstrapped Argo CD from clinic-gitops, shipped booking-api as a Gateway-weighted canary with a Prometheus AnalysisTemplate, deliberately released a version returning 5% errors, and captured the aborted AnalysisRun plus the revert PR that restored the stable tag (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://argo-cd.readthedocs.io/en/stable/user-guide/multiple_sources/" target="_blank" rel="noopener">Argo CD — Multiple sources for an Application</a>: the chart-from-ECR plus values-from-Git pattern in Part II.</li>
+        <li><a class="text-coral underline" href="https://argo-cd.readthedocs.io/en/stable/user-guide/sync-waves/" target="_blank" rel="noopener">Argo CD — Sync phases and waves</a>: hook types, delete policies and wave ordering.</li>
+        <li><a class="text-coral underline" href="https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/" target="_blank" rel="noopener">Argo CD — ApplicationSet controller</a>: every generator, Go templating and the RollingSync strategy.</li>
+        <li><a class="text-coral underline" href="https://argo-cd.readthedocs.io/en/stable/operator-manual/upgrading/2.14-3.0/" target="_blank" rel="noopener">Argo CD — Upgrading 2.14 to 3.0</a>: the RBAC and tracking changes to check before migrating a client.</li>
+        <li><a class="text-coral underline" href="https://github.com/argoproj-labs/rollouts-plugin-trafficrouter-gatewayapi" target="_blank" rel="noopener">argoproj-labs — Rollouts Gateway API plugin</a>: the HTTPRoute weight wiring used in Part IV.</li>
+        <li><a class="text-coral underline" href="https://github.com/argoproj/argo-rollouts/blob/master/docs/features/analysis.md" target="_blank" rel="noopener">Argo Rollouts — Analysis and progressive delivery</a>: AnalysisTemplate fields, failure limits and providers.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/best-practices/introduction.html" target="_blank" rel="noopener">AWS — EKS Best Practices Guide</a>: cluster-level guidance that the GitOps repo should encode.</li>
+      </ul>
