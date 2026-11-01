@@ -682,6 +682,201 @@ sequenceDiagram
         officer and the backend lead know things you do not.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Review a risky infra PR from its plan, then write the RFC</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will review a colleague's pull request against the <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>
+        stack the way Part III teaches: plan first, blast radius before style, every comment labelled. The PR description
+        says "no downtime". The plan says otherwise. Then you fix the PR as its author should have written it, and write an
+        RFC for a real-shaped decision (ECS or EKS for a new client) that passes a structural check before any human
+        reads it.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A labelled review that names every replacement in the plan, a fixed PR whose plan destroys only what it should, and an RFC that passes <code class="inline">rfc-check.sh</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">3–4 hours, half of it writing the RFC</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code> (plan only), plus local Git</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">About USD 0.06 per hour while the CN1 stack is up. You never apply the PR</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">Terraform, AWS CLI, <code class="inline">jq</code>, <code class="inline">git</code>; the CN1 stack and its local state in <code class="inline">~/labs/cn1</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up, and put the CN1 stack under Git.</strong> A plan needs real state to compare against. If you
+        destroyed CN1, re-run its steps 2 and 6 first (push the image, apply).
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login
+export REPO=888899990000.dkr.ecr.ap-southeast-1.amazonaws.com/lab-$ME/booking-api
+mkdir -p ~/labs/ar5 &amp;&amp; cd ~/labs/cn1
+terraform plan -var me=$ME -var image=$REPO:1.0.0 -detailed-exitcode &gt;/dev/null; echo "exit=$?"
+<span class="out">exit=0</span>                                     <span class="cm"># 0 = no drift: a clean base for the review</span>
+git init -q -b main 2&gt;/dev/null; git add *.tf .terraform.lock.hcl &amp;&amp; git commit -qm "CN1 baseline"</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create the PR branch.</strong> This script plays your colleague. Run it without reading it; you review the
+        result the way you would on GitHub.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">PR setup script (run it, don't read it)</summary>
+          <pre class="code mt-3">git switch -q -c pr-217-tune-booking-api
+perl -pi -e 's/= local\.name$/= "\${local.name}-alb"/' alb.tf
+perl -pi -e 's/security_groups = \[aws_security_group\.alb\.id\].*/cidr_blocks     = ["0.0.0.0\/0"]   # TEMP: QA curls tasks directly/' network.tf
+perl -ni -e 'next if /retention_in_days/; s#/booking-api"#/api"#; s/= 256$/= 1024/; s/= 512$/= 2048/; print' ecs.tf
+perl -pi -e 's/rollback = true/rollback = false/' service.tf
+git commit -qam "perf: tune booking-api, align names with the naming standard"</pre>
+        </details>
+        <pre class="code">git diff main --stat
+<span class="out"> alb.tf     | 2 +-
+ ecs.tf     | 7 +++----
+ network.tf | 2 +-
+ service.tf | 2 +-
+ 4 files changed, 6 insertions(+), 7 deletions(-)</span>     <span class="cm"># fewer files? your CN1 files differ: edit by hand</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Read the PR as the author presents it.</strong> The description says:
+        <em>"PR #217: bumps booking-api CPU for p99, aligns the ALB and log group with the naming standard, opens the task
+        port temporarily so QA can curl tasks directly. Config only, no downtime."</em> Read
+        <code class="inline">git diff main</code> once, and write your first impressions in
+        <code class="inline">~/labs/ar5/review.md</code> before you look at any plan. You will compare them later.
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Read the plan before the code.</strong> Save the plan, then ask it the one question that matters first:
+        what gets destroyed, and why.
+        <pre class="code">terraform plan -var me=$ME -var image=$REPO:1.0.0 -out=pr217.tfplan | tail -1
+<span class="out">Plan: 4 to add, 2 to change, 4 to destroy.</span>
+terraform show -json pr217.tfplan | jq -r '.resource_changes[]
+  | select(.change.actions | index("delete"))
+  | "\(.change.actions | join("/"))  \(.address)  because: \([.change.replace_paths[]? | join(".")] | join(", "))"'
+<span class="out">delete/create  aws_cloudwatch_log_group.api  because: name
+delete/create  aws_ecs_task_definition.api  because: container_definitions, cpu, memory
+delete/create  aws_lb.this  because: name
+delete/create  aws_lb_listener.http  because: load_balancer_arn</span>
+terraform show -json pr217.tfplan | jq -r '.resource_changes[] | select(.change.actions == ["update"]) | .address'
+<span class="out">aws_ecs_service.api
+aws_security_group.task</span></pre>
+        Four destroys in a "config only" PR. Note which of them a user would notice, which lose data, and which are
+        routine.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Write the review, top to bottom of the checklist.</strong> Use the Part III order (plan, blast radius,
+        IAM and network, rollback, cost, operability, conventions) and the labels. One comment per finding, with the
+        evidence and the fix you would accept. The first one is done for you.
+        <span class="code-label">~/labs/ar5/review.md</span>
+        <pre class="code"># Review: PR #217 perf: tune booking-api
+Verdict: request changes · Reviewed against: pr217.tfplan (4 add / 2 change / 4 destroy)
+
+1. blocker: the plan replaces aws_lb.this (name change forces it). The ALB gets a new DNS
+   name, so every record pointing at the old one breaks, and the listener is recreated with
+   it. ALB names are cosmetic: please drop the rename. If the standard really needs it, that
+   is a planned migration with a DNS cutover, not a line in a perf PR.
+2. ...</pre>
+        <pre class="code">cost() { awk -v c=$1 -v m=$2 'BEGIN{printf "USD %.0f/month for 2 tasks\n", 2*730*(c*0.04048+m*0.00444)}'; }
+cost 0.25 0.5; cost 1 2                         <span class="cm"># Fargate ARM prices from the AR2 lab</span>
+<span class="out">USD 18/month for 2 tasks
+USD 72/month for 2 tasks</span></pre>
+        Aim for at least five numbered comments. Put the cost delta in the cost comment as a number, not an adjective.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Score your review against the key.</strong> Count how many you found, and which ones only the plan showed
+        you. Compare with your step 3 first impressions.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer key: six findings</summary>
+          <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+            <li><strong>blocker (plan):</strong> ALB rename replaces <code class="inline">aws_lb.this</code> and, through
+            <code class="inline">load_balancer_arn</code>, the listener. New DNS name, minutes of outage. The description's
+            "no downtime" is wrong.</li>
+            <li><strong>blocker (plan, data):</strong> log group rename replaces it, and the destroy deletes every existing log
+            event. Removing <code class="inline">retention_in_days</code> means the new group keeps logs forever, at
+            CloudWatch storage prices.</li>
+            <li><strong>blocker (network):</strong> task port 8080 open to <code class="inline">0.0.0.0/0</code>. In this
+            stack tasks have public IPs, so anyone on the internet can reach the API around the ALB. "TEMP" rules are never
+            removed; QA should go through the ALB or use ECS Exec.</li>
+            <li><strong>blocker (rollback):</strong> <code class="inline">rollback = false</code> on the circuit breaker means
+            a bad deploy stays bad. Nothing in the description mentions it.</li>
+            <li><strong>question (cost):</strong> 4× CPU and memory is about USD 18 → 72 a month for two tasks. Where is the
+            p99 evidence that CPU is the bottleneck? A k6 run before and after (<a href="./sr4.html" class="text-viol underline decoration-viol/40">SR4</a>) settles it.</li>
+            <li><strong>suggestion (blast radius):</strong> three unrelated changes in one PR. Split them, so the CPU change
+            can merge today and the rest gets its own discussion. The task definition replacement is routine and expected.</li>
+          </ul>
+          <p class="mt-2">Most people find the security group from the diff. Few find the listener and the log deletion
+          without the plan. That is the whole argument for reading the plan first.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Write the RFC for a decision you will meet.</strong> A new client, Smile Dental (fictional), wants six
+        services live in 10 weeks with a 99.9% SLO and an infra budget of USD 3,000 a month. Their two DevOps engineers
+        have done CN1–CN3 but have never been on call for Kubernetes. Their CTO has "heard Kubernetes is the standard".
+        Copy the Part II skeleton to <code class="inline">~/labs/ar5/docs/rfcs/0001-ecs-or-eks-for-smile-dental.md</code>
+        and fill it, using the decision table in <a href="./cn2.html" class="text-viol underline decoration-viol/40">CN2</a>
+        and real numbers (EKS control plane USD 0.10 an hour is about USD 73 a month per cluster, before nodes and add-ons).
+        Then run the structural check below. It cannot judge your argument; it only refuses to let you skip the hard parts.
+        <span class="code-label">~/labs/ar5/rfc-check.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># rfc-check.sh FILE: fails if an RFC skips the sections reviewers need</span>
+f=${1:?usage: rfc-check.sh docs/rfcs/NNNN-title.md}; bad=0
+need() { grep -Eq "$1" "$f" || { echo "MISSING: $2"; bad=1; }; }
+need 'Decider: *[A-Za-z]'             "a named decider"
+need 'closes [0-9]{4}-[0-9]{2}-[0-9]{2}' "a review closing date"
+need '4\.0 Do nothing'                "the do-nothing option"
+need '^## 6\. Cost'                   "a cost section"
+need 'USD [0-9]'                      "at least one cost in USD"
+need '^## 8\. Rollback'               "a rollback section"
+need '^## 10\. Open questions'        "open questions"
+[ "$bad" -eq 0 ] &amp;&amp; echo "RFC structure OK: now ask three named reviewers"
+exit "$bad"</pre>
+        <pre class="code">cd ~/labs/ar5 &amp;&amp; chmod +x rfc-check.sh &amp;&amp; ./rfc-check.sh docs/rfcs/0001-ecs-or-eks-for-smile-dental.md
+<span class="out">RFC structure OK: now ask three named reviewers</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">review.md</code> has at least
+        five labelled comments including the ALB, log group and security group blockers, each citing the plan or the diff;
+        the cost comment contains a number; <code class="inline">rfc-check.sh</code> prints "RFC structure OK"; and your RFC
+        recommends one option and says what evidence would change your mind.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Fix the PR the way the author should have written it.</strong> The PR as written is the break. Rewrite the
+        branch so it contains only the CPU change (the part with a business reason), and prove with the plan that the only
+        replacement left is the routine task definition revision.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">git checkout main -- alb.tf network.tf service.tf ecs.tf
+perl -pi -e 's/= 256$/= 1024/; s/= 512$/= 2048/' ecs.tf
+git commit -qam "perf(booking-api): 1 vCPU / 2 GB for p99 (k6 evidence in PR)"
+terraform plan -var me=$ME -var image=$REPO:1.0.0 -out=pr217.tfplan | tail -1
+<span class="out">Plan: 1 to add, 1 to change, 1 to destroy.</span>
+terraform show -json pr217.tfplan | jq -r '.resource_changes[] | select(.change.actions | index("delete")) | .address'
+<span class="out">aws_ecs_task_definition.api</span></pre>
+          <p class="mt-2">A new task definition revision is how every ECS deploy works, and the service update rolls tasks
+          one by one behind the ALB. The rename, the open port and the circuit-breaker change go into their own PRs, or
+          nowhere. The lesson: a reviewer's best tool is "please split this". Small PRs have plans you can read in a
+          minute, and their descriptions are harder to get wrong.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Never apply the PR branch. Return to <code class="inline">main</code>, delete the branch
+        and the saved plan, then destroy the CN1 stack if you brought it up for this lab. Keep
+        <code class="inline">~/labs/ar5</code>: the review and the RFC are evidence.
+        <pre class="code">cd ~/labs/cn1 &amp;&amp; git switch -q main &amp;&amp; git branch -D pr-217-tune-booking-api &amp;&amp; rm -f pr217.tfplan
+terraform plan -var me=$ME -var image=$REPO:1.0.0 -detailed-exitcode &gt;/dev/null; echo "exit=$?"
+<span class="out">exit=0</span>                                     <span class="cm"># main still matches what is deployed</span>
+terraform destroy -var me=$ME -var image=$REPO:1.0.0          <span class="cm"># if you are done with CN1</span>
+<span class="out">Destroy complete! Resources: 22 destroyed.</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>A saved plan is an apply waiting to happen.</strong>
+        <code class="inline">terraform apply pr217.tfplan</code> runs without asking for confirmation, and this one would
+        delete your ALB and logs. Delete review plans when you're done, and never leave the CN1 stack up for days: it costs
+        about USD 1.50 a day.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

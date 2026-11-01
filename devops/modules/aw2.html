@@ -682,6 +682,217 @@ psql "host=localhost port=15432 user=readonly dbname=booking"   <span class="cm"
         pipeline (<a href="./se2.html" class="text-viol underline decoration-viol/40">SE2</a>) catch the security group
         before it ships, and Session Manager is already there as the answer when someone asks "then how do I get in?"</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Build a two-AZ VPC by hand and prove its routes</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will build, one CLI call at a time, the pieces the VPC module hides: a VPC, public and private subnets in two
+        AZs, an internet gateway, two route tables and a free S3 gateway endpoint. Then you ask Reachability Analyzer
+        whether a network interface in each tier can reach the internet, and read its answer in terms of routes and
+        public IPs. No instances, no NAT gateway: the whole lab costs well under a dollar. The AW3 lab reuses this VPC.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A VPC <code class="inline">10.98.0.0/16</code> whose public and private tiers you can classify from route tables alone, with Reachability Analyzer output to prove it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">60–90 minutes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1a</code> and <code class="inline">ap-southeast-1b</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">About USD 0.005 per hour for one Elastic IP, plus USD 0.10 per Reachability Analyzer analysis (you run five or six). VPC, subnets, IGW, route tables, ENIs and the S3 gateway endpoint are free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">AWS CLI v2, <code class="inline">jq</code>, the <code class="inline">gol-sandbox</code> SSO profile from the <a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a> lab</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell and a tagging helper.</strong> Every resource gets a <code class="inline">Name</code>,
+        <code class="inline">Owner</code> and <code class="inline">Lab</code> tag. The helper builds the
+        <code class="inline">--tag-specifications</code> string so you do not mistype it twenty times.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login --sso-session gol
+aws sts get-caller-identity --query Account --output text
+<span class="out">888899990000</span>
+mkdir -p ~/labs/aw2 &amp;&amp; cd ~/labs/aw2
+tag() { echo "ResourceType=$1,Tags=[{Key=Name,Value=lab-$ME-$2},{Key=Owner,Value=$ME},{Key=Lab,Value=AW2}]"; }
+tag vpc vpc
+<span class="out">ResourceType=vpc,Tags=[{Key=Name,Value=lab-yourhandle-vpc},{Key=Owner,Value=yourhandle},{Key=Lab,Value=AW2}]</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create the VPC and four subnets.</strong> <code class="inline">10.98.0.0/16</code> overlaps none of our
+        environments. The layout copies prod at a smaller scale: small <code class="inline">/24</code> public subnets for
+        load balancers, large <code class="inline">/19</code> private subnets for workloads.
+        <pre class="code">VPC=$(aws ec2 create-vpc --cidr-block 10.98.0.0/16 --tag-specifications "$(tag vpc vpc)" \
+  --query Vpc.VpcId --output text)
+aws ec2 modify-vpc-attribute --vpc-id $VPC --enable-dns-hostnames '{"Value":true}'
+sub() { aws ec2 create-subnet --vpc-id $VPC --cidr-block $1 --availability-zone ap-southeast-1$2 \
+  --tag-specifications "$(tag subnet $3)" --query Subnet.SubnetId --output text; }
+PUB_A=$(sub 10.98.0.0/24 a public-a);   PUB_B=$(sub 10.98.1.0/24 b public-b)
+PRIV_A=$(sub 10.98.32.0/19 a private-a); PRIV_B=$(sub 10.98.64.0/19 b private-b)
+aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC \
+  --query 'Subnets[].[Tags[?Key==`Name`]|[0].Value,CidrBlock,AvailabilityZone,AvailableIpAddressCount]' --output text | sort
+<span class="out">lab-yourhandle-private-a   10.98.32.0/19   ap-southeast-1a   8187
+lab-yourhandle-private-b   10.98.64.0/19   ap-southeast-1b   8187
+lab-yourhandle-public-a    10.98.0.0/24    ap-southeast-1a   251
+lab-yourhandle-public-b    10.98.1.0/24    ap-southeast-1b   251</span>   <span class="cm"># AWS reserves 5 IPs per subnet</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Add the internet gateway and the two route tables.</strong> Right now every subnet is isolated: the only
+        route is <code class="inline">local</code>. A subnet becomes public when its route table sends
+        <code class="inline">0.0.0.0/0</code> to an IGW, and nothing else makes it so.
+        <pre class="code">IGW=$(aws ec2 create-internet-gateway --tag-specifications "$(tag internet-gateway igw)" \
+  --query InternetGateway.InternetGatewayId --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC
+RT_PUB=$(aws ec2 create-route-table --vpc-id $VPC --tag-specifications "$(tag route-table public)" \
+  --query RouteTable.RouteTableId --output text)
+RT_PRIV=$(aws ec2 create-route-table --vpc-id $VPC --tag-specifications "$(tag route-table private)" \
+  --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $RT_PUB --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW
+<span class="out">{ "Return": true }</span>
+for s in $PUB_A $PUB_B;   do aws ec2 associate-route-table --route-table-id $RT_PUB  --subnet-id $s &gt;/dev/null; done
+for s in $PRIV_A $PRIV_B; do aws ec2 associate-route-table --route-table-id $RT_PRIV --subnet-id $s &gt;/dev/null; done</pre>
+        There is no NAT gateway. In a real environment each private route table would also have
+        <code class="inline">0.0.0.0/0 → nat-…</code>, one NAT per AZ, at USD 0.059 per hour each plus USD 0.059 per GB.
+        Two of them left running for a month is about USD 85 before any traffic, which is why this lab skips them.
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Add the S3 gateway endpoint, then read the route tables.</strong> The endpoint adds a prefix-list route to
+        the private table, so S3 traffic from private subnets never needs a NAT. Save your IDs so that later steps, and
+        the AW3 lab, can reload them.
+        <pre class="code">VPCE=$(aws ec2 create-vpc-endpoint --vpc-id $VPC --vpc-endpoint-type Gateway \
+  --service-name com.amazonaws.ap-southeast-1.s3 --route-table-ids $RT_PRIV \
+  --tag-specifications "$(tag vpc-endpoint s3)" --query VpcEndpoint.VpcEndpointId --output text)
+for rt in $RT_PUB $RT_PRIV; do echo "== $rt"; aws ec2 describe-route-tables --route-table-ids $rt \
+  --query 'RouteTables[].Routes[].[DestinationCidrBlock||DestinationPrefixListId,GatewayId,State]' --output text; done
+<span class="out">== rtb-0a1b2c3d4e5f60718
+10.98.0.0/16    local                    active
+0.0.0.0/0       igw-0f9e8d7c6b5a43210    active
+== rtb-0c2d3e4f5a6b70819
+10.98.0.0/16    local                    active
+pl-6fa54006     vpce-0b2d8e4f1a9c37d21   active</span>
+cat &gt; ids.env &lt;&lt;EOF
+export VPC=$VPC IGW=$IGW RT_PUB=$RT_PUB RT_PRIV=$RT_PRIV VPCE=$VPCE
+export PUB_A=$PUB_A PUB_B=$PUB_B PRIV_A=$PRIV_A PRIV_B=$PRIV_B
+EOF</pre>
+        Classify each table before you go on: the first is public (default route to an IGW), the second is isolated
+        today (no default route at all) and would be private once it had a NAT route.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Place a test network interface in each tier and ask Reachability Analyzer.</strong> An ENI is a free,
+        stand-in for an instance. The analyzer reads your configuration (it sends no packets) and answers "can this
+        source reach that destination on TCP 443, and if not, which component says no?".
+        <pre class="code">SG=$(aws ec2 create-security-group --group-name lab-$ME-aw2 --description "AW2 lab test ENIs" \
+  --vpc-id $VPC --tag-specifications "$(tag security-group sg)" --query GroupId --output text)
+eni() { aws ec2 create-network-interface --subnet-id $1 --groups $SG \
+  --tag-specifications "$(tag network-interface $2)" --query NetworkInterface.NetworkInterfaceId --output text; }
+ENI_PUB=$(eni $PUB_A eni-public); ENI_PRIV=$(eni $PRIV_A eni-private)
+path() { aws ec2 create-network-insights-path --source $1 --destination $IGW --protocol tcp --destination-port 443 \
+  --tag-specifications "$(tag network-insights-path $2)" --query NetworkInsightsPath.NetworkInsightsPathId --output text; }
+P_PUB=$(path $ENI_PUB path-public); P_PRIV=$(path $ENI_PRIV path-private)
+analyze() {
+  local a=$(aws ec2 start-network-insights-analysis --network-insights-path-id $1 \
+    --query NetworkInsightsAnalysis.NetworkInsightsAnalysisId --output text)
+  while [ "$(aws ec2 describe-network-insights-analyses --network-insights-analysis-ids $a \
+    --query 'NetworkInsightsAnalyses[0].Status' --output text)" = running ]; do sleep 5; done
+  aws ec2 describe-network-insights-analyses --network-insights-analysis-ids $a --query 'NetworkInsightsAnalyses[0]' \
+    | jq -r '"found=\(.NetworkPathFound)  \([.Explanations[]?.ExplanationCode] | unique | join(","))"'
+}
+analyze $P_PUB;  analyze $P_PRIV
+<span class="out">found=false  IGW_PUBLIC_IP_ASSOCIATION_FOR_EGRESS</span>   <span class="cm"># route is fine, but no public IP</span>
+<span class="out">found=false  NO_ROUTE_TO_DESTINATION</span>              <span class="cm"># no route to the IGW at all</span></pre>
+        Two different reasons. A public subnet needs <em>both</em> a route to the IGW and a public IP on the interface;
+        the private one fails earlier, at the route table.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Give the public ENI an Elastic IP and analyse again.</strong> This is what the ALB, a NAT gateway or a
+        <code class="inline">map-public-ip-on-launch</code> subnet does for you automatically.
+        <pre class="code">EIP=$(aws ec2 allocate-address --domain vpc --tag-specifications "$(tag elastic-ip eip)" \
+  --query AllocationId --output text)
+aws ec2 associate-address --allocation-id $EIP --network-interface-id $ENI_PUB &gt;/dev/null
+echo "export SG=$SG ENI_PUB=$ENI_PUB ENI_PRIV=$ENI_PRIV P_PUB=$P_PUB P_PRIV=$P_PRIV EIP=$EIP" &gt;&gt; ids.env
+analyze $P_PUB;  analyze $P_PRIV
+<span class="out">found=true
+found=false  NO_ROUTE_TO_DESTINATION</span>                <span class="cm"># private stays private: that is the point</span></pre>
+        Open the successful analysis in the VPC console (Reachability Analyzer) once: it draws the hop-by-hop path ENI
+        → security group → route table → IGW, which is exactly the chain you debug in Part III.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">describe-subnets</code> lists four subnets across two AZs;
+        the public route table has <code class="inline">0.0.0.0/0 → igw-…</code> and the private one has
+        <code class="inline">local</code> plus a <code class="inline">pl-…</code> S3 route and nothing else;
+        the public path analysis returns <code class="inline">found=true</code> and the private one returns
+        <code class="inline">NO_ROUTE_TO_DESTINATION</code>; and you can explain why the public ENI failed until it had an
+        Elastic IP.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Lose a route.</strong> Someone "tidies up" the public route table. Run the command, then pretend you only
+        know the symptom: "the public subnet can't reach the internet any more". Find the cause using
+        <code class="inline">analyze</code> and <code class="inline">describe-route-tables</code>, and fix it.
+        <pre class="code">aws ec2 delete-route --route-table-id $RT_PUB --destination-cidr-block 0.0.0.0/0
+analyze $P_PUB
+<span class="out">found=false  NO_ROUTE_TO_DESTINATION</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=$PUB_A \
+  --query 'RouteTables[].Routes[].[DestinationCidrBlock,GatewayId]' --output text
+<span class="out">10.98.0.0/16    local</span>                      <span class="cm"># the default route is gone</span>
+aws ec2 create-route --route-table-id $RT_PUB --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW
+analyze $P_PUB
+<span class="out">found=true</span></pre>
+          <p class="mt-2">The code changed from <code class="inline">IGW_PUBLIC_IP_ASSOCIATION_FOR_EGRESS</code> to
+          <code class="inline">NO_ROUTE_TO_DESTINATION</code>, which points straight at the route table, not the security
+          group or the IP. Filtering route tables by <code class="inline">association.subnet-id</code> answers "which table
+          does this subnet actually use?", the question to ask first, because a subnet with no explicit association uses
+          the VPC's <em>main</em> table. In a Terraform-managed VPC this fault is drift, and the next
+          <code class="inline">terraform plan</code> would show the route being re-added.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Clean up.</strong> Delete the test pieces (analyses, paths, Elastic IP, ENIs, security group) today. If
+        you are going straight to the <a href="./aw3.html" class="text-viol underline decoration-viol/40">AW3</a> lab,
+        keep the network itself and run the second block when AW3 is done. A VPC is deleted from the inside out:
+        analyses before paths, addresses before interfaces, subnets before route tables, the IGW detached before the VPC.
+        <span class="code-label">part 1: the test pieces (now)</span>
+        <pre class="code">cd ~/labs/aw2 &amp;&amp; source ids.env
+for p in $P_PUB $P_PRIV; do
+  for a in $(aws ec2 describe-network-insights-analyses --network-insights-path-id $p \
+      --query 'NetworkInsightsAnalyses[].NetworkInsightsAnalysisId' --output text); do
+    aws ec2 delete-network-insights-analysis --network-insights-analysis-id $a &gt;/dev/null; done
+  aws ec2 delete-network-insights-path --network-insights-path-id $p &gt;/dev/null
+done
+aws ec2 disassociate-address --association-id $(aws ec2 describe-addresses --allocation-ids $EIP \
+  --query 'Addresses[0].AssociationId' --output text)
+aws ec2 release-address --allocation-id $EIP
+for e in $ENI_PUB $ENI_PRIV; do aws ec2 delete-network-interface --network-interface-id $e; done
+aws ec2 delete-security-group --group-id $SG &gt;/dev/null
+aws ec2 describe-addresses --filters Name=tag:Owner,Values=$ME --query 'Addresses[].AllocationId'
+<span class="out">[]</span></pre>
+        <span class="code-label">part 2: the network (after AW3, or now if you are stopping here)</span>
+        <pre class="code">cd ~/labs/aw2 &amp;&amp; source ids.env
+aws ec2 delete-vpc-endpoints --vpc-endpoint-ids $VPCE &gt;/dev/null
+for s in $PUB_A $PUB_B $PRIV_A $PRIV_B; do aws ec2 delete-subnet --subnet-id $s; done
+for rt in $RT_PUB $RT_PRIV; do aws ec2 delete-route-table --route-table-id $rt; done
+aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC
+aws ec2 delete-internet-gateway --internet-gateway-id $IGW
+aws ec2 delete-vpc --vpc-id $VPC
+aws ec2 describe-vpcs --filters Name=tag:Owner,Values=$ME Name=tag:Lab,Values=AW2 --query 'Vpcs[].VpcId'
+<span class="out">[]</span></pre>
+        If <code class="inline">delete-subnet</code> or <code class="inline">delete-vpc</code> fails with
+        <code class="inline">DependencyViolation</code>, something is still inside:
+        <code class="inline">aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=$VPC</code> tells you what
+        (usually a forgotten ENI, or an ALB from AW3 that is still being deleted).
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>What keeps billing if you forget:</strong> the Elastic IP, at USD 0.005 per
+        hour (about USD 3.60 a month) whether or not it is attached. The VPC, subnets, route tables and gateway endpoint are
+        free, so a forgotten empty VPC costs nothing, but it still counts against the sandbox's limit of five VPCs per
+        Region. If you added a NAT gateway on your own, delete it first: it is USD 1.40 a day on its own.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

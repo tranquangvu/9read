@@ -1,0 +1,1699 @@
+<!-- meta: days=6 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Hands-on: Deploy the Clinic Platform on EKS End to End</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          This module is one long, ordered build. You start on your laptop with <code class="inline">kind</code> and a single
+          Helm chart for the three clinic services, then build the AWS foundation in Terraform (VPC, EKS, RDS, SQS, Secrets
+          Manager, ECR and four Pod Identity roles), hand the cluster to Argo CD, wire a GitHub Actions pipeline that builds
+          ARM64 images and bumps a tag in Git, verify every hop from the load balancer to the worker, roll back with
+          <code class="inline">git revert</code>, and tear it all down in the right order. Each Part is a build phase. Concepts
+          are linked, not re-taught: <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a> for the cluster,
+          <a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a> for load balancing,
+          <a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a> for identity and secrets,
+          <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a> for scaling,
+          <a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a> for Helm,
+          <a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a> for Argo CD and
+          <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a> for troubleshooting. Running it day to day
+          afterwards is <a href="./ks15.html" class="text-viol underline decoration-viol/40">KS15</a>.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> every EKS concept can be correct on its own and the system still
+          fails at the joins. The chart names a ServiceAccount the Pod Identity association does not know. The migration Job
+          runs before the Secret it needs exists. The ALB never appears because a subnet tag is missing. Teardown hangs for an
+          hour because a load balancer the controller created is still holding the VPC. You only learn the joins by building
+          the whole thing once, start to finish, and then destroying it cleanly.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Rehearse on kind</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Prove the chart on your laptop before AWS charges a cent</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Most first EKS deployments fail on chart bugs: a wrong port, a probe path that 404s, a container that cannot write
+        its pid file. Those bugs cost nothing to find on <code class="inline">kind</code> and about USD 0.40 an hour to find
+        on EKS. So Part I writes the chart and runs it locally against an in-cluster Postgres. Parts II to IV then reuse the
+        same chart unchanged, with a different values file.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">What you are building, and in what order</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The end state is the lab-kit platform running in your own cluster <code class="inline">lab-$ME-eks</code> in
+        <code class="inline">gol-sandbox</code>. Traffic enters an internet-facing ALB, reaches <code class="inline">booking-web</code>
+        (nginx), which proxies <code class="inline">/api/*</code> to <code class="inline">booking-api</code>. The API writes to RDS
+        Postgres and sends a <code class="inline">booking.created</code> message to SQS, and <code class="inline">booking-worker</code>
+        consumes it. Argo CD pulls the desired state from your GitOps repository, and External Secrets copies the database
+        URL out of Secrets Manager.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 300" class="w-full min-w-[640px]" role="img" aria-label="End state: GitHub Actions pushes images to ECR and commits tags to the GitOps repo; Argo CD in the EKS cluster syncs from Git; an ALB sends traffic to booking-web, which proxies to booking-api; booking-api writes to RDS and sends to SQS; booking-worker reads SQS; External Secrets reads Secrets Manager">
+          <rect x="185" y="25" width="285" height="262" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 5"/>
+          <text x="197" y="18" font-size="11" font-weight="700" fill="#6E6B64">EKS lab-&lt;you&gt;-eks · namespace booking</text>
+          <text x="560" y="18" font-size="11" font-weight="700" fill="#6E6B64">AWS services</text>
+          <text x="10" y="18" font-size="11" font-weight="700" fill="#6E6B64">GitHub + ECR</text>
+          <g class="anim-pulse"><rect x="200" y="40" width="110" height="42" rx="9" fill="#0D9488"/>
+            <text x="255" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-web</text>
+            <text x="255" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">nginx · /api/* proxy</text></g>
+          <g class="anim-pulse d1"><rect x="340" y="40" width="115" height="42" rx="9" fill="#0D9488"/>
+            <text x="397" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api</text>
+            <text x="397" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">HPA 2–6 · PDB</text></g>
+          <g class="anim-pulse d2"><rect x="340" y="120" width="115" height="42" rx="9" fill="#0D9488"/>
+            <text x="397" y="138" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-worker</text>
+            <text x="397" y="152" text-anchor="middle" fill="#ffffffbb" font-size="9">SQS long poll</text></g>
+          <g class="anim-pulse d3"><rect x="200" y="200" width="110" height="42" rx="9" fill="#6d5acd"/>
+            <text x="255" y="218" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Argo CD</text>
+            <text x="255" y="232" text-anchor="middle" fill="#ffffffbb" font-size="9">app-of-apps</text></g>
+          <g class="anim-pulse d4"><rect x="340" y="200" width="115" height="42" rx="9" fill="#6d5acd"/>
+            <text x="397" y="218" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">External Secrets</text>
+            <text x="397" y="232" text-anchor="middle" fill="#ffffffbb" font-size="9">→ Secret clinic-db</text></g>
+          <g class="anim-pulse"><rect x="560" y="40" width="150" height="42" rx="9" fill="#37474F"/>
+            <text x="635" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">RDS Postgres 16</text>
+            <text x="635" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">db.t4g.micro · private</text></g>
+          <g class="anim-pulse d1"><rect x="560" y="120" width="150" height="42" rx="9" fill="#37474F"/>
+            <text x="635" y="138" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SQS reminders</text>
+            <text x="635" y="152" text-anchor="middle" fill="#ffffffbb" font-size="9">booking.created</text></g>
+          <g class="anim-pulse d2"><rect x="560" y="200" width="150" height="42" rx="9" fill="#37474F"/>
+            <text x="635" y="218" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Secrets Manager</text>
+            <text x="635" y="232" text-anchor="middle" fill="#ffffffbb" font-size="9">lab-&lt;you&gt;/clinic/db</text></g>
+          <g class="anim-pulse d3"><rect x="10" y="40" width="140" height="42" rx="9" fill="#2563EB"/>
+            <text x="80" y="58" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB (internet)</text>
+            <text x="80" y="72" text-anchor="middle" fill="#ffffffbb" font-size="9">made by LB Controller</text></g>
+          <g class="anim-pulse d4"><rect x="10" y="120" width="140" height="42" rx="9" fill="#37474F"/>
+            <text x="80" y="138" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ECR lab-&lt;you&gt;/*</text>
+            <text x="80" y="152" text-anchor="middle" fill="#ffffffbb" font-size="9">arm64 · immutable tags</text></g>
+          <g class="anim-pulse"><rect x="10" y="190" width="140" height="38" rx="9" fill="#D97757"/>
+            <text x="80" y="213" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">GitHub Actions</text></g>
+          <g class="anim-pulse d1"><rect x="10" y="245" width="140" height="38" rx="9" fill="#DB2777"/>
+            <text x="80" y="268" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">clinic-gitops repo</text></g>
+          <line x1="150" y1="61" x2="200" y2="61" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="310" y1="61" x2="340" y2="61" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="455" y1="61" x2="560" y2="61" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="455" y1="75" x2="560" y2="130" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="560" y1="150" x2="455" y2="150" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="560" y1="221" x2="455" y2="221" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="80" y1="190" x2="80" y2="162" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="80" y1="228" x2="80" y2="245" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="150" y1="264" x2="200" y2="232" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="160" y="185" font-size="9" fill="#A8A49B" class="anim-bounce">push image</text>
+          <text x="155" y="285" font-size="9" fill="#A8A49B">Argo CD pulls</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Phase</th><th class="px-4 py-3">Where it runs</th><th class="px-4 py-3">Time</th><th class="px-4 py-3">Running cost</th><th class="px-4 py-3">Concepts from</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">I · Rehearse</td><td class="px-4 py-3"><code class="inline">kind</code> on your laptop</td><td class="px-4 py-3">1–2 h</td><td class="px-4 py-3">0</td><td class="px-4 py-3">KS1, KS2, KS9</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">II · Foundation</td><td class="px-4 py-3">Terraform → <code class="inline">gol-sandbox</code></td><td class="px-4 py-3">1 h writing, ~25 min apply</td><td class="px-4 py-3">≈ USD 0.37/h from here on</td><td class="px-4 py-3">AW2, AW5, KS5, KS6, KS7</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">III · Platform and app</td><td class="px-4 py-3">Argo CD, from your GitOps repo</td><td class="px-4 py-3">1–2 h</td><td class="px-4 py-3">+ ALB ≈ USD 0.04/h</td><td class="px-4 py-3">KS6, KS7, KS8, KS10</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">IV · Ship, verify, tear down</td><td class="px-4 py-3">GitHub Actions, your shell</td><td class="px-4 py-3">1–2 h</td><td class="px-4 py-3">back to 0 after teardown</td><td class="px-4 py-3">CI1, CI4, KS10, KS11</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Plan the AWS phases (II to IV) for one sitting or two consecutive days, and tear down at the end of each day if you
+        stop overnight: Part IV shows how, and Terraform recreates it in about 25 minutes. Set up the working directory once.
+        Everything in this module lives under <code class="inline">~/labs/ks14</code>, and the <code class="inline">gitops/</code>
+        folder becomes your GitOps repository in Part III.
+      </p>
+      <pre class="code mt-3">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1   <span class="cm"># ME = your GitHub handle</span>
+mkdir -p ~/labs/ks14/gitops/clinic/templates &amp;&amp; cd ~/labs/ks14
+cp -r ~/clinic-app ./clinic-app          <span class="cm"># the lab kit, fetched on the lab setup page</span>
+brew install kubeconform                  <span class="cm"># schema validator; Linux: release binary from github.com/yannh/kubeconform</span>
+kind version; helm version --short; kubectl version --client | head -1
+<span class="out">kind v0.29.0 go1.24.… darwin/arm64
+v3.19.0+g3d8990f
+Client Version: v1.33.4</span>                  <span class="cm"># any kind ≥ 0.27, Helm 3, kubectl 1.33 is fine</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">One chart for three services, and why not three charts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        You have two reasonable shapes. <strong>One chart per service</strong> (or one shared <code class="inline">clinic-service</code>
+        chart installed three times, as in <a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>) is right
+        when services release on different schedules and belong to different teams. <strong>One chart for the platform</strong>
+        is right when the services ship together from one repository with one version number, which is exactly the lab kit.
+        We pick one chart, <code class="inline">clinic</code>: one Argo CD Application, one sync, one tag to bump, and the
+        migration runs once per release instead of once per service. The cost is a <code class="inline">range</code> loop in
+        the templates, which is a fair trade for a newcomer reading one file instead of three.
+      </p>
+      <pre class="code mt-3">gitops/clinic/
+├── Chart.yaml
+├── values.yaml            <span class="cm"># defaults, safe for any environment</span>
+├── values-local.yaml      <span class="cm"># kind: local images, in-cluster Postgres, no worker</span>
+├── values-sandbox.yaml    <span class="cm"># EKS: ECR images, RDS via External Secrets, ALB Ingress (Part III)</span>
+└── templates/
+    ├── _helpers.tpl       deployment.yaml   service.yaml
+    ├── ingress.yaml       migrate-job.yaml  local-postgres.yaml</pre>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/Chart.yaml</span>
+        <pre class="code">apiVersion: v2
+name: clinic
+description: booking-api, booking-web and booking-worker, released together
+type: application
+version: 0.1.0
+appVersion: "1.0.0"</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/values.yaml</span>
+        <pre class="code">image:
+  prefix: clinic                <span class="cm"># kind: local names; sandbox: your ECR registry/lab-&lt;you&gt;</span>
+  tag: "1.0.0"                  <span class="cm"># the one line CI rewrites</span>
+chaos: false                    <span class="cm"># true only on kind and in the sandbox, never in prod</span>
+awsRegion: ap-southeast-1
+queueUrl: ""
+db: { secretName: clinic-db, ssl: false }
+migrate: { backoffLimit: 0 }    <span class="cm"># a failed migration stops the sync; no blind retries</span>
+ingress: { enabled: false, className: alb, host: "", annotations: {} }
+localPostgres: { enabled: false }
+services:
+  booking-api:
+    enabled: true
+    port: 8080
+    uid: 65532                  <span class="cm"># distroless "nonroot"</span>
+    health: { live: /healthz, ready: /readyz }
+    resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { memory: 256Mi } }
+    hpa: { min: 2, max: 6, cpu: 70 }
+  booking-web:
+    enabled: true
+    port: 8080
+    uid: 101                    <span class="cm"># nginx-unprivileged</span>
+    health: { live: /healthz, ready: /healthz }
+    writable: [/tmp, /etc/nginx/conf.d]   <span class="cm"># nginx pid + rendered config</span>
+    resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 128Mi } }
+    hpa: { min: 2, max: 4, cpu: 70 }
+  booking-worker:
+    enabled: true
+    replicas: 1
+    uid: 65532
+    grace: 40                   <span class="cm"># 20 s long poll + one batch of work</span>
+    resources: { requests: { cpu: 50m, memory: 96Mi }, limits: { memory: 192Mi } }</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Every value maps to a fact about the lab-kit images. <code class="inline">booking-api</code> fails readiness while
+        Postgres is down or while it drains, but liveness only checks the process, so a database blip never restarts it
+        (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>). <code class="inline">booking-web</code>
+        needs two writable directories because nginx writes its pid file to <code class="inline">/tmp</code> and renders
+        <code class="inline">API_UPSTREAM</code> into <code class="inline">/etc/nginx/conf.d</code> at start-up.
+        <code class="inline">booking-worker</code> has no HTTP port, so it gets no probes, no Service and no HPA. Queue-driven
+        scaling for it is KEDA's job (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The Deployment template, field by field</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        One template renders all three Deployments. Read the comments: each one is a production decision, not decoration.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/templates/deployment.yaml (1/2)</span>
+        <pre class="code">{{- range $name, $s := .Values.services }}
+{{- if $s.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels: { app: {{ $name }} }
+spec:
+  {{- if not $s.hpa }}
+  replicas: {{ $s.replicas }}            <span class="cm"># with an HPA, the HPA owns replicas</span>
+  {{- end }}
+  selector: { matchLabels: { app: {{ $name }} } }
+  template:
+    metadata: { labels: { app: {{ $name }} } }
+    spec:
+      serviceAccountName: {{ $name }}    <span class="cm"># Pod Identity binds to this name</span>
+      terminationGracePeriodSeconds: {{ $s.grace | default 30 }}   <span class="cm"># &gt; preStop 10 s + DRAIN_MS 5 s</span>
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ $s.uid }}          <span class="cm"># numeric, so the kubelet can verify non-root</span>
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: app
+          image: {{ $.Values.image.prefix }}/{{ $name }}:{{ $.Values.image.tag }}
+          env: {{- include "clinic.env" (dict "name" $name "v" $.Values) | nindent 12 }}
+          resources: {{- toYaml $s.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/templates/deployment.yaml (2/2)</span>
+        <pre class="code">          {{- with $s.health }}
+          ports: [{ containerPort: {{ $s.port }} }]
+          livenessProbe: { httpGet: { path: {{ .live }}, port: {{ $s.port }} }, periodSeconds: 10 }
+          readinessProbe: { httpGet: { path: {{ .ready }}, port: {{ $s.port }} }, periodSeconds: 5 }
+          lifecycle: { preStop: { sleep: { seconds: 10 } } }   <span class="cm"># let the ALB deregister first</span>
+          {{- end }}
+          {{- with $s.writable }}
+          volumeMounts:
+            {{- range $i, $path := . }}
+            - { name: tmp{{ $i }}, mountPath: {{ $path }} }
+            {{- end }}
+          {{- end }}
+      {{- with $s.writable }}
+      volumes:
+        {{- range $i, $path := . }}
+        - { name: tmp{{ $i }}, emptyDir: {} }
+        {{- end }}
+      {{- end }}
+{{- end }}
+{{- end }}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The shutdown timeline is the part people get wrong. When a Pod is deleted, the kubelet runs the
+        <code class="inline">preStop</code> hook first: a 10-second <code class="inline">sleep</code> action (built into the
+        kubelet since Kubernetes 1.30, so it works in a distroless image with no <code class="inline">sleep</code> binary).
+        During those 10 seconds the endpoint is removed and the ALB stops sending new requests. Then SIGTERM arrives,
+        <code class="inline">booking-api</code> flips <code class="inline">/readyz</code> to 503, waits
+        <code class="inline">DRAIN_MS</code> (5 s) for in-flight requests and exits. The total is about 15 seconds, inside the
+        30-second grace period. If the grace period were shorter than preStop plus drain, the kubelet would SIGKILL requests
+        mid-flight on every deploy.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/templates/_helpers.tpl — environment per service</span>
+        <pre class="code">{{- define "clinic.env" -}}
+{{- $v := .v -}}
+{{- if eq .name "booking-api" }}
+- { name: APP_VERSION, value: {{ $v.image.tag | quote }} }
+- { name: MIGRATE_ON_START, value: "false" }      <span class="cm"># only the PreSync Job migrates</span>
+- { name: DRAIN_MS, value: "5000" }
+- { name: DATABASE_SSL, value: {{ $v.db.ssl | quote }} }
+- { name: CHAOS, value: {{ ternary "on" "off" $v.chaos | quote }} }
+- name: DATABASE_URL
+  valueFrom: { secretKeyRef: { name: {{ $v.db.secretName }}, key: DATABASE_URL } }
+{{- end }}
+{{- if eq .name "booking-web" }}
+- { name: API_UPSTREAM, value: "http://booking-api:8080" }
+{{- else }}
+- { name: QUEUE_URL, value: {{ $v.queueUrl | quote }} }
+- { name: AWS_REGION, value: {{ $v.awsRegion | quote }} }   <span class="cm"># the SDK needs it; Pod Identity does not set it</span>
+{{- end }}
+{{- end }}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>The <code class="inline">runAsUser</code> trap.</strong> The distroless
+        images declare <code class="inline">USER nonroot</code>, a <em>name</em>. With <code class="inline">runAsNonRoot: true</code>
+        and no numeric <code class="inline">runAsUser</code>, the kubelet cannot prove the user is not root and refuses to
+        start the container: <code class="inline">CreateContainerConfigError: container has runAsNonRoot and image has
+        non-numeric user (nonroot)</code>. Set the UID explicitly: 65532 for distroless, 101 for nginx-unprivileged.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Service, ServiceAccount, PDB, HPA, Ingress and the migration Job</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The supporting objects are short. Each enabled service gets a ServiceAccount, because Pod Identity in Part II binds
+        AWS roles to ServiceAccount <em>names</em>. Services with a port get a ClusterIP Service. Services with an HPA also get
+        a PodDisruptionBudget, so a node drain never takes both replicas at once
+        (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>,
+        <a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/templates/service.yaml</span>
+        <pre class="code">{{- range $name, $s := .Values.services }}
+{{- if $s.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: {{ $name }} }
+{{- end }}
+{{- if and $s.enabled $s.port }}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: {{ $name }} }
+spec:
+  selector: { app: {{ $name }} }
+  ports: [{ port: {{ $s.port }}, targetPort: {{ $s.port }} }]
+{{- end }}
+{{- if and $s.enabled $s.hpa }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: {{ $name }} }
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: {{ $name }} } }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: {{ $name }} }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: {{ $name }} }
+  minReplicas: {{ $s.hpa.min }}
+  maxReplicas: {{ $s.hpa.max }}
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: {{ $s.hpa.cpu }} } }
+{{- end }}
+{{- end }}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The Ingress sends everything to <code class="inline">booking-web</code>. The browser only ever talks to the web tier,
+        and nginx forwards <code class="inline">/api/*</code> to the <code class="inline">booking-api</code> Service inside the
+        cluster. One ALB rule, one target group, and the API is never exposed on its own. The annotations that make it an
+        ALB live in the sandbox values file, so the template stays controller-neutral.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/templates/ingress.yaml</span>
+        <pre class="code">{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: clinic
+  {{- with .Values.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - {{- with .Values.ingress.host }}
+      host: {{ . }}
+      {{- end }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: booking-web, port: { number: 8080 } } }
+{{- end }}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The migration is a Job that runs the API image with <code class="inline">args: ["server.js", "migrate"]</code>. The
+        image's entrypoint is <code class="inline">node</code>, so overriding <code class="inline">args</code> (not
+        <code class="inline">command</code>) runs <code class="inline">node server.js migrate</code>, which creates the schema
+        and exits 0. Under Argo CD the <code class="inline">PreSync</code> annotation runs it before any Deployment changes
+        (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>). Plain Helm ignores that annotation, so
+        on <code class="inline">kind</code> the Job simply runs alongside everything else and retries until Postgres is up.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/templates/migrate-job.yaml</span>
+        <pre class="code">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: booking-api-migrate-{{ .Values.image.tag | replace "." "-" }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync                          <span class="cm"># runs before any Deployment changes</span>
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation <span class="cm"># keep the last run for its logs</span>
+spec:
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never              <span class="cm"># default ServiceAccount: no AWS permissions needed</span>
+      securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: migrate
+          image: {{ .Values.image.prefix }}/booking-api:{{ .Values.image.tag }}
+          args: ["server.js", "migrate"]  <span class="cm"># creates the schema and exits 0</span>
+          env:
+            - { name: DATABASE_SSL, value: {{ .Values.db.ssl | quote }} }
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: {{ .Values.db.secretName }}, key: DATABASE_URL } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }</pre>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>Why the Job uses the default ServiceAccount.</strong> A PreSync hook runs
+        <em>before</em> the Sync phase creates the chart's ServiceAccounts. On the very first sync,
+        <code class="inline">serviceAccountName: booking-api</code> would point at an account that does not exist yet and the Job
+        Pod would never be created. The migration needs only the database URL, not AWS permissions, so the namespace's
+        default ServiceAccount is both sufficient and least-privilege.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Render, validate, then install on kind</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        For local runs the chart brings its own Postgres and a plain Secret holding the URL. Both are gated by
+        <code class="inline">localPostgres.enabled</code>, which only <code class="inline">values-local.yaml</code> turns on.
+        The worker is disabled locally because it exits at start-up without a real <code class="inline">QUEUE_URL</code>; it
+        comes alive on EKS.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/templates/local-postgres.yaml</span>
+        <pre class="code">{{- if .Values.localPostgres.enabled }}
+apiVersion: v1
+kind: Secret
+metadata: { name: {{ .Values.db.secretName }} }
+stringData:
+  DATABASE_URL: postgres://clinic:clinic@postgres:5432/clinic   <span class="cm"># kind only</span>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: postgres }
+spec:
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: clinic }
+            - { name: POSTGRES_PASSWORD, value: clinic }
+            - { name: POSTGRES_DB, value: clinic }
+          ports: [{ containerPort: 5432 }]
+          readinessProbe: { exec: { command: [pg_isready, -U, clinic] } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres }
+spec: { selector: { app: postgres }, ports: [{ port: 5432 }] }
+{{- end }}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">gitops/clinic/values-local.yaml</span>
+        <pre class="code">image: { prefix: clinic, tag: "1.0.0" }
+chaos: true
+migrate: { backoffLimit: 4 }          <span class="cm"># local Postgres starts with the Job, so let it retry</span>
+localPostgres: { enabled: true }
+services:
+  booking-worker: { enabled: false }  <span class="cm"># needs a real SQS queue: it comes alive on EKS</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Now create the cluster, build the images for your laptop's architecture, load them into the
+        <code class="inline">kind</code> node (there is no registry), and validate the rendered output before installing it.
+        <code class="inline">kubeconform -strict</code> rejects unknown fields, which is how a misspelt
+        <code class="inline">readinessProbe</code> key gets caught before a cluster ever sees it.
+      </p>
+      <pre class="code mt-3">kind create cluster --name clinic
+for s in booking-api booking-web; do docker build -t clinic/$s:1.0.0 clinic-app/$s; done
+kind load docker-image clinic/booking-api:1.0.0 clinic/booking-web:1.0.0 --name clinic
+helm lint gitops/clinic -f gitops/clinic/values-local.yaml
+<span class="out">1 chart(s) linted, 0 chart(s) failed</span>
+helm template clinic gitops/clinic -f gitops/clinic/values-local.yaml \
+  | kubeconform -strict -summary -kubernetes-version 1.33.0
+<span class="out">Summary: 14 resources found parsing stdin - Valid: 14, Invalid: 0, Errors: 0, Skipped: 0</span>
+helm upgrade --install clinic gitops/clinic -n booking --create-namespace -f gitops/clinic/values-local.yaml
+kubectl -n booking get pods                         <span class="cm"># after about a minute</span>
+<span class="out">NAME                               READY   STATUS      RESTARTS   AGE
+booking-api-6c9d7b8f4-7kx2p        1/1     Running     0          62s
+booking-api-6c9d7b8f4-tq9wz        1/1     Running     0          47s
+booking-api-migrate-1-0-0-hx8rd    0/1     Error       0          62s   <span class="cm"># Postgres was not up yet</span>
+booking-api-migrate-1-0-0-p2m4c    0/1     Completed   0          50s
+booking-web-7f6b5d9c8-4jv8n        1/1     Running     0          62s
+booking-web-7f6b5d9c8-zr6cd        1/1     Running     0          47s
+postgres-5b7c9f6d4-l8m2s           1/1     Running     0          62s</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        There is no ingress controller on <code class="inline">kind</code>, so reach the web tier the way you will debug it
+        in production: a port-forward to the Service. Open <code class="inline">http://localhost:3000</code> in a browser,
+        book a slot, and check the same path with curl from a second terminal.
+      </p>
+      <pre class="code mt-3">kubectl -n booking port-forward svc/booking-web 3000:8080      <span class="cm"># leave running</span>
+curl -s localhost:3000/api/healthz
+<span class="out">{"ok":true,"version":"1.0.0"}</span>
+curl -s -XPOST localhost:3000/api/bookings -H 'content-type: application/json' \
+  -d '{"patient":"An","slot":"2026-11-02T09:00"}'
+<span class="out">{"id":1,"patient":"An","slot":"2026-11-02T09:00:00.000Z","created_at":"…"}</span>
+kubectl -n booking delete pod -l app=booking-api --wait=false
+sleep 12; kubectl -n booking logs -l app=booking-api --since=30s | grep SIGTERM   <span class="cm"># preStop first, then SIGTERM</span>
+<span class="out">{"ts":"…","level":"info","msg":"SIGTERM received, draining","service":"booking-api","version":"1.0.0"}</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>What kind proved, and what it cannot:</strong> the chart renders and
+        validates, every container starts non-root on a read-only filesystem, probes pass, the web tier finds the API by
+        Service name, the migration Job works, and SIGTERM arrives 10 seconds after deletion. It cannot prove anything
+        about IAM, the ALB, RDS TLS or SQS. Those are Part II and III. Run
+        <code class="inline">kind delete cluster --name clinic</code> when you are done, or keep it for the
+        <a href="./ks15.html" class="text-viol underline decoration-viol/40">KS15</a> drills.</div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · AWS foundation in Terraform</div>
+      <h2 class="font-display text-2xl font-bold mt-2">One Terraform root builds the network, the cluster, the data layer and every identity</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Part II is about 200 lines of HCL in <code class="inline">~/labs/ks14/infra</code>, applied once. It creates
+        everything the cluster needs from AWS before a single Kubernetes manifest arrives: subnets tagged for the load
+        balancer controller, a cluster your SSO role can administer, a database, a queue, a secret, three image
+        repositories, and the IAM roles that Pods will receive through Pod Identity. Kubernetes add-ons are deliberately
+        <em>not</em> here; they arrive from Git in Part III, which is the bootstrap boundary from
+        <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The decisions baked into this root</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A lab is allowed shortcuts, as long as you can name each one and say what production does instead. These are the
+        shortcuts, and the reasons they are safe here.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Decision</th><th class="px-4 py-3">This lab</th><th class="px-4 py-3">Production (clinic-prod-eks)</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">State</td><td class="px-4 py-3">One root, local state file</td><td class="px-4 py-3">Network, cluster and data in separate S3 states with <code class="inline">use_lockfile</code> (<a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">NAT</td><td class="px-4 py-3">One NAT gateway for 2 AZs</td><td class="px-4 py-3">One per AZ, plus VPC endpoints for ECR, STS, Secrets Manager (<a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Compute</td><td class="px-4 py-3">Managed node group, 2 × <code class="inline">t4g.large</code> (Graviton)</td><td class="px-4 py-3">Small system node group plus Karpenter NodePools (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">API endpoint</td><td class="px-4 py-3">Public, restricted to your IP /32, plus private</td><td class="px-4 py-3">Private only, reached over VPN or SSM</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cluster admin</td><td class="px-4 py-3">Access entry for your own SSO role</td><td class="px-4 py-3">Access entries for Identity Center roles; break-glass (<a href="./ks15.html" class="text-viol underline decoration-viol/40">KS15</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">DB password</td><td class="px-4 py-3"><code class="inline">random_password</code>, stored in state and Secrets Manager</td><td class="px-4 py-3"><code class="inline">manage_master_user_password</code>, rotated by RDS (<a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Add-on versions</td><td class="px-4 py-3">Latest compatible (<code class="inline">most_recent</code>)</td><td class="px-4 py-3">Pinned exact versions, bumped by PR</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/versions.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers {
+    aws    = { source = "hashicorp/aws", version = "~&gt; 6.0" }
+    random = { source = "hashicorp/random", version = "~&gt; 3.6" }
+  }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "KS14" } }   <span class="cm"># region + profile come from your env</span>
+}
+variable "me" { type = string }
+variable "my_cidr" { type = string }                         <span class="cm"># your public IP /32, for the API endpoint</span>
+locals {
+  name = "lab-${var.me}"
+  azs  = ["ap-southeast-1a", "ap-southeast-1b"]
+}</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The VPC: subnet tags are the contract with the load balancer controller</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Nodes, Pods and RDS go in private subnets. Only the ALB and the NAT gateway live in public ones. The AWS Load
+        Balancer Controller does not take subnet IDs from you: it <em>discovers</em> them by tag, so these two tags decide
+        whether your Ingress ever gets an address (<a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>).
+        The private /19s leave room for thousands of Pod IPs, because the VPC CNI gives every Pod a real VPC address.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/network.tf</span>
+        <pre class="code">module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~&gt; 6.0"
+
+  name            = "${local.name}-eks"
+  cidr            = "10.98.0.0/16"
+  azs             = local.azs
+  public_subnets  = ["10.98.0.0/24", "10.98.1.0/24"]
+  private_subnets = ["10.98.32.0/19", "10.98.64.0/19"]
+
+  enable_nat_gateway = true
+  single_nat_gateway = true                     <span class="cm"># lab: one NAT, about USD 1.40 a day</span>
+
+  public_subnet_tags  = { "kubernetes.io/role/elb" = "1" }           <span class="cm"># internet-facing ALBs</span>
+  private_subnet_tags = { "kubernetes.io/role/internal-elb" = "1" }  <span class="cm"># internal LBs</span>
+}</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>The single NAT is a cost decision, and it has a failure mode.</strong>
+        One NAT gateway costs about USD 0.06 an hour plus USD 0.06 per GB processed. Every image pull, every SQS call and
+        every Secrets Manager read from a private Pod goes through it. If its AZ fails, nodes in the other AZ lose outbound
+        access. That is acceptable for a lab and never for prod, which uses one NAT per AZ plus gateway and interface
+        endpoints so most AWS traffic never touches NAT (<a href="./ar2.html" class="text-viol underline decoration-viol/40">AR2</a>).</div>
+
+      <h3 class="font-semibold text-lg mt-8">The cluster: Graviton managed nodes, access entries, Pod Identity agent</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <strong>Managed node group or EKS Auto Mode?</strong> Auto Mode would remove the node group and run the load balancer
+        controller, VPC CNI and EBS driver for you. That is why we do not use it here. Auto Mode's built-in load balancing
+        uses its own IngressClass controller (<code class="inline">eks.amazonaws.com/alb</code>), so you would never install,
+        configure, give an identity to or debug the AWS Load Balancer Controller that our production Karpenter clusters run.
+        This module is the rehearsal for those clusters, so it uses the same pieces. Two Graviton
+        <code class="inline">t4g.large</code> nodes (2 vCPU, 8 GiB, up to 35 Pods each) hold Argo CD, the add-ons and the
+        app with room for the HPA to scale. <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>
+        compares all four compute options.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/eks.tf</span>
+        <pre class="code">data "aws_caller_identity" "me" {}
+data "aws_iam_session_context" "me" { arn = data.aws_caller_identity.me.arn }  <span class="cm"># SSO session → role ARN</span>
+
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~&gt; 21.0"                           <span class="cm"># v21 = AWS provider 6 input names</span>
+
+  name               = "${local.name}-eks"
+  kubernetes_version = "1.33"
+  vpc_id             = module.vpc.vpc_id
+  subnet_ids         = module.vpc.private_subnets
+
+  endpoint_public_access       = true
+  endpoint_public_access_cidrs = [var.my_cidr]  <span class="cm"># only your laptop; Argo CD runs inside</span>
+  endpoint_private_access      = true           <span class="cm"># nodes use the private path</span>
+
+  authentication_mode                      = "API"   <span class="cm"># access entries only, no aws-auth ConfigMap</span>
+  enable_cluster_creator_admin_permissions = false   <span class="cm"># explicit entry below instead</span>
+  enable_irsa                              = false   <span class="cm"># Pod Identity only</span>
+
+  access_entries = {
+    learner = {
+      principal_arn = data.aws_iam_session_context.me.issuer_arn
+      policy_associations = { admin = {
+        policy_arn   = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+        access_scope = { type = "cluster" } } }
+    }
+  }</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/eks.tf (continued, same module block)</span>
+        <pre class="code">  addons = {
+    vpc-cni                = { before_compute = true }  <span class="cm"># nodes stay NotReady without it</span>
+    eks-pod-identity-agent = { before_compute = true }  <span class="cm"># controllers need creds on first start</span>
+    kube-proxy             = {}
+    coredns                = {}
+  }
+
+  eks_managed_node_groups = {
+    default = {
+      ami_type       = "AL2023_ARM_64_STANDARD"   <span class="cm"># Graviton: images must be linux/arm64</span>
+      instance_types = ["t4g.large"]
+      min_size       = 2
+      max_size       = 3
+      desired_size   = 2
+    }
+  }
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two defaults of the v21 module matter later. Node instances get an IMDS hop limit of 1, so Pods cannot borrow the
+        node role's credentials; anything without a Pod Identity association has <em>no</em> AWS credentials at all, which is
+        what you want, and what the Break-it exercise exploits. And add-ons without <code class="inline">addon_version</code>
+        install the latest compatible build; production pins them (<a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The data layer and the image repositories</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        RDS sits in the private subnets and accepts 5432 only from the node security group. Pods share their node's security
+        group unless you enable security groups for Pods (<a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>).
+        Terraform writes the full <code class="inline">DATABASE_URL</code> into Secrets Manager as JSON, so External Secrets can
+        copy one property into the cluster without any templating.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/data.tf (1/2) — Postgres</span>
+        <pre class="code">resource "random_password" "db" {
+  length  = 24
+  special = false                              <span class="cm"># URL-safe: it goes inside DATABASE_URL</span>
+}
+resource "aws_db_subnet_group" "db" {
+  name       = "${local.name}-clinic"
+  subnet_ids = module.vpc.private_subnets
+}
+resource "aws_security_group" "db" {
+  name   = "${local.name}-clinic-db"
+  vpc_id = module.vpc.vpc_id
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [module.eks.node_security_group_id]   <span class="cm"># Pods use the node SG</span>
+  }
+}
+resource "aws_db_instance" "clinic" {
+  identifier             = "${local.name}-clinic"
+  engine                 = "postgres"
+  engine_version         = "16"
+  instance_class         = "db.t4g.micro"
+  allocated_storage      = 20
+  db_name                = "clinic"
+  username               = "clinic"
+  password               = random_password.db.result
+  db_subnet_group_name   = aws_db_subnet_group.db.name
+  vpc_security_group_ids = [aws_security_group.db.id]
+  skip_final_snapshot    = true                <span class="cm"># lab only: destroy without a snapshot</span>
+  apply_immediately      = true
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/data.tf (2/2) — secret, queue, repositories</span>
+        <pre class="code">resource "aws_secretsmanager_secret" "db" {
+  name                    = "${local.name}/clinic/db"
+  recovery_window_in_days = 0                  <span class="cm"># lab: delete at once, so you can recreate it</span>
+}
+resource "aws_secretsmanager_secret_version" "db" {
+  secret_id = aws_secretsmanager_secret.db.id
+  secret_string = jsonencode({
+    DATABASE_URL = "postgres://clinic:${random_password.db.result}@${aws_db_instance.clinic.address}:5432/clinic"
+  })
+}
+resource "aws_sqs_queue" "reminders" {
+  name                       = "${local.name}-clinic-reminders"
+  visibility_timeout_seconds = 60
+}
+resource "aws_ecr_repository" "svc" {
+  for_each             = toset(["booking-api", "booking-web", "booking-worker"])
+  name                 = "${local.name}/${each.key}"
+  image_tag_mutability = "IMMUTABLE"           <span class="cm"># a tag in Git always means the same bytes</span>
+  force_delete         = true                  <span class="cm"># lab: destroy even with images inside</span>
+}</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Postgres 16 on RDS has <code class="inline">rds.force_ssl</code> on by default, so a plain connection is refused with
+        <code class="inline">no pg_hba.conf entry … no encryption</code>. That is why the sandbox values set
+        <code class="inline">db.ssl: true</code>, which the API turns into a TLS connection.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Pod Identity: four roles, nothing on the node role</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Four workloads call AWS APIs, so four IAM roles are bound to four ServiceAccounts through Pod Identity associations
+        (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>). Every association is just a triple of
+        cluster, namespace and ServiceAccount name. Get one character wrong and the Pod silently starts with no credentials.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Workload</th><th class="px-4 py-3">Namespace / ServiceAccount</th><th class="px-4 py-3">Can do</th><th class="px-4 py-3">Symptom if missing</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">AWS Load Balancer Controller</td><td class="px-4 py-3"><code class="inline">kube-system / aws-load-balancer-controller</code></td><td class="px-4 py-3">Create ALBs, target groups, SG rules</td><td class="px-4 py-3">Ingress has no ADDRESS; controller logs show credential errors</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">External Secrets</td><td class="px-4 py-3"><code class="inline">external-secrets / external-secrets</code></td><td class="px-4 py-3">Read <em>one</em> secret</td><td class="px-4 py-3">ExternalSecret <code class="inline">SecretSyncedError</code>; API Pods stuck in CreateContainerConfigError</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">booking-api</td><td class="px-4 py-3"><code class="inline">booking / booking-api</code></td><td class="px-4 py-3"><code class="inline">sqs:SendMessage</code></td><td class="px-4 py-3"><code class="inline">POST /bookings</code> returns 500 after the row is written</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">booking-worker</td><td class="px-4 py-3"><code class="inline">booking / booking-worker</code></td><td class="px-4 py-3"><code class="inline">sqs:ReceiveMessage</code>, <code class="inline">sqs:DeleteMessage</code></td><td class="px-4 py-3">CrashLoopBackOff, queue depth grows</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/identity.tf — the two controllers</span>
+        <pre class="code">module "lbc_pod_identity" {
+  source  = "terraform-aws-modules/eks-pod-identity/aws"
+  version = "~&gt; 2.0"
+  name    = "${local.name}-lbc"
+  attach_aws_lb_controller_policy = true          <span class="cm"># upstream policy, kept current by the module</span>
+  associations = { this = {
+    cluster_name    = module.eks.cluster_name
+    namespace       = "kube-system"
+    service_account = "aws-load-balancer-controller" } }
+}
+module "eso_pod_identity" {
+  source  = "terraform-aws-modules/eks-pod-identity/aws"
+  version = "~&gt; 2.0"
+  name    = "${local.name}-eso"
+  attach_external_secrets_policy        = true
+  external_secrets_secrets_manager_arns = [aws_secretsmanager_secret.db.arn]  <span class="cm"># this secret only</span>
+  external_secrets_create_permission    = false
+  associations = { this = {
+    cluster_name    = module.eks.cluster_name
+    namespace       = "external-secrets"
+    service_account = "external-secrets" } }
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/apps.tf — the two clinic workloads, plus outputs</span>
+        <pre class="code">locals {
+  app_sqs = {
+    booking-api    = ["sqs:SendMessage"]
+    booking-worker = ["sqs:ReceiveMessage", "sqs:DeleteMessage"]
+  }
+}
+data "aws_iam_policy_document" "pod_trust" {
+  statement {
+    actions = ["sts:AssumeRole", "sts:TagSession"]      <span class="cm"># TagSession is required</span>
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+resource "aws_iam_role" "app" {
+  for_each           = local.app_sqs
+  name               = "${local.name}-${each.key}"
+  assume_role_policy = data.aws_iam_policy_document.pod_trust.json
+}
+resource "aws_iam_role_policy" "app_sqs" {
+  for_each = local.app_sqs
+  role     = aws_iam_role.app[each.key].id
+  policy = jsonencode({ Version = "2012-10-17", Statement = [{
+    Effect = "Allow", Action = each.value, Resource = aws_sqs_queue.reminders.arn }] })
+}
+resource "aws_eks_pod_identity_association" "app" {
+  for_each        = local.app_sqs
+  cluster_name    = module.eks.cluster_name
+  namespace       = "booking"
+  service_account = each.key                          <span class="cm"># = the chart's ServiceAccount name</span>
+  role_arn        = aws_iam_role.app[each.key].arn
+}
+output "vpc_id" { value = module.vpc.vpc_id }
+output "queue_url" { value = aws_sqs_queue.reminders.url }
+output "ecr_registry" { value = split("/", aws_ecr_repository.svc["booking-api"].repository_url)[0] }</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Validate, apply, connect</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Validate before you plan: <code class="inline">terraform validate</code> catches a misspelt module input in seconds,
+        which matters because the EKS module renamed most inputs between v20 and v21. Then read the plan. Expect roughly 90
+        resources to add (the exact number depends on module versions), every name starting <code class="inline">lab-$ME</code>,
+        and nothing to change or destroy.
+      </p>
+      <pre class="code mt-3">cd ~/labs/ks14/infra
+aws sso login &amp;&amp; aws sts get-caller-identity --query Account --output text
+<span class="out">888899990000</span>                                  <span class="cm"># anything else: stop and fix your profile</span>
+cat &gt; terraform.tfvars &lt;&lt;EOF
+me      = "$ME"
+my_cidr = "$(curl -s https://checkip.amazonaws.com)/32"
+EOF
+terraform init &amp;&amp; terraform validate
+<span class="out">Success! The configuration is valid.</span>
+terraform plan -out tfplan | tail -1
+<span class="out">Plan: … to add, 0 to change, 0 to destroy.</span>   <span class="cm"># roughly 90 to add</span>
+terraform apply tfplan                         <span class="cm"># ~20–25 min: EKS ~10, nodes ~3, RDS ~8</span>
+aws eks update-kubeconfig --name lab-$ME-eks --alias lab-$ME-eks
+kubectl get nodes -L kubernetes.io/arch
+<span class="out">NAME                                              STATUS   ROLES    AGE   VERSION               ARCH
+ip-10-98-41-17.ap-southeast-1.compute.internal    Ready    &lt;none&gt;   4m    v1.33.x-eks-…         arm64
+ip-10-98-77-203.ap-southeast-1.compute.internal   Ready    &lt;none&gt;   4m    v1.33.x-eks-…         arm64</span>
+aws eks list-pod-identity-associations --cluster-name lab-$ME-eks \
+  --query 'associations[].[namespace,serviceAccount]' --output text | sort
+<span class="out">booking	booking-api
+booking	booking-worker
+external-secrets	external-secrets
+kube-system	aws-load-balancer-controller</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>If your IP changes</strong> (new Wi-Fi, VPN), <code class="inline">kubectl</code>
+        starts timing out because the public endpoint only accepts your old /32. Rewrite <code class="inline">my_cidr</code> in
+        <code class="inline">terraform.tfvars</code> and apply again; it is an in-place update of about a minute.</div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · Platform add-ons and GitOps</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Install Argo CD by hand once; everything after that arrives from Git</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        From here on, you change the cluster by committing to <code class="inline">lab-$ME-clinic-gitops</code>, never by
+        running <code class="inline">helm install</code> or <code class="inline">kubectl apply</code> against it. There is exactly
+        one exception: Argo CD itself and the single root Application that tells it where to look. That is the bootstrap
+        boundary from <a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>, now with your own hands
+        on it. Before Git can describe the app, though, the images it names have to exist.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Push the first images to ECR</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The nodes are Graviton, so build <code class="inline">linux/arm64</code> even on an x86 laptop (buildx emulates it).
+        Tag <code class="inline">1.0.0</code> is pushed by hand this once; from Part IV on, only CI pushes, with a tag derived
+        from the commit.
+      </p>
+      <pre class="code mt-3">cd ~/labs/ks14
+export REG=$(terraform -chdir=infra output -raw ecr_registry)
+export VPC_ID=$(terraform -chdir=infra output -raw vpc_id) QUEUE_URL=$(terraform -chdir=infra output -raw queue_url)
+export GITOPS=https://github.com/$ME/lab-$ME-clinic-gitops.git
+aws ecr get-login-password | docker login --username AWS --password-stdin $REG
+<span class="out">Login Succeeded</span>
+for s in booking-api booking-web booking-worker; do
+  docker buildx build --platform linux/arm64 -t $REG/lab-$ME/$s:1.0.0 --push clinic-app/$s
+done
+aws ecr describe-images --repository-name lab-$ME/booking-worker --query 'imageDetails[].imageTags' --output text
+<span class="out">1.0.0</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">The GitOps repository: one root, three layers</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The repository is small. <code class="inline">root.yaml</code> is the app-of-apps: an Application whose source is the
+        <code class="inline">apps/</code> directory, which in turn holds one Application per component. Sync waves order the
+        layers: platform controllers first (wave -2), then the namespace's configuration and secret (wave -1), then the
+        clinic chart (wave 0). Argo CD does not wait for a child Application to be <em>healthy</em> before the next wave, so
+        each child also gets a <code class="inline">retry</code> policy. If a CRD is not installed yet, the sync fails, backs
+        off, and succeeds a minute later.
+      </p>
+      <pre class="code mt-3">gitops/                                   <span class="cm"># → github.com/$ME/lab-$ME-clinic-gitops</span>
+├── root.yaml                             <span class="cm"># applied once by hand; watches apps/</span>
+├── apps/
+│   ├── aws-load-balancer-controller.yaml  <span class="cm"># wave -2, Helm chart from eks-charts</span>
+│   ├── external-secrets.yaml              <span class="cm"># wave -2, Helm chart</span>
+│   ├── metrics-server.yaml                <span class="cm"># wave -2, Helm chart (HPA needs it)</span>
+│   ├── clinic-config.yaml                 <span class="cm"># wave -1, path clinic-config/</span>
+│   └── clinic.yaml                        <span class="cm"># wave 0, path clinic/ + values-sandbox.yaml</span>
+├── clinic-config/
+│   ├── clustersecretstore.yaml
+│   └── externalsecret.yaml
+└── clinic/                                <span class="cm"># the chart from Part I</span></pre>
+      <pre class="code mt-3">cd ~/labs/ks14/gitops &amp;&amp; mkdir -p apps clinic-config
+cat &gt; root.yaml &lt;&lt;EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  project: default
+  source: { repoURL: $GITOPS, targetRevision: main, path: apps }
+  destination: { server: https://kubernetes.default.svc, namespace: argocd }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }   <span class="cm"># delete a file in apps/ → that app is removed</span>
+EOF</pre>
+
+      <h3 class="font-semibold text-lg mt-8">Platform Applications: load balancer controller, External Secrets, metrics-server</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each platform add-on is an Application that points at the upstream Helm chart with a pinned version. The versions
+        below were current in late 2026; run <code class="inline">helm search repo &lt;repo&gt;/&lt;chart&gt;</code> and pin
+        whatever is current when you do the lab. The heredocs expand <code class="inline">$ME</code> and
+        <code class="inline">$VPC_ID</code> as they write the files.
+      </p>
+      <pre class="code mt-3">cat &gt; apps/aws-load-balancer-controller.yaml &lt;&lt;EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aws-load-balancer-controller
+  namespace: argocd
+  annotations: { argocd.argoproj.io/sync-wave: "-2" }
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: https://aws.github.io/eks-charts
+    chart: aws-load-balancer-controller
+    targetRevision: 3.6.2
+    helm:
+      valuesObject:
+        clusterName: lab-$ME-eks
+        region: ap-southeast-1
+        vpcId: $VPC_ID                    <span class="cm"># Pods cannot reach IMDS to discover it</span>
+        replicaCount: 1                   <span class="cm"># lab; prod runs 2</span>
+        serviceAccount: { name: aws-load-balancer-controller }   <span class="cm"># = the association</span>
+        enableServiceMutatorWebhook: false
+  destination: { server: https://kubernetes.default.svc, namespace: kube-system }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    retry: { limit: 5, backoff: { duration: 10s, factor: 2, maxDuration: 3m } }
+EOF</pre>
+      <pre class="code mt-3">app() {                                        <span class="cm"># $1 chart  $2 repo  $3 version  $4 namespace</span>
+  cat &gt; apps/$1.yaml &lt;&lt;EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: $1
+  namespace: argocd
+  annotations: { argocd.argoproj.io/sync-wave: "-2" }
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source: { repoURL: "$2", chart: $1, targetRevision: $3 }
+  destination: { server: https://kubernetes.default.svc, namespace: $4 }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]   <span class="cm"># ESO's CRDs are too big for client-side apply</span>
+    retry: { limit: 5, backoff: { duration: 10s, factor: 2, maxDuration: 3m } }
+EOF
+}
+app external-secrets https://charts.external-secrets.io 2.14.0 external-secrets
+app metrics-server https://kubernetes-sigs.github.io/metrics-server/ 3.14.0 kube-system</pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Add-on</th><th class="px-4 py-3">Chart (version used here)</th><th class="px-4 py-3">Why the clinic needs it</th><th class="px-4 py-3">Healthy looks like</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">AWS Load Balancer Controller</td><td class="px-4 py-3"><code class="inline">eks/aws-load-balancer-controller</code> 3.6.2</td><td class="px-4 py-3">Turns the <code class="inline">clinic</code> Ingress into an ALB with IP targets</td><td class="px-4 py-3">IngressClass <code class="inline">alb</code> exists; Ingress gets an ADDRESS</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">External Secrets Operator</td><td class="px-4 py-3"><code class="inline">external-secrets/external-secrets</code> 2.14.0</td><td class="px-4 py-3">Copies <code class="inline">DATABASE_URL</code> from Secrets Manager into Secret <code class="inline">clinic-db</code></td><td class="px-4 py-3">ClusterSecretStore <code class="inline">Valid</code>; ExternalSecret <code class="inline">SecretSynced</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">metrics-server</td><td class="px-4 py-3"><code class="inline">metrics-server/metrics-server</code> 3.14.0</td><td class="px-4 py-3">CPU metrics for the HPA; without it, targets read <code class="inline">&lt;unknown&gt;</code></td><td class="px-4 py-3"><code class="inline">kubectl top pods -n booking</code> prints numbers</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The database secret: ClusterSecretStore, then ExternalSecret</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The store tells ESO <em>where</em> secrets live and which namespaces may use it. It has no
+        <code class="inline">auth</code> block, so ESO uses its own Pod Identity role, which can read exactly one secret. The
+        ExternalSecret names the secret and the JSON property to copy. Git holds the reference; the value never touches the
+        repository (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>). The API is
+        <code class="inline">external-secrets.io/v1</code>; ESO releases before 0.16 only served
+        <code class="inline">v1beta1</code>, which you will still meet in older client clusters.
+      </p>
+      <pre class="code mt-3">cat &gt; clinic-config/clustersecretstore.yaml &lt;&lt;EOF
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata: { name: sandbox-secrets-manager }
+spec:
+  provider:
+    aws: { service: SecretsManager, region: ap-southeast-1 }   <span class="cm"># creds: ESO's Pod Identity role</span>
+  conditions:
+    - namespaces: [booking]                                    <span class="cm"># only booking may use this store</span>
+EOF
+cat &gt; clinic-config/externalsecret.yaml &lt;&lt;EOF
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata: { name: clinic-db, namespace: booking }
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { kind: ClusterSecretStore, name: sandbox-secrets-manager }
+  target: { name: clinic-db }                                  <span class="cm"># = db.secretName in the chart</span>
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef: { key: lab-$ME/clinic/db, property: DATABASE_URL }
+EOF</pre>
+      <pre class="code mt-3">cat &gt; apps/clinic-config.yaml &lt;&lt;EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: clinic-config
+  namespace: argocd
+  annotations: { argocd.argoproj.io/sync-wave: "-1" }
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source: { repoURL: $GITOPS, targetRevision: main, path: clinic-config }
+  destination: { server: https://kubernetes.default.svc, namespace: booking }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, SkipDryRunOnMissingResource=true]  <span class="cm"># CRDs may not exist yet</span>
+    retry: { limit: 10, backoff: { duration: 10s, factor: 2, maxDuration: 3m } }
+EOF</pre>
+
+      <h3 class="font-semibold text-lg mt-8">The clinic Application and the PreSync migration</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The sandbox values file is the only environment-specific input to the chart: ECR images, the queue, TLS to RDS,
+        and the Ingress annotations that make the load balancer controller build an internet-facing ALB with IP targets.
+        The <code class="inline">load-balancer-name</code> and <code class="inline">tags</code> annotations exist for
+        teardown: they make your ALB findable by name and by tag in a shared account. ALB names are limited to 32
+        characters, so keep <code class="inline">lab-$ME-clinic</code> within that.
+      </p>
+      <pre class="code mt-3">cat &gt; clinic/values-sandbox.yaml &lt;&lt;EOF
+image:
+  prefix: $REG/lab-$ME
+  tag: "1.0.0"
+chaos: true                       <span class="cm"># sandbox only: /admin/burn drives the HPA check in Part IV</span>
+queueUrl: $QUEUE_URL
+db: { secretName: clinic-db, ssl: true }
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/load-balancer-name: lab-$ME-clinic
+    alb.ingress.kubernetes.io/tags: Owner=$ME,Lab=KS14
+EOF
+helm template clinic clinic -f clinic/values-sandbox.yaml | kubeconform -strict -summary -kubernetes-version 1.33.0
+<span class="out">Summary: 14 resources found parsing stdin - Valid: 14, Invalid: 0, Errors: 0, Skipped: 0</span>
+cat &gt; apps/clinic.yaml &lt;&lt;EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: clinic
+  namespace: argocd
+  annotations: { argocd.argoproj.io/sync-wave: "0" }
+  finalizers: [resources-finalizer.argocd.argoproj.io]   <span class="cm"># deleting the app deletes the Ingress → the ALB</span>
+spec:
+  project: default
+  source:
+    repoURL: $GITOPS
+    targetRevision: main
+    path: clinic
+    helm: { valueFiles: [values-sandbox.yaml] }
+  destination: { server: https://kubernetes.default.svc, namespace: booking }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]
+    retry: { limit: 3, backoff: { duration: 20s, factor: 2, maxDuration: 3m } }
+EOF</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On every sync of <code class="inline">clinic</code>, Argo CD runs the migration Job first and waits for it. If it
+        exits non-zero, the sync stops there, and the Deployments keep running the previous version against an unchanged
+        schema. That is the reason migrations must be expand-only: during a rollout, old and new Pods share the schema
+        (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>). On the very first sync the Job may sit
+        in <code class="inline">CreateContainerConfigError</code> for a few seconds until ESO has written
+        <code class="inline">clinic-db</code>; the kubelet retries on its own.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R as root app
+    participant P as platform apps (wave -2)
+    participant C as clinic-config (wave -1)
+    participant K as clinic (wave 0)
+    participant J as PreSync Job
+    R->>P: create LBC, ESO, metrics-server Applications
+    P-->>P: charts install, CRDs appear
+    R->>C: create clinic-config
+    C-->>C: retry until the ESO CRDs exist
+    C->>C: ExternalSecret → Secret clinic-db
+    R->>K: create clinic
+    K->>J: PreSync: server.js migrate
+    J-->>K: exit 0 ("migration ok")
+    K->>K: Sync: SAs, Services, Deployments, PDBs, HPAs, Ingress
+    Note over K: LBC sees the Ingress → ALB active in 2–3 min
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Bootstrap Argo CD and watch it converge</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Push the repository first, because Argo CD reads from GitHub, not from your disk. A public repository is fine for the
+        lab: it holds names and references, never secret values. For a private one, register it with
+        <code class="inline">argocd repo add</code> and a read-only token. Then install Argo CD with Helm (Dex and
+        notifications off; you log in as <code class="inline">admin</code>) and apply the root Application.
+      </p>
+      <pre class="code mt-3">cd ~/labs/ks14/gitops
+git init -b main &amp;&amp; git add . &amp;&amp; git commit -qm "clinic platform: chart, platform apps, config"
+gh repo create lab-$ME-clinic-gitops --public --source . --push
+helm repo add argo https://argoproj.github.io/argo-helm &amp;&amp; helm repo update argo
+helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace --version 10.11.6 \
+  --set dex.enabled=false --set notifications.enabled=false        <span class="cm"># chart 10.11.6 = Argo CD v3.5.6</span>
+kubectl -n argocd rollout status deploy/argocd-server
+<span class="out">deployment "argocd-server" successfully rolled out</span>
+kubectl apply -f root.yaml
+<span class="out">application.argoproj.io/root created</span>
+kubectl -n argocd get applications                 <span class="cm"># repeat until all six are Synced/Healthy, ~5 min</span>
+<span class="out">NAME                           SYNC STATUS   HEALTH STATUS
+aws-load-balancer-controller   Synced        Healthy
+clinic                         Synced        Healthy
+clinic-config                  Synced        Healthy
+external-secrets               Synced        Healthy
+metrics-server                 Synced        Healthy
+root                           Synced        Healthy</span></pre>
+      <pre class="code mt-3">kubectl -n booking get externalsecret,job,pods,ingress
+<span class="out">NAME                                         STORE                     REFRESH INTERVAL   STATUS         READY
+externalsecret.external-secrets.io/clinic-db sandbox-secrets-manager   1h                 SecretSynced   True
+NAME                                  STATUS     COMPLETIONS   DURATION
+job.batch/booking-api-migrate-1-0-0   Complete   1/1           9s
+NAME                                  READY   STATUS      RESTARTS   AGE
+pod/booking-api-7d9f6c5b8-5qk2x       1/1     Running     0          3m
+pod/booking-api-7d9f6c5b8-w8n4r       1/1     Running     0          3m
+pod/booking-web-5c8b7d6f9-9hx7m       1/1     Running     0          3m
+pod/booking-web-5c8b7d6f9-kl2vp       1/1     Running     0          3m
+pod/booking-worker-6f7c8d9b5-r4t6z    1/1     Running     0          3m
+NAME                               CLASS   HOSTS   ADDRESS                                                     PORTS
+ingress.networking.k8s.io/clinic   alb     *       lab-yourhandle-clinic-1234567890.ap-southeast-1.elb.amazonaws.com   80</span>
+kubectl -n booking logs job/booking-api-migrate-1-0-0
+<span class="out">{"ts":"…","level":"info","msg":"migration ok","service":"booking-api","version":"dev"}</span>
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
+kubectl -n argocd port-forward svc/argocd-server 8443:443    <span class="cm"># UI: https://localhost:8443, user admin</span></pre>
+      <div class="mt-4 callout callout-info"><strong>When a wave sticks.</strong> Read the Application's condition before
+        anything else: <code class="inline">kubectl -n argocd get app clinic-config -o jsonpath='{.status.conditions}'</code>.
+        "could not find external-secrets.io/ClusterSecretStore" means ESO is still installing; the retry handles it. An
+        Ingress with no ADDRESS after five minutes means the controller is unhappy: its logs
+        (<code class="inline">kubectl -n kube-system logs deploy/aws-load-balancer-controller</code>) name the missing subnet tag
+        or the IAM action it was denied. <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a> has the
+        full failure table.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Optional: HTTPS on your sandbox hostname</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The lab works over plain HTTP on the ALB's DNS name. If the sandbox hosted zone
+        <code class="inline">sandbox.clinic.example.com</code> exists in <code class="inline">gol-sandbox</code>, you can add
+        <code class="inline">$ME.sandbox.clinic.example.com</code> with an ACM certificate and ExternalDNS
+        (<a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>). Add this file to the infra root and apply:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/dns.tf (optional)</span>
+        <pre class="code">data "aws_route53_zone" "sandbox" { name = "sandbox.clinic.example.com" }
+resource "aws_acm_certificate" "app" {
+  domain_name       = "${var.me}.sandbox.clinic.example.com"
+  validation_method = "DNS"
+}
+resource "aws_route53_record" "cert" {
+  zone_id = data.aws_route53_zone.sandbox.zone_id
+  name    = one(aws_acm_certificate.app.domain_validation_options).resource_record_name
+  type    = one(aws_acm_certificate.app.domain_validation_options).resource_record_type
+  records = [one(aws_acm_certificate.app.domain_validation_options).resource_record_value]
+  ttl     = 60
+}
+resource "aws_acm_certificate_validation" "app" {
+  certificate_arn         = aws_acm_certificate.app.arn
+  validation_record_fqdns = [aws_route53_record.cert.fqdn]
+}
+module "edns_pod_identity" {
+  source                        = "terraform-aws-modules/eks-pod-identity/aws"
+  version                       = "~&gt; 2.0"
+  name                          = "${local.name}-external-dns"
+  attach_external_dns_policy    = true
+  external_dns_hosted_zone_arns = [data.aws_route53_zone.sandbox.arn]
+  associations = { this = { cluster_name = module.eks.cluster_name,
+    namespace = "external-dns", service_account = "external-dns" } }
+}
+output "cert_arn" { value = aws_acm_certificate_validation.app.certificate_arn }</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Then add <code class="inline">app external-dns https://kubernetes-sigs.github.io/external-dns/ 1.23.0 external-dns</code>
+        and give that Application <code class="inline">helm.valuesObject</code> of
+        <code class="inline">{ policy: sync, txtOwnerId: lab-$ME, domainFilters: [$ME.sandbox.clinic.example.com] }</code>, so
+        it can only ever touch your own name. In <code class="inline">values-sandbox.yaml</code> set
+        <code class="inline">ingress.host</code> to your hostname and add three annotations:
+        <code class="inline">alb.ingress.kubernetes.io/certificate-arn</code> (the output above),
+        <code class="inline">alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'</code> and
+        <code class="inline">alb.ingress.kubernetes.io/ssl-redirect: "443"</code>.
+      </p>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · Ship, verify, roll back, tear down</div>
+      <h2 class="font-display text-2xl font-bold mt-2">CI changes Git, Argo CD changes the cluster, and teardown runs in reverse</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        The pipeline never talks to the cluster. It builds and pushes images with a short-lived AWS role, then commits one
+        line to the GitOps repository. Argo CD notices the commit and does the deploy. That split is why a rollback is a
+        <code class="inline">git revert</code>, and why the CI role cannot do anything to EKS
+        (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">CI: an OIDC role, a native arm64 build, a tag bump in Git</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        GitHub's OIDC provider is registered once per AWS account; the sandbox already has it
+        (<code class="inline">aws iam list-open-id-connect-providers</code>). Your role trusts only pushes to
+        <code class="inline">main</code> of your own app repository, and can only push to your three ECR repositories
+        (<a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a>).
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/infra/ci.tf</span>
+        <pre class="code">variable "app_repo" { type = string }                 <span class="cm"># "&lt;you&gt;/lab-&lt;you&gt;-clinic-app"</span>
+data "aws_iam_openid_connect_provider" "github" { url = "https://token.actions.githubusercontent.com" }
+resource "aws_iam_role" "gha_push" {
+  name = "${local.name}-gha-ecr-push"
+  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
+    Effect    = "Allow", Action = "sts:AssumeRoleWithWebIdentity"
+    Principal = { Federated = data.aws_iam_openid_connect_provider.github.arn }
+    Condition = { StringEquals = {
+      "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+      "token.actions.githubusercontent.com:sub" = "repo:${var.app_repo}:ref:refs/heads/main" } } }] })
+}
+resource "aws_iam_role_policy" "gha_push" {
+  role = aws_iam_role.gha_push.id
+  policy = jsonencode({ Version = "2012-10-17", Statement = [
+    { Effect = "Allow", Action = "ecr:GetAuthorizationToken", Resource = "*" },
+    { Effect = "Allow", Resource = [for r in aws_ecr_repository.svc : r.arn], Action = [
+      "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
+      "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"] }] })
+}
+output "push_role_arn" { value = aws_iam_role.gha_push.arn }</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks14/clinic-app/.github/workflows/release.yml</span>
+        <pre class="code">name: release
+on: { push: { branches: [main] } }
+permissions: { id-token: write, contents: read }
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm                <span class="cm"># native arm64, no QEMU (free on public repos)</span>
+    outputs: { tag: "${{ steps.tag.outputs.tag }}" }
+    steps:
+      - uses: actions/checkout@v5
+      - id: tag
+        run: echo "tag=sha-${GITHUB_SHA::7}" &gt;&gt; "$GITHUB_OUTPUT"   <span class="cm"># immutable, traceable</span>
+      - uses: aws-actions/configure-aws-credentials@v5
+        with: { role-to-assume: "${{ vars.PUSH_ROLE_ARN }}", aws-region: ap-southeast-1 }
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - env: { REG: "${{ steps.ecr.outputs.registry }}", TAG: "${{ steps.tag.outputs.tag }}", ME: "${{ vars.ME }}" }
+        run: |
+          for s in booking-api booking-web booking-worker; do
+            docker buildx build --platform linux/arm64 -t $REG/lab-$ME/$s:$TAG --push $s
+          done
+  bump:
+    needs: build
+    runs-on: ubuntu-24.04                    <span class="cm"># yq is preinstalled here</span>
+    steps:
+      - uses: actions/checkout@v5
+        with: { repository: "${{ vars.GITOPS_REPO }}", token: "${{ secrets.GITOPS_TOKEN }}" }
+      - env: { TAG: "${{ needs.build.outputs.tag }}" }
+        run: |
+          yq -i '.image.tag = strenv(TAG)' clinic/values-sandbox.yaml
+          git config user.name clinic-ci &amp;&amp; git config user.email clinic-ci@users.noreply.github.com
+          git diff --quiet || { git commit -qam "deploy(clinic): $TAG" &amp;&amp; git push; }   <span class="cm"># rerun-safe</span></pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">GITOPS_TOKEN</code> is a fine-grained personal access token limited to
+        <code class="inline">lab-$ME-clinic-gitops</code>, with Contents read/write and a 7-day expiry. That is acceptable for a
+        lab; on a client, the bump uses a GitHub App token scoped to the GitOps repo, as in KS10. Wire it up, push, and
+        watch one commit travel to the cluster:
+      </p>
+      <pre class="code mt-3">echo "app_repo = \"$ME/lab-$ME-clinic-app\"" &gt;&gt; ~/labs/ks14/infra/terraform.tfvars
+terraform -chdir=$HOME/labs/ks14/infra apply  <span class="cm"># 2 to add: the role and its policy</span>
+gh repo create lab-$ME-clinic-app --public     <span class="cm"># empty, so variables exist before the first run</span>
+R=$ME/lab-$ME-clinic-app
+gh variable set PUSH_ROLE_ARN -R $R --body "$(terraform -chdir=$HOME/labs/ks14/infra output -raw push_role_arn)"
+gh variable set ME -R $R --body $ME; gh variable set GITOPS_REPO -R $R --body $ME/lab-$ME-clinic-gitops
+gh secret set GITOPS_TOKEN -R $R              <span class="cm"># paste the fine-grained token</span>
+cd ~/labs/ks14/clinic-app &amp;&amp; sed -i.bak 's/&lt;h1&gt;Clinic booking&lt;/&lt;h1&gt;Clinic booking on EKS&lt;/' booking-web/index.html &amp;&amp; rm booking-web/*.bak
+git init -qb main &amp;&amp; git add . &amp;&amp; git commit -qm "clinic app with release pipeline"
+git remote add origin https://github.com/$R.git &amp;&amp; git push -u origin main
+gh run watch -R $R                             <span class="cm"># ~4 min: build, then bump</span>
+<span class="out">✓ main release · 1234567890
+  ✓ build in 3m12s
+  ✓ bump in 9s</span></pre>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    D["git push<br/>lab-you-clinic-app"] --> B["build job · arm64<br/>OIDC → gha-ecr-push"]
+    B --> E["ECR<br/>lab-you/*:sha-abc1234"]
+    B --> U["bump job<br/>yq .image.tag"]
+    U --> G["lab-you-clinic-gitops<br/>commit on main"]
+    G -->|"poll ≤ 3 min"| A["Argo CD<br/>PreSync migrate → rollout"]
+    E -.->|"nodes pull"| A
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">Verify every hop, in the order traffic takes them</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        "The pods are Running" is not verification. Check each join from the outside in, so that the first failing line
+        tells you which layer to open. Argo CD polls Git every two to three minutes; to skip the wait, annotate the
+        Application with <code class="inline">argocd.argoproj.io/refresh=normal</code>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Hop</th><th class="px-4 py-3">Proof</th><th class="px-4 py-3">If it fails, look at</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Internet → ALB → web</td><td class="px-4 py-3"><code class="inline">curl $URL/healthz</code> prints <code class="inline">ok</code></td><td class="px-4 py-3">Target health, Ingress events, LBC logs (<a href="./ks6.html" class="text-viol underline decoration-viol/40">KS6</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">web → api</td><td class="px-4 py-3"><code class="inline">/api/healthz</code> shows the new <code class="inline">sha-…</code> version</td><td class="px-4 py-3">nginx logs, Service endpoints</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">api → RDS</td><td class="px-4 py-3">POST returns 201; GET returns the row from every replica</td><td class="px-4 py-3"><code class="inline">/readyz</code>, the Secret, RDS security group</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">api → SQS → worker</td><td class="px-4 py-3">Worker logs <code class="inline">reminder sent</code> with the booking id; queue depth back to 0</td><td class="px-4 py-3">Pod Identity associations (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">HPA</td><td class="px-4 py-3">Load on <code class="inline">/api/admin/burn</code> takes <code class="inline">booking-api</code> above 2 replicas</td><td class="px-4 py-3"><code class="inline">kubectl top</code>, metrics-server (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code mt-3">export URL=http://$(kubectl -n booking get ingress clinic -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+curl -s $URL/healthz; curl -s $URL/api/healthz
+<span class="out">ok
+{"ok":true,"version":"sha-3f9c2e1"}</span>
+curl -s -XPOST $URL/api/bookings -H 'content-type: application/json' -d '{"patient":"Binh","slot":"2026-11-03T10:00"}'
+<span class="out">{"id":1,"patient":"Binh","slot":"2026-11-03T10:00:00.000Z","created_at":"…"}</span>
+for i in 1 2 3 4; do curl -s $URL/api/bookings | jq length; done      <span class="cm"># same answer from every replica</span>
+<span class="out">1
+1
+1
+1</span>
+kubectl -n booking logs deploy/booking-worker --since=5m | grep 'reminder sent'
+<span class="out">{"ts":"…","level":"info","msg":"reminder sent","service":"booking-worker","bookingId":1}</span>
+aws sqs get-queue-attributes --queue-url $QUEUE_URL --attribute-names ApproximateNumberOfMessages \
+  --query Attributes.ApproximateNumberOfMessages --output text
+<span class="out">0</span>
+for i in $(seq 150); do curl -so /dev/null "$URL/api/admin/burn?ms=800" &amp; curl -so /dev/null "$URL/api/admin/burn?ms=800"; wait; done
+kubectl -n booking get hpa booking-api
+<span class="out">NAME          REFERENCE                TARGETS         MINPODS   MAXPODS   REPLICAS
+booking-api   Deployment/booking-api   cpu: 412%/70%   2         6         6</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The burn loop keeps two requests of 800 ms in flight, short enough that the liveness probe (1-second timeout) still
+        gets answered between them. Longer burns block Node's single thread, fail liveness and turn a scaling test into a
+        restart storm, which is a lesson of its own for <a href="./ks15.html" class="text-viol underline decoration-viol/40">KS15</a>.
+        The HPA scales back down about five minutes after the load stops.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Roll back with git revert</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A rollback is a new commit that restores the previous tag. Argo CD syncs it like any other change, re-runs the
+        (idempotent, expand-only) migration and rolls the Deployments back. Git keeps the record of who rolled back what and
+        when. <code class="inline">kubectl rollout undo</code> would be reverted by self-heal within minutes; it is a
+        break-glass tool only (<a href="./ks15.html" class="text-viol underline decoration-viol/40">KS15</a>).
+      </p>
+      <pre class="code mt-3">cd ~/labs/ks14/gitops &amp;&amp; git pull -q &amp;&amp; git log --oneline -2
+<span class="out">3f9c2e1 deploy(clinic): sha-3f9c2e1
+8a1b2c3 clinic platform: chart, platform apps, config</span>
+git revert --no-edit HEAD &amp;&amp; git push -q
+kubectl -n argocd annotate app clinic argocd.argoproj.io/refresh=normal --overwrite
+kubectl -n booking rollout status deploy/booking-api &amp;&amp; curl -s $URL/api/healthz
+<span class="out">deployment "booking-api" successfully rolled out
+{"ok":true,"version":"1.0.0"}</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The next push to the app repository will bump the tag forward again, so a revert buys time; the fix still lands as a
+        normal commit to <code class="inline">lab-$ME-clinic-app</code>.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Ordered teardown, and what it costs until you run it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Terraform does not know about the ALB, its target groups or its security groups: the load balancer controller
+        created them from an Ingress. If you run <code class="inline">terraform destroy</code> first, the cluster disappears
+        with the controller inside it, the ALB stays behind, and the VPC deletion then fails after a long wait with
+        <code class="inline">DependencyViolation</code>. So the order is: remove the app through Git, wait for the ALB to go,
+        check for leftovers, and only then destroy. Do the hands-on lab below first if you are going on to it: its last
+        step is this same teardown.
+      </p>
+      <pre class="code mt-3">cd ~/labs/ks14/gitops &amp;&amp; git rm -q apps/clinic.yaml &amp;&amp; git commit -qm "teardown: remove clinic" &amp;&amp; git push -q
+kubectl -n argocd annotate app root argocd.argoproj.io/refresh=normal --overwrite   <span class="cm"># root prunes clinic</span>
+kubectl -n booking get ingress                       <span class="cm"># the finalizer deletes the Ingress, then the ALB</span>
+<span class="out">No resources found in booking namespace.</span>
+until ! aws elbv2 describe-load-balancers --names lab-$ME-clinic &gt;/dev/null 2&gt;&amp;1; do sleep 10; done; echo "ALB gone"
+<span class="out">ALB gone</span>
+aws resourcegroupstaggingapi get-resources --tag-filters Key=elbv2.k8s.aws/cluster,Values=lab-$ME-eks \
+  --query 'ResourceTagMappingList[].ResourceARN'      <span class="cm"># target groups, controller-made SGs</span>
+<span class="out">[]</span>
+terraform -chdir=$HOME/labs/ks14/infra destroy        <span class="cm"># ~15 min; read the list first</span>
+<span class="out">Destroy complete! Resources: … destroyed.</span>
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=KS14 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span>                                                 <span class="cm"># a KMS key "pending deletion" is expected</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        If <code class="inline">destroy</code> stalls on a subnet or security group, something outside Terraform still has a
+        network interface there. <code class="inline">aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=$VPC_ID
+        --query 'NetworkInterfaces[].[NetworkInterfaceId,Description]'</code> names it, usually
+        <code class="inline">ELB app/lab-…</code>. Delete that load balancer, then run destroy again. The GitHub repositories
+        cost nothing; delete them with <code class="inline">gh repo delete</code> when you no longer need them as evidence.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Item (ap-southeast-1, on-demand)</th><th class="px-4 py-3">Rate</th><th class="px-4 py-3">≈ USD per hour</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">EKS control plane (standard support)</td><td class="px-4 py-3">USD 0.10/h per cluster</td><td class="px-4 py-3">0.10</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">2 × t4g.large nodes + 2 × 20 GB gp3</td><td class="px-4 py-3">about 0.085/h each</td><td class="px-4 py-3">0.17</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">NAT gateway (one)</td><td class="px-4 py-3">about 0.06/h + 0.06/GB</td><td class="px-4 py-3">0.06+</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">RDS db.t4g.micro, single-AZ, 20 GB</td><td class="px-4 py-3">about 0.025/h + storage</td><td class="px-4 py-3">0.03</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ALB (from Part III)</td><td class="px-4 py-3">about 0.025/h + LCUs</td><td class="px-4 py-3">0.03</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Public IPv4: NAT + two ALB nodes</td><td class="px-4 py-3">0.005/h each</td><td class="px-4 py-3">0.015</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Secrets Manager, SQS, ECR storage, KMS, logs</td><td class="px-4 py-3">per month, tiny at lab volume</td><td class="px-4 py-3">&lt; 0.01</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Total</td><td class="px-4 py-3"></td><td class="px-4 py-3"><strong>≈ 0.41 ≈ USD 10 a day</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>About USD 10 a day, about USD 300 a month if forgotten.</strong> That is
+        several months of a learner's sandbox budget for one weekend left running. If you stop for the night, run the
+        teardown. To come back: <code class="inline">terraform apply</code>; put the new <code class="inline">vpc_id</code> into
+        <code class="inline">apps/aws-load-balancer-controller.yaml</code> and <code class="inline">git revert</code> the teardown
+        commit; re-run the last release workflow to refill the (destroyed) ECR repositories; then the Argo CD Helm install
+        and <code class="inline">kubectl apply -f root.yaml</code>. About 40 minutes, because everything else is in Git.</div>
+
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Survive a bad release and a missing permission</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Parts I to IV built the platform. This drill proves you can operate it under pressure. You ship a broken release
+        through Git and watch the rollout strategy keep the site up, roll it back with <code class="inline">git revert</code>,
+        and then hunt down a deleted Pod Identity association from nothing but symptoms. Both faults are among the most
+        common EKS incidents on client projects.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">Zero failed requests during a bad release, a clean Git rollback, and a credentials fault found and fixed from its symptoms</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">1.5–2 hours, on top of Parts I–IV</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your <code class="inline">lab-$ME-eks</code> cluster in <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">The running platform: about USD 0.41 per hour</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The platform from Parts II–IV, all six Applications green; two terminals; <code class="inline">yq</code> and <code class="inline">jq</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell and confirm the platform is green.</strong> If you tore it down, follow the "come back"
+        callout at the end of Part IV first (about 40 minutes).
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login &amp;&amp; kubectl config use-context lab-$ME-eks
+export URL=http://$(kubectl -n booking get ingress clinic -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+export QUEUE_URL=$(terraform -chdir=$HOME/labs/ks14/infra output -raw queue_url)
+kubectl -n argocd get applications --no-headers | awk '{print $2, $3}' | sort | uniq -c
+<span class="out">      6 Synced Healthy</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Start an availability probe and record the baseline.</strong> In a second terminal, leave this loop running for
+        the whole lab. Every character is one request to the API through the ALB and nginx.
+        <pre class="code">while true; do curl -s -o /dev/null -w '%{http_code} ' $URL/api/readyz; sleep 1; done
+<span class="out">200 200 200 200 200 …</span></pre>
+        Back in the first terminal, note the version and the Git revision Argo CD has deployed:
+        <pre class="code">curl -s $URL/api/healthz; echo
+<span class="out">{"ok":true,"version":"1.0.0"}</span>          <span class="cm"># or your latest sha-… tag</span>
+kubectl -n argocd get app clinic -o jsonpath='{.status.sync.revision}' | cut -c1-7; echo
+<span class="out">c41d9e0</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Ship a bad release.</strong> Someone "tunes" the readiness path to <code class="inline">/ready</code>, which the
+        API does not serve. It is a one-line change that passes review, <code class="inline">helm lint</code> and kubeconform.
+        <pre class="code">cd ~/labs/ks14/gitops &amp;&amp; git pull -q
+yq -i '.services["booking-api"].health.ready = "/ready"' clinic/values-sandbox.yaml
+git commit -qam "tune booking-api readiness path" &amp;&amp; git push -q
+kubectl -n argocd annotate app clinic argocd.argoproj.io/refresh=normal --overwrite</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Watch it fail safely.</strong> The new ReplicaSet starts one Pod that never becomes Ready. The old Pods keep
+        serving, because with 2 replicas the default strategy allows 1 extra Pod (<code class="inline">maxSurge</code> 25%,
+        rounded up) and 0 unavailable (<code class="inline">maxUnavailable</code> 25%, rounded down). Your probe terminal keeps
+        printing <code class="inline">200</code>.
+        <pre class="code">kubectl -n booking get pods -l app=booking-api
+<span class="out">NAME                           READY   STATUS    RESTARTS   AGE
+booking-api-7d9f6c5b8-5qk2x    1/1     Running   0          2h
+booking-api-7d9f6c5b8-w8n4r    1/1     Running   0          2h
+booking-api-84c6d7f9b-zx5lm    0/1     Running   0          70s</span>
+kubectl -n booking events --for pod/booking-api-84c6d7f9b-zx5lm | tail -2
+<span class="out">40s   Warning   Unhealthy   pod/booking-api-84c6d7f9b-zx5lm   Readiness probe failed: HTTP probe failed with statuscode: 404</span>
+kubectl -n argocd get app clinic --no-headers
+<span class="out">clinic   Synced   Progressing</span></pre>
+        Wait for the Deployment's <code class="inline">progressDeadlineSeconds</code> (600 s by default). Argo CD then marks the
+        app <code class="inline">Degraded</code>, which is the signal that pages on-call in production.
+        <pre class="code">kubectl -n booking get deploy booking-api -o jsonpath='{.status.conditions[?(@.type=="Progressing")].reason}'; echo
+<span class="out">ProgressDeadlineExceeded</span>
+kubectl -n argocd get app clinic --no-headers
+<span class="out">clinic   Synced   Degraded</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Roll back with Git.</strong> Revert the bad commit. Do not edit the Deployment by hand: self-heal would
+        undo it, and nobody would know what you changed.
+        <pre class="code">git revert --no-edit HEAD &amp;&amp; git push -q
+kubectl -n argocd annotate app clinic argocd.argoproj.io/refresh=normal --overwrite
+kubectl -n booking rollout status deploy/booking-api --timeout=5m
+<span class="out">deployment "booking-api" successfully rolled out</span>
+kubectl -n argocd get app clinic --no-headers
+<span class="out">clinic   Synced   Healthy</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Read the audit trail.</strong> Git shows the change and its revert; Argo CD's history shows each revision it
+        deployed. Together they answer "what changed, when, and who undid it" for the postmortem.
+        <pre class="code">git log --oneline -3
+<span class="out">e7f8a90 Revert "tune booking-api readiness path"
+5b6c7d8 tune booking-api readiness path
+c41d9e0 Revert "deploy(clinic): sha-3f9c2e1"</span>   <span class="cm"># your Part IV rollback</span>
+kubectl -n argocd get app clinic -o jsonpath='{range .status.history[*]}{.revision} {.deployedAt}{"\n"}{end}' \
+  | tail -3                                         <span class="cm"># full SHAs: 1.0.0/sha, bad, revert</span></pre>
+        Stop the probe loop. Count the non-200 codes it printed: the target is zero.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> your probe loop printed only
+        <code class="inline">200</code> through the bad release and the rollback; you saw the readiness 404 in the Pod events
+        and <code class="inline">ProgressDeadlineExceeded</code> on the Deployment; Argo CD went
+        <code class="inline">Progressing → Degraded → Healthy</code>; <code class="inline">git log</code> shows the change and
+        its revert; and you can explain why the old Pods were never taken out of service.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Lose the worker's identity.</strong> A teammate "cleans up" an association they think is unused. Run this,
+        restart the worker so it starts fresh, then book five appointments.
+        <pre class="code">ASSOC=$(aws eks list-pod-identity-associations --cluster-name lab-$ME-eks --namespace booking \
+  --service-account booking-worker --query 'associations[0].associationId' --output text)
+aws eks delete-pod-identity-association --cluster-name lab-$ME-eks --association-id $ASSOC &gt;/dev/null
+kubectl -n booking rollout restart deploy/booking-worker &amp;&amp; kubectl -n booking rollout status deploy/booking-worker
+sleep 45                                     <span class="cm"># let the old Pod finish its last 20 s long poll and exit</span>
+for i in 1 2 3 4 5; do curl -s -o /dev/null -w '%{http_code} ' -XPOST $URL/api/bookings \
+  -H 'content-type: application/json' -d "{\"patient\":\"Drill $i\",\"slot\":\"2026-11-04T09:00\"}"; done
+<span class="out">201 201 201 201 201</span></pre>
+        The bookings succeed, so the website looks fine. Two minutes later the worker Pod is in
+        <code class="inline">CrashLoopBackOff</code> and <code class="inline">ApproximateNumberOfMessages</code> is 5 and not
+        falling: patients are not getting reminders. Using only <code class="inline">kubectl logs --previous</code>, the Pod's
+        environment (<code class="inline">kubectl get pod -o jsonpath='{.spec.containers[0].env}'</code>) and
+        <code class="inline">aws eks list-pod-identity-associations</code>, find the cause before you open the answer.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl -n booking logs deploy/booking-worker --previous | grep -m1 Error
+<span class="out">CredentialsProviderError: Could not load credentials from any providers</span>
+kubectl -n booking get pod -l app=booking-worker -o jsonpath='{.items[0].spec.containers[0].env[*].name}'; echo
+<span class="out">QUEUE_URL AWS_REGION</span>                  <span class="cm"># no AWS_CONTAINER_CREDENTIALS_FULL_URI: nothing injected</span>
+aws eks list-pod-identity-associations --cluster-name lab-$ME-eks --namespace booking \
+  --query 'associations[].serviceAccount' --output text
+<span class="out">booking-api</span></pre>
+          <p class="mt-2">The Pod Identity webhook only injects the credential variables when an association exists for the
+          ServiceAccount <em>at the moment the Pod is created</em>. The restarted worker got none. It cannot fall back to the
+          node role either, because the node's IMDS hop limit of 1 blocks Pods, so the SDK finds no credentials, the
+          long-poll throws, and the process exits. The API is unaffected because its own association is intact. Fix it the
+          way it was built: <code class="inline">terraform -chdir=$HOME/labs/ks14/infra apply</code> shows exactly
+          <code class="inline">1 to add</code> (the drift), then <code class="inline">kubectl -n booking rollout restart
+          deploy/booking-worker</code>. Within a minute the logs show five <code class="inline">reminder sent</code> lines and
+          the queue drains to 0. The lessons: credentials bind at Pod start, and a permission fault in an async consumer is
+          invisible to a health check on the website. You need a queue-depth or age alarm
+          (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>).</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Clean up.</strong> Run the Part IV teardown in its order: remove the app through Git so the controller
+        deletes the ALB, confirm the ALB and its target groups are gone, then destroy with Terraform and check that nothing
+        tagged with your lab remains.
+        <pre class="code">cd ~/labs/ks14/gitops &amp;&amp; git rm -q apps/clinic.yaml &amp;&amp; git commit -qm "teardown" &amp;&amp; git push -q
+kubectl -n argocd annotate app root argocd.argoproj.io/refresh=normal --overwrite
+until ! aws elbv2 describe-load-balancers --names lab-$ME-clinic &gt;/dev/null 2&gt;&amp;1; do sleep 10; done; echo "ALB gone"
+<span class="out">ALB gone</span>
+aws resourcegroupstaggingapi get-resources --tag-filters Key=elbv2.k8s.aws/cluster,Values=lab-$ME-eks \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span>
+terraform -chdir=$HOME/labs/ks14/infra destroy
+<span class="out">Destroy complete! Resources: … destroyed.</span>
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=KS14 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span>
+kind delete cluster --name clinic            <span class="cm"># the Part I rehearsal, if it is still running</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Forgot to destroy?</strong> The platform costs about USD 0.41 an hour,
+        roughly USD 10 a day, mostly the EKS control plane, the two nodes and the NAT gateway. If the destroy fails part-way,
+        do not walk away: read the error, remove what blocks it (usually a load balancer or an ENI, see Part IV) and run it
+        again until it says <code class="inline">Destroy complete!</code>.</div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An agent writes this much YAML and HCL quickly, and most of it will be right. The failures are at the joins this
+        module is about: names that must match across Terraform, the chart and Argo CD, and ordering it cannot see from
+        one file. Give it the sandbox only, with a role that can plan but not apply, and review every join yourself.
+      </p>
+      <pre class="code mt-3">Here are infra/*.tf, clinic/values-sandbox.yaml and apps/*.yaml. Build a table of every
+name that must match across them: Pod Identity namespace + ServiceAccount vs the chart's
+ServiceAccounts, the ExternalSecret target vs db.secretName, the secret key vs the Terraform
+secret, clusterName/vpcId in the LBC app vs Terraform outputs. Flag every mismatch. Change nothing.</pre>
+      <pre class="code mt-3">Render `helm template clinic clinic -f clinic/values-sandbox.yaml` and review it for:
+probes on the right paths and ports, runAsUser numeric, readOnlyRootFilesystem with the
+writable dirs nginx needs, grace period &gt; preStop + DRAIN_MS, no replicas field where an HPA
+exists, and a PreSync Job that does not reference a ServiceAccount created in the Sync phase.</pre>
+      <pre class="code mt-3">terraform destroy is stuck deleting subnet-0abc… in lab-$ME-eks for 10 minutes. Using only
+read-only aws ec2 / elbv2 describe calls, list what still holds an ENI in that VPC and which
+Kubernetes object most likely created it. Propose the deletion order; do not delete anything.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Draft the chart templates and the Argo CD Applications</li>
+            <li>Cross-check names between Terraform, values and manifests</li>
+            <li>Turn the verification table into a script that exits non-zero on the first failing hop</li>
+            <li>Read controller logs and map errors to the missing tag or IAM action</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The plan creates nothing outside <code class="inline">lab-$ME-*</code> and touches no shared resource</li>
+            <li>Every Pod Identity role is scoped to one resource ARN</li>
+            <li>The teardown order: app through Git, ALB gone, then <code class="inline">destroy</code></li>
+            <li><code class="inline">CHAOS</code> is off in any values file that is not a lab</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-written EKS end-to-end setups:</strong>
+        <code class="inline">enable_irsa = true</code> plus Pod Identity "to be safe"; permissions added to the node role
+        "to fix AccessDenied"; <code class="inline">helm install</code> steps in a GitOps runbook; a PreSync Job using the
+        app's ServiceAccount; <code class="inline">replicas:</code> set alongside an HPA; an <code class="inline">x86_64</code>
+        image on Graviton nodes; <code class="inline">external-secrets.io/v1beta1</code> on a current ESO; a missing
+        <code class="inline">kubernetes.io/role/elb</code> tag; <code class="inline">targetRevision: HEAD</code> on a third-party
+        chart; and a teardown that starts with <code class="inline">terraform destroy</code>.</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Has run the lab kit with Docker Compose; has never deployed anything to a Kubernetes cluster on AWS.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can name the pieces (VPC, EKS, LB Controller, ESO, Argo CD, CI) and the order they go in, but has not built them together.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Completes the build following this page; needs help when a wave sticks, an Ingress gets no address or teardown hangs.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Builds the platform from an empty sandbox to a verified, CI-driven deployment in a day without this page open for anything but reference; diagnoses a stuck sync, a missing association or a missing subnet tag from symptoms; rolls back through Git; tears down with zero orphans.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Turns this build into the team's reusable EKS starter (module, chart, GitOps template), runs it for a new client, and coaches juniors through their first end-to-end build and teardown.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> starting from an empty sandbox and
+        a blank page, you reach a green verification table in under four hours; a mentor then deletes one Pod Identity
+        association and one subnet tag, and you find and fix both in under 20 minutes, then tear down with an empty
+        tagging-API result.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ <code class="inline">terraform destroy</code> first</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The controller dies with the cluster, the ALB it made survives, and the VPC deletion fails after a long timeout. Always delete Ingresses (through Git) and wait for the ALB to go before destroying.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ A migration hook that needs Sync-phase objects</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">PreSync runs before the chart's ServiceAccounts, Secrets and ExternalSecrets exist. Reference only what an earlier wave or a separate Application created, or the first sync never finishes.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Fixing <code class="inline">AccessDenied</code> on the node role</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">It "works", and every Pod on the node now has that permission. Find the missing or misspelt association instead, then restart the Pod.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Rehearse on kind, deploy the same chart</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Only the values file differs between laptop and cluster, so every chart bug you fixed locally stays fixed. Render both values files through kubeconform in CI.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Name and tag what controllers create</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">load-balancer-name</code> and <code class="inline">tags</code> annotations make controller-made resources findable by name and by the tagging API, which turns an orphan hunt into one command.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="kind-rehearsal"> <span>I wrote one Helm chart for the three services, validated it with kubeconform and ran it on kind with probes, non-root read-only containers and a working migration Job.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="tf-foundation"> <span>I built the VPC, EKS, RDS, SQS, Secrets Manager, ECR and four Pod Identity roles in Terraform, and can explain every lab shortcut and its production replacement.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="gitops-converge"> <span>I bootstrapped Argo CD by hand once and had the add-ons, the database secret and the app arrive from my GitOps repository through waves, retries and a PreSync migration.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="ci-verify"> <span>My CI pushed arm64 images with OIDC and bumped the tag in Git; I verified every hop from the ALB to the worker and scaled the API with the HPA.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="eks-e2e"> <span class="font-semibold">Completed the full build and the hands-on drill in gol-sandbox: shared the two GitHub repositories, a screenshot of all six Argo CD apps Healthy, the probe-loop output showing zero failed requests through the bad release and its git revert, the worker fault diagnosis, and the empty tagging-API result after teardown (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest" target="_blank" rel="noopener">Terraform Registry — terraform-aws-modules/eks</a> — every v21 input used in Part II, and the upgrade notes from v20.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html" target="_blank" rel="noopener">AWS — EKS Pod Identity</a> — how associations, the agent and credential injection work, and SDK version requirements.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html" target="_blank" rel="noopener">AWS — Route traffic with the AWS Load Balancer Controller</a> — install, subnet discovery tags and Ingress annotations.</li>
+        <li><a class="text-coral underline" href="https://github.com/external-secrets/external-secrets" target="_blank" rel="noopener">External Secrets Operator — README</a> — the AWS Secrets Manager provider and the <code class="inline">v1</code> API.</li>
+        <li><a class="text-coral underline" href="https://argo-cd.readthedocs.io/en/stable/operator-manual/cluster-bootstrapping/" target="_blank" rel="noopener">Argo CD — Cluster bootstrapping</a> · <a class="text-coral underline" href="https://argo-cd.readthedocs.io/en/stable/user-guide/resource_hooks/" target="_blank" rel="noopener">Resource hooks</a> — app-of-apps and the PreSync migration pattern.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/" target="_blank" rel="noopener">Kubernetes — Container lifecycle hooks</a> — the <code class="inline">sleep</code> preStop action behind the shutdown timeline.</li>
+        <li><a class="text-coral underline" href="https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services" target="_blank" rel="noopener">GitHub — OpenID Connect in AWS</a> — the trust policy conditions used by the CI role.</li>
+      </ul>

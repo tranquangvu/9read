@@ -691,6 +691,266 @@ True</span></pre>
         Identity role by resource name prefix (<code class="inline">arn:aws:s3:::clinic-prod-preview-*</code>) and limit
         which namespaces may create ACK kinds with AppProjects and admission policy.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Write a PreviewEnvironment controller and watch it reconcile</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will install the <code class="inline">PreviewEnvironment</code> CRD from Part I on a local kind cluster and run
+        a 50-line controller that turns each object into a <code class="inline">booking-api</code> Deployment, reports
+        <code class="inline">Ready</code> in status, repairs drift, and cleans up a "DNS record" through a finalizer. The
+        controller is written in Python with <strong>kopf</strong> rather than Kubebuilder, so you can finish in an
+        afternoon without a Go toolchain; every rule from Part II (idempotent, level-triggered, status only on change,
+        ownerReferences, finalizers) is the same. Then you stop the controller and get an object stuck in
+        <code class="inline">Terminating</code>, the most common operator ticket there is.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A <code class="inline">kubectl get pe</code> that shows <code class="inline">Ready True</code>, children that are garbage-collected, and a finalizer you have seen block a delete</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop: a kind cluster, with the controller running in a terminal against it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free. About 2 GB of RAM for Docker</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>), Python 3.11 or newer, the lab kit in <code class="inline">~/clinic-app/</code>, two terminals</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Create the cluster, load two image tags and install kopf.</strong> The CRD only accepts Git-SHA-shaped
+        tags, so you tag the same lab-kit image twice with made-up SHAs. Pin the Python libraries: the
+        <code class="inline">kubernetes</code> client changed its default PATCH content type in recent major versions,
+        which is why the code below always passes <code class="inline">_content_type</code>.
+        <pre class="code">mkdir -p ~/labs/ks12 &amp;&amp; cd ~/labs/ks12
+kind create cluster --name ks12 --image kindest/node:v1.33.1
+docker build -t booking-api:1a2b3c4 ~/clinic-app/booking-api
+docker tag booking-api:1a2b3c4 booking-api:5d6e7f8
+kind load docker-image booking-api:1a2b3c4 booking-api:5d6e7f8 --name ks12
+python3 -m venv .venv &amp;&amp; . .venv/bin/activate
+pip install kopf==1.45.2 kubernetes==37.0.1
+kubectl create namespace previews &amp;&amp; kubectl create namespace platform
+kubectl -n platform create configmap preview-dns     <span class="cm"># stands in for Route 53: outside the PE's namespace</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Install the CRD and prove the API server enforces it.</strong> This is the Part I schema plus a
+        <code class="inline">status</code> schema, so the controller's own writes are validated too.
+        <span class="code-label">~/labs/ks12/crd.yaml</span>
+        <pre class="code">apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata: { name: previewenvironments.platform.clinic.example.com }
+spec:
+  group: platform.clinic.example.com
+  scope: Namespaced
+  names: { kind: PreviewEnvironment, plural: previewenvironments, singular: previewenvironment, shortNames: [pe] }
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources: { status: {} }
+      additionalPrinterColumns:
+        - { name: PR, type: integer, jsonPath: .spec.pullRequest }
+        - { name: Tag, type: string, jsonPath: .spec.apiImageTag }
+        - { name: Ready, type: string, jsonPath: '.status.conditions[?(@.type=="Ready")].status' }
+        - { name: Age, type: date, jsonPath: .metadata.creationTimestamp }
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [pullRequest, apiImageTag]
+              x-kubernetes-validations:
+                - { rule: "self.ttlHours &lt;= 72", message: "previews live at most 3 days" }
+              properties:
+                pullRequest: { type: integer, minimum: 1 }
+                apiImageTag: { type: string, pattern: '^[0-9a-f]{7,40}$' }
+                ttlHours:    { type: integer, default: 24 }
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type:   { type: string }
+                      status: { type: string, enum: ["True", "False", "Unknown"] }
+                      reason: { type: string }</pre>
+        <pre class="code">kubectl apply -f crd.yaml
+kubectl wait --for condition=Established crd/previewenvironments.platform.clinic.example.com
+kubectl -n previews create -f - &lt;&lt;'YAML'
+apiVersion: platform.clinic.example.com/v1alpha1
+kind: PreviewEnvironment
+metadata: { name: pr-999 }
+spec: { pullRequest: 999, apiImageTag: latest }
+YAML
+<span class="out">The PreviewEnvironment "pr-999" is invalid: spec.apiImageTag: Invalid value: "latest": spec.apiImageTag in body should match '^[0-9a-f]{7,40}$'</span>
+kubectl explain pe.spec.ttlHours | head -3          <span class="cm"># your type now has docs, like a built-in</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Write the controller.</strong> One reconcile function handles create, update and operator restart
+        ("resume"); a timer calls it again every 10 seconds, which is what makes it level-triggered; a delete handler
+        owns the cleanup that garbage collection cannot do, because the ConfigMap lives in another namespace.
+        <span class="code-label">~/labs/ks12/operator.py (1 of 2)</span>
+        <pre class="code">import kopf, kubernetes
+
+PE = ("platform.clinic.example.com", "v1alpha1", "previewenvironments")
+MERGE = "application/merge-patch+json"
+
+@kopf.on.startup()
+def start(settings: kopf.OperatorSettings, **_):
+    kubernetes.config.load_kube_config()                    <span class="cm"># runs on your laptop, as you</span>
+    settings.persistence.progress_storage = kopf.AnnotationsProgressStorage()   <span class="cm"># .status stays ours</span>
+
+def desired(name, spec):
+    labels = {"app": f"{name}-api"}
+    api = {"name": "api", "image": f"booking-api:{spec['apiImageTag']}",
+           "env": [{"name": "APP_VERSION", "value": spec["apiImageTag"]}],
+           "readinessProbe": {"httpGet": {"path": "/readyz", "port": 8080}}}
+    deploy = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": f"{name}-api"},
+              "spec": {"replicas": 1, "selector": {"matchLabels": labels},
+                       "template": {"metadata": {"labels": labels}, "spec": {"containers": [api]}}}}
+    kopf.adopt(deploy)                                      <span class="cm"># sets namespace + ownerReference to the PE</span>
+    return deploy
+
+@kopf.on.create(*PE)
+@kopf.on.update(*PE)
+@kopf.on.resume(*PE)
+def reconcile(name, namespace, spec, **_):
+    apps, want = kubernetes.client.AppsV1Api(), desired(name, spec)
+    try:
+        have = apps.read_namespaced_deployment(f"{name}-api", namespace)
+    except kubernetes.client.ApiException as e:
+        if e.status != 404:
+            raise                                           <span class="cm"># kopf retries with backoff</span>
+        apps.create_namespaced_deployment(namespace, want)
+    else:
+        if have.spec.template.spec.containers[0].image != want["spec"]["template"]["spec"]["containers"][0]["image"]:
+            apps.patch_namespaced_deployment(f"{name}-api", namespace, want, _content_type=MERGE)</pre>
+        <span class="code-label">~/labs/ks12/operator.py (2 of 2, same file, appended)</span>
+        <pre class="code">        {"data": {name: f"{name}.preview.clinic.example.com"}}, _content_type=MERGE)   <span class="cm"># "DNS record"</span>
+
+@kopf.timer(*PE, interval=10, initial_delay=5)
+def resync(name, namespace, spec, status, patch, **_):
+    reconcile(name=name, namespace=namespace, spec=spec)    <span class="cm"># level-triggered: repair drift every 10 s</span>
+    d = kubernetes.client.AppsV1Api().read_namespaced_deployment(f"{name}-api", namespace)
+    ready = "True" if (d.status.ready_replicas or 0) &gt;= 1 else "False"
+    if (status.get("conditions") or [{}])[0].get("status") != ready:     <span class="cm"># write status only on change</span>
+        patch.status["conditions"] = [{"type": "Ready", "status": ready,
+                                       "reason": "DeploymentReady" if ready == "True" else "Waiting"}]
+
+@kopf.on.delete(*PE)                                        <span class="cm"># a delete handler = kopf adds a finalizer</span>
+def cleanup(name, **_):
+    kubernetes.client.CoreV1Api().patch_namespaced_config_map("preview-dns", "platform",
+        {"data": {name: None}}, _content_type=MERGE)        <span class="cm"># remove the record; then the finalizer goes</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Run it and create a preview.</strong> In terminal 1, start the controller scoped to one namespace.
+        <code class="inline">--standalone</code> skips kopf's multi-replica peering, which a laptop does not need.
+        <pre class="code">cd ~/labs/ks12 &amp;&amp; . .venv/bin/activate
+kopf run operator.py --standalone --namespace previews
+<span class="out">[…] kopf.activities.star [INFO    ] Activity 'start' succeeded.</span></pre>
+        In terminal 2, create a valid object and look at everything the controller did with it.
+        <pre class="code">cd ~/labs/ks12
+kubectl -n previews apply -f - &lt;&lt;'YAML'
+apiVersion: platform.clinic.example.com/v1alpha1
+kind: PreviewEnvironment
+metadata: { name: pr-412 }
+spec: { pullRequest: 412, apiImageTag: 1a2b3c4 }
+YAML
+kubectl -n previews get pe                           <span class="cm"># READY is empty for ~10 s, then the timer fills it</span>
+<span class="out">NAME     PR    TAG       READY   AGE
+pr-412   412   1a2b3c4   True    25s</span>
+kubectl -n previews get deploy pr-412-api -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'
+<span class="out">PreviewEnvironment/pr-412</span>
+kubectl -n previews get pe pr-412 -o jsonpath='{.metadata.finalizers}{"\n"}'
+<span class="out">["kopf.zalando.org/KopfFinalizerMarker"]</span>
+kubectl -n platform get configmap preview-dns -o jsonpath='{.data}{"\n"}'
+<span class="out">{"pr-412":"pr-412.preview.clinic.example.com"}</span></pre>
+        Terminal 1 logs <code class="inline">Handler 'reconcile' succeeded.</code>, then
+        <code class="inline">Creation is processed: 1 succeeded; 0 failed.</code>, then a
+        <code class="inline">Timer 'resync' succeeded.</code> line every 10 seconds. That last line is a hint that a
+        real controller needs log levels: at 200 objects it would be 20 lines a second.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Prove it is level-triggered: cause drift, then change the spec.</strong> Delete the child by hand, as if
+        someone tidied up "unused" Deployments, then change the image tag the way CI would.
+        <pre class="code">kubectl -n previews delete deploy pr-412-api
+kubectl -n previews get deploy -w                    <span class="cm"># back within ~10 s; Ctrl-C to stop watching</span>
+<span class="out">NAME         READY   UP-TO-DATE   AVAILABLE   AGE
+pr-412-api   0/1     1            0           2s
+pr-412-api   1/1     1            1           6s</span>
+kubectl -n previews patch pe pr-412 --type merge -p '{"spec":{"apiImageTag":"5d6e7f8"}}'
+kubectl -n previews rollout status deploy/pr-412-api
+kubectl -n previews port-forward deploy/pr-412-api 8080:8080 &gt;/dev/null &amp;
+sleep 2; curl -s localhost:8080/healthz; echo; kill %1
+<span class="out">{"ok":true,"version":"5d6e7f8"}</span></pre>
+        Notice what you did not write: no "if the Deployment was deleted" branch. Reconcile compares desired with actual
+        and fixes the difference, whatever caused it.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Delete the preview and watch both cleanup paths.</strong> The finalizer holds the object until
+        <code class="inline">cleanup</code> has removed the DNS entry; garbage collection then removes the Deployment
+        because of its ownerReference.
+        <pre class="code">kubectl -n previews delete pe pr-412
+<span class="out">previewenvironment.platform.clinic.example.com "pr-412" deleted</span>
+kubectl -n platform get configmap preview-dns -o jsonpath='{.data}{"\n"}'
+<span class="cm"># prints an empty line: the record is gone</span>
+kubectl -n previews get deploy,pods                  <span class="cm"># the Pod may take a few seconds to terminate</span>
+<span class="out">No resources found in previews namespace.</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        an invalid tag is rejected at <code class="inline">kubectl create</code>; <code class="inline">kubectl get pe</code>
+        shows your PR, tag and <code class="inline">Ready True</code>; a hand-deleted Deployment comes back within
+        10 seconds; <code class="inline">/healthz</code> reports the new tag after a spec patch; and deleting the preview
+        empties <code class="inline">preview-dns</code> and leaves no Deployment behind.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Uninstall the controller before its objects.</strong> With the controller running, create
+        <code class="inline">pr-500</code> (repeat step 4 with name <code class="inline">pr-500</code> and
+        <code class="inline">pullRequest: 500</code>) and wait for <code class="inline">Ready True</code>. Now press
+        Ctrl-C in terminal 1, the way someone removes an operator's Helm release first, and run
+        <code class="inline">kubectl -n previews delete pe pr-500</code>. The command hangs. Press Ctrl-C;
+        <code class="inline">kubectl -n previews get pe</code> still lists <code class="inline">pr-500</code>, and a
+        <code class="inline">kubectl delete namespace previews</code> would now sit in <code class="inline">Terminating</code>
+        as well (do not run it). Find out exactly what the API server is waiting for, and fix it without leaving
+        anything behind.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl -n previews get pe pr-500 -o jsonpath='{.metadata.deletionTimestamp}  {.metadata.finalizers}{"\n"}'
+<span class="out">2026-11-01T10:41:07Z  ["kopf.zalando.org/KopfFinalizerMarker"]</span></pre>
+          <p class="mt-2">A <code class="inline">deletionTimestamp</code> plus a finalizer means "deleted, waiting for the
+          owner of that finalizer to clean up", and nobody is running to do it. The right fix is to bring the controller
+          back: start <code class="inline">kopf run</code> again, it resumes, runs <code class="inline">cleanup</code>,
+          removes the finalizer, and the object disappears together with its DNS entry and its Deployment.</p>
+          <p class="mt-2">The tempting fix, <code class="inline">kubectl -n previews patch pe pr-500 --type merge -p '{"metadata":{"finalizers":null}}'</code>,
+          also makes the object vanish, but <code class="inline">preview-dns</code> keeps the <code class="inline">pr-500</code>
+          key: in real life a Route 53 record or an S3 bucket nobody owns any more. Try it on a third preview to see the
+          leak, then remove the key by hand. The lesson: delete custom resources while their controller is running, wait
+          for them to go, and only then uninstall the controller.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Clean up.</strong> In this order: objects while the controller still runs, then the controller, then the
+        CRD, then the cluster.
+        <pre class="code">kubectl -n previews delete pe --all                  <span class="cm"># controller running: finalizers complete</span>
+kubectl -n platform get configmap preview-dns -o jsonpath='{.data}{"\n"}'
+<span class="cm"># expect an empty line; remove any key you leaked in step 7</span>
+<span class="cm"># now press Ctrl-C in terminal 1</span>
+kubectl delete crd previewenvironments.platform.clinic.example.com
+kind delete cluster --name ks12
+<span class="out">Deleting cluster "ks12" ...</span>
+deactivate</pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

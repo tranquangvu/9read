@@ -777,6 +777,257 @@ echo $?
         it, and then replace it with a ten-line lifecycle policy that nobody has to maintain.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Find and clean up orphaned EBS volumes, safely</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        An <strong>EBS volume</strong> is a network disk for EC2. When an instance is deleted, its extra volumes often stay
+        behind, unattached and still billed: classic waste, and a classic first automation job. You will create three
+        tiny volumes in the sandbox, write a read-only Bash report that lists them, then a Python (boto3) clean-up script
+        that is a dry run by default, honours a <code class="inline">Keep=true</code> tag and has unit tests that run
+        without AWS. Finally you break the report in a way that looks like success.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A ShellCheck-clean report script, a tested boto3 prune script, and two of your three volumes deleted by it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">About 2 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop, plus sandbox account <code class="inline">gol-sandbox</code> in <code class="inline">ap-southeast-1</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Under USD 0.01: three 1 GiB gp3 volumes cost about USD 0.0004 per hour together</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">AWS CLI, <code class="inline">jq</code> and sandbox access from the <a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>; <code class="inline">uv</code> and <code class="inline">shellcheck</code>, installed in step 1</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell and tools.</strong> <code class="inline">uv</code> runs Python scripts with their
+        dependencies in a throwaway environment; <code class="inline">shellcheck</code> finds Bash bugs before they run.
+        Check that you are in the sandbox before you create anything.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login
+aws sts get-caller-identity --query Account --output text
+<span class="out">888899990000</span>                                       <span class="cm"># anything else: stop and fix your profile</span>
+brew install uv shellcheck                         <span class="cm"># Linux: your package manager, or pipx install uv</span>
+mkdir -p ~/labs/fn5 &amp;&amp; cd ~/labs/fn5</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create three orphaned volumes to find.</strong> They are tagged the lab way. The third also gets
+        <code class="inline">Keep=true</code>, which your clean-up must respect.
+        <pre class="code">for n in 1 2 3; do
+  aws ec2 create-volume --availability-zone ap-southeast-1a --size 1 --volume-type gp3 \
+    --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=lab-$ME-orphan-$n},{Key=Owner,Value=$ME},{Key=Lab,Value=FN5}]" \
+    --query VolumeId --output text
+done
+<span class="out">vol-0a1b2c3d4e5f60001
+vol-0a1b2c3d4e5f60002
+vol-0a1b2c3d4e5f60003</span>
+aws ec2 create-tags --resources vol-0a1b2c3d4e5f60003 --tags Key=Keep,Value=true   <span class="cm"># use YOUR third ID</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Write the read-only report in Bash.</strong> Strict mode, a usage message, long options, an account
+        preflight, and a summary line with a count: every habit from Parts I and III in 23 lines.
+        <span class="code-label">~/labs/fn5/orphans.sh</span>
+        <pre class="code"><span class="cm">#!/usr/bin/env bash</span>
+<span class="cm"># orphans.sh — list unattached EBS volumes for one owner. Read-only.</span>
+set -Eeuo pipefail
+usage() { echo "Usage: orphans.sh --owner NAME --account 123456789012" &gt;&amp;2; }
+owner=""; account=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --owner)   owner="${2:?--owner needs a value}"; shift 2 ;;
+    --account) account="${2:?--account needs a value}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *)         echo "unknown option: $1" &gt;&amp;2; usage; exit 2 ;;
+  esac
+done
+[[ -n "$owner" &amp;&amp; "$account" =~ ^[0-9]{12}$ ]] || { usage; exit 2; }
+actual=$(aws sts get-caller-identity --query Account --output text)
+[[ "$actual" == "$account" ]] || { echo "refusing: credentials are for $actual, expected $account" &gt;&amp;2; exit 1; }
+<span class="cm"># shellcheck disable=SC2016  # the backticks are a JMESPath literal, not shell</span>
+rows=$(aws ec2 describe-volumes \
+  --filters Name=status,Values=available "Name=tag:Owner,Values=$owner" \
+  --query 'Volumes[].[VolumeId, Size, CreateTime, Tags[?Key==`Name`]|[0].Value]' --output json |
+  jq -r '.[] | [.[0], "\(.[1]) GiB", .[2][0:10], (.[3] // "-")] | @tsv')
+[[ -n "$rows" ]] &amp;&amp; printf '%s\n' "$rows"
+echo "summary: $(grep -c . &lt;&lt;&lt;"$rows" || true) unattached volume(s) tagged Owner=$owner"</pre>
+        <pre class="code">shellcheck orphans.sh &amp;&amp; echo "shellcheck clean"
+<span class="out">shellcheck clean</span>
+bash orphans.sh --owner $ME --account 888899990000
+<span class="out">vol-0a1b2c3d4e5f60001	1 GiB	2026-11-01	lab-yourhandle-orphan-1
+vol-0a1b2c3d4e5f60002	1 GiB	2026-11-01	lab-yourhandle-orphan-2
+vol-0a1b2c3d4e5f60003	1 GiB	2026-11-01	lab-yourhandle-orphan-3
+summary: 3 unattached volume(s) tagged Owner=yourhandle</span>
+bash orphans.sh --owner $ME --account 222233334444; echo "exit $?"
+<span class="out">refusing: credentials are for 888899990000, expected 222233334444
+exit 1</span>
+bash orphans.sh --owner $ME; echo "exit $?"
+<span class="out">Usage: orphans.sh --owner NAME --account 123456789012
+exit 2</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Write the clean-up in Python.</strong> The work is in a <code class="inline">prune()</code> function that
+        receives the EC2 client as an argument. That one design choice is what makes it testable in the next step.
+        <span class="code-label">~/labs/fn5/prune_volumes.py — the work</span>
+        <pre class="code"><span class="cm"># /// script</span>
+<span class="cm"># requires-python = "&gt;=3.12"</span>
+<span class="cm"># dependencies = ["boto3&gt;=1.40"]</span>
+<span class="cm"># ///</span>
+"""Delete unattached EBS volumes tagged Owner=&lt;owner&gt;. Dry run unless --apply."""
+import argparse, logging, sys
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+log = logging.getLogger("prune")
+CFG = Config(region_name="ap-southeast-1", retries={"mode": "standard", "max_attempts": 10})
+
+def prune(ec2, owner: str, apply: bool) -&gt; tuple[int, int, int]:
+    """Return (deleted_or_would_delete, kept, errors). Takes the client so tests can stub it."""
+    deleted = kept = errors = 0
+    pages = ec2.get_paginator("describe_volumes").paginate(Filters=[
+        {"Name": "status", "Values": ["available"]},             <span class="cm"># available = attached to nothing</span>
+        {"Name": "tag:Owner", "Values": [owner]}])
+    for vol in (v for page in pages for v in page["Volumes"]):
+        vid, tags = vol["VolumeId"], {t["Key"]: t["Value"] for t in vol.get("Tags", [])}
+        if tags.get("Keep") == "true":
+            kept += 1; log.info("kept (Keep=true) volume=%s", vid); continue
+        try:
+            ec2.delete_volume(VolumeId=vid, DryRun=not apply)
+            deleted += 1; log.info("deleted volume=%s", vid)
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code == "DryRunOperation":                         <span class="cm"># AWS: you WOULD be allowed</span>
+                deleted += 1; log.info("DRY RUN would delete volume=%s", vid)
+            else:
+                errors += 1; log.error("volume=%s %s", vid, code)
+    return deleted, kept, errors</pre>
+        <span class="code-label">~/labs/fn5/prune_volumes.py — arguments and preflight (append)</span>
+        <pre class="code">def main() -&gt; int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--owner", required=True)
+    p.add_argument("--account", required=True, help="expected 12-digit account ID")
+    p.add_argument("--apply", action="store_true", help="actually delete")
+    a = p.parse_args()
+    session = boto3.Session()                                     <span class="cm"># default chain: AWS_PROFILE</span>
+    account = session.client("sts", config=CFG).get_caller_identity()["Account"]
+    if account != a.account:
+        sys.exit(f"refusing: credentials are for {account}, expected {a.account}")
+    d, k, e = prune(session.client("ec2", config=CFG), a.owner, a.apply)
+    log.info("done deleted=%d kept=%d errors=%d apply=%s", d, k, e, a.apply)
+    return 1 if e else 0
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-5s %(message)s")
+    sys.exit(main())</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Test it without AWS.</strong> botocore's <strong>Stubber</strong> intercepts calls on a client and
+        returns the answers you queue up, and fails the test if the script sends different parameters. The first test
+        proves a dry run really passes <code class="inline">DryRun=True</code> and skips <code class="inline">Keep=true</code>;
+        the second proves a permission error is counted, not swallowed.
+        <span class="code-label">~/labs/fn5/test_prune.py</span>
+        <pre class="code">import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
+from botocore.stub import Stubber
+from prune_volumes import prune
+
+def ec2_client():                                     <span class="cm"># no credentials, no network: Stubber answers</span>
+    return boto3.client("ec2", region_name="ap-southeast-1", config=Config(signature_version=UNSIGNED))
+
+def vol(vid, **tags):
+    return {"VolumeId": vid, "Tags": [{"Key": k, "Value": v} for k, v in tags.items()]}
+
+def test_dry_run_deletes_nothing_and_respects_keep():
+    ec2 = ec2_client()
+    with Stubber(ec2) as s:
+        s.add_response("describe_volumes", {"Volumes": [vol("vol-1", Owner="an"), vol("vol-2", Owner="an", Keep="true")]})
+        s.add_client_error("delete_volume", service_error_code="DryRunOperation", http_status_code=412,
+                           expected_params={"VolumeId": "vol-1", "DryRun": True})   <span class="cm"># DryRun must be True</span>
+        assert prune(ec2, "an", apply=False) == (1, 1, 0)
+        s.assert_no_pending_responses()
+
+def test_permission_error_is_counted_not_swallowed():
+    ec2 = ec2_client()
+    with Stubber(ec2) as s:
+        s.add_response("describe_volumes", {"Volumes": [vol("vol-3", Owner="an")]})
+        s.add_client_error("delete_volume", service_error_code="UnauthorizedOperation", http_status_code=403)
+        assert prune(ec2, "an", apply=True) == (0, 0, 1)</pre>
+        <pre class="code">uv run --with boto3 --with pytest pytest -q
+<span class="out">..                                                                       [100%]
+2 passed in 0.20s</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Dry run against the sandbox, then apply.</strong> Read the dry-run summary before you add
+        <code class="inline">--apply</code>: two to delete, one kept. Then run the real thing, and run it a second time to
+        prove it is idempotent (a second run changes nothing and does not fail).
+        <pre class="code">uv run prune_volumes.py --owner $ME --account 888899990000
+<span class="out">INFO  DRY RUN would delete volume=vol-0a1b2c3d4e5f60001
+INFO  DRY RUN would delete volume=vol-0a1b2c3d4e5f60002
+INFO  kept (Keep=true) volume=vol-0a1b2c3d4e5f60003
+INFO  done deleted=2 kept=1 errors=0 apply=False</span>
+bash orphans.sh --owner $ME --account 888899990000 | tail -1
+<span class="out">summary: 3 unattached volume(s) tagged Owner=yourhandle</span>     <span class="cm"># dry run touched nothing</span>
+uv run prune_volumes.py --owner $ME --account 888899990000 --apply
+<span class="out">INFO  deleted volume=vol-0a1b2c3d4e5f60001
+INFO  deleted volume=vol-0a1b2c3d4e5f60002
+INFO  kept (Keep=true) volume=vol-0a1b2c3d4e5f60003
+INFO  done deleted=2 kept=1 errors=0 apply=True</span>
+uv run prune_volumes.py --owner $ME --account 888899990000 --apply; echo "exit $?"
+<span class="out">INFO  kept (Keep=true) volume=vol-0a1b2c3d4e5f60003
+INFO  done deleted=0 kept=1 errors=0 apply=True
+exit 0</span></pre>
+        Volumes being deleted show state <code class="inline">deleting</code> for a few seconds, so an immediate re-run
+        may still list them; wait ten seconds and try again.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">shellcheck orphans.sh</code>
+        prints nothing; <code class="inline">pytest</code> shows <code class="inline">2 passed</code>; the dry run said
+        "would delete" twice and changed nothing; after <code class="inline">--apply</code>,
+        <code class="inline">orphans.sh</code> reports exactly one volume, the <code class="inline">Keep=true</code> one; and
+        both scripts refuse to run against the wrong account.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>A report that lies by saying nothing.</strong> In <code class="inline">orphans.sh</code>, change
+        <code class="inline">"Name=tag:Owner,Values=$owner"</code> to <code class="inline">"Name=tag:owner,Values=$owner"</code>
+        (a typo an agent or a tired human makes) and run it. It exits 0 and says
+        <code class="inline">summary: 0 unattached volume(s)</code>, although your Keep volume is still there. Find the
+        cause using the AWS CLI on its own, then decide how the script should behave so this cannot pass silently.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">aws ec2 describe-volumes --filters "Name=tag:owner,Values=$ME" --query 'length(Volumes)'
+<span class="out">0</span>
+aws ec2 describe-volumes --filters "Name=tag:Owner,Values=$ME" --query 'length(Volumes)'
+<span class="out">1</span>
+aws ec2 describe-volumes --filters "Name=tag:Owner,Values=$ME" --query 'Volumes[0].Tags[].Key'
+<span class="out">[ "Name", "Owner", "Lab", "Keep" ]</span>                    <span class="cm"># tag keys are case-sensitive</span></pre>
+          <p class="mt-2">AWS tag keys are case-sensitive, and a filter that matches nothing is not an error: it is an
+          empty, successful answer. Test the filter alone, one condition at a time, until the count changes. Then fix the
+          typo, and make "zero results" visible: for a report, print the filter in the summary line; for a clean-up job
+          that runs on a schedule, log a warning when it finds nothing for several runs in a row. A green job that checks
+          nothing is worse than a red one.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Clean up.</strong> Delete the volume you kept, then confirm nothing from this lab is left.
+        <pre class="code">aws ec2 delete-volume --volume-id vol-0a1b2c3d4e5f60003    <span class="cm"># your Keep volume's ID</span>
+sleep 15
+aws ec2 describe-volumes --filters "Name=tag:Owner,Values=$ME" Name=tag:Lab,Values=FN5 --query 'length(Volumes)'
+<span class="out">0</span></pre>
+        Keep <code class="inline">orphans.sh</code>, <code class="inline">prune_volumes.py</code> and the test: they are
+        the starting point of the evidence task.
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Forgot to clean up?</strong> Three 1 GiB gp3 volumes cost about
+        USD 0.0004 an hour, roughly USD 0.29 a month, so the bill is not the risk. The risk is the habit: in a real account the same orphans are
+        500 GiB io2 volumes at hundreds of dollars a month. Run your own report against the sandbox before you log off.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
@@ -874,7 +1125,7 @@ Then tell me whether this job should be a script at all or a Terraform-managed f
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="text-tools"> <span>I can pick grep, sed, awk, jq or yq for a given input and wrote an awk report over an access log and a jq filter over AWS CLI output.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="unattended"> <span>My scripts have arguments with a usage message, a dry-run default, an account preflight, and a lock when scheduled with cron.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="boto3"> <span>I wrote a boto3 script that uses an SSO profile or the default chain, a paginator, retry config and error-code handling.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="report-pr"> <span class="font-semibold">In gol-dev, wrote an untagged-resource report in Bash (ShellCheck clean) and the snapshot prune in Python with a pytest Stubber test, opened a PR with both dry-run outputs pasted in, and wrote one paragraph naming which job should move to Terraform or a lifecycle policy (mentor evidence ✓).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="report-pr"> <span class="font-semibold">Completed the hands-on lab, then in gol-dev wrote an untagged-resource report in Bash (ShellCheck clean) and the snapshot prune in Python with a pytest Stubber test, opened a PR with both dry-run outputs pasted in, and wrote one paragraph naming which job should move to Terraform or a lifecycle policy (mentor evidence ✓).</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>

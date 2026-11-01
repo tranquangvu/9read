@@ -638,6 +638,242 @@ aws elasticache describe-events --source-type replication-group --duration 30 \
         connection string that names <code class="inline">clinic-prod-cache-001</code>, turns a 40-second failover into an
         outage that lasts until someone restarts the service.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: A private Postgres, a tunnel, and a point-in-time restore</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will create an RDS PostgreSQL 17 instance that has no public address, reach it from your laptop through a
+        Session Manager port-forwarding tunnel, and run the lab-kit <code class="inline">booking-api</code> against it.
+        Then you make the mistake Part III warns about, deleting every booking, and recover the rows with a
+        point-in-time restore into a new instance. A short DynamoDB exercise shows the conditional write that makes
+        idempotency work. Everything is AWS CLI in the VPC from the
+        <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a> lab.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">booking-api on your laptop writing to a private RDS instance, and the deleted rows read back from a restored copy, with the restore time measured</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours, about half of it waiting for RDS (create ~10 min, restore ~15 min, delete ~10 min)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code>, the AW2 lab VPC (private subnets for RDS, a public one for the tunnel host)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">About USD 0.04 per hour: <code class="inline">db.t4g.micro</code> Single-AZ (~USD 0.025) and 20 GB gp3, a <code class="inline">t4g.nano</code> tunnel host with a public IPv4 (~USD 0.01). About USD 0.07 per hour while the restored copy exists. Multi-AZ would double the database line</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">AWS CLI v2 with the Session Manager plugin (<a href="./aw3.html" class="text-viol underline decoration-viol/40">AW3</a> step 1), Node 22, <code class="inline">jq</code>, the lab kit in <code class="inline">~/clinic-app/</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell, the network and a tiny SQL helper.</strong> Load the AW2 IDs (or rerun AW2 steps 1–4).
+        There is no <code class="inline">psql</code> in the toolchain, so a four-line Node script using booking-api's own
+        <code class="inline">pg</code> driver does the job.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login --sso-session gol
+source ~/labs/aw2/ids.env &amp;&amp; echo $VPC $PRIV_A $PRIV_B $PUB_A
+mkdir -p ~/labs/aw5 &amp;&amp; cd ~/clinic-app/booking-api &amp;&amp; npm install --no-audit --no-fund
+TAGS="Key=Owner,Value=$ME Key=Lab,Value=AW5"</pre>
+        <span class="code-label">~/clinic-app/booking-api/sql.mjs</span>
+        <pre class="code">import pg from "pg";
+const c = new pg.Client({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+await c.connect();
+const r = await c.query(process.argv[2]);
+console.log(r.command === "SELECT" ? JSON.stringify(r.rows) : `${r.command} ${r.rowCount}`);
+await c.end();</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create the security groups and start the database.</strong> The database accepts 5432 only from the
+        tunnel host's group. <code class="inline">--manage-master-user-password</code> puts the password in Secrets Manager
+        instead of your shell history, and a backup retention of 1 day is enough to switch on PITR.
+        <pre class="code">sg() { aws ec2 create-security-group --group-name lab-$ME-aw5-$1 --description "AW5 $1" --vpc-id $VPC \
+  --tag-specifications "ResourceType=security-group,Tags=[{Key=Owner,Value=$ME},{Key=Lab,Value=AW5}]" \
+  --query GroupId --output text; }
+JUMP_SG=$(sg jump); DB_SG=$(sg db)                   <span class="cm"># the jump group has no inbound rules at all</span>
+aws ec2 authorize-security-group-ingress --group-id $DB_SG --protocol tcp --port 5432 \
+  --source-group $JUMP_SG &gt;/dev/null
+aws rds create-db-subnet-group --db-subnet-group-name lab-$ME-aw5 --db-subnet-group-description "AW5 lab" \
+  --subnet-ids $PRIV_A $PRIV_B --tags $TAGS &gt;/dev/null
+aws rds create-db-instance --db-instance-identifier lab-$ME-aw5 \
+  --engine postgres --engine-version 17 --db-instance-class db.t4g.micro \
+  --allocated-storage 20 --storage-type gp3 --storage-encrypted \
+  --db-name clinic --master-username clinic --manage-master-user-password \
+  --db-subnet-group-name lab-$ME-aw5 --vpc-security-group-ids $DB_SG \
+  --no-publicly-accessible --no-multi-az --backup-retention-period 1 \
+  --tags $TAGS --query 'DBInstance.DBInstanceStatus' --output text
+<span class="out">creating</span>                                             <span class="cm"># ~10 minutes: do step 3 meanwhile</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Launch the tunnel host.</strong> A <code class="inline">t4g.nano</code> with only the Session Manager
+        policy, no key pair and no inbound rules. It is the jump box without SSH from Part IV of
+        <a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>.
+        <pre class="code">aws iam create-role --role-name lab-$ME-aw5-ssm --tags $TAGS \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+    "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' &gt;/dev/null
+aws iam attach-role-policy --role-name lab-$ME-aw5-ssm \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam create-instance-profile --instance-profile-name lab-$ME-aw5-ssm &gt;/dev/null
+aws iam add-role-to-instance-profile --instance-profile-name lab-$ME-aw5-ssm --role-name lab-$ME-aw5-ssm
+sleep 15                                             <span class="cm"># new instance profiles take a moment to be usable</span>
+AMI=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
+  --query Parameter.Value --output text)
+JUMP=$(aws ec2 run-instances --image-id $AMI --instance-type t4g.nano --subnet-id $PUB_A \
+  --security-group-ids $JUMP_SG --associate-public-ip-address \
+  --iam-instance-profile Name=lab-$ME-aw5-ssm --metadata-options HttpTokens=required \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=lab-$ME-aw5-jump},{Key=Owner,Value=$ME},{Key=Lab,Value=AW5}]" \
+  --query 'Instances[0].InstanceId' --output text)
+aws ec2 wait instance-running --instance-ids $JUMP</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Open the tunnel.</strong> When the database is available, forward local port 15432 through the host to
+        the RDS endpoint. Leave this running in a second terminal: export <code class="inline">AWS_PROFILE</code> and
+        <code class="inline">AWS_REGION</code> there too, and paste the values of <code class="inline">echo $JUMP $DB_HOST</code>.
+        <pre class="code">aws rds wait db-instance-available --db-instance-identifier lab-$ME-aw5
+DB_HOST=$(aws rds describe-db-instances --db-instance-identifier lab-$ME-aw5 \
+  --query 'DBInstances[0].Endpoint.Address' --output text); echo $DB_HOST
+<span class="out">lab-yourhandle-aw5.c9x8y7z6w5v4.ap-southeast-1.rds.amazonaws.com</span>
+<span class="cm"># terminal 2</span>
+aws ssm start-session --target $JUMP --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters "{\"host\":[\"$DB_HOST\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"15432\"]}"
+<span class="out">Starting session with SessionId: yourhandle@goldenowl.asia-0b7c6d5e4f3a21098
+Port 15432 opened for sessionId yourhandle@goldenowl.asia-0b7c6d5e4f3a21098.
+Waiting for connections...</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Run booking-api against RDS.</strong> Read the password from the managed secret, URL-encode it, and start
+        the API on port 3000. It migrates the schema on start.
+        <pre class="code">cd ~/clinic-app/booking-api
+SECRET=$(aws rds describe-db-instances --db-instance-identifier lab-$ME-aw5 \
+  --query 'DBInstances[0].MasterUserSecret.SecretArn' --output text)
+PW=$(aws secretsmanager get-secret-value --secret-id $SECRET --query SecretString --output text \
+  | jq -r '.password | @uri')
+export DATABASE_URL="postgres://clinic:$PW@localhost:15432/clinic"
+DATABASE_SSL=true PORT=3000 APP_VERSION=aw5-lab node server.js &amp;
+<span class="out">{"ts":"…","level":"info","msg":"migration ok","service":"booking-api","version":"aw5-lab"}
+{"ts":"…","level":"info","msg":"listening","service":"booking-api","version":"aw5-lab","port":3000}</span>
+for p in An Binh Chi; do curl -s -XPOST localhost:3000/bookings -H 'content-type: application/json' \
+  -d "{\"patient\":\"$p\",\"slot\":\"2026-11-02T09:00\"}" &gt;/dev/null; done
+curl -s localhost:3000/readyz; echo; node sql.mjs "SELECT count(*) FROM bookings"
+<span class="out">{"ready":true}
+[{"count":"3"}]</span></pre>
+        Unlike the in-memory store in the CN1 lab, these rows survive a restart of the API. Stop it with
+        <code class="inline">kill %1</code> and start it again to see.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Snapshot, then make the mistake.</strong> Take a manual snapshot (what you do before any risky change),
+        note the time, wait a few seconds, then delete every booking as a bad migration would.
+        <pre class="code">aws rds create-db-snapshot --db-instance-identifier lab-$ME-aw5 \
+  --db-snapshot-identifier lab-$ME-aw5-before --tags $TAGS &gt;/dev/null
+sleep 5; T=$(date -u +%Y-%m-%dT%H:%M:%SZ); echo "last good moment: $T"; sleep 5
+node sql.mjs "DELETE FROM bookings"
+<span class="out">DELETE 3</span>
+curl -s localhost:3000/bookings
+<span class="out">[]</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Restore to the last good moment, into a new instance.</strong> RDS can only restore up to its
+        <code class="inline">LatestRestorableTime</code>, which trails real time by about five minutes, so wait for it to
+        pass <code class="inline">$T</code>. Time the restore: that number is your RTO for this size.
+        <pre class="code">until [[ "$(aws rds describe-db-instances --db-instance-identifier lab-$ME-aw5 \
+  --query 'DBInstances[0].LatestRestorableTime' --output text | cut -c1-19)" &gt; "${T%Z}" ]]; do sleep 30; done
+START=$(date +%s)
+aws rds restore-db-instance-to-point-in-time --source-db-instance-identifier lab-$ME-aw5 \
+  --target-db-instance-identifier lab-$ME-aw5-pitr --restore-time $T \
+  --db-subnet-group-name lab-$ME-aw5 --vpc-security-group-ids $DB_SG \
+  --db-instance-class db.t4g.micro --no-multi-az --no-publicly-accessible --tags $TAGS &gt;/dev/null
+aws rds wait db-instance-available --db-instance-identifier lab-$ME-aw5-pitr
+echo "restore took $(( ($(date +%s) - START) / 60 )) min"
+<span class="out">restore took 14 min</span>
+PITR_HOST=$(aws rds describe-db-instances --db-instance-identifier lab-$ME-aw5-pitr \
+  --query 'DBInstances[0].Endpoint.Address' --output text)
+<span class="cm"># terminal 3: a second tunnel, local port 15433</span>
+aws ssm start-session --target $JUMP --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters "{\"host\":[\"$PITR_HOST\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"15433\"]}"
+<span class="cm"># back in terminal 1: the restored copy has the same users and password as the source had at $T</span>
+DATABASE_URL="postgres://clinic:$PW@localhost:15433/clinic" node sql.mjs "SELECT id, patient FROM bookings ORDER BY id"
+<span class="out">[{"id":1,"patient":"An"},{"id":2,"patient":"Binh"},{"id":3,"patient":"Chi"}]</span></pre>
+        In a real incident you would now copy these rows back into the live instance in a reviewed transaction, keeping
+        every booking made after the mistake. Restoring the manual snapshot instead would have worked too, but it would
+        lose anything written between the snapshot and the mistake.
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>DynamoDB in five minutes.</strong> An on-demand table keyed on an idempotency key, and the conditional
+        write from Part IV that refuses a duplicate.
+        <pre class="code">aws dynamodb create-table --table-name lab-$ME-aw5-idem --billing-mode PAY_PER_REQUEST \
+  --attribute-definitions AttributeName=idem_key,AttributeType=S \
+  --key-schema AttributeName=idem_key,KeyType=HASH --tags $TAGS &gt;/dev/null
+aws dynamodb wait table-exists --table-name lab-$ME-aw5-idem
+for i in 1 2; do aws dynamodb put-item --table-name lab-$ME-aw5-idem \
+  --item '{"idem_key":{"S":"bk-7f3a"},"booking_id":{"N":"1"}}' \
+  --condition-expression 'attribute_not_exists(idem_key)' &amp;&amp; echo "write $i stored"; done
+<span class="out">write 1 stored
+An error occurred (ConditionalCheckFailedException) when calling the PutItem operation: The conditional request failed</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">describe-db-instances</code> shows <code class="inline">PubliclyAccessible: false</code> and
+        you still reached the database through the tunnel; booking-api's <code class="inline">/readyz</code> returned
+        <code class="inline">{"ready":true}</code> against RDS; the restored instance returned the three deleted rows; you
+        wrote down how many minutes the restore took; and the second DynamoDB write failed with
+        <code class="inline">ConditionalCheckFailedException</code>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>"It works on my machine against local Postgres."</strong> A teammate starts booking-api against RDS with
+        the environment they use for the compose stack. Run it, read the error, and prove the cause from the RDS side
+        before you open the answer.
+        <pre class="code">kill %1 2&gt;/dev/null; PORT=3000 node server.js           <span class="cm"># DATABASE_URL still set, DATABASE_SSL is not</span>
+<span class="out">error: no pg_hba.conf entry for host "10.98.0.47", user "clinic", database "clinic", no encryption</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">aws rds describe-db-parameters --db-parameter-group-name default.postgres17 \
+  --query "Parameters[?ParameterName=='rds.force_ssl'].ParameterValue" --output text
+<span class="out">1</span>
+DATABASE_SSL=true PORT=3000 node server.js &amp;
+<span class="out">{"ts":"…","level":"info","msg":"listening",…}</span></pre>
+          <p class="mt-2">The key words are <code class="inline">no encryption</code>. RDS for PostgreSQL 15 and later sets
+          <code class="inline">rds.force_ssl = 1</code> by default, so the server rejects any connection that is not TLS.
+          The host in the message is the tunnel host's private IP, which also proves the network path (security groups,
+          tunnel) is fine: the request got all the way to Postgres's own authentication. The fix is on the client:
+          <code class="inline">DATABASE_SSL=true</code>, never turning <code class="inline">rds.force_ssl</code> off. A
+          timeout with no message would have pointed at the network instead.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Clean up.</strong> Stop the API and both tunnels (Ctrl-C), then delete the databases first because they
+        take longest. <code class="inline">--delete-automated-backups</code> stops the PITR backups from lingering, and
+        the managed secret is deleted with the instance.
+        <pre class="code">kill %1 2&gt;/dev/null
+for db in lab-$ME-aw5-pitr lab-$ME-aw5; do aws rds delete-db-instance --db-instance-identifier $db \
+  --skip-final-snapshot --delete-automated-backups &gt;/dev/null; done
+aws rds delete-db-snapshot --db-snapshot-identifier lab-$ME-aw5-before &gt;/dev/null
+aws dynamodb delete-table --table-name lab-$ME-aw5-idem &gt;/dev/null
+aws ec2 terminate-instances --instance-ids $JUMP &gt;/dev/null
+aws rds wait db-instance-deleted --db-instance-identifier lab-$ME-aw5-pitr
+aws rds wait db-instance-deleted --db-instance-identifier lab-$ME-aw5
+aws ec2 wait instance-terminated --instance-ids $JUMP
+aws rds delete-db-subnet-group --db-subnet-group-name lab-$ME-aw5
+for g in $DB_SG $JUMP_SG; do aws ec2 delete-security-group --group-id $g &gt;/dev/null; done
+aws iam remove-role-from-instance-profile --instance-profile-name lab-$ME-aw5-ssm --role-name lab-$ME-aw5-ssm
+aws iam delete-instance-profile --instance-profile-name lab-$ME-aw5-ssm
+aws iam detach-role-policy --role-name lab-$ME-aw5-ssm \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam delete-role --role-name lab-$ME-aw5-ssm
+aws rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier,'lab-$ME')].DBInstanceIdentifier"
+<span class="out">[]</span>
+aws rds describe-db-snapshots --query "DBSnapshots[?contains(DBSnapshotIdentifier,'lab-$ME')].DBSnapshotIdentifier"
+<span class="out">[]</span></pre>
+        Then run part 2 of the AW2 clean-up if you are done with the VPC.
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Forgot to clean up?</strong> The database and tunnel host cost about USD 1
+        a day, and USD 1.70 a day while the restored copy exists. A stopped RDS instance is not a safe parking spot: storage
+        still bills, and AWS starts it again automatically after seven days. Manual snapshots bill until you delete them.
+        Delete, do not stop.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

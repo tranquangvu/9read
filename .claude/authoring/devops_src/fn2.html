@@ -671,6 +671,220 @@ curl -fsS -m 3 localhost:8080/healthz &amp;&amp; echo " healthy"</pre>
         replace it. Fix the cause in the image or the config code, not by hand on one instance. Diagnosis on the box,
         repair in Git.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Run booking-api on a box, then nurse the box back to health</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will turn a throwaway Linux container into a small "server": install tools with the package manager, create
+        a service user, lock down a config file, and run the lab-kit <code class="inline">booking-api</code> as that user.
+        Then you make the box sick three times (a runaway process, a full disk that <code class="inline">du</code> cannot
+        explain, an out-of-memory kill) and diagnose each one with the commands from this module. A container is used
+        instead of an EC2 instance because it is free, starts in seconds and can be thrown away when you break it badly.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3"><code class="inline">booking-api</code> answering on port 8080 as user <code class="inline">booking</code>, and a written cause for each of four injected faults</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">About 2 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">A Debian 12 container on your laptop (Docker)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">Docker Desktop (or Colima) and the lab kit in <code class="inline">~/clinic-app/</code>, both from the <a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>. Docker itself is taught in <a href="./fn6.html" class="text-viol underline decoration-viol/40">FN6</a>; here it is only a disposable Linux box</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-info"><strong>What a container cannot show you.</strong> A container normally runs one
+        program, not systemd, so there is no <code class="inline">systemctl</code> or <code class="inline">journalctl</code>
+        here. You start the service by hand with the same three facts a unit file holds (which user, which environment
+        file, which command), and you write the real unit on an EC2 instance in the evidence task.</div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Start the box.</strong> The flags give it a 256 MiB memory limit and a separate 64 MiB disk for logs, so
+        the faults later stay inside the container and cannot fill your laptop. Your prompt changes to
+        <code class="inline">root@sick:/#</code>: every command until the clean-up step runs <em>inside</em> the box.
+        <pre class="code">docker run -it --rm --name sick --hostname sick --memory 256m \
+  --tmpfs /var/log/booking-api:size=64m \
+  -v ~/clinic-app/booking-api:/src:ro \
+  node:22-bookworm-slim bash
+cat /etc/os-release | head -1; whoami; nproc
+<span class="out">PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"
+root
+8</span>                                                   <span class="cm"># CPUs Docker gives the VM; yours may differ</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Install the tools with the package manager.</strong> <code class="inline">apt-get</code> is Debian's
+        package manager: <code class="inline">update</code> downloads the list of available packages, and
+        <code class="inline">install</code> fetches a package plus everything it depends on. Slim images ship without
+        these tools, which is a feature in production and an inconvenience now.
+        <pre class="code">apt-get update -qq &amp;&amp; apt-get install -y -qq procps iproute2 lsof sysstat curl &gt;/dev/null
+dpkg -l procps iproute2 lsof | awk '/^ii/ {print $2, $3}'     <span class="cm"># ii = installed</span>
+<span class="out">iproute2 6.1.0-3
+lsof 4.95.0-1
+procps 2:4.0.2-3</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Create a service user, install the app and protect its config.</strong> The app gets its own
+        <strong>system user</strong> with no login shell. The config file is owned by root, readable by the
+        <code class="inline">booking</code> group and by nobody else: mode <code class="inline">640</code>.
+        <pre class="code">useradd --system --no-create-home --shell /usr/sbin/nologin booking
+mkdir -p /opt/booking-api /etc/booking-api &amp;&amp; cp -r /src/. /opt/booking-api/
+cd /opt/booking-api &amp;&amp; npm install --omit=dev --no-audit --no-fund --loglevel=error &amp;&amp; cd /
+printf 'APP_VERSION=fn2-lab\nCHAOS=on\nDRAIN_MS=3000\n' &gt; /etc/booking-api/env
+chown root:booking /etc/booking-api/env &amp;&amp; chmod 640 /etc/booking-api/env
+chown booking:booking /var/log/booking-api
+ls -l /etc/booking-api/env
+<span class="out">-rw-r----- 1 root booking 43 Nov  1 09:02 /etc/booking-api/env</span>
+runuser -u nobody -- cat /etc/booking-api/env
+<span class="out">cat: /etc/booking-api/env: Permission denied</span>       <span class="cm"># "other" has no r: exactly what we wanted</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Write a start script and run the service as <code class="inline">booking</code>.</strong> The script does
+        what the unit file's <code class="inline">EnvironmentFile=</code> and <code class="inline">ExecStart=</code> lines
+        do. <code class="inline">exec</code> replaces the shell with node, so signals go straight to the app.
+        <span class="code-label">/opt/booking-api/start.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+set -euo pipefail
+set -a; . /etc/booking-api/env; set +a              <span class="cm"># export every variable in the file</span>
+exec node /opt/booking-api/server.js &gt;&gt; /var/log/booking-api/app.log 2&gt;&amp;1</pre>
+        <pre class="code">start() { runuser -u booking -- bash /opt/booking-api/start.sh &amp; sleep 2; curl -s localhost:8080/healthz; echo; }
+start
+<span class="out">{"ok":true,"version":"fn2-lab"}</span>
+ps -o user,pid,ppid,stat,cmd -C node
+<span class="out">USER       PID  PPID STAT CMD
+booking    412   405 Sl   node /opt/booking-api/server.js</span>
+ss -tlnp
+<span class="out">State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+LISTEN 0      511                *:8080             *:*     users:(("node",pid=412,fd=21))</span>
+tail -1 /var/log/booking-api/app.log
+<span class="out">{"ts":"2026-11-01T09:03:10.114Z","level":"info","msg":"listening","service":"booking-api","version":"fn2-lab","port":8080}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Stop it gracefully with a signal, then take a healthy baseline.</strong> SIGTERM asks the app to finish
+        and exit; the app logs it, waits <code class="inline">DRAIN_MS</code> and exits by itself. Then run the
+        first-five-minutes checks while everything is healthy, so you know what "normal" looks like.
+        <pre class="code">kill -TERM $(pgrep -u booking node); sleep 4; tail -1 /var/log/booking-api/app.log; pgrep node || echo "gone"
+<span class="out">{"ts":"…","level":"info","msg":"SIGTERM received, draining","service":"booking-api","version":"fn2-lab"}
+gone</span>
+start
+uptime; df -h /var/log/booking-api; free -m | head -2
+<span class="out"> 09:05:01 up 2 days,  1:12,  0 user,  load average: 0.08, 0.10, 0.09
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs            64M   12K   64M   1% /var/log/booking-api
+               total        used        free      shared  buff/cache   available
+Mem:            7838        1490        5602          10         997        6348</span>
+cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.current
+<span class="out">268435456
+84213760</span>                       <span class="cm"># the real limit (256 MiB) and real use (~80 MiB)</span></pre>
+        Notice that <code class="inline">free</code> shows the whole Docker VM (about 8 GB here), not your 256 MiB. Inside
+        a container, and inside ECS tasks and Kubernetes Pods, the limit lives in the cgroup files.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Fault 1: a runaway process.</strong> Start a loop that burns a whole CPU core, then find and stop it as if
+        you did not know it was there.
+        <pre class="code">( while :; do :; done ) &amp;
+sleep 30; uptime
+<span class="out"> 09:06:12 up 2 days,  1:13,  0 user,  load average: 0.71, 0.24, 0.13</span>   <span class="cm"># 1-min load climbing toward 1</span>
+top -b -n 1 -o %CPU | head -9 | tail -3
+<span class="out">    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+    447 root      20   0    4204   1880    400 R 100.0   0.0   0:31.02 bash
+    412 booking   20   0  1022m  62m  41m S   0.0   0.8   0:00.41 node</span>
+kill -TERM 447 &amp;&amp; sleep 1 &amp;&amp; ps -p 447 || echo "stopped"
+<span class="out">    PID TTY          TIME CMD
+stopped</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Fault 2: a full disk that <code class="inline">du</code> cannot explain.</strong> A big log file is
+        deleted while a process still has it open. The name is gone, but the space is not freed until the last process
+        closes it. This is the most common "the disk is full but I deleted the logs" incident.
+        <pre class="code">fallocate -l 62M /var/log/booking-api/old.log         <span class="cm"># reserve 62 MiB instantly</span>
+tail -f /var/log/booking-api/old.log &gt; /dev/null &amp;     <span class="cm"># a process holding it open</span>
+rm /var/log/booking-api/old.log
+df -h /var/log/booking-api | tail -1; du -sh /var/log/booking-api
+<span class="out">tmpfs            64M   63M  1.5M  98% /var/log/booking-api
+16K	/var/log/booking-api</span>                          <span class="cm"># df says full, du says empty</span>
+lsof +L1 /var/log/booking-api
+<span class="out">COMMAND PID USER   FD   TYPE DEVICE SIZE/OFF NLINK NODE NAME
+tail    459 root    3r   REG   0,85 65011712     0    3 /var/log/booking-api/old.log (deleted)</span>
+kill 459; sleep 1; df -h /var/log/booking-api | tail -1
+<span class="out">tmpfs            64M   16K   64M   1% /var/log/booking-api</span></pre>
+        <code class="inline">NLINK 0</code> means no filename points to the file any more. On a real server the holder
+        is usually the app itself; restarting it (or truncating with <code class="inline">: &gt; file</code> instead of
+        <code class="inline">rm</code>) frees the space.
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Fault 3: an out-of-memory kill.</strong> <code class="inline">CHAOS=on</code> enables
+        <code class="inline">/admin/leak</code>, which keeps 50 MiB more memory each call. Call it until something
+        happens, then prove what happened without guessing.
+        <pre class="code">for i in 1 2 3 4 5; do curl -s localhost:8080/admin/leak; echo; done
+<span class="out">{"leakedMiB":50}
+{"leakedMiB":100}
+{"leakedMiB":150}
+</span>                                                     <span class="cm"># empty replies: the process died mid-request</span>
+pgrep node || echo "booking-api is not running"
+<span class="out">booking-api is not running</span>
+tail -1 /var/log/booking-api/app.log                    <span class="cm"># no error line: SIGKILL cannot be caught</span>
+dmesg 2&gt;&amp;1 | tail -1
+<span class="out">dmesg: read kernel buffer failed: Operation not permitted</span>
+grep oom_kill /sys/fs/cgroup/memory.events
+<span class="out">oom_kill 1</span>                                            <span class="cm"># the kernel killed a process for exceeding 256 MiB</span>
+start</pre>
+        A process that vanishes with no last log line was killed with SIGKILL, and the usual sender is the OOM killer.
+        On a VM you read it in <code class="inline">dmesg</code>; in a container you read the cgroup's
+        <code class="inline">memory.events</code>; on ECS and Kubernetes it shows as exit code 137 and
+        <code class="inline">OOMKilled</code>.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">curl localhost:8080/healthz</code>
+        returns <code class="inline">"version":"fn2-lab"</code>; <code class="inline">ps</code> shows node running as
+        <code class="inline">booking</code>, not root; <code class="inline">nobody</code> cannot read
+        <code class="inline">/etc/booking-api/env</code>; and you have written down, for faults 1–3, the one command whose
+        output proved the cause (<code class="inline">top</code>, <code class="inline">lsof +L1</code>,
+        <code class="inline">memory.events</code>).</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>The service will not come back.</strong> Simulate a teammate's forgotten debug server, then restart
+        booking-api the normal way:
+        <pre class="code">kill -TERM $(pgrep -u booking node); sleep 4
+runuser -u nobody -- node -e 'require("http").createServer((q,s)=&gt;s.end("debug\n")).listen(8080)' &amp;
+start
+<span class="out">debug</span>                                                 <span class="cm"># that is not booking-api's JSON</span></pre>
+        Health checks that only test "port 8080 answers" would call this box healthy. Using
+        <code class="inline">pgrep</code>, the log file, <code class="inline">ss -tlnp</code> and
+        <code class="inline">ps</code>, find out why booking-api is not running and who owns the port, then fix it.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">grep -m1 EADDRINUSE /var/log/booking-api/app.log
+<span class="out">Error: listen EADDRINUSE: address already in use :::8080</span>
+ss -tlnp | grep 8080
+<span class="out">LISTEN 0      511                *:8080             *:*     users:(("node",pid=503,fd=18))</span>
+ps -o user,pid,cmd -p 503
+<span class="out">USER       PID CMD
+nobody     503 node -e require("http").createServer((q,s)=&gt;s.end("debug\n")).listen(8080)</span>
+kill -TERM 503 &amp;&amp; start
+<span class="out">{"ok":true,"version":"fn2-lab"}</span></pre>
+          <p class="mt-2">booking-api crashed at start-up because something else already held port 8080. The clue that
+          it was not booking-api answering is the body, and <code class="inline">ss -tlnp</code> names the real owner. The
+          lesson: a health check should check something only your app returns (here the JSON version), and "port in use"
+          is always answered by <code class="inline">ss -tlnp</code> (or <code class="inline">lsof -i :8080</code>), never by
+          guessing.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Clean up.</strong> Leave the box; <code class="inline">--rm</code> deletes the container and everything
+        you did inside it. Keep the <code class="inline">node:22-bookworm-slim</code> image: FN6 uses it.
+        <pre class="code">exit
+docker ps -a --filter name=sick --format '{{.Names}}' | wc -l
+<span class="out">       0</span></pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
@@ -761,7 +975,7 @@ access than "restart and read logs for booking-api", and propose the narrowest r
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="systemd"> <span>I wrote a systemd unit for a service running as its own user, enabled it, and queried its logs with <code class="inline">journalctl</code>.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="resources"> <span>I can read <code class="inline">top</code>, <code class="inline">free</code>, <code class="inline">df</code>, <code class="inline">iostat</code> and <code class="inline">ss</code> output and say which resource is the bottleneck.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="access"> <span>I connected to an instance with SSM Session Manager and with SSH over SSM, with port 22 closed in the security group.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="sick-box"> <span class="font-semibold">On a sandbox Amazon Linux 2023 instance, ran a demo HTTP service as a hardened systemd unit, then diagnosed three faults a mentor injected (full disk, unreadable config, OOM kill). Wrote a one-page runbook with the commands, the output that pointed to each cause and the fix (mentor evidence ✓).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="sick-box"> <span class="font-semibold">Completed the hands-on lab, then on a sandbox Amazon Linux 2023 instance ran a demo HTTP service as a hardened systemd unit, then diagnosed three faults a mentor injected (full disk, unreadable config, OOM kill). Wrote a one-page runbook with the commands, the output that pointed to each cause and the fix (mentor evidence ✓).</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>

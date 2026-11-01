@@ -635,6 +635,312 @@ gh api "repos/golden-owl/clinic-app/deployments?environment=prod&amp;per_page=10
         change failure rate and time to restore. Show the client a monthly chart: on the clinic, change failure rate
         dropped from 18% to under 10% in the quarter after canaries and expand/contract became the rule.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Promote one digest from dev to staging, then roll it back</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will add two GitHub environments to your CI1 repo, give staging a required reviewer, and write a deploy
+        workflow that takes one image digest, rolls it out to a dev ECS service, waits for your approval, and rolls the
+        same digest out to the staging service behind the CN1 load balancer. Then you ship a second version, watch old and
+        new tasks serve side by side, roll back by deploying the previous digest, and break a local database with a rename
+        to see why migrations must be expand/contract.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">Two deploys and one rollback through the pipeline, each the same digest in dev and staging, with your approval recorded on staging</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours, plus the CN1 stack if you do not have it yet</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your <code class="inline">lab-$ME-clinic-app</code> repo, <code class="inline">gol-sandbox</code> in <code class="inline">ap-southeast-1</code>, Docker on your laptop for the last part</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">About USD 0.08 per hour while it runs: the CN1 stack (USD 0.06) plus one extra small ARM64 task and its public IPv4 address</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The <a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a> repo, ECR repository and at least one pushed image; the <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a> stack up in <code class="inline">~/labs/cn1</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up and check what you build on.</strong> <code class="inline">V1</code> is the newest image CI1
+        pushed. <code class="inline">CN1_IMAGE</code> is whatever you passed as <code class="inline">-var image</code> when
+        you built CN1. If the service is missing, do CN1 lab steps 1 and 3–6 now with
+        <code class="inline">-var image=$REPO@$V1</code> (skip its step 2: CI1 already made the repository and pushed an
+        image), and set <code class="inline">CN1_IMAGE=$REPO@$V1</code>.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login &amp;&amp; mkdir -p ~/labs/ci2/deploy-role
+export REPO=888899990000.dkr.ecr.$AWS_REGION.amazonaws.com/lab-$ME/booking-api
+aws ecr describe-images --repository-name lab-$ME/booking-api \
+  --query 'sort_by(imageDetails,&amp;imagePushedAt)[-1].imageDigest' --output text
+<span class="out">sha256:9b1e47c0a1b2…</span>
+export V1=sha256:9b1e47c0a1b2…                               <span class="cm"># paste the full digest</span>
+export CN1_IMAGE=$REPO:1.0.0                                 <span class="cm"># or $REPO@$V1 if you build CN1 now</span>
+aws ecs describe-services --cluster lab-$ME-cn1 --services booking-api \
+  --query 'services[0].[status,runningCount]' --output text
+<span class="out">ACTIVE	2</span>
+export URL=$(terraform -chdir=$HOME/labs/cn1 output -raw url)</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Hand the running image over to the pipeline.</strong> From now on the pipeline registers task definition
+        revisions and points the service at them. Terraform must stop reverting that, or the next
+        <code class="inline">terraform apply</code> silently rolls production back. Add this inside
+        <code class="inline">aws_ecs_service.api</code> in <code class="inline">~/labs/cn1/service.tf</code>:
+        <span class="code-label">~/labs/cn1/service.tf (inside aws_ecs_service.api)</span>
+        <pre class="code">  lifecycle {
+    ignore_changes = [task_definition]                       <span class="cm"># the deploy pipeline owns this</span>
+  }</pre>
+        <pre class="code">cd ~/labs/cn1 &amp;&amp; terraform apply -var me=$ME -var image=$CN1_IMAGE
+<span class="out">No changes. Your infrastructure matches the configuration.</span></pre>
+        If the plan wants to replace the task definition, you passed a different image than last time: answer
+        <code class="inline">no</code> and fix <code class="inline">CN1_IMAGE</code>.
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Create a dev service next to the CN1 one.</strong> To keep the lab cheap, "dev" is a one-task service in the
+        same cluster with no load balancer, and "staging" is the CN1 service behind the ALB. In real accounts they are
+        separate clusters in <code class="inline">gol-dev</code> and <code class="inline">gol-staging</code>. Copying the
+        network block from the existing service saves you looking up subnets.
+        <pre class="code">NET=$(aws ecs describe-services --cluster lab-$ME-cn1 --services booking-api \
+  --query 'services[0].networkConfiguration' --output json)
+aws ecs create-service --cluster lab-$ME-cn1 --service-name booking-api-dev \
+  --task-definition lab-$ME-cn1-booking-api --desired-count 1 --launch-type FARGATE \
+  --network-configuration "$NET" \
+  --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true}" \
+  --tags key=Owner,value=$ME key=Lab,value=CI2 --query 'service.status' --output text
+<span class="out">ACTIVE</span>
+aws ecs wait services-stable --cluster lab-$ME-cn1 --services booking-api-dev</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Create a deploy role that only the two environments can assume.</strong> The <code class="inline">sub</code>
+        values end in <code class="inline">environment:dev</code> and <code class="inline">environment:staging</code>, so a
+        job without an <code class="inline">environment:</code> line, or a staging job that was not approved, never gets
+        AWS credentials.
+        <span class="code-label">~/labs/ci2/deploy-role/main.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "CI2" } }
+}
+variable "me" { type = string }
+data "aws_caller_identity" "me" {}
+data "aws_iam_openid_connect_provider" "github" { url = "https://token.actions.githubusercontent.com" }
+locals {
+  acct = data.aws_caller_identity.me.account_id
+  repo = "repo:${var.me}/lab-${var.me}-clinic-app"
+}
+resource "aws_iam_role" "deploy" {
+  name = "lab-${var.me}-gha-deploy"
+  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
+    Effect = "Allow", Action = "sts:AssumeRoleWithWebIdentity"
+    Principal = { Federated = data.aws_iam_openid_connect_provider.github.arn }
+    Condition = { StringEquals = {
+      "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+      "token.actions.githubusercontent.com:sub" = ["${local.repo}:environment:dev", "${local.repo}:environment:staging"]
+  } } }] })
+}
+resource "aws_iam_role_policy" "deploy" {
+  role = aws_iam_role.deploy.id
+  policy = jsonencode({ Version = "2012-10-17", Statement = [
+    { Effect = "Allow", Action = ["ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition"], Resource = "*" },
+    { Effect = "Allow", Action = ["ecs:UpdateService", "ecs:DescribeServices"],
+      Resource = "arn:aws:ecs:ap-southeast-1:${local.acct}:service/lab-${var.me}-cn1/*" },
+    { Effect = "Allow", Action = "iam:PassRole", Resource = "arn:aws:iam::${local.acct}:role/lab-${var.me}-cn1-exec",
+      Condition = { StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" } } }] })
+}
+output "role_arn" { value = aws_iam_role.deploy.arn }</pre>
+        <pre class="code">cd ~/labs/ci2/deploy-role
+terraform init &gt;/dev/null &amp;&amp; terraform apply -var me=$ME
+<span class="out">Apply complete! Resources: 2 added, 0 changed, 0 destroyed.</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Create the environments and their variables.</strong> Staging gets you as its required reviewer. On a real
+        team <code class="inline">prevent_self_review</code> is <code class="inline">true</code>; you set it to false here
+        because you are the whole team.
+        <pre class="code">cd ~/labs/ci1/lab-$ME-clinic-app &amp;&amp; git switch -q main &amp;&amp; git pull -q
+gh api -X PUT repos/$ME/lab-$ME-clinic-app/environments/dev --silent
+jq -n --argjson id "$(gh api user --jq .id)" '{reviewers: [{type: "User", id: $id}], prevent_self_review: false}' \
+  | gh api -X PUT repos/$ME/lab-$ME-clinic-app/environments/staging --input - --silent
+gh variable set DEPLOY_ROLE_ARN --body "$(terraform -chdir=$HOME/labs/ci2/deploy-role output -raw role_arn)"
+gh variable set ME --body $ME
+gh variable set SERVICE --env dev --body booking-api-dev
+gh variable set SERVICE --env staging --body booking-api
+gh api repos/$ME/lab-$ME-clinic-app/environments --jq '.environments[] | [.name, (.protection_rules | length)] | @tsv'
+<span class="out">dev	0
+staging	1</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Write the reusable deploy job and the promotion chain.</strong> The deploy job renders the task definition
+        currently registered for the family with the new digest, registers it, updates the service, and stays red unless
+        the service reaches a steady state. It also sets <code class="inline">APP_VERSION</code> to the first 12 characters
+        of the digest, so <code class="inline">/healthz</code> tells you which build is serving.
+        <span class="code-label">.github/workflows/_deploy.yml</span>
+        <pre class="code">name: _deploy
+on:
+  workflow_call:
+    inputs:
+      environment: { type: string, required: true }
+      digest: { type: string, required: true }
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}                   <span class="cm"># approval gate + env vars + OIDC sub</span>
+    permissions: { contents: read, id-token: write }
+    concurrency: { group: "deploy-${{ inputs.environment }}", cancel-in-progress: false }
+    steps:
+      - id: v
+        env: { DIGEST: "${{ inputs.digest }}" }
+        run: echo "short=${DIGEST:7:12}" &gt;&gt; "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with: { role-to-assume: "${{ vars.DEPLOY_ROLE_ARN }}", aws-region: ap-southeast-1 }
+      - id: td
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-family: lab-${{ vars.ME }}-cn1-booking-api
+          container-name: api
+          image: ${{ vars.ECR_REPO }}@${{ inputs.digest }}  <span class="cm"># a digest, never a tag</span>
+          environment-variables: APP_VERSION=${{ steps.v.outputs.short }}
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.td.outputs.task-definition }}
+          cluster: lab-${{ vars.ME }}-cn1
+          service: ${{ vars.SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10</pre>
+        <span class="code-label">.github/workflows/deploy.yml</span>
+        <pre class="code">name: deploy
+on:
+  workflow_dispatch:
+    inputs:
+      digest: { description: "sha256:… pushed by the booking-api workflow", required: true }
+permissions: { contents: read, id-token: write }
+jobs:
+  dev:
+    uses: ./.github/workflows/_deploy.yml
+    with: { environment: dev, digest: "${{ inputs.digest }}" }
+  staging:
+    needs: dev                                               <span class="cm"># staging is unreachable unless dev went green</span>
+    uses: ./.github/workflows/_deploy.yml
+    with: { environment: staging, digest: "${{ inputs.digest }}" }</pre>
+        <pre class="code">git add .github/workflows &amp;&amp; git commit -qm "deploy pipeline" &amp;&amp; git push -q</pre>
+        Pin the four <code class="inline">uses:</code> lines by SHA with the loop from CI1 step 5 before you push, if you
+        want the repo to stay consistent.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Deploy V1, approve staging, and check both services run the same digest.</strong>
+        <pre class="code">gh workflow run deploy.yml -f digest=$V1
+sleep 10; gh run view $(gh run list --workflow deploy.yml -L1 --json databaseId -q '.[0].databaseId')
+<span class="out">✓ dev / deploy
+* staging / deploy (Waiting for review)</span>
+gh run view --web $(gh run list --workflow deploy.yml -L1 --json databaseId -q '.[0].databaseId')
+<span class="cm"># in the browser: Review deployments → tick staging → Approve and deploy</span>
+for s in booking-api-dev booking-api; do
+  td=$(aws ecs describe-services --cluster lab-$ME-cn1 --services $s --query 'services[0].taskDefinition' --output text)
+  aws ecs describe-task-definition --task-definition $td --query 'taskDefinition.containerDefinitions[0].image' --output text
+done
+<span class="out">888899990000.dkr.ecr.ap-southeast-1.amazonaws.com/lab-yourhandle/booking-api@sha256:9b1e47c0a1b2…
+888899990000.dkr.ecr.ap-southeast-1.amazonaws.com/lab-yourhandle/booking-api@sha256:9b1e47c0a1b2…</span>
+curl -s $URL/healthz
+<span class="out">{"ok":true,"version":"9b1e47c0a1b2"}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Ship V2 and watch a rolling deploy.</strong> Change one log message, let the CI1 workflow push the image,
+        and deploy its digest. During the staging rollout, poll the URL: for a minute or two both versions answer. That
+        overlap is why every release must work next to the previous one.
+        <pre class="code">sed -i.bak 's/"listening"/"listening (v2)"/' booking-api/server.js &amp;&amp; rm booking-api/server.js.bak
+git commit -qam "v2 log line" &amp;&amp; git push -q
+sleep 10; gh run watch --exit-status $(gh run list --workflow booking-api.yml -L1 --json databaseId -q '.[0].databaseId') &gt;/dev/null
+export V2=$(aws ecr describe-images --repository-name lab-$ME/booking-api \
+  --query 'sort_by(imageDetails,&amp;imagePushedAt)[-1].imageDigest' --output text)
+gh workflow run deploy.yml -f digest=$V2                 <span class="cm"># approve staging again when dev is green</span>
+while true; do curl -s $URL/healthz; echo; sleep 3; done   <span class="cm"># Ctrl-C when only the new version answers</span>
+<span class="out">{"ok":true,"version":"9b1e47c0a1b2"}
+{"ok":true,"version":"4d7e01f39c2a"}
+{"ok":true,"version":"9b1e47c0a1b2"}
+{"ok":true,"version":"4d7e01f39c2a"}
+{"ok":true,"version":"4d7e01f39c2a"}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Roll back by deploying the previous digest.</strong> A rollback is a deploy of an artifact you already
+        trust, through the same gates. It takes as long as any other deploy, which is why you rehearse it.
+        <pre class="code">gh workflow run deploy.yml -f digest=$V1                 <span class="cm"># approve staging</span>
+curl -s $URL/healthz
+<span class="out">{"ok":true,"version":"9b1e47c0a1b2"}</span>
+gh api repos/$ME/lab-$ME-clinic-app/deployments --jq '.[0:6][] | [.environment, .created_at] | @tsv'
+<span class="out">staging	2026-11-01T10:41:12Z
+dev	2026-11-01T10:38:50Z
+staging	2026-11-01T10:22:31Z
+…</span>                                                     <span class="cm"># the environments keep a deployment history</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> the deploy workflow shows three runs, each with
+        <code class="inline">dev</code> green before <code class="inline">staging</code> started; staging's deployments
+        list your approval; both services report the same image digest after each run;
+        <code class="inline">curl $URL/healthz</code> shows the V1 short digest again after the rollback; and
+        <code class="inline">terraform plan</code> in <code class="inline">~/labs/cn1</code> does not try to change the
+        service's task definition.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Run the migration an agent wrote, while the app is serving.</strong> On your laptop, start the local stack
+        from the lab kit and create a booking. Then apply the "simple rename" that a change request asked for:
+        <pre class="code">cd ~/clinic-app &amp;&amp; docker compose up -d --build
+curl -s -XPOST localhost:8080/bookings -H 'content-type: application/json' -d '{"patient":"An","slot":"2026-11-02T09:00"}'
+<span class="out">{"id":1,"patient":"An","slot":"2026-11-02T09:00:00.000Z",…}</span>
+docker compose exec postgres psql -U clinic -c 'ALTER TABLE bookings RENAME COLUMN patient TO patient_name;'
+<span class="out">ALTER TABLE</span>
+curl -s -XPOST localhost:8080/bookings -H 'content-type: application/json' -d '{"patient":"Binh","slot":"2026-11-02T10:00"}'
+<span class="out">{"error":"internal"}</span></pre>
+        Every write is now failing. Find the cause in the API's logs, undo it, and then do the same change the
+        expand/contract way so the running version keeps working.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">docker compose logs booking-api | grep '"request failed"' | tail -1
+<span class="out">{"level":"error","msg":"request failed","path":"/bookings","err":"column \"patient\" of relation \"bookings\" does not exist",…}</span>
+docker compose exec postgres psql -U clinic -c 'ALTER TABLE bookings RENAME COLUMN patient_name TO patient;'
+<span class="cm"># expand: add the new column, backfill it, keep it in sync while old code still writes "patient"</span>
+docker compose exec -T postgres psql -U clinic &lt;&lt;'SQL'
+ALTER TABLE bookings ADD COLUMN patient_name text;
+UPDATE bookings SET patient_name = patient WHERE patient_name IS NULL;
+CREATE FUNCTION bookings_sync_name() RETURNS trigger AS $$
+BEGIN NEW.patient_name := COALESCE(NEW.patient_name, NEW.patient); RETURN NEW; END $$ LANGUAGE plpgsql;
+CREATE TRIGGER bookings_sync_name BEFORE INSERT OR UPDATE ON bookings
+  FOR EACH ROW EXECUTE FUNCTION bookings_sync_name();
+SQL
+curl -s -XPOST localhost:8080/bookings -H 'content-type: application/json' -d '{"patient":"Binh","slot":"2026-11-02T10:00"}' | jq -r .patient_name
+<span class="out">Binh</span>                                                 <span class="cm"># old code writes, new column fills itself</span></pre>
+          <p class="mt-2">The running code inserts into <code class="inline">patient</code>. A rename removes that column
+          at once, so every task of the current version fails until the new version is fully rolled out, and a rollback
+          to the old version fails too. The expand step only <em>adds</em>, so the old version keeps working. Later releases
+          switch reads and writes to <code class="inline">patient_name</code>, and a final contract release drops the
+          trigger and the old column once nothing uses it.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">11</div><div class="step-body">
+        <strong>Clean up.</strong> Remove the dev service and the local stack. Keep the CN1 stack, the deploy role and the
+        environments if you go straight on to <a href="./ci3.html" class="text-viol underline decoration-viol/40">CI3</a>;
+        otherwise destroy them too.
+        <pre class="code">aws ecs delete-service --cluster lab-$ME-cn1 --service booking-api-dev --force --query 'service.status' --output text
+<span class="out">DRAINING</span>
+cd ~/clinic-app &amp;&amp; docker compose down -v
+<span class="cm"># when you are done with the ECS labs:</span>
+cd ~/labs/ci2/deploy-role &amp;&amp; terraform destroy -var me=$ME
+<span class="out">Destroy complete! Resources: 2 destroyed.</span>
+cd ~/labs/cn1 &amp;&amp; terraform destroy -var me=$ME -var image=$CN1_IMAGE
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=CI2 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Forgot to destroy?</strong> The CN1 stack plus the dev service cost
+        about USD 0.08 an hour, close to USD 2 a day. Deleting the dev service alone saves only a quarter of that: the ALB
+        and its addresses are the bulk. If you stop for the day, destroy CN1 and recreate it tomorrow with one
+        <code class="inline">terraform apply</code>.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

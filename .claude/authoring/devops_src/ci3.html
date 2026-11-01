@@ -279,13 +279,19 @@
     sid       = <span class="st">"EnableIAMPolicies"</span>
     actions   = [<span class="st">"kms:*"</span>]
     resources = [<span class="st">"*"</span>]
-    principals { type = <span class="st">"AWS"</span>, identifiers = [<span class="st">"arn:aws:iam::444455556666:root"</span>] }
+    principals {
+      type        = <span class="st">"AWS"</span>
+      identifiers = [<span class="st">"arn:aws:iam::444455556666:root"</span>]
+    }
   }
   statement {                                        <span class="cm"># 2. decrypt only when called through these services</span>
     sid       = <span class="st">"DecryptViaSecretsServices"</span>
     actions   = [<span class="st">"kms:Decrypt"</span>]
     resources = [<span class="st">"*"</span>]
-    principals { type = <span class="st">"AWS"</span>, identifiers = [aws_iam_role.booking_api_exec.arn] }
+    principals {
+      type        = <span class="st">"AWS"</span>
+      identifiers = [aws_iam_role.booking_api_exec.arn]
+    }
     condition {
       test     = <span class="st">"StringEquals"</span>
       variable = <span class="st">"kms:ViaService"</span>
@@ -639,6 +645,264 @@ aws cloudtrail lookup-events --lookup-attributes AttributeKey=AccessKeyId,Attrib
       <pre class="code mt-3"><span class="out">eventTime            userIdentity.arn                                              secretId
 2026-10-29 09:41:07  arn:aws:sts::444455556666:assumed-role/AWSReservedSSO_Admin/an  clinic/prod/booking-api/db</span>
 <span class="cm"># an engineer read the prod DB secret: fine during an incident, worth a question otherwise</span></pre>
+
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Inject DATABASE_URL from Secrets Manager, rotate it, and catch a leaked key</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will run booking-api on Fargate with its <code class="inline">DATABASE_URL</code> coming from Secrets Manager,
+        with the value never touching Terraform code, state or the task definition. A Postgres sidecar in the same task
+        stands in for RDS, so the lab is cheap and the API proves the secret is right by running its migration. Then you
+        rotate the value, take the execution role's permission away to see the exact failure, and run a secret scanner
+        over a repo with a planted key.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A task whose log says <code class="inline">migration ok</code> with a database password nobody typed into code, and a scanner that finds a key you deleted two commits ago</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">About 2 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3"><code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code>; your laptop for the scanning part</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">About USD 0.03 per hour while a task runs (0.5 vCPU ARM64 Fargate and one public IPv4 address); the secret is USD 0.40 a month, prorated</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">A <code class="inline">booking-api</code> image in <code class="inline">lab-$ME/booking-api</code> (from <a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a>), <code class="inline">openssl</code>, <code class="inline">jq</code>, <code class="inline">gitleaks</code> (<code class="inline">brew install gitleaks</code>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up and pick the image.</strong> If the repository is empty, push one image with the
+        <code class="inline">docker buildx</code> line from CN1 step 2 (the repository itself already exists from CI1).
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1 TF_VAR_me=yourhandle
+aws sso login &amp;&amp; mkdir -p ~/labs/ci3/stack &amp;&amp; cd ~/labs/ci3/stack
+export REPO=888899990000.dkr.ecr.$AWS_REGION.amazonaws.com/lab-$ME/booking-api
+export TF_VAR_image=$REPO@$(aws ecr describe-images --repository-name lab-$ME/booking-api \
+  --query 'sort_by(imageDetails,&amp;imagePushedAt)[-1].imageDigest' --output text)
+echo $TF_VAR_image
+<span class="out">888899990000.dkr.ecr.ap-southeast-1.amazonaws.com/lab-yourhandle/booking-api@sha256:9b1e47c0…</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Write the network, the secret's container and the execution role.</strong> Terraform creates the secret
+        but no value, so nothing sensitive can end up in state. The execution role is what ECS uses to fetch the secret
+        <em>before</em> your container starts; the <code class="inline">grant_secret_read</code> switch is for the break-it
+        step.
+        <span class="code-label">~/labs/ci3/stack/main.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "CI3" } }
+}
+variable "me" { type = string }
+variable "image" { type = string }
+variable "grant_secret_read" {
+  type    = bool
+  default = true
+}
+locals { name = "lab-${var.me}-ci3" }
+
+module "vpc" {
+  source             = "terraform-aws-modules/vpc/aws"
+  version            = "~&gt; 6.0"
+  name               = local.name
+  cidr               = "10.95.0.0/16"
+  azs                = ["ap-southeast-1a"]
+  public_subnets     = ["10.95.0.0/24"]
+  enable_nat_gateway = false                                 <span class="cm"># lab: public IP instead of NAT</span>
+}
+resource "aws_security_group" "task" {
+  name   = "${local.name}-task"
+  vpc_id = module.vpc.vpc_id
+  egress {                                                   <span class="cm"># outbound only: ECR, Secrets Manager, logs</span>
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+resource "aws_secretsmanager_secret" "db" {
+  name                    = "lab/${var.me}/ci3/booking-api"
+  recovery_window_in_days = 0                                <span class="cm"># lab only: delete at once on destroy</span>
+}</pre>
+        <span class="code-label">~/labs/ci3/stack/iam.tf</span>
+        <pre class="code">resource "aws_iam_role" "exec" {
+  name = "${local.name}-exec"
+  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{ Effect = "Allow",
+  Action = "sts:AssumeRole", Principal = { Service = "ecs-tasks.amazonaws.com" } }] })
+}
+resource "aws_iam_role_policy_attachment" "exec" {
+  role       = aws_iam_role.exec.name                        <span class="cm"># ECR pull + logs, NOT secrets</span>
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+resource "aws_iam_role_policy" "read_secret" {
+  count = var.grant_secret_read ? 1 : 0
+  role  = aws_iam_role.exec.id
+  policy = jsonencode({ Version = "2012-10-17", Statement = [{ Effect = "Allow",
+  Action = "secretsmanager:GetSecretValue", Resource = aws_secretsmanager_secret.db.arn }] })   <span class="cm"># this secret only</span>
+}</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Write the task definition with <code class="inline">secrets</code>, not <code class="inline">environment</code>.</strong>
+        Each <code class="inline">valueFrom</code> names a secret ARN plus a JSON key (<code class="inline">:url::</code>);
+        ECS fetches it at start and sets it as an environment variable inside the container only.
+        <span class="code-label">~/labs/ci3/stack/task.tf</span>
+        <pre class="code">resource "aws_ecs_cluster" "this" { name = local.name }
+resource "aws_cloudwatch_log_group" "this" {
+  name              = "/ecs/${local.name}"
+  retention_in_days = 1
+}
+locals {
+  logs = { logDriver = "awslogs", options = { "awslogs-group" = aws_cloudwatch_log_group.this.name,
+  "awslogs-region" = "ap-southeast-1", "awslogs-stream-prefix" = "lab" } }
+}
+resource "aws_ecs_task_definition" "api" {
+  family                   = "${local.name}-booking-api"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 512
+  memory                   = 1024
+  execution_role_arn       = aws_iam_role.exec.arn
+  runtime_platform {
+    cpu_architecture        = "ARM64"
+    operating_system_family = "LINUX"
+  }
+  container_definitions = jsonencode([
+    { name = "db", image = "public.ecr.aws/docker/library/postgres:16-alpine", essential = true, logConfiguration = local.logs,
+      environment = [{ name = "POSTGRES_USER", value = "clinic" }, { name = "POSTGRES_DB", value = "clinic" }]
+      secrets     = [{ name = "POSTGRES_PASSWORD", valueFrom = "${aws_secretsmanager_secret.db.arn}:password::" }]
+    healthCheck = { command = ["CMD-SHELL", "pg_isready -U clinic"], interval = 5, retries = 10 } },
+    { name = "api", image = var.image, essential = true, logConfiguration = local.logs,
+      dependsOn   = [{ containerName = "db", condition = "HEALTHY" }]
+      environment = [{ name = "APP_VERSION", value = "ci3-lab" }]
+      secrets     = [{ name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.db.arn}:url::" }] }   <span class="cm"># a reference, not a value</span>
+  ])
+}
+output "run_task_network" {
+  value = "awsvpcConfiguration={subnets=[${module.vpc.public_subnets[0]}],securityGroups=[${aws_security_group.task.id}],assignPublicIp=ENABLED}"
+}</pre>
+        <pre class="code">terraform init &gt;/dev/null &amp;&amp; terraform apply
+<span class="out">Apply complete! Resources: 17 added, 0 changed, 0 destroyed.</span>   <span class="cm"># count varies with the VPC module version</span>
+export NET=$(terraform output -raw run_task_network)</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Put the value into the secret from your shell, not from Terraform.</strong> The password is generated,
+        stored and forgotten by your terminal in one go.
+        <pre class="code">PW=$(openssl rand -hex 16)
+aws secretsmanager put-secret-value --secret-id lab/$ME/ci3/booking-api --query VersionStages --output text \
+  --secret-string "$(jq -nc --arg pw "$PW" '{password: $pw, url: "postgres://clinic:\($pw)@localhost:5432/clinic"}')"
+<span class="out">AWSCURRENT</span>
+unset PW
+terraform show -no-color | grep -c 'localhost:5432'
+<span class="out">0</span>                                                    <span class="cm"># the value is not in state</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Run the task and let the migration prove the secret.</strong> The API only logs
+        <code class="inline">migration ok</code> after it connected to Postgres with the URL it was given.
+        <pre class="code">TASK=$(aws ecs run-task --cluster lab-$ME-ci3 --launch-type FARGATE --task-definition lab-$ME-ci3-booking-api \
+  --network-configuration "$NET" --query 'tasks[0].taskArn' --output text)
+aws ecs wait tasks-running --cluster lab-$ME-ci3 --tasks $TASK
+sleep 20; aws logs tail /ecs/lab-$ME-ci3 --since 10m --format short | grep -E '"migration ok"|"listening"'
+<span class="out">2026-11-01T10:05:12 {"ts":"…","level":"info","msg":"migration ok","service":"booking-api","version":"ci3-lab"}
+2026-11-01T10:05:12 {"ts":"…","level":"info","msg":"listening","service":"booking-api","version":"ci3-lab","port":8080}</span>
+aws ecs describe-task-definition --task-definition lab-$ME-ci3-booking-api \
+  --query 'taskDefinition.containerDefinitions[1].secrets' --output text
+<span class="out">DATABASE_URL	arn:aws:secretsmanager:ap-southeast-1:888899990000:secret:lab/yourhandle/ci3/booking-api-AbCdEf:url::</span></pre>
+        Anyone who can read the task definition sees where the secret lives, not what it is.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Rotate the value, and see what a running task does about it.</strong> ECS reads secrets once, when a task
+        starts. The running task keeps the old value until it is replaced; that is why rotation needs a redeploy (or an
+        app that re-reads) and an overlap period where both values work.
+        <pre class="code">PW=$(openssl rand -hex 16)
+aws secretsmanager put-secret-value --secret-id lab/$ME/ci3/booking-api --query VersionStages --output text \
+  --secret-string "$(jq -nc --arg pw "$PW" '{password: $pw, url: "postgres://clinic:\($pw)@localhost:5432/clinic"}')"
+<span class="out">AWSCURRENT</span>
+unset PW
+aws secretsmanager list-secret-version-ids --secret-id lab/$ME/ci3/booking-api \
+  --query 'Versions[].VersionStages' --output text
+<span class="out">AWSPREVIOUS
+AWSCURRENT</span>
+aws ecs stop-task --cluster lab-$ME-ci3 --task $TASK --reason "CI3: rotate" &gt;/dev/null
+TASK=$(aws ecs run-task --cluster lab-$ME-ci3 --launch-type FARGATE --task-definition lab-$ME-ci3-booking-api \
+  --network-configuration "$NET" --query 'tasks[0].taskArn' --output text)
+aws ecs wait tasks-running --cluster lab-$ME-ci3 --tasks $TASK
+sleep 20; aws logs tail /ecs/lab-$ME-ci3 --since 2m --format short | grep -c '"migration ok"'
+<span class="out">1</span>                                                    <span class="cm"># the new task got the new value</span></pre>
+        With RDS, the database itself must accept the new password before tasks pick it up, which is why Part III uses the
+        managed rotation that keeps <code class="inline">AWSPREVIOUS</code> valid during the switch.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Catch a leaked key with a scanner, before and after commit.</strong> Make a throwaway local repo and plant a
+        fake key in a <code class="inline">.env</code> file. Never push this repo anywhere.
+        <pre class="code">aws ecs stop-task --cluster lab-$ME-ci3 --task $TASK &gt;/dev/null           <span class="cm"># stop billing first</span>
+mkdir -p ~/labs/ci3/leaky &amp;&amp; cd ~/labs/ci3/leaky &amp;&amp; git init -qb main
+echo "# demo" &gt; README.md &amp;&amp; git add . &amp;&amp; git commit -qm init
+printf 'AWS_ACCESS_KEY_ID=AKIAQX4TZ7RVLN2MWP5K\nAWS_SECRET_ACCESS_KEY=tR9vXq2Lm8Zp4Wn6Ky1Hs3Jd7Fb5Gc0Ae8Qu2Io4\n' &gt; .env
+git add .env &amp;&amp; gitleaks git --staged --no-banner -v --redact=80 .   <span class="cm"># what a pre-commit hook runs</span>
+<span class="out">Finding:     AWS_ACCESS_KEY_ID=AKIA...
+RuleID:      aws-access-token
+File:        .env
+…
+WRN leaks found: 2</span>
+git commit -qm "add env" &amp;&amp; git rm -q .env &amp;&amp; git commit -qm "remove env"
+gitleaks git --no-banner --redact=80 . ; echo "exit=$?"
+<span class="out">WRN leaks found: 2
+exit=1</span>                                               <span class="cm"># deleting the file did not delete the leak</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> the task log shows
+        <code class="inline">migration ok</code>; <code class="inline">describe-task-definition</code> shows only an ARN
+        for <code class="inline">DATABASE_URL</code>; <code class="inline">terraform show | grep -c localhost:5432</code>
+        prints <code class="inline">0</code>; the secret has an <code class="inline">AWSPREVIOUS</code> and an
+        <code class="inline">AWSCURRENT</code> version; and gitleaks exits 1 on a repo whose latest commit no longer
+        contains the key.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Someone trims the execution role.</strong> Apply <code class="inline">terraform apply -var grant_secret_read=false</code>
+        in <code class="inline">~/labs/ci3/stack</code>, then start a task as in step 5. It never reaches
+        <code class="inline">RUNNING</code>, and there are no application logs at all. Find the exact reason using only the
+        ECS API before you open the answer.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">aws ecs wait tasks-stopped --cluster lab-$ME-ci3 --tasks $TASK
+aws ecs describe-tasks --cluster lab-$ME-ci3 --tasks $TASK --query 'tasks[0].stoppedReason' --output text
+<span class="out">ResourceInitializationError: unable to pull secrets or registry auth: … unable to retrieve secret from asm:
+… AccessDeniedException: User: arn:aws:sts::888899990000:assumed-role/lab-yourhandle-ci3-exec/…
+is not authorized to perform: secretsmanager:GetSecretValue on resource: arn:aws:secretsmanager:…:secret:lab/yourhandle/ci3/booking-api-AbCdEf</span></pre>
+          <p class="mt-2">Secrets are fetched by the <strong>execution role</strong> during task start-up, before any
+          container runs, so the app never logs anything and the error lives only in <code class="inline">stoppedReason</code>.
+          Granting <code class="inline">GetSecretValue</code> to the <em>task</em> role would not help. Apply again without
+          the variable to restore the policy. If the secret used a customer managed KMS key, the execution role would also
+          need <code class="inline">kms:Decrypt</code> on that key, and the error would name KMS instead.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Stop any task, destroy the stack (the secret goes at once because of the zero recovery
+        window), and delete the throwaway repo.
+        <pre class="code">cd ~/labs/ci3/stack
+for t in $(aws ecs list-tasks --cluster lab-$ME-ci3 --query 'taskArns[]' --output text); do
+  aws ecs stop-task --cluster lab-$ME-ci3 --task $t &gt;/dev/null; done
+terraform destroy
+<span class="out">Destroy complete! Resources: 17 destroyed.</span>
+aws secretsmanager describe-secret --secret-id lab/$ME/ci3/booking-api 2&gt;&amp;1 | grep -o ResourceNotFoundException
+<span class="out">ResourceNotFoundException</span>
+rm -rf ~/labs/ci3/leaky
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=CI3 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>A running task bills until you stop it.</strong> One task here is about
+        USD 0.03 an hour, so a forgotten one is under USD 1 a day, but <code class="inline">run-task</code> tasks have no
+        service to scale them down and no end date. Check with
+        <code class="inline">aws ecs list-tasks --cluster lab-$ME-ci3</code> before you log off. A secret left behind costs
+        USD 0.40 a month; one with a real recovery window (7–30 days) keeps that name reserved until it expires.</div>
 
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>

@@ -742,6 +742,216 @@ aws iam list-organizations-features --profile gol-mgmt-admin
 }
 <span class="cm"># target: SNS topic → PagerDuty "platform-critical". A silent break-glass login is an incident.</span></pre>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Prove what a role can do before it ships</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will sign in to the sandbox through Identity Center, create a permission boundary and a role that carries it,
+        and give that role a deliberately sloppy policy of the kind an agent might write. Then you prove three ways what
+        the role can really do: with the policy simulator, by assuming the role and calling AWS, and with IAM Access
+        Analyzer. Finally a teammate's explicit deny breaks an upload, and you find it the way you would in a real
+        AccessDenied ticket. Everything here is IAM and the AWS CLI; the Terraform version comes in
+        <a href="./ia1.html" class="text-viol underline decoration-viol/40">IA1</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A role whose effective permissions you can state exactly, and evidence (simulator output, a real AccessDenied, analyzer findings) to back the statement</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">60–90 minutes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code> (888899990000), <code class="inline">ap-southeast-1</code>, your laptop's AWS CLI</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Effectively zero. IAM and policy validation are free; each Access Analyzer <code class="inline">check-no-public-access</code> call costs about USD 0.002</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">AWS CLI v2 and <code class="inline">jq</code> (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>), an Identity Center user with the <code class="inline">SandboxAdmin</code> permission set on gol-sandbox</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your SSO profile and sign in.</strong> Add the sandbox profile to <code class="inline">~/.aws/config</code>.
+        If you already have the <code class="inline">[sso-session gol]</code> block from Part IV, add only the profile.
+        <span class="code-label">~/.aws/config (append)</span>
+        <pre class="code">[sso-session gol]
+sso_start_url = https://goldenowl.awsapps.com/start
+sso_region = ap-southeast-1
+sso_registration_scopes = sso:account:access
+
+[profile gol-sandbox]
+sso_session = gol
+sso_account_id = 888899990000
+sso_role_name = SandboxAdmin
+region = ap-southeast-1</pre>
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login --sso-session gol
+aws sts get-caller-identity --query Arn --output text
+<span class="out">arn:aws:sts::888899990000:assumed-role/AWSReservedSSO_SandboxAdmin_1a2b3c4d5e6f7a8b/yourhandle@goldenowl.asia</span>
+export ACCOUNT=888899990000                          <span class="cm"># any other account number: stop and fix your profile</span>
+mkdir -p ~/labs/aw1 &amp;&amp; cd ~/labs/aw1
+ls ~/.aws/credentials 2&gt;/dev/null || echo "no static keys: good"
+<span class="out">no static keys: good</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create the permission boundary.</strong> This is the ceiling for every role you create in this lab: S3,
+        SQS and CloudWatch Logs, nothing else. A boundary grants nothing on its own.
+        <span class="code-label">~/labs/aw1/boundary.json</span>
+        <pre class="code">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AppCeiling",
+    "Effect": "Allow",
+    "Action": ["s3:*", "sqs:*", "logs:*"],
+    "Resource": "*"
+  }]
+}</pre>
+        <pre class="code">export BOUNDARY_ARN=$(aws iam create-policy --policy-name lab-$ME-boundary \
+  --policy-document file://boundary.json \
+  --tags Key=Owner,Value=$ME Key=Lab,Value=AW1 --query Policy.Arn --output text)
+echo $BOUNDARY_ARN
+<span class="out">arn:aws:iam::888899990000:policy/lab-yourhandle-boundary</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Create a role that carries the boundary, and give it a sloppy policy.</strong> A real task role would
+        trust <code class="inline">ecs-tasks.amazonaws.com</code>. This one trusts your own account so that you can
+        assume it yourself in step 5. The permission policy is the kind of thing an agent writes "to be safe".
+        <span class="code-label">~/labs/aw1/trust.json</span>
+        <pre class="code">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::888899990000:root" },
+    "Action": "sts:AssumeRole"
+  }]
+}</pre>
+        <span class="code-label">~/labs/aw1/app-policy.json</span>
+        <pre class="code">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "TooBroad",
+    "Effect": "Allow",
+    "Action": ["s3:*", "iam:*"],
+    "Resource": "*"
+  }]
+}</pre>
+        <pre class="code">aws iam create-role --role-name lab-$ME-app --path /lab/ \
+  --assume-role-policy-document file://trust.json \
+  --permissions-boundary $BOUNDARY_ARN \
+  --tags Key=Owner,Value=$ME Key=Lab,Value=AW1 &gt;/dev/null
+aws iam put-role-policy --role-name lab-$ME-app --policy-name app --policy-document file://app-policy.json
+export ROLE_ARN=arn:aws:iam::$ACCOUNT:role/lab/lab-$ME-app
+aws iam get-role --role-name lab-$ME-app --query 'Role.PermissionsBoundary.PermissionsBoundaryArn' --output text
+<span class="out">arn:aws:iam::888899990000:policy/lab-yourhandle-boundary</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Ask the simulator.</strong> Before reading the output, predict each line: the role's policy says
+        <code class="inline">s3:*</code> and <code class="inline">iam:*</code>; the boundary says S3, SQS and Logs.
+        <pre class="code">aws iam simulate-principal-policy --policy-source-arn $ROLE_ARN \
+  --action-names s3:ListAllMyBuckets s3:GetObject iam:CreateUser sqs:SendMessage \
+  --query 'EvaluationResults[].[EvalActionName,EvalDecision,PermissionsBoundaryDecisionDetail.AllowedByPermissionsBoundary]' \
+  --output text
+<span class="out">s3:ListAllMyBuckets   allowed        True
+s3:GetObject          allowed        True
+iam:CreateUser        implicitDeny   False</span>   <span class="cm"># the policy allows it, the boundary does not</span>
+<span class="out">sqs:SendMessage       implicitDeny   True</span>    <span class="cm"># the boundary allows it, but nothing grants it</span></pre>
+        The two denied lines are the whole lesson of Part III. Effective permissions are the <em>intersection</em>:
+        the boundary removed <code class="inline">iam:*</code>, and it did not add <code class="inline">sqs:*</code>.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Prove it for real by assuming the role.</strong> A profile with <code class="inline">role_arn</code> and
+        <code class="inline">source_profile</code> makes the CLI call <code class="inline">sts:AssumeRole</code> for you,
+        using your SSO session as the source.
+        <pre class="code">aws configure set role_arn $ROLE_ARN --profile lab-aw1
+aws configure set source_profile gol-sandbox --profile lab-aw1
+aws configure set region ap-southeast-1 --profile lab-aw1
+aws sts get-caller-identity --profile lab-aw1 --query Arn --output text
+<span class="out">arn:aws:sts::888899990000:assumed-role/lab-yourhandle-app/botocore-session-1730450000</span>
+aws s3 ls --profile lab-aw1 | head -2                <span class="cm"># works: allowed by both</span>
+<span class="out">2026-09-02 08:11:40 gol-sandbox-cloudtrail-logs
+2026-10-14 03:22:19 gol-sandbox-tfstate</span>
+aws iam list-users --profile lab-aw1
+<span class="out">An error occurred (AccessDenied) when calling the ListUsers operation: User: arn:aws:sts::888899990000:assumed-role/lab-yourhandle-app/botocore-session-1730450000 is not authorized to perform: iam:ListUsers on resource: arn:aws:iam::888899990000:user/ because no permissions boundary allows the iam:ListUsers action</span></pre>
+        Read the end of that error: it names the layer that said no. Compare it with the table in Part III.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Let Access Analyzer review the policies.</strong> First lint the sloppy permission policy. Then check two
+        trust policies for public access: yours, and one where someone typed <code class="inline">"*"</code> as the principal.
+        <pre class="code">aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \
+  --policy-document file://app-policy.json --query 'findings[].[findingType,issueCode]' --output text
+<span class="out">SECURITY_WARNING   PASS_ROLE_WITH_STAR_IN_RESOURCE</span>   <span class="cm"># iam:* includes iam:PassRole on "*"</span>
+jq '.Statement[0].Principal = {"AWS": "*"}' trust.json &gt; trust-public.json
+for f in trust.json trust-public.json; do
+  echo -n "$f  "; aws accessanalyzer check-no-public-access --policy-document file://$f \
+    --resource-type AWS::IAM::AssumeRolePolicyDocument --query result --output text
+done
+<span class="out">trust.json  PASS
+trust-public.json  FAIL</span>                          <span class="cm"># anyone with an AWS account could assume it</span></pre>
+        In a real pull request you would now replace <code class="inline">iam:*</code> with nothing at all, and the role
+        would need no boundary exception.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">get-caller-identity</code> shows the <code class="inline">SandboxAdmin</code> SSO role in
+        888899990000 and you have no <code class="inline">~/.aws/credentials</code> file;
+        the simulator shows <code class="inline">iam:CreateUser</code> as <code class="inline">implicitDeny</code> with
+        <code class="inline">False</code> from the boundary; <code class="inline">aws iam list-users --profile lab-aw1</code>
+        fails with "no permissions boundary allows"; and Access Analyzer returns <code class="inline">PASS</code> for your
+        trust policy and <code class="inline">FAIL</code> for the public one.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>A teammate adds a guardrail.</strong> Run the command below without reading the policy too closely, as
+        if it arrived in someone else's change. Then a developer reports that uploads from this role fail. Using only
+        <code class="inline">simulate-principal-policy</code> (look at <code class="inline">MatchedStatements</code> and
+        <code class="inline">--context-entries</code>), find which policy blocks <code class="inline">s3:PutObject</code> and
+        what the client must do differently.
+        <pre class="code">aws iam put-role-policy --role-name lab-$ME-app --policy-name team-guardrail --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Deny", "Action": "s3:PutObject", "Resource": "*",
+    "Condition": { "Null": { "s3:x-amz-server-side-encryption": "true" } } }] }'
+aws iam simulate-principal-policy --policy-source-arn $ROLE_ARN --action-names s3:PutObject \
+  --query 'EvaluationResults[].EvalDecision' --output text
+<span class="out">explicitDeny</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">aws iam simulate-principal-policy --policy-source-arn $ROLE_ARN --action-names s3:PutObject \
+  --query 'EvaluationResults[].MatchedStatements[].SourcePolicyId' --output text
+<span class="out">team-guardrail</span>
+aws iam simulate-principal-policy --policy-source-arn $ROLE_ARN --action-names s3:PutObject \
+  --context-entries ContextKeyName=s3:x-amz-server-side-encryption,ContextKeyValues=AES256,ContextKeyType=string \
+  --query 'EvaluationResults[].EvalDecision' --output text
+<span class="out">allowed</span></pre>
+          <p class="mt-2"><code class="inline">explicitDeny</code> means a statement matched and said no, so no Allow anywhere
+          can rescue the request. The deny fires when the request carries no
+          <code class="inline">x-amz-server-side-encryption</code> header (the <code class="inline">Null</code> condition is
+          true). With the header set, the deny no longer matches and the original Allow applies. The fix belongs in the
+          client (<code class="inline">aws s3 cp --sse AES256</code>, or the SDK's <code class="inline">ServerSideEncryption</code>
+          parameter), not in deleting the guardrail. Note that <code class="inline">implicitDeny</code> would have pointed
+          you to a missing Allow instead: the word tells you which kind of fix to look for.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Clean up.</strong> Inline policies first, then the role, then the boundary. Try deleting the boundary first
+        if you like: IAM refuses with <code class="inline">DeleteConflict</code> while any role still uses it.
+        <pre class="code">for p in app team-guardrail; do aws iam delete-role-policy --role-name lab-$ME-app --policy-name $p; done
+aws iam delete-role --role-name lab-$ME-app
+aws iam delete-policy --policy-arn $BOUNDARY_ARN
+aws iam list-roles --path-prefix /lab/ --query "Roles[?contains(RoleName,'$ME')].RoleName"
+<span class="out">[]</span>
+aws iam list-policies --scope Local --query "Policies[?PolicyName=='lab-$ME-boundary'].Arn"
+<span class="out">[]</span></pre>
+        Finally, delete the <code class="inline">[profile lab-aw1]</code> block from <code class="inline">~/.aws/config</code>
+        (there is no CLI command that removes a profile) and keep the <code class="inline">gol-sandbox</code> profile for
+        the next labs.
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Nothing here bills, but a leftover role is still a finding.</strong> A role
+        that trusts the whole account and allows <code class="inline">s3:*</code> is exactly what the sandbox's own Access
+        Analyzer and Security Hub checks flag. Delete it the same day, and never copy the
+        <code class="inline">"AWS": "…:root"</code> trust policy into a real account: production roles trust a service
+        principal or one named role.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

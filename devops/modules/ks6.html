@@ -804,6 +804,267 @@ aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
 10.20.101.33   unhealthy   Target.ResponseCodeMismatch</span>
 <span class="cm"># ResponseCodeMismatch: /healthz returned 3xx/5xx; the Pod is up but the check is wrong or the app is sick</span></pre>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Pod IPs, prefix delegation and an ALB for booking-api</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will deploy the lab-kit <code class="inline">booking-api</code> to your sandbox EKS cluster, count the VPC
+        addresses each node holds, switch on prefix delegation and watch the ENIs change. Then you install the AWS Load
+        Balancer Controller with Pod Identity and Helm, and expose the API through an ALB with target type
+        <code class="inline">ip</code>, so you can see Pod IPs sitting in a real target group. The break-and-fix ends at a
+        <code class="inline">503</code> that has nothing to do with AWS.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">An ALB URL that answers <code class="inline">/healthz</code> from booking-api Pods registered by IP, on a cluster with prefix delegation on</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code>, the EKS cluster from the <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a> lab (managed node group, not Auto Mode)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">The ALB adds about USD 0.04 per hour on top of the KS5 cluster (about USD 0.20 per hour for control plane and two small nodes)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>), the lab kit in <code class="inline">~/clinic-app/</code>, the <code class="inline">lab-$ME/booking-api:1.0.0</code> image from the <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a> lab (step 2 rebuilds it if you deleted it)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell and find your cluster.</strong> If you destroyed the KS5 cluster, recreate it first with
+        <code class="inline">cd ~/labs/ks5 &amp;&amp; terraform apply -var me=$ME</code> (about 15 minutes). The last column
+        must not be <code class="inline">True</code>: Auto Mode runs its own load balancer controller, and installing a
+        second one fights it.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login
+export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)   <span class="cm"># must be 888899990000</span>
+export CLUSTER=lab-$ME-eks                                   <span class="cm"># the name you used in the KS5 lab</span>
+aws eks describe-cluster --name $CLUSTER --query 'cluster.[status,version,computeConfig.enabled]' --output text
+<span class="out">ACTIVE	1.33	None</span>
+export VPC=$(aws eks describe-cluster --name $CLUSTER --query cluster.resourcesVpcConfig.vpcId --output text)
+aws eks update-kubeconfig --name $CLUSTER --alias lab-ks6
+kubectl get nodes
+<span class="out">NAME                                           STATUS   ROLES    AGE   VERSION
+ip-10-30-37-112.ap-southeast-1.compute.internal   Ready    &lt;none&gt;   2h    v1.33.x-eks-…
+ip-10-30-71-9.ap-southeast-1.compute.internal     Ready    &lt;none&gt;   2h    v1.33.x-eks-…</span>
+mkdir -p ~/labs/ks6 &amp;&amp; cd ~/labs/ks6</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Deploy booking-api.</strong> If the <code class="inline">1.0.0</code> image from the CN1 lab is still in ECR, run only the first line.
+        The Service is a plain <code class="inline">ClusterIP</code>: with target type <code class="inline">ip</code> the ALB
+        never needs a NodePort.
+        <pre class="code">export REPO=$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/lab-$ME/booking-api
+aws ecr create-repository --repository-name lab-$ME/booking-api --tags Key=Owner,Value=$ME Key=Lab,Value=KS6 &gt;/dev/null
+aws ecr get-login-password | docker login -u AWS --password-stdin ${REPO%%/*} &amp;&amp; docker buildx build --platform linux/arm64 -t $REPO:1.0.0 --push ~/clinic-app/booking-api</pre>
+        <span class="code-label">~/labs/ks6/api.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-api, namespace: booking }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: booking-api } }
+  template:
+    metadata: { labels: { app: booking-api } }
+    spec:
+      containers:
+        - name: api
+          image: REPO:1.0.0                                <span class="cm"># replaced by sed below</span>
+          env: [{ name: APP_VERSION, value: ks6-lab }]
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /readyz, port: http }, periodSeconds: 5 }
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 128Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: booking-api, namespace: booking }
+spec:
+  selector: { app: booking-api }
+  ports: [{ name: http, port: 80, targetPort: http }]</pre>
+        <pre class="code">kubectl create namespace booking
+sed "s#REPO#$REPO#" api.yaml | kubectl apply -f -
+kubectl -n booking get pods -o wide
+<span class="out">NAME                           READY   STATUS    IP             NODE
+booking-api-6d8f7c9b54-2xkqp   1/1     Running   10.30.44.201   ip-10-30-37-112…
+booking-api-6d8f7c9b54-x7m4n   1/1     Running   10.30.80.17    ip-10-30-71-9…</span>    <span class="cm"># Pod IPs are VPC subnet addresses</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Count the addresses each node holds.</strong> Compare max Pods with the Part I formula, then look at the ENIs
+        behind each node and the free addresses left in each subnet. Write the numbers down; you compare them in step 4.
+        <pre class="code">kubectl get nodes -o custom-columns=NODE:.metadata.name,TYPE:.metadata.labels.node\\.kubernetes\\.io/instance-type,PODS:.status.allocatable.pods
+<span class="out">NODE                                              TYPE        PODS
+ip-10-30-37-112.ap-southeast-1.compute.internal   t4g.medium  17</span>     <span class="cm"># 3 ENIs × (6 − 1) + 2</span>
+for ID in $(kubectl get nodes -o jsonpath='{.items[*].spec.providerID}' | tr ' ' '\n' | cut -d/ -f5); do
+  echo "== $ID"; aws ec2 describe-network-interfaces --filters Name=attachment.instance-id,Values=$ID \
+    --query 'NetworkInterfaces[].[NetworkInterfaceId,length(PrivateIpAddresses),length(Ipv4Prefixes || `[]`)]' --output text
+done
+<span class="out">== i-0a1b2c3d4e5f60718
+eni-0f1e2d3c4b5a69788	6	0
+eni-0a9b8c7d6e5f40312	6	0</span>       <span class="cm"># 12 addresses held for a handful of Pods: the warm pool</span>
+aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC \
+  --query 'Subnets[].[Tags[?Key==`Name`]|[0].Value,CidrBlock,AvailableIpAddressCount]' --output table</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Turn on prefix delegation through the add-on, then scale.</strong> This goes through the EKS add-on API, not
+        <code class="inline">kubectl set env</code>, so the next add-on update keeps it. (In <code class="inline">clinic-infra</code>
+        the same JSON is the add-on's <code class="inline">configuration_values</code>, as in Part II.)
+        <pre class="code">aws eks update-addon --cluster-name $CLUSTER --addon-name vpc-cni \
+  --configuration-values '{"env":{"ENABLE_PREFIX_DELEGATION":"true"}}' --query update.status --output text
+<span class="out">InProgress</span>
+aws eks wait addon-active --cluster-name $CLUSTER --addon-name vpc-cni
+kubectl -n booking scale deploy booking-api --replicas=12
+# re-run the ENI loop from step 3
+<span class="out">eni-0f1e2d3c4b5a69788	6	1</span>          <span class="cm"># a /28 prefix: 16 addresses in one slot</span>
+kubectl get nodes -o custom-columns=NODE:.metadata.name,PODS:.status.allocatable.pods
+<span class="out">ip-10-30-37-112.ap-southeast-1.compute.internal   17</span>   <span class="cm"># unchanged: max Pods is set when a node boots</span></pre>
+        New Pods now get addresses from prefixes, but the kubelet's max Pods only rises on nodes launched after the change.
+        Node rotation is a <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a> topic; for this
+        lab, notice that the subnet's free count now drops in steps of 16. Scale back with
+        <code class="inline">kubectl -n booking scale deploy booking-api --replicas=2</code>.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Give the controller an IAM role through Pod Identity.</strong> The policy is the upstream one for the
+        version you install. The Pod Identity agent add-on must be running; the first command installs it if KS5 did not.
+        <pre class="code">aws eks describe-addon --cluster-name $CLUSTER --addon-name eks-pod-identity-agent --query addon.status --output text \
+  || aws eks create-addon --cluster-name $CLUSTER --addon-name eks-pod-identity-agent
+<span class="out">ACTIVE</span>
+curl -fsSLo lbc-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.13.0/docs/install/iam_policy.json
+cat &gt; trust.json &lt;&lt;'EOF'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},
+  "Action":["sts:AssumeRole","sts:TagSession"]}]}
+EOF
+aws iam create-policy --policy-name lab-$ME-ks6-lbc --policy-document file://lbc-policy.json &gt;/dev/null
+aws iam create-role --role-name lab-$ME-ks6-lbc --assume-role-policy-document file://trust.json \
+  --tags Key=Owner,Value=$ME Key=Lab,Value=KS6 &gt;/dev/null
+aws iam attach-role-policy --role-name lab-$ME-ks6-lbc --policy-arn arn:aws:iam::$ACCOUNT:policy/lab-$ME-ks6-lbc
+aws eks create-pod-identity-association --cluster-name $CLUSTER --namespace kube-system \
+  --service-account aws-load-balancer-controller --role-arn arn:aws:iam::$ACCOUNT:role/lab-$ME-ks6-lbc \
+  --query association.associationId --output text
+<span class="out">a-0abc1def2ghi3jkl4</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Install the controller with Helm, pinned.</strong> Chart <code class="inline">1.13.0</code> ships controller
+        <code class="inline">v2.13.0</code>, matching the policy you downloaded. The ServiceAccount name must equal the one in
+        the association, which is the chart's default.
+        <pre class="code">helm repo add eks https://aws.github.io/eks-charts &amp;&amp; helm repo update eks
+helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller -n kube-system \
+  --version 1.13.0 --set clusterName=$CLUSTER --set region=$AWS_REGION --set vpcId=$VPC \
+  --set enableServiceMutatorWebhook=false
+kubectl -n kube-system rollout status deploy/aws-load-balancer-controller
+<span class="out">deployment "aws-load-balancer-controller" successfully rolled out</span>
+kubectl -n kube-system logs deploy/aws-load-balancer-controller | grep -ci accessdenied
+<span class="out">0</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Check the subnet tags, then write the Ingress.</strong> Controller v2.12.1 and later can fall back to
+        "public subnets are the ones routed to an internet gateway", but we tag explicitly so the choice is reviewable. If
+        the first command prints nothing, tag the public subnets yourself.
+        <pre class="code">aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC Name=tag:kubernetes.io/role/elb,Values=1 \
+  --query 'Subnets[].SubnetId' --output text
+<span class="out">subnet-0aa11bb22cc33dd44	subnet-0ee55ff66aa77bb88</span>
+# only if empty:  aws ec2 create-tags --resources &lt;public-subnet-ids&gt; --tags Key=kubernetes.io/role/elb,Value=1</pre>
+        <span class="code-label">~/labs/ks6/ingress.yaml</span>
+        <pre class="code">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: booking-api
+  namespace: booking
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip              <span class="cm"># Pod IPs straight into the target group</span>
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=10
+    alb.ingress.kubernetes.io/load-balancer-name: lab-yourhandle-ks6   <span class="cm"># put your handle here</span>
+    alb.ingress.kubernetes.io/tags: Owner=yourhandle,Lab=KS6
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: booking-api, port: { name: http } } }</pre>
+        <pre class="code">sed "s/yourhandle/$ME/g" ingress.yaml | kubectl apply -f -
+kubectl -n booking get ingress booking-api -w          <span class="cm"># ADDRESS appears in about a minute</span>
+<span class="out">NAME          CLASS   HOSTS   ADDRESS                                                       PORTS
+booking-api   alb     *       lab-yourhandle-ks6-123456789.ap-southeast-1.elb.amazonaws.com   80</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Prove the target group holds Pod IPs.</strong> The ALB takes another minute or two to become active. Compare
+        the registered targets with the Pod IPs from step 2: they are the same addresses, port 8080, no NodePort anywhere.
+        <pre class="code">export URL=http://$(kubectl -n booking get ingress booking-api -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+curl -s $URL/healthz
+<span class="out">{"ok":true,"version":"ks6-lab"}</span>
+TG=$(kubectl -n booking get targetgroupbindings -o jsonpath='{.items[0].spec.targetGroupARN}')
+aws elbv2 describe-target-health --target-group-arn $TG \
+  --query 'TargetHealthDescriptions[].[Target.Id,Target.Port,TargetHealth.State]' --output text
+<span class="out">10.30.44.201	8080	healthy
+10.30.80.17	8080	healthy</span>
+kubectl -n booking get pods -o custom-columns=POD:.metadata.name,IP:.status.podIP</pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">curl $URL/healthz</code> returns <code class="inline">"version":"ks6-lab"</code>; the target group
+        lists exactly your Pod IPs on port 8080, all <code class="inline">healthy</code>;
+        <code class="inline">aws eks describe-addon … vpc-cni</code> shows the prefix delegation configuration and at least one
+        ENI has an <code class="inline">Ipv4Prefixes</code> entry; you can explain why <code class="inline">allocatable.pods</code>
+        did not change; and the controller logs contain no <code class="inline">AccessDenied</code>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Break the path behind the ALB.</strong> Run the patch below, then <code class="inline">curl -i $URL/healthz</code>
+        a few times over a minute. The ALB answers <code class="inline">503 Service Temporarily Unavailable</code>, yet every
+        Pod is <code class="inline">Running</code> and <code class="inline">Ready</code>, the controller is healthy and
+        nothing changed in AWS by hand. Find the cause using the target group, the TargetGroupBinding and the EndpointSlices
+        before you open the answer.
+        <pre class="code">kubectl -n booking patch svc booking-api -p '{"spec":{"selector":{"app":"booking-api-v2"}}}'</pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">aws elbv2 describe-target-health --target-group-arn $TG --query 'TargetHealthDescriptions'
+<span class="out">[]</span>                                                   <span class="cm"># no targets at all, not unhealthy ones</span>
+kubectl -n booking get endpointslices -l kubernetes.io/service-name=booking-api
+<span class="out">NAME                ADDRESSTYPE   PORTS     ENDPOINTS   AGE
+booking-api-8sx2f   IPv4          &lt;unset&gt;   &lt;unset&gt;     40m</span></pre>
+          <p class="mt-2">The controller registers whatever the Service's EndpointSlices contain. The selector now matches no Pod,
+          so the slices are empty, the controller deregisters every target, and an ALB with an empty target group returns
+          503. The fix is the selector, not the ALB:
+          <code class="inline">kubectl -n booking patch svc booking-api -p '{"spec":{"selector":{"app":"booking-api"}}}'</code>,
+          and targets reappear within seconds. The lesson: with target type <code class="inline">ip</code>, the target group is
+          a mirror of the EndpointSlices. An empty target group is a Kubernetes selector or readiness problem first.
+          The full 502/503/504 table is in <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a>.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Clean up.</strong> Delete the Ingress first and wait until the ALB is gone: if you uninstall the controller
+        or destroy the cluster first, nobody is left to delete the ALB and it bills until you find it. Then remove the
+        controller, its identity and the policy. Keep the cluster if you go on to the
+        <a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a> lab today; otherwise destroy it from
+        <code class="inline">~/labs/ks5</code>.
+        <pre class="code">kubectl -n booking delete ingress booking-api
+aws elbv2 describe-load-balancers --names lab-$ME-ks6 2&gt;&amp;1 | grep -c LoadBalancerNotFound   <span class="cm"># repeat until 1</span>
+<span class="out">1</span>
+helm -n kube-system uninstall aws-load-balancer-controller
+ASSOC=$(aws eks list-pod-identity-associations --cluster-name $CLUSTER --namespace kube-system \
+  --service-account aws-load-balancer-controller --query 'associations[0].associationId' --output text)
+aws eks delete-pod-identity-association --cluster-name $CLUSTER --association-id $ASSOC &gt;/dev/null
+aws iam detach-role-policy --role-name lab-$ME-ks6-lbc --policy-arn arn:aws:iam::$ACCOUNT:policy/lab-$ME-ks6-lbc
+aws iam delete-role --role-name lab-$ME-ks6-lbc
+aws iam delete-policy --policy-arn arn:aws:iam::$ACCOUNT:policy/lab-$ME-ks6-lbc
+kubectl delete namespace booking
+aws ecr delete-repository --repository-name lab-$ME/booking-api --force &gt;/dev/null   <span class="cm"># skip if you keep it for KS14</span>
+# when you are done with EKS for the day:  cd ~/labs/ks5 &amp;&amp; terraform destroy -var me=$ME
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=KS6 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Forgot to clean up?</strong> The ALB alone is about USD 0.60 a day, and
+        the KS5 cluster behind it about USD 5 a day. An orphaned ALB (controller removed before the Ingress) does not show up
+        in <code class="inline">kubectl</code> at all: find it with
+        <code class="inline">aws elbv2 describe-load-balancers --names lab-$ME-ks6</code> and delete it by ARN.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

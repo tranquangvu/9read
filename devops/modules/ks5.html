@@ -738,6 +738,263 @@ external-secrets     Synced        Healthy
 platform-baseline    Synced        Healthy
 booking              Synced        Healthy</span></pre>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Your first EKS cluster, from Terraform to kubectl</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You provision a real EKS cluster in the sandbox with <code class="inline">terraform-aws-modules/eks</code> v21: a
+        small VPC, a Graviton managed node group, the four core add-ons, and two access entries (yours as cluster admin, and
+        a read-only role scoped to one namespace). Then you check access from both the AWS side and the Kubernetes side, lock
+        yourself out on purpose, and let Terraform let you back in. The KS6 and KS7 labs build on this cluster, so its
+        names matter: cluster <code class="inline">lab-$ME-eks</code>, code in <code class="inline">~/labs/ks5</code>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3"><code class="inline">kubectl get nodes</code> shows two arm64 nodes in a cluster you built from code, and you can prove who may do what in it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2 hours, about 20 minutes of it waiting for the control plane</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">About USD 0.70 per hour: the control plane is USD 0.60/h because 1.33 is in extended support (USD 0.10/h on a standard-support version), plus two <code class="inline">t4g.medium</code> nodes, their disks and public IPv4 addresses</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>): AWS CLI v2, Terraform ≥ 1.10, <code class="inline">kubectl</code> 1.33</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell.</strong> The public API endpoint will only accept your current public IP, so record it.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login
+aws sts get-caller-identity --query Arn --output text
+<span class="out">arn:aws:sts::888899990000:assumed-role/AWSReservedSSO_SandboxAdmin_4c1e…/yourhandle@goldenowl.vn</span>
+export TF_VAR_me=$ME TF_VAR_my_ip=$(curl -s https://checkip.amazonaws.com)
+echo $TF_VAR_my_ip
+<span class="out">203.0.113.24</span>
+mkdir -p ~/labs/ks5 &amp;&amp; cd ~/labs/ks5</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Write the provider and a cheap VPC.</strong> As in the CN1 lab there is no NAT gateway: nodes sit in public
+        subnets with public IPs so they can reach ECR and the EKS API. This is a lab shortcut only. The prod cluster in Part
+        III uses private subnets and a private endpoint.
+        <span class="code-label">~/labs/ks5/main.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "KS5" } }
+}
+variable "me" { type = string }
+variable "my_ip" { type = string }
+locals { name = "lab-${var.me}-eks" }
+
+data "aws_caller_identity" "me" {}
+data "aws_iam_session_context" "me" { arn = data.aws_caller_identity.me.arn }   <span class="cm"># the SSO role behind your session</span>
+
+module "vpc" {
+  source                  = "terraform-aws-modules/vpc/aws"
+  version                 = "~&gt; 6.0"
+  name                    = local.name
+  cidr                    = "10.98.0.0/16"
+  azs                     = ["ap-southeast-1a", "ap-southeast-1b"]
+  public_subnets          = ["10.98.0.0/20", "10.98.16.0/20"]       <span class="cm"># /20: room for Pod IPs (KS6)</span>
+  public_subnet_tags      = { "kubernetes.io/role/elb" = 1 }        <span class="cm"># KS6: where public ALBs go</span>
+  map_public_ip_on_launch = true                                    <span class="cm"># lab only: nodes need a route out</span>
+  enable_nat_gateway      = false
+}
+output "cluster_name" { value = module.eks.cluster_name }</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Write the cluster.</strong> Compare it with the prod <code class="inline">cluster.tf</code> in Part III.
+        The differences are deliberate lab choices: a public endpoint locked to your IP, public subnets, small burstable
+        nodes, and the newest add-on version instead of pinned ones.
+        <span class="code-label">~/labs/ks5/eks.tf</span>
+        <pre class="code">module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~&gt; 21.0"
+
+  name               = local.name
+  kubernetes_version = "1.33"
+  vpc_id             = module.vpc.vpc_id
+  subnet_ids         = module.vpc.public_subnets
+
+  endpoint_public_access       = true
+  endpoint_public_access_cidrs = ["${var.my_ip}/32"]          <span class="cm"># only your laptop can reach the API</span>
+
+  authentication_mode                      = "API"            <span class="cm"># access entries only</span>
+  enable_cluster_creator_admin_permissions = false            <span class="cm"># no hidden admin: see access.tf</span>
+  enable_irsa                              = false
+  access_entries                           = local.access_entries
+
+  addons = {
+    vpc-cni                = { before_compute = true }        <span class="cm"># before nodes, or they stay NotReady</span>
+    eks-pod-identity-agent = { before_compute = true }
+    kube-proxy             = {}
+    coredns                = {}                               <span class="cm"># lab: most recent; prod pins addon_version</span>
+  }
+  eks_managed_node_groups = {
+    default = {
+      ami_type       = "AL2023_ARM_64_STANDARD"               <span class="cm"># Graviton</span>
+      instance_types = ["t4g.medium"]
+      min_size       = 1
+      max_size       = 2
+      desired_size   = 2
+    }
+  }
+}</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Write the access entries.</strong> Two people-shaped principals: your own SSO role as cluster admin, and a
+        new IAM role that stands in for a developer with read-only access to one namespace.
+        <span class="code-label">~/labs/ks5/access.tf</span>
+        <pre class="code">resource "aws_iam_role" "viewer" {
+  name = "${local.name}-viewer"
+  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{ Effect = "Allow",
+    Action = "sts:AssumeRole", Principal = { AWS = data.aws_iam_session_context.me.issuer_arn } }] })
+}
+output "viewer_role_arn" { value = aws_iam_role.viewer.arn }
+locals {
+  access_entries = {
+    me = {
+      principal_arn = data.aws_iam_session_context.me.issuer_arn  <span class="cm"># the role ARN, not the session ARN</span>
+      policy_associations = { admin = {
+        policy_arn   = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+        access_scope = { type = "cluster" } } }
+    }
+    viewer = {
+      principal_arn = aws_iam_role.viewer.arn
+      policy_associations = { view = {
+        policy_arn   = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+        access_scope = { type = "namespace", namespaces = ["booking"] } } }
+    }
+  }
+}</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Plan, read, apply.</strong> Before you type <code class="inline">yes</code>, find these in the plan: one
+        <code class="inline">aws_eks_cluster</code> with version <code class="inline">1.33</code>, four
+        <code class="inline">aws_eks_addon</code>, one <code class="inline">aws_eks_node_group</code>, two
+        <code class="inline">aws_eks_access_entry</code> and two policy associations, and nothing to change or destroy.
+        <pre class="code">terraform init
+terraform plan -out=tfplan | grep -E 'aws_eks_(cluster|addon|node_group|access)[^ ]* will be created|^Plan:'
+terraform apply tfplan                         <span class="cm"># 15–20 minutes; the control plane is most of it</span>
+<span class="out">Apply complete! Resources: 50 added, 0 changed, 0 destroyed.</span>   <span class="cm"># count varies with module versions</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Connect and look around.</strong> <code class="inline">update-kubeconfig</code> writes a context that calls
+        <code class="inline">aws eks get-token</code> each time, so there is no static credential in the file.
+        <pre class="code">aws eks update-kubeconfig --name lab-$ME-eks --alias lab-eks
+kubectl get nodes -L kubernetes.io/arch,topology.kubernetes.io/zone
+<span class="out">NAME                                         STATUS   VERSION               ARCH    ZONE
+ip-10-98-5-117.ap-southeast-1.compute.internal   Ready    v1.33.…-eks-…   arm64   ap-southeast-1a
+ip-10-98-21-40.ap-southeast-1.compute.internal   Ready    v1.33.…-eks-…   arm64   ap-southeast-1b</span>
+kubectl auth whoami | head -3
+<span class="out">ATTRIBUTE   VALUE
+Username    arn:aws:sts::888899990000:assumed-role/AWSReservedSSO_SandboxAdmin_4c1e…/yourhandle@goldenowl.vn
+Groups      [system:authenticated]</span>
+kubectl get pods -n kube-system -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName | sort
+<span class="out">aws-node-…                  ip-10-98-21-40…      <span class="cm"># VPC CNI, one per node</span>
+coredns-…                   ip-10-98-5-117…
+eks-pod-identity-agent-…    ip-10-98-21-40…
+kube-proxy-…                ip-10-98-5-117…</span>                             <span class="cm"># …and the rest: no etcd, no API server Pods</span>
+aws eks list-addons --cluster-name lab-$ME-eks --output text
+<span class="out">ADDONS	coredns
+ADDONS	eks-pod-identity-agent
+ADDONS	kube-proxy
+ADDONS	vpc-cni</span>
+kubectl run dnscheck --rm -i --restart=Never --image=public.ecr.aws/docker/library/busybox:1.36 \
+  -- nslookup kubernetes.default.svc.cluster.local | grep -A1 '^Name'
+<span class="out">Name:	kubernetes.default.svc.cluster.local
+Address: 172.20.0.1</span>                                  <span class="cm"># Pod scheduled, CNI gave it an IP, CoreDNS answered</span></pre>
+        Compare this with the kind lab in KS1: the control plane Pods are missing because AWS runs them in its own
+        account. That is the shared responsibility line from Part I, visible in one command.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Prove the access model from both sides.</strong> First the AWS side, then log in as the viewer role and
+        check what it can and cannot do. <code class="inline">update-kubeconfig</code> switches your current context, so
+        use <code class="inline">--context</code> on every command from here on.
+        <pre class="code">aws eks list-access-entries --cluster-name lab-$ME-eks --output text
+<span class="out">ACCESSENTRIES	arn:aws:iam::888899990000:role/aws-reserved/sso.amazonaws.com/ap-southeast-1/AWSReservedSSO_SandboxAdmin_4c1e…
+ACCESSENTRIES	arn:aws:iam::888899990000:role/default-eks-node-group-2026…   <span class="cm"># type EC2_LINUX: lets nodes join</span>
+ACCESSENTRIES	arn:aws:iam::888899990000:role/lab-yourhandle-eks-viewer</span>
+kubectl --context lab-eks create namespace booking
+aws eks update-kubeconfig --name lab-$ME-eks --alias lab-eks-viewer --role-arn $(terraform output -raw viewer_role_arn)
+kubectl --context lab-eks-viewer -n booking get pods
+<span class="out">No resources found in booking namespace.</span>
+kubectl --context lab-eks-viewer -n booking auth can-i get secrets
+<span class="out">no</span>
+kubectl --context lab-eks-viewer -n booking auth can-i create deployments
+<span class="out">no</span>
+kubectl --context lab-eks-viewer -n kube-system get pods
+<span class="out">Error from server (Forbidden): pods is forbidden: User "arn:aws:sts::888899990000:assumed-role/lab-yourhandle-eks-viewer/…"
+cannot list resource "pods" in API group "" in the namespace "kube-system"</span>
+kubectl config use-context lab-eks</pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        two <code class="inline">arm64</code> nodes are <code class="inline">Ready</code> in two AZs;
+        <code class="inline">list-addons</code> shows the four add-ons; the DNS check resolved
+        <code class="inline">kubernetes.default</code>; the viewer can list Pods in <code class="inline">booking</code> but not
+        read Secrets or touch <code class="inline">kube-system</code>; and you can point to the line in
+        <code class="inline">eks.tf</code> that makes the API unreachable from any other IP.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Lose your own access.</strong> A teammate "cleans up stale access entries" by hand. Simulate it:
+        <pre class="code">aws eks delete-access-entry --cluster-name lab-$ME-eks --principal-arn \
+  "$(aws eks list-access-entries --cluster-name lab-$ME-eks --query "accessEntries[?contains(@,'SandboxAdmin')]|[0]" --output text)"
+kubectl --context lab-eks get nodes
+<span class="out">error: You must be logged in to the server (the server has asked for the client to provide credentials)</span></pre>
+        You are still a sandbox administrator in AWS, and <code class="inline">aws sts get-caller-identity</code> still works.
+        Explain why Kubernetes rejects you, how this differs from a timeout, and get back in without clicking in the console.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">aws eks list-access-entries --cluster-name lab-$ME-eks --output text | grep -c SandboxAdmin
+<span class="out">0</span>
+terraform plan | grep -E 'will be created|^Plan:'
+<span class="out">  # module.eks.aws_eks_access_entry.this["me"] will be created
+  # module.eks.aws_eks_access_policy_association.this["me_admin"] will be created
+Plan: 2 to add, 0 to change, 0 to destroy.</span>
+terraform apply
+kubectl --context lab-eks get nodes             <span class="cm"># works again within seconds</span></pre>
+          <p class="mt-2">Authentication (your token is a valid AWS identity) succeeded. EKS then found no access entry
+          for your role and refused you: that is the 401 above. Deleting an entry also deletes its policy associations,
+          so the plan restores both. The lesson has two halves. Cluster access is an EKS API object that IAM admins can
+          change from outside the cluster, which is why it belongs in Terraform, where drift shows up in a plan and a
+          rebuild is one apply. And learn to read the symptom: <em>Unauthorized</em> or <em>credentials</em> means
+          identity or access entry; an <code class="inline">i/o timeout</code> means you never reached the API, for example
+          because your IP changed and no longer matches <code class="inline">endpoint_public_access_cidrs</code> (fix: re-export
+          <code class="inline">TF_VAR_my_ip</code> and apply).</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Going on to KS6 today? Keep the cluster: it is the starting point there. Otherwise
+        destroy it now. Delete anything that created AWS resources from inside the cluster first (a
+        <code class="inline">LoadBalancer</code> Service or an Ingress), or the VPC cannot be deleted. In this lab you created
+        none.
+        <pre class="code">kubectl --context lab-eks get svc -A | grep LoadBalancer    <span class="cm"># must print nothing</span>
+terraform destroy                               <span class="cm"># about 10–15 minutes</span>
+<span class="out">Destroy complete! Resources: 50 destroyed.</span>
+aws eks list-clusters --query "clusters[?contains(@,'$ME')]"
+<span class="out">[]</span>
+aws ec2 describe-instances --filters Name=tag:Owner,Values=$ME Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].InstanceId'
+<span class="out">[]</span>
+kubectl config delete-context lab-eks; kubectl config delete-context lab-eks-viewer</pre>
+        The module's KMS key for Secrets encryption is scheduled for deletion rather than deleted at once. That is
+        normal, and a key pending deletion costs nothing.
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>This is the most expensive lab so far.</strong> At about USD 0.70 an
+        hour, a cluster left up overnight costs about USD 10 and a forgotten one about USD 500 a month, several times the
+        sandbox budget. If you go on to KS6 and KS7, do it in the same sitting, or destroy now and recreate with
+        <code class="inline">cd ~/labs/ks5 &amp;&amp; terraform apply</code> (20 minutes) when you start them.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

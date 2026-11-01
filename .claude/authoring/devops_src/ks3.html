@@ -706,6 +706,292 @@ kubectl -n booking exec deploy/booking-api -- node -e "require('net').connect(54
         when only the booking team and Argo CD can create Pods here. Restricting who can do that is RBAC and admission
         policy, in <a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Route, resolve and fence booking-web and booking-api</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You run both services on the kind cluster from the KS2 lab and follow one request through every layer of this
+        module: the DNS answer CoreDNS gives, the iptables rules kube-proxy wrote, a Gateway API route served by Envoy
+        Gateway, and NetworkPolicies that allow exactly the arrows in the diagram. kind's built-in CNI (kindnet) enforces
+        NetworkPolicy since kind 0.24, so a denied connection really times out. The break-and-fix is the mistake almost
+        everyone makes the first time: a policy that forgets the load balancer.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3"><code class="inline">app.clinic.local</code> and <code class="inline">api.clinic.local</code> routed through a Gateway, with default-deny policies and a proven denied path</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop: the kind cluster <code class="inline">lab</code> from the <a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2 lab</a></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">Docker, kind 0.29+, <code class="inline">kubectl</code> 1.33, Helm 3, the lab kit in <code class="inline">~/clinic-app</code>, <code class="inline">~/labs/kind/lab.yaml</code> from KS2</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Get the cluster and both images.</strong> If <code class="inline">kind get clusters</code> does not list
+        <code class="inline">lab</code>, create it from the KS2 config. Loading an image that is already there is harmless.
+        <pre class="code">kind get clusters | grep -qx lab || kind create cluster --config ~/labs/kind/lab.yaml
+kubectl config use-context kind-lab
+docker build -t booking-api:1.0.0 ~/clinic-app/booking-api
+docker build -t booking-web:1.0.0 ~/clinic-app/booking-web
+kind load docker-image booking-api:1.0.0 booking-web:1.0.0 --name lab
+kubectl create namespace booking --dry-run=client -o yaml | kubectl apply -f -
+kubectl config set-context --current --namespace=booking
+mkdir -p ~/labs/ks3/k8s &amp;&amp; cd ~/labs/ks3</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Deploy both services.</strong> booking-api gets a normal Service and a headless one, so you can compare the
+        two DNS answers. booking-web reaches the API by its Service name.
+        <span class="code-label">~/labs/ks3/k8s/api.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-api, namespace: booking }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: booking-api } }
+  template:
+    metadata: { labels: { app: booking-api } }
+    spec:
+      containers:
+        - name: api
+          image: booking-api:1.0.0
+          ports: [{ name: http, containerPort: 8080 }]
+          env: [{ name: APP_VERSION, value: ks3-lab }]
+          readinessProbe: { httpGet: { path: /readyz, port: http } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: booking-api, namespace: booking }
+spec:
+  selector: { app: booking-api }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: booking-api-headless, namespace: booking }
+spec:
+  clusterIP: None                      <span class="cm"># no virtual IP: DNS returns the Pod IPs</span>
+  selector: { app: booking-api }
+  ports: [{ name: http, port: 8080 }]</pre>
+        <span class="code-label">~/labs/ks3/k8s/web.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-web, namespace: booking }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: booking-web } }
+  template:
+    metadata: { labels: { app: booking-web } }
+    spec:
+      containers:
+        - name: web
+          image: booking-web:1.0.0
+          ports: [{ name: http, containerPort: 8080 }]
+          env: [{ name: API_UPSTREAM, value: "http://booking-api" }]   <span class="cm"># Service name, port 80</span>
+          readinessProbe: { httpGet: { path: /healthz, port: http } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: booking-web, namespace: booking }
+spec:
+  selector: { app: booking-web }
+  ports: [{ name: http, port: 80, targetPort: http }]</pre>
+        <pre class="code">kubectl apply -f k8s/api.yaml -f k8s/web.yaml
+kubectl rollout status deploy/booking-api &amp;&amp; kubectl rollout status deploy/booking-web</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Look up the Services from a debug Pod.</strong> netshoot has <code class="inline">dig</code> and
+        <code class="inline">curl</code>, which the distroless API image does not.
+        <pre class="code">kubectl run debug -it --rm --restart=Never --image=nicolaka/netshoot:v0.13 -- bash
+<span class="cm"># inside the Pod:</span>
+grep -v '^#' /etc/resolv.conf
+<span class="out">search booking.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5</span>                                    <span class="cm"># 10.96.0.10 is the kube-dns Service (CoreDNS)</span>
+dig +short booking-api.booking.svc.cluster.local
+<span class="out">10.96.87.211</span>                                       <span class="cm"># one virtual IP</span>
+dig +short booking-api-headless.booking.svc.cluster.local
+<span class="out">10.244.1.5
+10.244.3.4</span>                                         <span class="cm"># one A record per Ready Pod</span>
+curl -s booking-api/healthz; echo                  <span class="cm"># short name works thanks to the search list</span>
+<span class="out">{"ok":true,"version":"ks3-lab"}</span>
+curl -s booking-web/api/healthz; echo              <span class="cm"># web → nginx proxy → booking-api Service</span>
+<span class="out">{"ok":true,"version":"ks3-lab"}</span>
+exit</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Find the rules kube-proxy wrote.</strong> kind runs kube-proxy in iptables mode. Every node holds the same
+        NAT rules: one jump for the ClusterIP, and one rule per endpoint with a random probability.
+        <pre class="code">CIP=$(kubectl get svc booking-api -o jsonpath='{.spec.clusterIP}')
+docker exec lab-worker iptables-save -t nat | grep -- "-d $CIP/32"
+<span class="out">-A KUBE-SERVICES -d 10.96.87.211/32 -p tcp -m comment --comment "booking/booking-api:http cluster IP" -m tcp --dport 80 -j KUBE-SVC-…</span>
+docker exec lab-worker iptables-save -t nat | grep 'booking/booking-api:http -&gt;' | grep -- '-A KUBE-SVC'
+<span class="out">-A KUBE-SVC-… -m comment --comment "booking/booking-api:http -&gt; 10.244.1.5:8080" -m statistic --mode random --probability 0.50000000000 -j KUBE-SEP-…
+-A KUBE-SVC-… -m comment --comment "booking/booking-api:http -&gt; 10.244.3.4:8080" -j KUBE-SEP-…</span>
+kubectl scale deploy/booking-api --replicas=3     <span class="cm"># run the second grep again: three rules, 0.333 / 0.5 / rest</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Install a Gateway API implementation.</strong> On EKS the Gateway is an ALB (KS6). Locally you use Envoy
+        Gateway, which installs the Gateway API CRDs with it. kind has no cloud load balancer, so the Envoy Service stays
+        <code class="inline">&lt;pending&gt;</code> and you reach it with <code class="inline">port-forward</code>.
+        <pre class="code">helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.9.3 \
+  -n envoy-gateway-system --create-namespace
+kubectl wait --timeout=5m -n envoy-gateway-system deployment/envoy-gateway --for=condition=Available
+<span class="out">deployment.apps/envoy-gateway condition met</span>
+kubectl create namespace gateway</pre>
+        <span class="code-label">~/labs/ks3/k8s/gateway.yaml — platform-owned, same shape as Part III</span>
+        <pre class="code">apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: { name: eg }
+spec: { controllerName: gateway.envoyproxy.io/gatewayclass-controller }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: public, namespace: gateway }
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "*.clinic.local"
+      allowedRoutes:
+        namespaces:
+          from: Selector                 <span class="cm"># namespaces opt in with a label</span>
+          selector: { matchLabels: { gateway.clinic/public: "true" } }</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Attach the routes, and read their status.</strong> Apply the routes before you label the namespace, so you
+        see what a refused route looks like.
+        <span class="code-label">~/labs/ks3/k8s/routes.yaml — team-owned</span>
+        <pre class="code">apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: booking-web, namespace: booking }
+spec:
+  parentRefs: [{ name: public, namespace: gateway, sectionName: http }]
+  hostnames: [app.clinic.local]
+  rules: [{ backendRefs: [{ name: booking-web, port: 80 }] }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: booking-api, namespace: booking }
+spec:
+  parentRefs: [{ name: public, namespace: gateway, sectionName: http }]
+  hostnames: [api.clinic.local]
+  rules: [{ backendRefs: [{ name: booking-api, port: 80 }] }]</pre>
+        <pre class="code">kubectl apply -f k8s/gateway.yaml -f k8s/routes.yaml
+kubectl get httproute booking-api -o jsonpath='{range .status.parents[*].conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'
+<span class="out">Accepted=False (NotAllowedByListeners)
+ResolvedRefs=True (ResolvedRefs)</span>
+kubectl label namespace booking gateway.clinic/public=true
+<span class="cm"># run the status command again: Accepted=True (Accepted)</span>
+ENVOY_SVC=$(kubectl get svc -n envoy-gateway-system -o jsonpath='{.items[0].metadata.name}' \
+  --selector=gateway.envoyproxy.io/owning-gateway-namespace=gateway,gateway.envoyproxy.io/owning-gateway-name=public)
+kubectl -n envoy-gateway-system port-forward service/$ENVOY_SVC 8888:80 &gt;/dev/null 2&gt;&amp;1 &amp;
+curl -s -H 'Host: app.clinic.local' localhost:8888/api/healthz; echo
+<span class="out">{"ok":true,"version":"ks3-lab"}</span>             <span class="cm"># Envoy → booking-web → booking-api</span>
+curl -s -H 'Host: api.clinic.local' localhost:8888/healthz; echo
+<span class="out">{"ok":true,"version":"ks3-lab"}</span>             <span class="cm"># Envoy → booking-api</span>
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: admin.clinic.local' localhost:8888/
+<span class="out">404</span>                                         <span class="cm"># no route claims that host</span></pre>
+        <code class="inline">kubectl get gateway -n gateway public</code> may show <code class="inline">PROGRAMMED False</code>
+        with reason <code class="inline">AddressNotAssigned</code>. That only means nothing gave the Envoy Service an
+        external IP, which is expected on kind.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Fence the namespace.</strong> Save the three policies from Part IV's
+        <code class="inline">netpol-baseline.yaml</code> as <code class="inline">k8s/netpol-baseline.yaml</code>. Then
+        write the allow rules for the two workloads: booking-web accepts traffic from the Gateway's Envoy Pods, and
+        booking-api accepts traffic only from booking-web.
+        <span class="code-label">~/labs/ks3/k8s/netpol-apps.yaml</span>
+        <pre class="code">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: booking-web, namespace: booking }
+spec:
+  podSelector: { matchLabels: { app: booking-web } }
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: envoy-gateway-system } } }]
+      ports: [{ port: 8080 }]             <span class="cm"># the Pod port, not the Service port</span>
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: booking-api, namespace: booking }
+spec:
+  podSelector: { matchLabels: { app: booking-api } }
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ podSelector: { matchLabels: { app: booking-web } } }]
+      ports: [{ port: 8080 }]</pre>
+        <pre class="code">kubectl apply -f k8s/netpol-baseline.yaml -f k8s/netpol-apps.yaml
+curl -s -H 'Host: app.clinic.local' localhost:8888/api/healthz; echo
+<span class="out">{"ok":true,"version":"ks3-lab"}</span>             <span class="cm"># allowed: Envoy → web → api</span>
+kubectl run rogue --rm -it --restart=Never --labels=app=rogue \
+  --image=nicolaka/netshoot:v0.13 -- curl -s -m 3 http://booking-api/healthz
+<span class="out">curl: (28) Connection timed out after 3002 milliseconds</span>
+kubectl run fakeweb --rm -it --restart=Never --labels=app=booking-web \
+  --image=nicolaka/netshoot:v0.13 -- curl -s -m 3 http://booking-api/healthz
+<span class="out">{"ok":true,"version":"ks3-lab"}</span></pre>
+        If the rogue Pod gets an answer, your kind is older than 0.24 and does not enforce NetworkPolicy. Upgrade kind
+        and recreate the cluster. A policy you cannot see failing proves nothing.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        you can say which IP <code class="inline">booking-api</code> and <code class="inline">booking-api-headless</code>
+        resolve to and why they differ; you found the KUBE-SVC rules for the Service on a node; both HTTPRoutes report
+        <code class="inline">Accepted=True</code> and <code class="inline">ResolvedRefs=True</code>;
+        <code class="inline">app.clinic.local/api/healthz</code> answers with the policies applied; and the rogue Pod times out.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>The API host is down.</strong> After step 7 the web app works, but the mobile team, who call
+        <code class="inline">api.clinic.local</code> directly, report errors:
+        <pre class="code">curl -s -m 20 -w ' [%{http_code}]\n' -H 'Host: api.clinic.local' localhost:8888/healthz
+<span class="out">upstream connect error or disconnect/reset before headers. reset reason: connection timeout [503]</span></pre>
+        The route status is fine and the Pods are Ready. Find the cause and fix it without loosening the policy for anyone
+        else.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <p class="mt-2">Envoy answered, so the Gateway and route are fine. Envoy timed out <em>connecting</em> to the
+          backend, and a timeout rather than a refusal is the signature of a NetworkPolicy drop. On the
+          <code class="inline">api.clinic.local</code> path the caller is the Envoy Pod in
+          <code class="inline">envoy-gateway-system</code>, and the <code class="inline">booking-api</code> policy only admits
+          <code class="inline">app=booking-web</code>. The web path worked because there booking-web is the caller. Add the
+          Gateway as a second, separate peer (a new list item, so it is OR, not AND):</p>
+          <pre class="code mt-3">  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: booking-web } }
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: envoy-gateway-system } }
+      ports: [{ port: 8080 }]</pre>
+          <p class="mt-2">Apply it and the curl returns 200. On EKS the same mistake looks like ALB targets going
+          <code class="inline">unhealthy</code> right after a policy change, and the fix is the ALB subnet
+          <code class="inline">ipBlock</code> in Part IV. Every policy PR should list each entry point that reaches the
+          workload, not only the in-cluster callers.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Stop the port-forward, remove the Gateway before its controller, and the app namespace.
+        Going on to KS4? Keep the cluster. Otherwise delete it, which removes everything at once.
+        <pre class="code">kill %1
+kubectl delete -f k8s/routes.yaml -f k8s/gateway.yaml
+helm uninstall eg -n envoy-gateway-system
+kubectl delete namespace booking gateway envoy-gateway-system
+kind delete cluster --name lab                  <span class="cm"># only if you are stopping here</span>
+kind get clusters
+<span class="out">No kind clusters found.</span></pre>
+        <code class="inline">helm uninstall</code> leaves the Gateway API CRDs in place by design (Helm never deletes CRDs).
+        That is harmless on a lab cluster. On a shared cluster, CRDs are removed only on purpose, because deleting one
+        deletes every object of that kind.
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

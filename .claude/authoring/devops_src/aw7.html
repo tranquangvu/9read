@@ -603,6 +603,192 @@ done
         email stops arriving the moment resolvers pick up the new NS, and nobody notices until a patient's message bounces.
         Diff the full record sets between old and new name servers before T−0, every time.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Delegate your own subdomain, split traffic by weight, and validate a certificate</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will create a hosted zone for <code class="inline">yourhandle.sandbox.clinic.example.com</code>, delegate it
+        from the shared sandbox zone, and prove the chain with <code class="inline">dig</code>. Then you publish a weighted
+        pair of records, measure the 90/10 split, and move all traffic with one change. An ACM certificate validated through
+        your zone shows why delegation must be right before anything else. Finally you break the delegation and see the
+        classic symptom: "it works when I ask Route 53, nobody else can resolve it".
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A delegated subdomain that public resolvers can answer, a measured weighted split, and an <code class="inline">ISSUED</code> certificate</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">60–90 minutes</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, the shared public zone <code class="inline">sandbox.clinic.example.com</code>; ACM in <code class="inline">ap-southeast-1</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Effectively zero. A hosted zone is USD 0.50 a month but free if you delete it within 12 hours of creating it; queries cost USD 0.40 per million; public ACM certificates are free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">AWS CLI v2, <code class="inline">jq</code>, <code class="inline">dig</code> (from <a href="./fn3.html" class="text-viol underline decoration-viol/40">FN3</a>). In a personal account with no domain, do steps 2 and 4–5 with any zone name and query its name servers directly; steps 3, 6 and 7 need a real parent zone</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell and find the parent zone.</strong> The parent is shared by everyone in the sandbox, so
+        you will add exactly one record to it (your NS delegation) and nothing else.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login --sso-session gol
+export PARENT_NAME=sandbox.clinic.example.com SUB=$ME.sandbox.clinic.example.com
+PARENT=$(aws route53 list-hosted-zones-by-name --dns-name $PARENT_NAME \
+  --query "HostedZones[?Name=='$PARENT_NAME.' &amp;&amp; !Config.PrivateZone].Id" --output text)
+echo $PARENT
+<span class="out">/hostedzone/Z0123456789SANDBOXAB</span>
+mkdir -p ~/labs/aw7 &amp;&amp; cd ~/labs/aw7</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create your own public hosted zone and tag it.</strong> Route 53 gives it four name servers in four
+        different top-level domains; those are what the parent must point at.
+        <pre class="code">ZONE=$(aws route53 create-hosted-zone --name $SUB --caller-reference lab-$ME-aw7-$(date +%s) \
+  --hosted-zone-config Comment="AW7 lab $ME" --query HostedZone.Id --output text)
+aws route53 change-tags-for-resource --resource-type hostedzone --resource-id ${ZONE#/hostedzone/} \
+  --add-tags Key=Owner,Value=$ME Key=Lab,Value=AW7
+aws route53 get-hosted-zone --id $ZONE --query DelegationSet.NameServers --output text
+<span class="out">ns-1201.awsdns-22.org   ns-388.awsdns-48.com   ns-1890.awsdns-44.co.uk   ns-612.awsdns-12.net</span>
+NS1=$(aws route53 get-hosted-zone --id $ZONE --query 'DelegationSet.NameServers[0]' --output text)</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Delegate from the parent, then prove the chain.</strong> One NS record in the parent hands authority for
+        everything under your name to your zone. <code class="inline">dig +trace</code> walks the chain from the root the
+        way a resolver does.
+        <pre class="code">aws route53 get-hosted-zone --id $ZONE --query DelegationSet.NameServers --output json \
+  | jq --arg n $SUB '{Changes: [{Action: "UPSERT", ResourceRecordSet:
+      {Name: $n, Type: "NS", TTL: 300, ResourceRecords: [.[] | {Value: .}]}}]}' &gt; delegate.json
+C=$(aws route53 change-resource-record-sets --hosted-zone-id $PARENT --change-batch file://delegate.json \
+  --query ChangeInfo.Id --output text)
+aws route53 wait resource-record-sets-changed --id $C
+jq -n --arg n hello.$SUB --arg v "\"owned by $ME\"" '{Changes: [{Action: "UPSERT", ResourceRecordSet:
+  {Name: $n, Type: "TXT", TTL: 60, ResourceRecords: [{Value: $v}]}}]}' &gt; hello.json   <span class="cm"># TXT values carry their own quotes</span>
+aws route53 change-resource-record-sets --hosted-zone-id $ZONE --change-batch file://hello.json &gt;/dev/null
+sleep 30; dig +trace +nodnssec hello.$SUB TXT | grep -E "IN[[:space:]]+(NS|TXT)" | tail -3
+<span class="out">yourhandle.sandbox.clinic.example.com. 300 IN NS ns-1201.awsdns-22.org.</span>   <span class="cm"># the parent hands off …</span>
+<span class="out">yourhandle.sandbox.clinic.example.com. 300 IN NS ns-612.awsdns-12.net.</span>
+<span class="out">hello.yourhandle.sandbox.clinic.example.com. 60 IN TXT "owned by yourhandle"</span>     <span class="cm"># … and your zone answers</span>
+dig +short @1.1.1.1 hello.$SUB TXT
+<span class="out">"owned by yourhandle"</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Publish a weighted pair.</strong> Two A records for the same name: <code class="inline">blue</code> (the
+        current platform) at weight 90 and <code class="inline">green</code> (the new one) at 10. The addresses are from
+        <code class="inline">192.0.2.0/24</code>, a range reserved for documentation, so nothing real is behind them.
+        <span class="code-label">~/labs/aw7/weights.sh</span>
+        <pre class="code">weights() {   # usage: weights &lt;blue-weight&gt; &lt;green-weight&gt;
+  jq -n --arg n api.$SUB --argjson b $1 --argjson g $2 '{Changes: [
+    {Action: "UPSERT", ResourceRecordSet: {Name: $n, Type: "A", SetIdentifier: "blue",  Weight: $b,
+      TTL: 10, ResourceRecords: [{Value: "192.0.2.10"}]}},
+    {Action: "UPSERT", ResourceRecordSet: {Name: $n, Type: "A", SetIdentifier: "green", Weight: $g,
+      TTL: 10, ResourceRecords: [{Value: "192.0.2.20"}]}}]}' &gt; weights.json
+  aws route53 wait resource-record-sets-changed --id $(aws route53 change-resource-record-sets \
+    --hosted-zone-id $ZONE --change-batch file://weights.json --query ChangeInfo.Id --output text)
+}</pre>
+        <pre class="code">source weights.sh &amp;&amp; weights 90 10
+for i in $(seq 200); do dig +short @$NS1 api.$SUB A; done | sort | uniq -c
+<span class="out"> 181 192.0.2.10
+  19 192.0.2.20</span>                                       <span class="cm"># about 90/10; your counts will differ a little</span>
+aws route53 test-dns-answer --hosted-zone-id ${ZONE#/hostedzone/} --record-name api.$SUB --record-type A \
+  --query RecordData --output text
+<span class="out">192.0.2.10</span>                                           <span class="cm"># one weighted pick, straight from Route 53</span></pre>
+        You asked the authoritative server directly, so every query is a fresh weighted choice. Through a normal resolver
+        each resolver caches one answer for the TTL, which is why real traffic splits are lumpy at low volume and why the
+        TTL is short.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Cut over, and see what the TTL means.</strong> Move all traffic to green with one change. The change is
+        <code class="inline">INSYNC</code> in seconds, but a resolver that cached blue keeps answering blue until its TTL
+        runs out.
+        <pre class="code">weights 0 100
+for i in $(seq 50); do dig +short @$NS1 api.$SUB A; done | sort | uniq -c
+<span class="out">  50 192.0.2.20</span>
+dig @1.1.1.1 api.$SUB A +noall +answer
+<span class="out">api.yourhandle.sandbox.clinic.example.com. 7 IN A 192.0.2.20</span>        <span class="cm"># the 7 is the TTL left in that cache</span></pre>
+        Going back is the same command with <code class="inline">weights 100 0</code>, which is the whole appeal of a
+        weighted cutover in the domain runbook of Part IV.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Request a certificate and validate it through your zone.</strong> ACM tells you a CNAME to publish; it
+        then looks it up from the public internet, so this only works because step 3's delegation is correct. This
+        certificate is in <code class="inline">ap-southeast-1</code>, the right Region for an ALB; one for CloudFront
+        would have to be requested in <code class="inline">us-east-1</code>.
+        <pre class="code">CERT=$(aws acm request-certificate --domain-name api.$SUB --validation-method DNS \
+  --tags Key=Owner,Value=$ME Key=Lab,Value=AW7 --query CertificateArn --output text)
+sleep 10                                             <span class="cm"># the validation record appears after a few seconds</span>
+aws acm describe-certificate --certificate-arn $CERT \
+  --query 'Certificate.DomainValidationOptions[0].ResourceRecord' --output json \
+  | jq '{Changes: [{Action: "UPSERT", ResourceRecordSet:
+      {Name: .Name, Type: .Type, TTL: 300, ResourceRecords: [{Value: .Value}]}}]}' &gt; acm-validation.json
+aws route53 change-resource-record-sets --hosted-zone-id $ZONE --change-batch file://acm-validation.json &gt;/dev/null
+aws acm wait certificate-validated --certificate-arn $CERT     <span class="cm"># usually 1–5 minutes</span>
+aws acm describe-certificate --certificate-arn $CERT --query Certificate.Status --output text
+<span class="out">ISSUED</span></pre>
+        Leave the validation CNAME in place for as long as the certificate exists: ACM uses it again for automatic
+        renewal.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">dig +trace hello.$SUB TXT</code> shows the parent's NS hand-off and your TXT answer;
+        <code class="inline">dig @1.1.1.1</code> resolves it too; 200 queries split about 90/10 and then 0/100 after one
+        change; and <code class="inline">describe-certificate</code> reports <code class="inline">ISSUED</code> for
+        <code class="inline">api.$SUB</code>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Lose the delegation.</strong> Someone cleaning up the parent zone deletes "an NS record nobody recognises".
+        Run it, then compare what your own name servers say with what the rest of the internet says, and explain the
+        difference before you open the answer.
+        <pre class="code">sed 's/"UPSERT"/"DELETE"/' delegate.json &gt; undelegate.json
+aws route53 wait resource-record-sets-changed --id $(aws route53 change-resource-record-sets \
+  --hosted-zone-id $PARENT --change-batch file://undelegate.json --query ChangeInfo.Id --output text)
+dig +short @$NS1 hello.$SUB TXT
+<span class="out">"owned by yourhandle"</span>
+dig @8.8.8.8 hello.$SUB TXT +noall +comments | grep status
+<span class="out">;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NXDOMAIN, id: 41522</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">dig +trace +nodnssec hello.$SUB TXT | grep SOA
+<span class="out">sandbox.clinic.example.com. 900 IN SOA ns-…awsdns….com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400</span>
+<span class="cm"># the trace stops at the parent: it is authoritative, has no NS for your name, so it says NXDOMAIN</span>
+C=$(aws route53 change-resource-record-sets --hosted-zone-id $PARENT --change-batch file://delegate.json \
+  --query ChangeInfo.Id --output text); aws route53 wait resource-record-sets-changed --id $C
+dig +trace +nodnssec hello.$SUB TXT | grep TXT
+<span class="out">hello.yourhandle.sandbox.clinic.example.com. 60 IN TXT "owned by yourhandle"</span></pre>
+          <p class="mt-2">Your zone was fine all along; only the pointer to it was gone. Asking your own name server
+          directly skips the delegation chain, which is why "it works for me" is not proof. The parent now answers for
+          your name itself, with NXDOMAIN, and public resolvers cache that negative answer for up to 900 seconds (the
+          lower of the SOA's TTL and its last field). So <code class="inline">dig @8.8.8.8</code> may keep saying NXDOMAIN
+          for up to 15 minutes after the fix, while <code class="inline">dig +trace</code>, which does not use a cache,
+          shows the fix at once. While delegation is broken, any ACM renewal or new DNS validation for names under it
+          also fails silently.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Clean up.</strong> Delete the certificate, then the delegation in the parent, then your records and your
+        zone. That order matters: a parent NS record pointing at a deleted zone is a <em>dangling delegation</em>, and
+        someone else could create a zone on those name servers and take over your name.
+        <pre class="code">aws acm delete-certificate --certificate-arn $CERT
+aws route53 change-resource-record-sets --hosted-zone-id $PARENT --change-batch file://undelegate.json &gt;/dev/null
+aws route53 list-resource-record-sets --hosted-zone-id $ZONE \
+  | jq '{Changes: [.ResourceRecordSets[] | select(.Type != "NS" and .Type != "SOA")
+        | {Action: "DELETE", ResourceRecordSet: .}]}' &gt; wipe.json
+aws route53 change-resource-record-sets --hosted-zone-id $ZONE --change-batch file://wipe.json &gt;/dev/null
+aws route53 delete-hosted-zone --id $ZONE --query ChangeInfo.Status --output text
+<span class="out">PENDING</span>
+aws route53 list-hosted-zones-by-name --dns-name $SUB --query "HostedZones[?Name=='$SUB.'].Id"
+<span class="out">[]</span>
+aws route53 list-resource-record-sets --hosted-zone-id $PARENT --query "ResourceRecordSets[?Name=='$SUB.']"
+<span class="out">[]</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>The bill is small; the risk is not.</strong> A hosted zone kept longer than
+        12 hours costs USD 0.50 for the month, and ten forgotten learner zones are USD 5. The real hazard is a leftover NS
+        record in the shared parent that points at a zone you deleted: that is how subdomain takeovers start. Always delete
+        the delegation first, and check the last command above returns <code class="inline">[]</code>.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

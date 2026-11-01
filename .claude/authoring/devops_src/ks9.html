@@ -680,6 +680,292 @@ jobs:
         <em>Skipped</em>, and a green summary hides that half the cluster config was never checked. Fail the job if the
         skipped count is above zero.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Write a Helm chart for booking-api and prove what it renders</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will write a small chart for <code class="inline">booking-api</code> from an empty folder: helpers with a stable
+        selector, a Deployment with probes and resources, a Service, a values schema, and one values file per environment.
+        You validate every environment with <code class="inline">helm template | kubeconform</code> before anything touches a
+        cluster, install it on <code class="inline">kind</code>, preview an upgrade with <code class="inline">helm diff</code>,
+        roll back, and then express the same prod differences as a Kustomize overlay to compare the two tools.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A chart that lints, renders valid YAML for dev and prod, installs and upgrades on kind, and rejects a typo in a values file</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop: <code class="inline">kind</code> with Kubernetes 1.33</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>), the lab kit in <code class="inline">~/clinic-app/</code>, and <code class="inline">kubeconform</code> (installed in step 1)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up the cluster, two image tags and kubeconform.</strong> Both tags are the same code; the tag is what
+        you will watch change. <code class="inline">kubeconform</code> validates YAML against the Kubernetes 1.33 schemas
+        without a cluster.
+        <pre class="code">mkdir -p ~/labs/ks9/charts/booking-api/templates &amp;&amp; cd ~/labs/ks9
+kind create cluster --name lab-ks9 --image kindest/node:v1.33.1
+docker build -t booking-api:1.0.0 ~/clinic-app/booking-api &amp;&amp; docker tag booking-api:1.0.0 booking-api:1.1.0
+kind load docker-image booking-api:1.0.0 booking-api:1.1.0 --name lab-ks9
+brew install kubeconform        <span class="cm"># Linux: download the release binary from github.com/yannh/kubeconform</span>
+kubeconform -v
+<span class="out">v0.7.0</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Write Chart.yaml and the default values.</strong> The chart version and the app version are different
+        things: the tag in values changes on every release, the chart version only when the packaging changes.
+        <span class="code-label">~/labs/ks9/charts/booking-api/Chart.yaml</span>
+        <pre class="code">apiVersion: v2
+name: booking-api
+description: booking-api for the KS9 lab
+type: application
+version: 0.1.0                  <span class="cm"># the chart's version: bump when templates or defaults change</span>
+appVersion: "1.0.0"             <span class="cm"># informational; the deployed tag comes from values</span>
+kubeVersion: "&gt;=1.31.0-0"</pre>
+        <span class="code-label">~/labs/ks9/charts/booking-api/values.yaml</span>
+        <pre class="code">image:
+  repository: booking-api
+  tag: ""                       <span class="cm"># required: set per environment</span>
+replicaCount: 1
+port: 8080
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { memory: 128Mi }
+env: {}                         <span class="cm"># extra environment variables, name: value</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Write the helpers and the Deployment.</strong> The selector is one label that never changes; everything
+        that does change (version, chart) goes in the other labels. The security fields make it pass Pod Security
+        <code class="inline">restricted</code> (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>).
+        <span class="code-label">~/labs/ks9/charts/booking-api/templates/_helpers.tpl</span>
+        <pre class="code">{{- define "booking-api.name" -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "booking-api.selectorLabels" -}}
+app: {{ include "booking-api.name" . }}
+{{- end }}
+
+{{- define "booking-api.labels" -}}
+{{ include "booking-api.selectorLabels" . }}
+app.kubernetes.io/version: {{ .Values.image.tag | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+{{- end }}</pre>
+        <span class="code-label">~/labs/ks9/charts/booking-api/templates/deployment.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "booking-api.name" . }}
+  labels: {{- include "booking-api.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: {{- include "booking-api.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "booking-api.labels" . | nindent 8 }}
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ required "image.tag is required" .Values.image.tag }}"
+          ports: [{ name: http, containerPort: {{ .Values.port }} }]
+          env:
+            - { name: APP_VERSION, value: {{ .Values.image.tag | quote }} }
+            {{- range $k, $v := .Values.env }}
+            - { name: {{ $k }}, value: {{ $v | quote }} }
+            {{- end }}
+          livenessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 10 }
+          readinessProbe: { httpGet: { path: /readyz, port: http }, periodSeconds: 5 }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+          resources: {{- toYaml .Values.resources | nindent 12 }}</pre>
+        <code class="inline">selectorLabels</code> feeds both the Deployment's <code class="inline">matchLabels</code> and the
+        Service's selector, so they cannot drift apart. A YAML <code class="inline">#</code> comment inside a helper would be
+        copied into every rendered label block, which is why there is none.
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Write the Service, the schema and the per-environment values.</strong> The schema turns a typo into an
+        error instead of a silently ignored key, and forces the tag to be a quoted semantic version.
+        <span class="code-label">~/labs/ks9/charts/booking-api/templates/service.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "booking-api.name" . }}
+  labels: {{- include "booking-api.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "booking-api.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: http, port: 80, targetPort: http }</pre>
+        <span class="code-label">~/labs/ks9/charts/booking-api/values.schema.json</span>
+        <pre class="code">{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "replicaCount", "resources"],
+  "properties": {
+    "image": { "type": "object", "additionalProperties": false, "required": ["repository", "tag"],
+      "properties": { "repository": { "type": "string" },
+                      "tag": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" } } },
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "port": { "type": "integer" },
+    "resources": { "type": "object", "required": ["requests"] },
+    "env": { "type": "object", "additionalProperties": { "type": "string" } }
+  }
+}</pre>
+        <pre class="code">cat &gt; values-dev.yaml &lt;&lt;'EOF'
+image: { tag: "1.0.0" }
+env: { CHAOS: "on" }
+EOF
+cat &gt; values-prod.yaml &lt;&lt;'EOF'
+image: { tag: "1.0.0" }
+replicaCount: 3
+resources:
+  requests: { cpu: 250m, memory: 256Mi }
+  limits: { memory: 512Mi }
+EOF</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Lint, render and validate every environment, then try a bad values file.</strong> This is exactly the CI
+        job from Part IV, run by hand.
+        <pre class="code">helm lint charts/booking-api -f values-dev.yaml
+<span class="out">1 chart(s) linted, 0 chart(s) failed</span>
+for e in dev prod; do helm template booking-api charts/booking-api -n booking -f values-$e.yaml \
+  | kubeconform -strict -summary -kubernetes-version 1.33.0; done
+<span class="out">Summary: 2 resources found parsing stdin - Valid: 2, Invalid: 0, Errors: 0, Skipped: 0
+Summary: 2 resources found parsing stdin - Valid: 2, Invalid: 0, Errors: 0, Skipped: 0</span>
+printf 'image: { tag: 1.10 }\nresouces: { requests: { cpu: 1 } }\n' &gt; values-bad.yaml
+helm lint charts/booking-api -f values-bad.yaml
+<span class="out">[ERROR] values.yaml: - (root): Additional property resouces is not allowed
+- image.tag: Invalid type. Expected: string, given: number
+Error: 1 chart(s) linted, 1 chart(s) failed</span></pre>
+        Without the schema, <code class="inline">tag: 1.10</code> would render as the float <code class="inline">1.1</code>
+        (a different image) and <code class="inline">resouces</code> would be ignored, leaving the Pod on the chart defaults.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Install, diff an upgrade, upgrade and roll back.</strong> <code class="inline">helm diff</code> shows the
+        change to the live release before you make it: one tag, one env var, one label.
+        <pre class="code">helm upgrade --install booking-api charts/booking-api -n booking --create-namespace -f values-dev.yaml --wait
+kubectl -n booking run curl --rm -it --restart=Never --image=curlimages/curl:8.11.1 -- curl -s booking-api/healthz
+<span class="out">{"ok":true,"version":"1.0.0"}</span>
+helm plugin install https://github.com/databus23/helm-diff --version v3.12.3
+helm diff upgrade booking-api charts/booking-api -n booking -f values-dev.yaml --set image.tag=1.1.0 --context 1
+<span class="out">booking, booking-api, Deployment (apps) has changed:
+-     image: "booking-api:1.0.0"
++     image: "booking-api:1.1.0"
+…</span>
+helm upgrade booking-api charts/booking-api -n booking -f values-dev.yaml --set image.tag=1.1.0 --wait
+helm history booking-api -n booking
+<span class="out">REVISION  STATUS      CHART              APP VERSION  DESCRIPTION
+1         superseded  booking-api-0.1.0  1.0.0        Install complete
+2         deployed    booking-api-0.1.0  1.0.0        Upgrade complete</span>
+helm rollback booking-api 1 -n booking --wait
+<span class="out">Rollback was a success! Happy Helming!</span></pre>
+        The APP VERSION column still says 1.0.0 after the upgrade: it comes from <code class="inline">Chart.yaml</code>, not
+        from the tag you deployed. Look at the running Pods' image instead. Under Argo CD
+        (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>) you will not run
+        <code class="inline">helm rollback</code> at all: Git is reverted instead.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Express prod as a Kustomize overlay, and compare.</strong> Use the rendered dev chart as a base, then a
+        strategic merge patch for the sizing, a JSON 6902 patch to drop <code class="inline">CHAOS</code>, and the
+        <code class="inline">images</code> transformer for the tag.
+        <pre class="code">mkdir -p kustomize/base kustomize/overlays/prod
+helm template booking-api charts/booking-api -f values-dev.yaml &gt; kustomize/base/booking-api.yaml
+printf 'resources: [booking-api.yaml]\n' &gt; kustomize/base/kustomization.yaml</pre>
+        <span class="code-label">~/labs/ks9/kustomize/overlays/prod/kustomization.yaml</span>
+        <pre class="code">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: booking
+resources: [../../base]
+images:
+  - { name: booking-api, newTag: "1.1.0" }           <span class="cm"># what CI would change</span>
+patches:
+  - path: prod.yaml                                   <span class="cm"># strategic merge: only the fields that differ</span>
+  - target: { kind: Deployment, name: booking-api }
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/containers/0/env/1  <span class="cm"># JSON 6902: drop CHAOS=on (by index!)</span></pre>
+        <span class="code-label">~/labs/ks9/kustomize/overlays/prod/prod.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-api }
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: api
+          resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { memory: 512Mi } }</pre>
+        <pre class="code">kubectl kustomize kustomize/overlays/prod | kubeconform -strict -summary -kubernetes-version 1.33.0
+<span class="out">Summary: 2 resources found parsing stdin - Valid: 2, Invalid: 0, Errors: 0, Skipped: 0</span>
+kubectl kustomize kustomize/overlays/prod | grep -E 'image:|value: 1|version:'
+<span class="out">    app.kubernetes.io/version: 1.0.0
+    app.kubernetes.io/version: 1.0.0
+        app.kubernetes.io/version: 1.0.0
+          value: 1.0.0
+        image: booking-api:1.1.0</span></pre>
+        Valid YAML, but wrong: the image says 1.1.0 while <code class="inline">APP_VERSION</code> and the version label still
+        say 1.0.0. Kustomize does not know the tag appears in three places; the chart did. The JSON patch also removes
+        "the second env var", whatever that happens to be next month. That is the trade-off behind our rule in Part IV.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">helm lint</code> passes with the dev
+        and prod values and fails with <code class="inline">values-bad.yaml</code>; kubeconform reports
+        <code class="inline">Invalid: 0</code> for dev, prod and the Kustomize overlay; <code class="inline">helm history</code>
+        shows three revisions (install, upgrade, rollback) and the Pods run <code class="inline">booking-api:1.0.0</code> again;
+        and you can name the two things the Kustomize overlay got wrong.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>"Improve" the selector.</strong> A teammate argues that the selector should follow the recommended labels
+        and adds <code class="inline">app.kubernetes.io/name</code> to it. Make that change in <code class="inline">_helpers.tpl</code>, then run the same upgrade as
+        in step 6. Lint passes and kubeconform passes, yet the upgrade fails. Explain the error, and why no validation step
+        before it could have caught this, before you open the answer.
+        <pre class="code">cp charts/booking-api/templates/_helpers.tpl helpers.good
+# edit the selectorLabels block in _helpers.tpl so it reads:
+{{- define "booking-api.selectorLabels" -}}
+app: {{ include "booking-api.name" . }}
+app.kubernetes.io/name: {{ include "booking-api.name" . }}      <span class="cm"># the "improvement"</span>
+{{- end }}
+helm template booking-api charts/booking-api -f values-dev.yaml | kubeconform -strict -summary
+helm upgrade booking-api charts/booking-api -n booking \
+  -f values-dev.yaml --set image.tag=1.1.0</pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3"><span class="out">Error: UPGRADE FAILED: cannot patch "booking-api" with kind Deployment: Deployment.apps "booking-api" is invalid:
+spec.selector: Invalid value: v1.LabelSelector{…"app":"booking-api", "app.kubernetes.io/name":"booking-api"…}: field is immutable</span></pre>
+          <p class="mt-2">A Deployment's selector cannot change after creation. Each file is valid on its own, so lint and
+          kubeconform are happy; the conflict only exists between the new YAML and the object already in the cluster. Had the
+          teammate added the version instead, every single release would hit this. Restore the helper
+          (<code class="inline">mv helpers.good charts/booking-api/templates/_helpers.tpl</code>)
+          and upgrade again. <code class="inline">helm diff</code> would have shown a <code class="inline">selector</code> change:
+          make "the selector changed" a reason to stop in every chart review. The tempting fix, deleting and recreating the
+          Deployment, takes every replica down at once.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Uninstall the release so you see what Helm removes, then delete the cluster. Keep
+        <code class="inline">~/labs/ks9/charts/booking-api</code>: the <a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>
+        lab deploys it with Argo CD.
+        <pre class="code">helm uninstall booking-api -n booking
+<span class="out">release "booking-api" uninstalled</span>
+kind delete cluster --name lab-ks9
+kind get clusters
+<span class="out">No kind clusters found.</span>
+rm -f values-bad.yaml</pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

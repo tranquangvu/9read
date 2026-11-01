@@ -723,6 +723,317 @@ terraform show -json tfplan \
         </div>
       </div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Remote state, a small network, and three safe refactors</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will bootstrap your own state bucket, build a small VPC with two subnets and three log groups from a remote
+        S3 backend with native locking, and then do the four things this module is about: read a plan before you apply it,
+        watch the lock stop a second apply, adopt a resource someone clicked into existence with an
+        <code class="inline">import</code> block, and rename a resource with a <code class="inline">moved</code> block
+        instead of destroying it. Everything here is free or close to it, so you can repeat it until it feels boring.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A stack whose state lives in S3, that you changed four times without a single unplanned destroy</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">About 2 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code>; two terminal windows</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Under USD 0.01 in total: a VPC, subnets and empty log groups are free; the state bucket holds a few KB</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">AWS CLI v2 and Terraform ≥ 1.10 from the <a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>. Your handle must be lowercase (it goes into a bucket name)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell.</strong> <code class="inline">TF_VAR_me</code> fills the <code class="inline">me</code>
+        variable in every Terraform command, so you never type <code class="inline">-var</code>. Do this in both terminal
+        windows.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1 TF_VAR_me=yourhandle
+aws sso login
+aws sts get-caller-identity --query Account --output text
+<span class="out">888899990000</span>                                       <span class="cm"># anything else: stop and fix your profile</span>
+terraform version | head -1
+<span class="out">Terraform v1.13.4</span>                                  <span class="cm"># must be 1.10 or newer for use_lockfile</span>
+mkdir -p ~/labs/ia1/bootstrap ~/labs/ia1/stack &amp;&amp; cd ~/labs/ia1/bootstrap</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Bootstrap the state bucket with local state.</strong> This tiny stack is the chicken-and-egg case from
+        Part III: it creates the bucket every later lab stores state in, so its own state stays in a local file. The
+        <code class="inline">data</code> source reads your account ID, which keeps the bucket name globally unique.
+        <span class="code-label">~/labs/ia1/bootstrap/main.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "IA1" } }
+}
+variable "me" { type = string }
+data "aws_caller_identity" "current" {}
+
+resource "aws_s3_bucket" "state" {
+  bucket        = "lab-${var.me}-tfstate-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true                                       <span class="cm"># lab only: lets destroy empty a versioned bucket</span>
+}
+resource "aws_s3_bucket_versioning" "state" {
+  bucket = aws_s3_bucket.state.id
+  versioning_configuration { status = "Enabled" }           <span class="cm"># every old state is recoverable</span>
+}
+resource "aws_s3_bucket_public_access_block" "state" {
+  bucket                  = aws_s3_bucket.state.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+resource "aws_s3_bucket_lifecycle_configuration" "state" {
+  bucket = aws_s3_bucket.state.id
+  rule {
+    id     = "expire-old-state-versions"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration { noncurrent_days = 30 }
+  }
+}
+output "bucket" { value = aws_s3_bucket.state.bucket }</pre>
+        <pre class="code">terraform init &amp;&amp; terraform apply
+<span class="out">Plan: 4 to add, 0 to change, 0 to destroy.
+…
+Apply complete! Resources: 4 added, 0 changed, 0 destroyed.
+
+Outputs:
+bucket = "lab-yourhandle-tfstate-888899990000"</span>
+export BUCKET=$(terraform output -raw bucket)</pre>
+        S3 encrypts every new object with SSE-S3 by default, so the bucket needs no encryption block. Keep this folder:
+        <code class="inline">terraform.tfstate</code> here is the only record of the bucket.
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Write the stack with a remote backend.</strong> The backend block cannot read variables, so you leave the
+        bucket out and pass it at <code class="inline">init</code> time (a <em>partial configuration</em>). The subnets and
+        log groups use <code class="inline">for_each</code>, so each instance is addressed by a key you chose, not by a
+        position in a list.
+        <span class="code-label">~/labs/ia1/stack/versions.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+  backend "s3" {
+    key          = "ia1/network.tfstate"                     <span class="cm"># one key per stack</span>
+    region       = "ap-southeast-1"
+    encrypt      = true
+    use_lockfile = true                                      <span class="cm"># S3-native lock, no DynamoDB table</span>
+  }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "IA1" } }
+}</pre>
+        <span class="code-label">~/labs/ia1/stack/main.tf</span>
+        <pre class="code">variable "me" {
+  type = string
+  validation {
+    condition     = can(regex("^[a-z0-9-]+$", var.me))
+    error_message = "me must be lowercase letters, digits and dashes."
+  }
+}
+locals {
+  name     = "lab-${var.me}-ia1"
+  subnets  = { "ap-southeast-1a" = "10.98.0.0/24", "ap-southeast-1b" = "10.98.1.0/24" }
+  services = toset(["booking-api", "booking-web", "booking-worker"])
+}
+resource "aws_vpc" "this" {
+  cidr_block = "10.98.0.0/16"
+  tags       = { Name = local.name }
+}
+resource "aws_subnet" "public" {
+  for_each          = local.subnets                          <span class="cm"># key = AZ, value = CIDR</span>
+  vpc_id            = aws_vpc.this.id                        <span class="cm"># this reference is the dependency</span>
+  availability_zone = each.key
+  cidr_block        = each.value
+  tags              = { Name = "${local.name}-${each.key}" }
+}
+resource "aws_cloudwatch_log_group" "svc" {
+  for_each          = local.services
+  name              = "/lab/${var.me}/ia1/${each.key}"
+  retention_in_days = 3
+}
+output "vpc_id" { value = aws_vpc.this.id }
+output "subnet_ids" { value = { for az, s in aws_subnet.public : az =&gt; s.id } }</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Init against the bucket, save a plan, read it, apply exactly that.</strong> Read the summary line first,
+        then scan for any <code class="inline">-</code> or <code class="inline">-/+</code>. On a first apply there must be
+        none.
+        <pre class="code">cd ~/labs/ia1/stack
+terraform init -backend-config="bucket=$BUCKET"
+<span class="out">Successfully configured the backend "s3"! Terraform will automatically
+use this backend unless the backend configuration changes.</span>
+terraform plan -out=tfplan
+<span class="out">  # aws_cloudwatch_log_group.svc["booking-api"] will be created
+  …
+  # aws_subnet.public["ap-southeast-1a"] will be created
+  …
+Plan: 6 to add, 0 to change, 0 to destroy.</span>
+terraform apply tfplan                                   <span class="cm"># a saved plan applies without asking again</span>
+<span class="out">Apply complete! Resources: 6 added, 0 changed, 0 destroyed.</span>
+terraform state list
+<span class="out">aws_cloudwatch_log_group.svc["booking-api"]
+aws_cloudwatch_log_group.svc["booking-web"]
+aws_cloudwatch_log_group.svc["booking-worker"]
+aws_subnet.public["ap-southeast-1a"]
+aws_subnet.public["ap-southeast-1b"]
+aws_vpc.this</span>
+aws s3 ls s3://$BUCKET/ia1/
+<span class="out">2026-11-01 09:12:40       6214 network.tfstate</span></pre>
+        There is no <code class="inline">terraform.tfstate</code> in this folder. Run <code class="inline">ls</code> to check.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Watch the lock stop a second apply.</strong> An apply with nothing to do exits at once, so first give it a
+        change: in <code class="inline">main.tf</code> set the VPC's tags to
+        <code class="inline">{ Name = local.name, Try = "1" }</code>. In terminal A, start an apply and leave it waiting at
+        the <code class="inline">Enter a value:</code> prompt. Terraform holds the lock the whole time it waits. In
+        terminal B, in the same folder, try to plan.
+        <pre class="code"><span class="cm"># terminal A</span>
+terraform apply
+<span class="out">Plan: 0 to add, 1 to change, 0 to destroy.
+  Enter a value:</span>                                       <span class="cm"># leave it here</span>
+<span class="cm"># terminal B, while A is waiting</span>
+terraform plan
+<span class="out">Error: Error acquiring the state lock
+…api error PreconditionFailed: At least one of the pre-conditions you specified did not hold
+Lock Info:
+  ID:        6b0e4c1a-…
+  Path:      lab-yourhandle-tfstate-888899990000/ia1/network.tfstate
+  Operation: OperationTypeApply
+  Who:       you@your-laptop</span>
+aws s3 ls s3://$BUCKET/ia1/
+<span class="out">2026-11-01 09:20:03        221 network.tfstate.tflock
+2026-11-01 09:12:40       6214 network.tfstate</span></pre>
+        Answer <code class="inline">no</code> in terminal A. The <code class="inline">.tflock</code> object disappears and
+        terminal B's plan now works. Remove the <code class="inline">Try</code> tag from the code again.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Adopt a resource that was clicked into existence.</strong> Play the colleague who created a log group by
+        hand, then bring it under Terraform without recreating it. The import <code class="inline">id</code> for a log
+        group is its name (each resource's registry page lists the ID format).
+        <pre class="code">aws logs create-log-group --log-group-name /lab/$ME/ia1/clicked --tags Owner=$ME,Lab=IA1</pre>
+        <span class="code-label">~/labs/ia1/stack/imports.tf</span>
+        <pre class="code">import {
+  to = aws_cloudwatch_log_group.clicked
+  id = "/lab/${var.me}/ia1/clicked"
+}
+resource "aws_cloudwatch_log_group" "clicked" {
+  name = "/lab/${var.me}/ia1/clicked"                        <span class="cm"># match reality first, change it later</span>
+}</pre>
+        <pre class="code">terraform plan
+<span class="out">aws_cloudwatch_log_group.clicked: Preparing import... [id=/lab/yourhandle/ia1/clicked]
+  # aws_cloudwatch_log_group.clicked will be imported
+Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.</span>
+terraform apply                                          <span class="cm"># type yes; state now has 7 resources</span></pre>
+        If your plan says <code class="inline">1 to change</code>, the code does not match what exists (often the tags).
+        Fix the code until the change disappears, <em>then</em> apply. Importing and changing in the same step hides which
+        was which.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Rename a resource: first the wrong way, then with <code class="inline">moved</code>.</strong> Rename
+        <code class="inline">aws_vpc.this</code> to <code class="inline">aws_vpc.main</code> in <code class="inline">main.tf</code>
+        (the resource block, the subnet's <code class="inline">vpc_id</code> and the output), then plan.
+        <pre class="code">terraform plan
+<span class="out">  # aws_vpc.this will be destroyed
+  # (because aws_vpc.this is not in configuration)
+  # aws_subnet.public["ap-southeast-1a"] must be replaced
+-/+ resource "aws_subnet" "public" {
+      ~ vpc_id = "vpc-0c1d…" -&gt; (known after apply) # forces replacement
+…
+Plan: 3 to add, 0 to change, 3 to destroy.</span>          <span class="cm"># a rename would rebuild the whole network</span></pre>
+        Do not apply that. Add the block below and plan again.
+        <span class="code-label">~/labs/ia1/stack/refactor.tf</span>
+        <pre class="code">moved {
+  from = aws_vpc.this
+  to   = aws_vpc.main
+}</pre>
+        <pre class="code">terraform plan
+<span class="out">  # aws_vpc.this has moved to aws_vpc.main
+Plan: 0 to add, 0 to change, 0 to destroy.</span>
+terraform apply                                          <span class="cm"># records the new address in state</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Find drift.</strong> Somebody "temporarily" raised a retention period in the console. Make that change from
+        the CLI, then let the plan tell you about it.
+        <pre class="code">aws logs put-retention-policy --log-group-name /lab/$ME/ia1/booking-api --retention-in-days 30
+terraform plan
+<span class="out">Note: Objects have changed outside of Terraform
+  # aws_cloudwatch_log_group.svc["booking-api"] has changed
+  ~ retention_in_days = 3 -&gt; 30
+…
+  # aws_cloudwatch_log_group.svc["booking-api"] will be updated in-place
+  ~ retention_in_days = 30 -&gt; 3
+Plan: 0 to add, 1 to change, 0 to destroy.</span></pre>
+        You now have to decide: apply to put the code's value back, or change the code to 30 if the console change was
+        right. Either way the code and AWS agree afterwards. Apply to revert it.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">aws s3 ls s3://$BUCKET/ia1/</code> shows <code class="inline">network.tfstate</code> and no
+        local state file exists in <code class="inline">stack/</code>; <code class="inline">terraform state list</code>
+        shows 7 resources including <code class="inline">aws_vpc.main</code> and
+        <code class="inline">aws_cloudwatch_log_group.clicked</code>; <code class="inline">terraform plan</code> says
+        <code class="inline">No changes</code>; and you saw a lock error from a second terminal with your own name in
+        <code class="inline">Who</code>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>A laptop dies in the middle of an apply.</strong> Add <code class="inline">Try = "2"</code> to the tags of
+        <code class="inline">aws_vpc.main</code>. In terminal A run <code class="inline">terraform apply</code> and leave it
+        at the prompt. In terminal B kill it the way a crash or a lost battery would:
+        <code class="inline">pkill -9 -f "terraform apply"</code>. Now every plan, from anyone, fails with
+        <code class="inline">Error acquiring the state lock</code>. Work out whether it is safe to remove the lock, and remove
+        it the supported way, before you open the answer.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">pgrep -fl "terraform apply" || echo "no apply running"
+<span class="out">no apply running</span>                                     <span class="cm"># and Who: in the error is you, so nobody else is mid-apply</span>
+aws s3 cp s3://$BUCKET/ia1/network.tfstate.tflock - | jq -r .ID
+<span class="out">9d2f7a40-…</span>
+terraform force-unlock 9d2f7a40-…                        <span class="cm"># paste the full ID; answer yes</span>
+<span class="out">Terraform state has been successfully unlocked!</span>
+terraform plan
+<span class="out">Plan: 0 to add, 1 to change, 0 to destroy.</span>           <span class="cm"># the Try tag, never applied</span></pre>
+          <p class="mt-2">A <code class="inline">kill -9</code> gives Terraform no chance to delete its
+          <code class="inline">.tflock</code> object, so the lock outlives the process. You confirmed two facts before
+          unlocking: no apply process exists, and the person in <code class="inline">Who</code> (you) agrees. On a team, that
+          second fact is a message to the named person, not a guess. Then remove the <code class="inline">Try</code> tag so
+          the plan is clean again. If the killed process had already started writing, you would also compare
+          <code class="inline">terraform plan</code> with AWS before doing anything else: the versioned bucket lets you
+          restore the previous state object if the new one is damaged.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Clean up.</strong> Destroy the stack first (its state lives in the bucket), then the bootstrap stack, which
+        empties and deletes the bucket. Keep the bootstrap folder if you go on to <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>,
+        which reuses the bucket: then skip the second destroy.
+        <pre class="code">cd ~/labs/ia1/stack &amp;&amp; terraform destroy
+<span class="out">Destroy complete! Resources: 7 destroyed.</span>              <span class="cm"># includes the imported log group</span>
+cd ~/labs/ia1/bootstrap &amp;&amp; terraform destroy
+<span class="out">Destroy complete! Resources: 4 destroyed.</span>
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=IA1 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span>                                                   <span class="cm"># deleted items can linger here for a few minutes</span></pre>
+        To recreate the bucket later: <code class="inline">cd ~/labs/ia1/bootstrap &amp;&amp; terraform apply</code>.
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Nothing here bills by the hour</strong>, which is why this lab is the
+        place to practise until you stop being nervous about plans. Do not copy two habits into real work: the
+        <code class="inline">force_destroy = true</code> on a state bucket (a real one keeps every version, and nobody can
+        delete it in one command), and applying from your laptop (from <a href="./ia2.html" class="text-viol underline decoration-viol/40">IA2</a>
+        on, a pipeline applies).</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

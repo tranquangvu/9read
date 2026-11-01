@@ -673,6 +673,213 @@ gh pr view 1287 --repo golden-owl/clinic-app \
         three months per level at L0–L1 and longer at L2–L3. Skipping L0 is the most common reason juniors stall: every
         later module assumes you can read a Linux process list and a <code class="inline">curl -v</code> without help.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Build a tiny pipeline and measure its DORA keys</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will create a small public GitHub repository with a two-stage pipeline (test, then a stand-in "deploy to
+        prod"), ship five changes through pull requests, and compute the four DORA keys from the data GitHub records. One
+        change will fail in production on purpose, so you also get a real change failure rate and a real recovery time.
+        The deploy step only prints a message, but GitHub records it as a <strong>deployment</strong> exactly as it would
+        for <code class="inline">booking-api</code>, so every command works unchanged on a real repository later.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A table of every prod deployment with its result, its pull request and its lead time, and the four keys computed from it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">About 1.5 hours, most of it waiting for pipelines</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop and your personal GitHub account (no AWS)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free: GitHub Actions minutes and environments are free on public repositories</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3"><code class="inline">git</code>, <code class="inline">gh</code> and <code class="inline">jq</code> from the <a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell and log in to GitHub.</strong> <code class="inline">gh</code> is the GitHub command-line
+        tool; it calls the same API the website uses. <code class="inline">ME</code> is your GitHub username.
+        <pre class="code">export ME=yourhandle
+gh auth login                       <span class="cm"># choose GitHub.com, HTTPS, log in with a browser</span>
+gh api user --jq .login
+<span class="out">yourhandle</span>                          <span class="cm"># must match $ME</span>
+mkdir -p ~/labs/fn1/dora-lab &amp;&amp; cd ~/labs/fn1/dora-lab
+git init -q -b main &amp;&amp; echo "1.0.0" &gt; VERSION</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Write the pipeline.</strong> A <strong>workflow</strong> is a YAML file that GitHub Actions runs on
+        events. This one runs <code class="inline">test</code> on every pull request, and on every push to
+        <code class="inline">main</code> runs <code class="inline">test</code> then <code class="inline">deploy-prod</code>.
+        The line <code class="inline">environment: prod</code> is what makes GitHub record a deployment.
+        <span class="code-label">~/labs/fn1/dora-lab/.github/workflows/pipeline.yml</span>
+        <pre class="code">name: pipeline
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: test -s VERSION &amp;&amp; echo "unit tests passed for $(cat VERSION)"
+  deploy-prod:
+    if: github.event_name == 'push'               <span class="cm"># PRs are tested, never deployed</span>
+    needs: test                                    <span class="cm"># a red test stops the line</span>
+    runs-on: ubuntu-24.04
+    environment: prod                              <span class="cm"># GitHub records a deployment for this job</span>
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "deploying booking-api $(cat VERSION)"   <span class="cm"># stand-in for the real deploy (CI2)</span>
+      - run: bash smoke.sh                         <span class="cm"># the check that runs after "deploy"</span></pre>
+        <span class="code-label">~/labs/fn1/dora-lab/smoke.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+set -euo pipefail
+<span class="cm"># production smoke test: the running version must be a plain MAJOR.MINOR.PATCH</span>
+if grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION; then
+  echo "smoke test passed: $(cat VERSION)"
+else
+  echo "smoke test FAILED: bad version '$(cat VERSION)'"; exit 1
+fi</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Create the repository and run the first deploy.</strong> The first push goes straight to
+        <code class="inline">main</code>; it is the only direct push in this lab. Public is required because environments
+        on private repositories need a paid plan. The repository contains nothing secret.
+        <pre class="code">git add . &amp;&amp; git commit -qm "chore: pipeline skeleton"
+gh repo create dora-lab --public --source . --push
+gh run watch --exit-status $(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')
+<span class="out">✓ main pipeline · 1234567890
+✓ test in 6s
+✓ deploy-prod in 5s</span>
+gh api "repos/$ME/dora-lab/deployments" --jq '.[] | {environment, sha: .sha[0:7], created_at}'
+<span class="out">{"created_at":"2026-11-01T02:14:31Z","environment":"prod","sha":"5e1c0b2"}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Ship three changes through pull requests.</strong> The shell function below does what a developer does
+        for each change: branch, commit, open a PR, wait for checks, merge, pull. The optional third argument waits
+        before merging, to stand in for "waiting for a reviewer". Give the third change a 15-minute wait so your value
+        stream in step 6 has a queue in it.
+        <pre class="code">ship() {   <span class="cm"># usage: ship VERSION "commit message" [seconds to wait for review]</span>
+  git switch -q -c "v$1" &amp;&amp; echo "$1" &gt; VERSION &amp;&amp; git commit -qam "$2" &amp;&amp; git push -qu origin "v$1"
+  gh pr create --fill
+  sleep 10 &amp;&amp; gh pr checks --watch                <span class="cm"># CI time on the PR</span>
+  sleep "${3:-0}"                                 <span class="cm"># queue time: nobody is working</span>
+  gh pr merge --squash --delete-branch
+  git switch -q main &amp;&amp; git pull -q
+}
+ship 1.0.1 "feat: show clinic opening hours"
+ship 1.0.2 "fix: correct slot timezone"
+ship 1.1.0 "feat: allow booking cancellation" 900
+<span class="out">https://github.com/yourhandle/dora-lab/pull/1
+All checks were successful
+✓ Squashed and merged pull request yourhandle/dora-lab#1 (feat: show clinic opening hours)</span>
+gh run list --workflow pipeline.yml --event push --limit 5 --json conclusion --jq '.[].conclusion'
+<span class="out">success
+success
+success
+success</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Write the measuring script and run it.</strong> It prints one line per prod deployment: when, the result,
+        the PR that caused it, and the lead time from that PR's first commit to the deployment. These are the same API
+        calls as Part III, now in a script you can point at any repository.
+        <span class="code-label">~/labs/fn1/dora.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># usage: dora.sh OWNER/REPO [ENVIRONMENT]  → deployed_at, result, PR, lead time</span>
+set -euo pipefail
+R="${1:?usage: dora.sh owner/repo [environment]}"; ENV="${2:-prod}"
+gh api "repos/$R/deployments?environment=$ENV&amp;per_page=100" \
+  --jq '.[] | [.id, .sha, .created_at] | @tsv' |
+while IFS=$'\t' read -r id sha deployed; do
+  state=$(gh api "repos/$R/deployments/$id/statuses" --jq '.[0].state')   <span class="cm"># newest status first</span>
+  pr=$(gh api "repos/$R/commits/$sha/pulls" --jq '.[0].number // empty')
+  if [ -z "$pr" ]; then printf '%s\t%s\t-\tdirect push\n' "$deployed" "$state"; continue; fi
+  first=$(gh api "repos/$R/pulls/$pr/commits" --jq '.[0].commit.author.date')
+  mins=$(jq -n --arg a "$first" --arg b "$deployed" '(($b|fromdateiso8601)-($a|fromdateiso8601))/60|floor')
+  printf '%s\t%s\t#%s\t%s min\n' "$deployed" "$state" "$pr" "$mins"
+done</pre>
+        <pre class="code">cd ~/labs/fn1 &amp;&amp; bash dora.sh $ME/dora-lab | tee deploys.tsv
+<span class="out">2026-11-01T02:58:40Z	success	#3	17 min
+2026-11-01T02:31:12Z	success	#2	1 min
+2026-11-01T02:28:05Z	success	#1	1 min
+2026-11-01T02:14:31Z	success	-	direct push</span>
+awk -F'\t' '{n++} $2=="failure"{f++} END{printf "deploys: %d  failed: %d  change failure rate: %.0f%%\n", n, f, 100*f/n}' deploys.tsv
+<span class="out">deploys: 4  failed: 0  change failure rate: 0%</span>
+awk -F'\t' '$4 ~ / min$/ {print $4+0}' deploys.tsv | sort -n | awk '{a[NR]=$1} END{print "median lead time:", a[int((NR+1)/2)], "min"}'
+<span class="out">median lead time: 1 min</span></pre>
+        Deployment frequency is the line count divided by the days covered. You did four in under an hour; the clinic
+        team's October was 46 in 22 working days.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Map the value stream of the slow change.</strong> Pull the timestamps for PR #3 and fill in the table
+        below in your notes. Work time is the time someone or something was actively doing the change; wait time is
+        everything else.
+        <pre class="code">gh pr view 3 -R $ME/dora-lab --json commits,createdAt,mergedAt \
+  --jq '{first_commit: .commits[0].committedDate, opened: .createdAt, merged: .mergedAt}'
+<span class="out">{"first_commit":"2026-11-01T02:41:20Z","merged":"2026-11-01T02:57:31Z","opened":"2026-11-01T02:41:24Z"}</span>
+grep '#3' deploys.tsv | cut -f1
+<span class="out">2026-11-01T02:58:40Z</span></pre>
+        <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+          <table class="w-full text-sm bg-card dark:bg-carddark">
+            <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+              <th class="px-4 py-3">Stage</th><th class="px-4 py-3">From → to</th><th class="px-4 py-3">Work or wait</th><th class="px-4 py-3">Minutes (example)</th></tr></thead>
+            <tbody class="divide-y divide-line dark:divide-linedark align-top">
+              <tr><td class="px-4 py-3 font-semibold">PR checks</td><td class="px-4 py-3">opened → checks green (<code class="inline">gh pr checks 3</code>)</td><td class="px-4 py-3">work (CI)</td><td class="px-4 py-3">0.5</td></tr>
+              <tr><td class="px-4 py-3 font-semibold">Review queue</td><td class="px-4 py-3">checks green → merged</td><td class="px-4 py-3">wait</td><td class="px-4 py-3">15.5</td></tr>
+              <tr><td class="px-4 py-3 font-semibold">Pipeline</td><td class="px-4 py-3">merged → deployment created</td><td class="px-4 py-3">work (CI)</td><td class="px-4 py-3">1.2</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="mt-2">Flow efficiency here is about 1.7 ÷ 17.2 = 10%. Even in a lab with no humans, the queue dominates.</p>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">gh run list</code> shows a
+        green <code class="inline">pipeline</code> run for every merge; <code class="inline">dora.sh</code> prints one
+        line per prod deployment with a PR number and a lead time; you have computed deployment frequency, median lead
+        time and change failure rate from <code class="inline">deploys.tsv</code>; and your value-stream table for PR #3
+        shows which stage was waiting.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Ship a change that fails in production.</strong> Run <code class="inline">ship 1.2.0-rc1 "feat: release
+        candidate for reminders"</code>. The PR check is green and the merge goes through, but the prod run goes red.
+        Re-run <code class="inline">dora.sh</code> and the two <code class="inline">awk</code> lines, then answer: what is
+        your change failure rate, why did the PR check not catch it, and how long does recovery take once you ship the
+        fix with <code class="inline">ship 1.2.0 "fix: use a release version"</code>?
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">bash dora.sh $ME/dora-lab | head -2
+<span class="out">2026-11-01T03:12:09Z	success	#5	2 min</span>
+<span class="out">2026-11-01T03:06:44Z	failure	#4	1 min</span>
+awk -F'\t' '{n++} $2=="failure"{f++} END{printf "deploys: %d  failed: %d  change failure rate: %.0f%%\n", n, f, 100*f/n}' &lt;(bash dora.sh $ME/dora-lab)
+<span class="out">deploys: 6  failed: 1  change failure rate: 17%</span>
+<span class="cm"># recovery time = fixed deploy - failed deploy = 03:12:09 - 03:06:44 ≈ 5 min</span>
+gh run view $(gh run list --workflow pipeline.yml --status failure --limit 1 --json databaseId --jq '.[0].databaseId') --log-failed | tail -2
+<span class="out">deploy-prod	…	smoke test FAILED: bad version '1.2.0-rc1'</span></pre>
+          <p class="mt-2">The PR's <code class="inline">test</code> job only checks that <code class="inline">VERSION</code>
+          is not empty, so the only check that understood the version format ran <em>after</em> the deploy. That is the
+          Feedback way from Part I: move the check left. Add <code class="inline">bash smoke.sh</code> to the
+          <code class="inline">test</code> job through one more PR, then try <code class="inline">ship 1.3.0-rc1 …</code>
+          again: the PR check goes red and nothing reaches prod, so the failure never counts against the change failure
+          rate. In a real incident, recovery time starts at the first alert, not at the failed deploy (Part III).</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Clean up.</strong> Keep <code class="inline">dora.sh</code> for the evidence task; delete the practice
+        repository. Deleting needs one extra permission on your <code class="inline">gh</code> login.
+        <pre class="code">gh auth refresh -h github.com -s delete_repo
+gh repo delete $ME/dora-lab --yes
+<span class="out">✓ Deleted repository yourhandle/dora-lab</span>
+gh repo view $ME/dora-lab 2&gt;&amp;1 | head -1
+<span class="out">GraphQL: Could not resolve to a Repository with the name 'yourhandle/dora-lab'. (repository)</span>
+rm -rf ~/labs/fn1/dora-lab</pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
@@ -762,7 +969,7 @@ changes that would remove the most waiting. Label each as Flow, Feedback or Lear
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="pipeline"> <span>I can walk through every stage of the <code class="inline">booking-api</code> pipeline, say what each proves, and explain why the image is built once.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="dora"> <span>I can define the four DORA keys precisely and compute at least two of them from real GitHub data.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="toil-blame"> <span>I have started a toil log with at least three entries and rewritten one incident description in blameless language.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="vsm-report"> <span class="font-semibold">For one real repository (a client project, or an active open-source repo), produced a one-page delivery report: the four DORA keys for the last 30 days with the commands used, a value-stream map of one recent PR with flow efficiency, a short CALMS assessment, and the top three improvements ranked by expected lead-time saving (mentor evidence ✓).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="vsm-report"> <span class="font-semibold">Completed the hands-on lab, then, using <code class="inline">dora.sh</code> on one real repository (a client project, or an active open-source repo), produced a one-page delivery report: the four DORA keys for the last 30 days with the commands used, a value-stream map of one recent PR with flow efficiency, a short CALMS assessment, and the top three improvements ranked by expected lead-time saving (mentor evidence ✓).</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>

@@ -31,8 +31,8 @@ TRAILING = ["Working with Claude Code", "Skill ladder: what each score looks lik
 SCAFFOLD = ["<!DOCTYPE html>", "../../assets/site.css", "../../assets/site.js", "mermaid",
             'id="sidebar"', 'id="module-nav"', 'id="menu-btn"', "data-theme-toggle",
             "data-group-chip", 'id="page-nav"', "callout callout-why"]
-BALANCED = "div article table thead tbody tr pre svg ul ol nav aside main label".split()
-GATES = [("lines", 600, 1400), ("diagrams", 3, None), ("tables", 3, None),
+BALANCED = "div article table thead tbody tr pre svg ul ol nav aside main label details".split()
+GATES = [("lines", 600, 1800), ("diagrams", 3, None), ("tables", 3, None),
          ("code", 8, None), ("callouts", 5, None), ("resources", 5, 8)]
 
 
@@ -97,6 +97,24 @@ def check_page(path: Path, mods: dict) -> None:
             fail(page, f"section out of order: {h}")
         else:
             last = i
+    lab_i = html.find('font-bold mt-14">Hands-on lab: ')
+    wcc_i = html.find(">Working with Claude Code</h2>")
+    if lab_i < 0:
+        fail(page, "missing 'Hands-on lab: …' h2")
+    else:
+        if not (pos[-1] < lab_i < wcc_i):
+            fail(page, "Hands-on lab must sit between Part IV and Working with Claude Code")
+        lab = html[lab_i:wcc_i]
+        steps = [int(n) for n in re.findall(r'<div class="step-n">(\d+)</div>', lab)]
+        if len(steps) < 6:
+            fail(page, f"lab has {len(steps)} steps, need ≥6")
+        if steps != list(range(1, len(steps) + 1)):
+            fail(page, f"lab steps not numbered 1..N: {steps}")
+        if "Done when:" not in lab:
+            fail(page, "lab missing 'Done when:' callout")
+        last = lab.rfind('<div class="step-n">')
+        if last < 0 or "Clean up" not in lab[last:]:
+            fail(page, "last lab step must be 'Clean up'")
     cc = html[html.find(">Working with Claude Code</h2>"):html.find(">Skill ladder:")]
     for need in ("Let the agent do", "You must check", "callout callout-warn"):
         if need not in cc:

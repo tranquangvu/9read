@@ -724,6 +724,204 @@ remote_addr:       10.20.1.87                      <span class="cm"># the ALB no
         <code class="inline">tcpdump</code>, so use ECS Exec (<a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>)
         and VPC Flow Logs (<a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>) instead.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Trace one booking request through every layer</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will run the clinic stack locally (nginx in front of <code class="inline">booking-api</code>, the same shape
+        as an ALB in front of ECS tasks), then follow a request down the layers: DNS, TCP, HTTP through a proxy, TLS on
+        real public endpoints, and finally the raw packets with <code class="inline">tcpdump</code>. You finish by
+        breaking the backend and proving which hop produced the error, which is the skill that matters on call.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A packet capture of nginx calling booking-api, a read certificate chain, and a 502 traced to the hop that produced it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">About 2 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop (Docker) and a few public HTTPS sites</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">Docker and the lab kit in <code class="inline">~/clinic-app/</code> (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>); <code class="inline">dig</code>, <code class="inline">curl</code>, <code class="inline">openssl</code> and <code class="inline">nc</code>, which macOS and most Linux desktops already have</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Start the stack and check your tools.</strong> Compose (taught in <a href="./fn6.html" class="text-viol underline decoration-viol/40">FN6</a>)
+        starts three containers on a private network: <code class="inline">postgres</code>,
+        <code class="inline">booking-api</code> on port 8080 and <code class="inline">booking-web</code> (nginx) on port
+        3000. nginx forwards <code class="inline">/api/*</code> to the API.
+        <pre class="code">cd ~/clinic-app &amp;&amp; docker compose up --build -d
+docker compose ps --format '{{.Service}}  {{.Status}}'
+<span class="out">booking-api  Up 20 seconds (healthy)
+booking-web  Up 19 seconds
+postgres  Up 31 seconds (healthy)</span>
+which dig curl openssl nc &gt;/dev/null &amp;&amp; echo "tools ok"
+<span class="out">tools ok</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>DNS: follow a name to an address.</strong> <code class="inline">+noall +answer</code> prints only the
+        answer. The second number on each line is the <strong>TTL</strong>, how many seconds a resolver may cache it.
+        Then ask the domain's <strong>authoritative</strong> server directly: the <code class="inline">aa</code> flag
+        means "this answer comes from the owner, not a cache".
+        <pre class="code">dig +noall +answer docs.aws.amazon.com A
+<span class="out">docs.aws.amazon.com.          5083 IN CNAME docs.cname-proxy.amazon.com.
+docs.cname-proxy.amazon.com.  18   IN CNAME public.www.docs.aws.a2z.com.
+public.www.docs.aws.a2z.com.  18   IN CNAME prod.www.docs.aws.a2z.com.
+prod.www.docs.aws.a2z.com.    18   IN A     108.156.144.8</span>     <span class="cm"># three aliases, then the address</span>
+dig +short NS example.com
+<span class="out">hera.ns.cloudflare.com.
+elliott.ns.cloudflare.com.</span>
+dig @hera.ns.cloudflare.com example.com A +norecurse | grep flags
+<span class="out">;; flags: qr aa; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1</span>
+dig no-such-host.clinic.invalid | grep status
+<span class="out">;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NXDOMAIN, id: 28228</span>   <span class="cm"># the name does not exist at all</span></pre>
+        Addresses and TTLs you see will differ; that is DNS working. Now look inside the Compose network, where Docker
+        runs its own small DNS server so containers find each other by service name:
+        <pre class="code">docker run --rm --network clinic-app_default nicolaka/netshoot:v0.13 \
+  sh -c 'grep nameserver /etc/resolv.conf; dig +short booking-api'
+<span class="out">nameserver 127.0.0.11</span>                               <span class="cm"># Docker's embedded resolver</span>
+<span class="out">172.18.0.3</span>                                          <span class="cm"># booking-api's private IP; yours may differ</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>TCP: tell "refused" from "timed out".</strong> <code class="inline">nc -z</code> only opens a TCP
+        connection (the three-way handshake) and closes it. Try a port that is listening, one that is not, and an
+        address where nothing answers at all.
+        <pre class="code">nc -zv -w 3 127.0.0.1 8080
+<span class="out">Connection to 127.0.0.1 port 8080 [tcp/http-alt] succeeded!</span>
+nc -zv -w 3 127.0.0.1 8081
+<span class="out">nc: connectx to 127.0.0.1 port 8081 (tcp) failed: Connection refused</span>       <span class="cm"># host said no: RST</span>
+nc -zv -w 3 10.255.255.1 443
+<span class="out">nc: connectx to 10.255.255.1 port 443 (tcp) failed: Operation timed out</span>    <span class="cm"># nobody answered</span></pre>
+        The wording differs slightly on Linux. The meaning does not: <em>refused</em> means a host is there with nothing
+        on that port; <em>timed out</em> means packets are dropped on the way, which on AWS is nearly always a
+        security group, NACL or route.
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>HTTP: see what the proxy changes.</strong> Call the API through nginx and directly, and compare. The
+        <code class="inline">&gt;</code> lines are what curl sent, <code class="inline">&lt;</code> lines what came back.
+        <pre class="code">curl -sv localhost:3000/api/healthz 2&gt;&amp;1 | grep -E '^[&lt;&gt;] (GET|Host|HTTP|Server)'
+<span class="out">&gt; GET /api/healthz HTTP/1.1
+&gt; Host: localhost:3000
+&lt; HTTP/1.1 200 OK
+&lt; Server: nginx/1.27.5</span>
+curl -si localhost:8080/healthz | grep -ci '^server:'
+<span class="out">0</span>                                                   <span class="cm"># Node sends no Server header</span>
+docker compose logs booking-api --since 1m | grep -o '"path":"[^"]*"' | tail -1
+<span class="out">"path":"/healthz"</span>                                   <span class="cm"># nginx stripped /api before forwarding</span></pre>
+        The <code class="inline">Server</code> header tells you which hop answered. Remember that for the break-it step.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>TLS: read a real certificate chain.</strong> Ask a public server for its chain. Entry 0 is the
+        <strong>leaf</strong> (the site's own certificate), then the intermediates; <code class="inline">s:</code> is the
+        subject, <code class="inline">i:</code> the issuer. Each issuer is the next entry's subject: that is the chain.
+        <pre class="code">openssl s_client -connect docs.aws.amazon.com:443 -servername docs.aws.amazon.com &lt;/dev/null 2&gt;/dev/null \
+  | grep -E '^ *[0-9] s:|^ *i:'
+<span class="out"> 0 s:CN=docs.aws.amazon.com
+   i:C=US, O=Amazon, CN=Amazon RSA 2048 S25
+ 1 s:C=US, O=Amazon, CN=Amazon RSA 2048 S25
+   i:C=US, O=Amazon, CN=Amazon Root CA 1
+ 2 s:C=US, O=Amazon, CN=Amazon Root CA 1
+   i:C=US, ST=Arizona, L=Scottsdale, O=Starfield Technologies, Inc., CN=Starfield Services Root Certificate Authority - G2</span>
+openssl s_client -connect docs.aws.amazon.com:443 -servername docs.aws.amazon.com &lt;/dev/null 2&gt;/dev/null \
+  | openssl x509 -noout -enddate -checkend $((30*86400))
+<span class="out">notAfter=Apr 26 05:01:14 2027 GMT
+Certificate will not expire</span>                        <span class="cm"># i.e. not within the next 30 days</span>
+curl -sS -o /dev/null https://expired.badssl.com
+<span class="out">curl: (60) SSL certificate problem: certificate has expired</span>
+curl -sS -o /dev/null https://wrong.host.badssl.com
+<span class="out">curl: (60) SSL: no alternative certificate subject name matches target host name 'wrong.host.badssl.com'</span></pre>
+        <code class="inline">badssl.com</code> serves deliberately broken certificates so you can learn the two most
+        common errors without waiting for one in production. If your OpenSSL prints the chain in a slightly different
+        format (LibreSSL on older Macs), the subjects and issuers are still there.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>HTTP versions and timings.</strong> curl negotiates HTTP/2 over TLS when the server offers it (a TLS
+        feature called ALPN). The <code class="inline">alt-svc</code> header is how a server advertises HTTP/3.
+        <pre class="code">curl -so /dev/null --http1.1 -w '%{http_version}\n' https://www.cloudflare.com
+<span class="out">1.1</span>
+curl -so /dev/null -w '%{http_version}\n' https://www.cloudflare.com
+<span class="out">2</span>
+curl -sI https://www.cloudflare.com | grep -i alt-svc
+<span class="out">alt-svc: h3=":443"; ma=86400</span>                       <span class="cm"># "I also speak HTTP/3 on UDP 443"</span>
+curl -so /dev/null -w 'dns %{time_namelookup}  tcp %{time_connect}  tls %{time_appconnect}  total %{time_total}\n' https://docs.aws.amazon.com/
+<span class="out">dns 0.003104  tcp 0.065295  tls 0.126902  total 0.508203</span></pre>
+        Subtract neighbours, as in Part IV: here TCP took about 62 ms and TLS about 62 ms more, one round trip each.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Packets: watch nginx call the API.</strong> <code class="inline">booking-api</code> is distroless and
+        has no tools, so attach a toolbox container to <em>its</em> network namespace and capture there. Run the capture
+        in one terminal and the request in a second one.
+        <pre class="code"><span class="cm"># terminal 1</span>
+docker run --rm -it --network container:clinic-app-booking-api-1 nicolaka/netshoot:v0.13 \
+  tcpdump -ni eth0 -A -c 6 'tcp port 8080'
+<span class="cm"># terminal 2</span>
+curl -s localhost:3000/api/bookings
+<span class="cm"># back in terminal 1</span>
+<span class="out">09:20:11.101 IP 172.18.0.4.51234 &gt; 172.18.0.3.8080: Flags [S], seq 2918…   </span><span class="cm"># SYN from nginx</span>
+<span class="out">09:20:11.101 IP 172.18.0.3.8080 &gt; 172.18.0.4.51234: Flags [S.], seq 7731…, ack 2918…
+09:20:11.101 IP 172.18.0.4.51234 &gt; 172.18.0.3.8080: Flags [.], ack 1, …
+09:20:11.102 IP 172.18.0.4.51234 &gt; 172.18.0.3.8080: Flags [P.], …, length 95
+GET /bookings HTTP/1.0
+Host: localhost
+Connection: close</span></pre>
+        Three things the proxy changed: the path lost <code class="inline">/api</code>, the version dropped to HTTP/1.0
+        (nginx's default towards upstreams), and a new TCP connection is opened per request. An ALB rewrites things too;
+        Part IV lists which headers it adds.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> you can show an answer with the
+        <code class="inline">aa</code> flag and an <code class="inline">NXDOMAIN</code>; you produced one "refused" and
+        one "timed out" and can say which layer each points to; you can name the leaf, intermediate and root of the
+        <code class="inline">docs.aws.amazon.com</code> chain; and your capture shows the SYN, SYN-ACK and the
+        <code class="inline">GET /bookings</code> nginx sent.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Kill the backend.</strong> The lab stack has <code class="inline">CHAOS=on</code>, so this makes the API
+        exit: <code class="inline">curl -s localhost:8080/admin/crash</code>. Now
+        <code class="inline">curl -si localhost:3000/api/bookings</code> fails after a few seconds. Using only
+        <code class="inline">curl -si</code>, <code class="inline">docker compose ps -a</code> and
+        <code class="inline">docker compose logs booking-web</code>, say which hop generated the error and why, then bring
+        the stack back.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">curl -si localhost:3000/api/bookings | grep -E '^HTTP|^Server'
+<span class="out">HTTP/1.1 502 Bad Gateway
+Server: nginx/1.27.5</span>                                <span class="cm"># nginx answered: the API never did</span>
+docker compose ps -a --format '{{.Service}}  {{.Status}}' | grep api
+<span class="out">booking-api  Exited (1) 40 seconds ago</span>
+docker compose logs booking-web | grep -m1 upstream
+<span class="out">… connect() failed (113: Host is unreachable) while connecting to upstream, … upstream: "http://172.18.0.3:8080/bookings"</span>
+<span class="cm"># the error text in brackets can differ by kernel; "while connecting to upstream" is the part that matters</span>
+docker compose start booking-api &amp;&amp; sleep 5 &amp;&amp; curl -si localhost:3000/api/bookings | head -1</pre>
+          <p class="mt-2">A 502 with <code class="inline">Server: nginx</code> means the proxy is fine and could not get an
+          answer from the upstream (on some machines the connect hangs instead and you get a 504 after 60 s; same cause).
+          The API container exited with code 1. If you still get 502 after starting the API, check the IP in the log line:
+          nginx looked up <code class="inline">booking-api</code> once at start-up and keeps the old address if the
+          container came back with a new one. <code class="inline">docker compose restart booking-web</code> fixes it.
+          That is DNS caching in a long-lived client, the same trap as an app that caches an RDS or ALB address forever.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Stop the stack and delete its database volume, then remove the toolbox image.
+        <pre class="code">cd ~/clinic-app &amp;&amp; docker compose down -v
+<span class="out"> ✔ Container clinic-app-booking-web-1  Removed
+ ✔ Container clinic-app-booking-api-1  Removed
+ ✔ Container clinic-app-postgres-1     Removed
+ ✔ Volume clinic-app_pgdata            Removed
+ ✔ Network clinic-app_default          Removed</span>
+docker image rm nicolaka/netshoot:v0.13 &gt;/dev/null
+docker ps --filter name=clinic-app -q | wc -l
+<span class="out">       0</span></pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

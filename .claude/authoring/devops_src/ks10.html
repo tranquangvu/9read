@@ -864,6 +864,274 @@ kubectl argo rollouts promote booking-api -n booking   <span class="cm"># skip t
         bad version.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Run booking-api from your own GitOps repo with Argo CD</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will install Argo CD on <code class="inline">kind</code>, create your own <code class="inline">lab-$ME-clinic-gitops</code>
+        repository on GitHub, and bootstrap it with one root Application (app-of-apps). The KS9 chart gains a dev Postgres and
+        a migration Job ordered by sync waves. Then you prove the GitOps rules on yourself: a <code class="inline">kubectl</code>
+        change is reverted, a release is a commit, and a rollback is a <code class="inline">git revert</code>. Canary analysis
+        with Argo Rollouts needs metrics and a gateway, so it stays in Part IV; the full platform version is
+        <a href="./ks14.html" class="text-viol underline decoration-viol/40">KS14</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">booking-api 1.0.0 → 1.1.0 → 1.0.0 on kind, each step a commit, with the migration Job always running before the new Pods</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop (<code class="inline">kind</code>, Kubernetes 1.33) and a public repository in your own GitHub account</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>) incl. <code class="inline">gh</code> and <code class="inline">argocd</code>, the lab kit in <code class="inline">~/clinic-app/</code>, the chart from the <a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a> lab in <code class="inline">~/labs/ks9/charts/booking-api</code> (redo KS9 steps 2–4 if you deleted it)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Create the cluster and load two image tags.</strong> Same code, two tags, so you can watch a release happen.
+        <pre class="code">export ME=yourhandle                                  <span class="cm"># your GitHub handle</span>
+mkdir -p ~/labs/ks10 &amp;&amp; cd ~/labs/ks10
+kind create cluster --name lab-ks10 --image kindest/node:v1.33.1
+docker build -t booking-api:1.0.0 ~/clinic-app/booking-api &amp;&amp; docker tag booking-api:1.0.0 booking-api:1.1.0
+kind load docker-image booking-api:1.0.0 booking-api:1.1.0 --name lab-ks10</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Install Argo CD, pinned, and log in with the CLI.</strong> Server-side apply is required because the CRDs are
+        too large for a client-side apply. Leave the port-forward running in its own terminal.
+        <pre class="code">kubectl create namespace argocd
+kubectl apply -n argocd --server-side --force-conflicts \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.4/manifests/install.yaml
+kubectl -n argocd rollout status deploy/argocd-server
+kubectl -n argocd port-forward svc/argocd-server 8443:443        <span class="cm"># terminal 2</span>
+argocd login localhost:8443 --insecure --username admin \
+  --password "$(argocd admin initial-password -n argocd | head -1)"
+<span class="out">'admin:login' logged in successfully</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Create your GitOps repository and copy the chart in.</strong> The repository is public so Argo CD needs no
+        credentials; it contains nothing secret except a throwaway dev database password, which you would never commit
+        for a real environment (Part III).
+        <pre class="code">gh repo create lab-$ME-clinic-gitops --public --clone &amp;&amp; cd lab-$ME-clinic-gitops
+mkdir -p apps platform/namespaces services
+cp -r ~/labs/ks9/charts/booking-api services/booking-api
+echo 'devPostgres: { enabled: false }' &gt;&gt; services/booking-api/values.yaml</pre>
+        Then add one property to <code class="inline">services/booking-api/values.schema.json</code>, after
+        <code class="inline">"env"</code>, so the schema accepts the new value:
+        <pre class="code">    "env": { "type": "object", "additionalProperties": { "type": "string" } },
+    "devPostgres": { "type": "object" }</pre>
+        <span class="code-label">services/booking-api/values-dev.yaml</span>
+        <pre class="code">image: { tag: "1.0.0" }
+devPostgres: { enabled: true }                   <span class="cm"># lab only: real environments use RDS</span>
+env:
+  CHAOS: "on"
+  MIGRATE_ON_START: "false"                      <span class="cm"># only the Job changes the schema</span>
+  DATABASE_URL: postgres://clinic:clinic@booking-db:5432/clinic</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Add the database and the migration Job, ordered by waves.</strong> Inside one sync Argo CD applies wave
+        −2 (Postgres), waits until it is healthy, runs the wave −1 Job and waits for it to complete, then applies wave 0
+        (the API). The Job is a <code class="inline">Sync</code> hook, so it runs again on every sync.
+        <span class="code-label">services/booking-api/templates/migrate-job.yaml</span>
+        <pre class="code">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "booking-api.name" . }}-migrate
+  annotations:
+    argocd.argoproj.io/hook: Sync                     <span class="cm"># runs inside the sync, ordered by wave</span>
+    argocd.argoproj.io/sync-wave: "-1"                <span class="cm"># after the DB (-2), before the app (0)</span>
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 0                                     <span class="cm"># a failed migration must not retry blindly</span>
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          args: ["server.js", "migrate"]              <span class="cm"># args, not command: the entrypoint is node</span>
+          env:
+            {{- range $k, $v := .Values.env }}
+            - { name: {{ $k }}, value: {{ $v | quote }} }
+            {{- end }}
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }</pre>
+        <span class="code-label">services/booking-api/templates/dev-postgres.yaml</span>
+        <pre class="code">{{- if .Values.devPostgres.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booking-db
+  annotations: { argocd.argoproj.io/sync-wave: "-2" }  <span class="cm"># first: the Job needs it</span>
+spec:
+  selector: { matchLabels: { app: booking-db } }
+  template:
+    metadata: { labels: { app: booking-db } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env: [{ name: POSTGRES_USER, value: clinic }, { name: POSTGRES_PASSWORD, value: clinic }, { name: POSTGRES_DB, value: clinic }]
+          readinessProbe: { exec: { command: ["pg_isready", "-U", "clinic"] }, periodSeconds: 5 }
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: booking-db
+  annotations: { argocd.argoproj.io/sync-wave: "-2" }
+spec: { selector: { app: booking-db }, ports: [{ port: 5432 }] }
+{{- end }}</pre>
+        <pre class="code">helm template booking-api services/booking-api -n booking -f services/booking-api/values-dev.yaml \
+  | kubeconform -strict -summary -kubernetes-version 1.33.0
+<span class="out">Summary: 5 resources found parsing stdin - Valid: 5, Invalid: 0, Errors: 0, Skipped: 0</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Write the app-of-apps and bootstrap it.</strong> <code class="inline">root.yaml</code> is the only thing you ever
+        apply by hand. It points at <code class="inline">apps/</code>, and every file there is a child Application. The
+        unquoted heredocs fill in your handle.
+        <pre class="code">export REPO=https://github.com/$ME/lab-$ME-clinic-gitops.git
+app() { cat &lt;&lt;EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: $1
+  namespace: argocd
+  annotations: { argocd.argoproj.io/sync-wave: "$3" }
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source: { repoURL: $REPO, targetRevision: main, path: $2 $4 }
+  destination: { server: https://kubernetes.default.svc, namespace: ${5:-argocd} }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    retry: { limit: 5, backoff: { duration: 10s, factor: 2, maxDuration: 2m } }
+EOF
+}
+app root apps 0 &gt; root.yaml
+app namespaces platform/namespaces -1 &gt; apps/namespaces.yaml
+app booking-api services/booking-api 0 ', helm: { releaseName: booking-api, valueFiles: [values-dev.yaml] }' booking \
+  &gt; apps/booking-api.yaml
+printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: booking\n  labels: { pod-security.kubernetes.io/warn: restricted }\n' \
+  &gt; platform/namespaces/booking.yaml
+git add -A &amp;&amp; git commit -qm "bootstrap: root app, namespaces, booking-api 1.0.0" &amp;&amp; git push -q
+kubectl apply -f root.yaml</pre>
+        Read the three generated files before you push: <code class="inline">apps/booking-api.yaml</code> must show
+        <code class="inline">path: services/booking-api, helm: {…}</code> and <code class="inline">namespace: booking</code>.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Watch the sync order, then use the API.</strong> The first sync takes a minute or two.
+        <pre class="code">argocd app list -o name
+<span class="out">argocd/booking-api
+argocd/namespaces
+argocd/root</span>
+argocd app wait booking-api --health --timeout 300
+kubectl -n booking get events --sort-by=.lastTimestamp | grep -E 'Created pod|Completed' | cut -c1-110
+<span class="out">… replicaset-controller  Created pod: booking-db-6f…        <span class="cm"># wave -2</span>
+… job-controller         Created pod: booking-api-migrate-… <span class="cm"># wave -1</span>
+… job-controller         Job completed
+… replicaset-controller  Created pod: booking-api-5d…       <span class="cm"># wave 0</span></span>
+kubectl -n booking logs job/booking-api-migrate | grep -o '"msg":"[^"]*"'
+<span class="out">"msg":"migration ok"</span>
+kubectl -n booking run curl --rm -i --restart=Never --image=curlimages/curl:8.11.1 -- \
+  curl -s -XPOST booking-api/bookings -H 'content-type: application/json' -d '{"patient":"An","slot":"2026-11-02T09:00"}'
+<span class="out">{"id":1,"patient":"An","slot":"2026-11-02T09:00:00.000Z",…}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Try to change the cluster behind Git's back.</strong> Self-heal reverts the drift within seconds, and the
+        reconciliation shows up in the app's events. This is why people in a GitOps team stop using
+        <code class="inline">kubectl edit</code> (<a href="./ks15.html" class="text-viol underline decoration-viol/40">KS15</a>).
+        <pre class="code">kubectl -n booking scale deploy booking-api --replicas=4; sleep 20
+kubectl -n booking get deploy booking-api -o jsonpath='{.spec.replicas}{"\n"}'
+<span class="out">1</span>
+kubectl -n argocd get events --field-selector involvedObject.name=booking-api | grep -i -m2 sync
+<span class="out">… OperationStarted   Initiated automated sync to '3f9c2ab…'
+… OperationCompleted  Sync operation to 3f9c2ab… succeeded</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Release 1.1.0 with a commit.</strong> Argo CD polls Git every three minutes;
+        <code class="inline">--refresh</code> asks it to look now. The migration Job runs again before the new Pods.
+        <pre class="code">sed -i.bak 's/tag: "1.0.0"/tag: "1.1.0"/' services/booking-api/values-dev.yaml &amp;&amp; rm services/booking-api/values-dev.yaml.bak
+git commit -qam "booking-api 1.1.0" &amp;&amp; git push -q
+argocd app get booking-api --refresh &gt;/dev/null &amp;&amp; argocd app wait booking-api --health --timeout 300
+kubectl -n booking run curl --rm -i --restart=Never --image=curlimages/curl:8.11.1 -- curl -s booking-api/healthz
+<span class="out">{"ok":true,"version":"1.1.0"}</span>
+argocd app history booking-api
+<span class="out">ID  DATE                           REVISION
+0   2026-11-01 10:12:40 +0700 +07  main (3f9c2ab)
+1   2026-11-01 10:31:05 +0700 +07  main (8a41d7e)</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Roll back the GitOps way.</strong> First try the button-style rollback and read why Argo CD refuses it. Then
+        revert the commit: Git stays the single source of truth, and the history shows who rolled back and why.
+        <pre class="code">argocd app rollback booking-api 0
+<span class="out">FATA[0000] rpc error: code = FailedPrecondition desc = rollback cannot be initiated when auto-sync is enabled</span>
+git revert --no-edit HEAD &amp;&amp; git push -q
+argocd app get booking-api --refresh &gt;/dev/null &amp;&amp; argocd app wait booking-api --health --timeout 300
+kubectl -n booking get deploy booking-api -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+<span class="out">booking-api:1.0.0</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">argocd app list</code> shows three
+        apps <code class="inline">Synced</code> and <code class="inline">Healthy</code>; the events show Postgres, then the migrate
+        Job, then the API, on each of the three syncs; a <code class="inline">kubectl scale</code> was reverted without you doing
+        anything; your repository's log reads bootstrap → 1.1.0 → revert, and the cluster runs
+        <code class="inline">booking-api:1.0.0</code>; and you can explain why <code class="inline">argocd app rollback</code> was refused.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Ship a migration that cannot start.</strong> Someone copies the migration command from the ECS task
+        definition in <a href="./cn3.html" class="text-viol underline decoration-viol/40">CN3</a>, where it is called
+        <code class="inline">command</code>. Make the same change together with a release to 1.1.0, push, and refresh. The app
+        goes <code class="inline">OutOfSync</code> / sync failed, yet <code class="inline">/healthz</code> still answers 1.0.0
+        and users notice nothing. Work out what failed, why the old version is still serving, and how to recover, before you
+        open the answer.
+        <pre class="code">sed -i.bak 's/          args: \["server.js"/          command: ["server.js"/' services/booking-api/templates/migrate-job.yaml
+sed -i.bak 's/tag: "1.0.0"/tag: "1.1.0"/' services/booking-api/values-dev.yaml
+rm services/booking-api/templates/*.bak services/booking-api/*.bak
+git commit -qam "booking-api 1.1.0 (migration command from ECS)" &amp;&amp; git push -q &amp;&amp; argocd app get booking-api --refresh | tail -4</pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">argocd app get booking-api | grep -E 'Sync Status|Message|migrate'
+<span class="out">Message:  … Job has reached the specified backoff limit
+batch  Job  booking  booking-api-migrate  Failed  …</span>
+kubectl -n booking describe pod -l job-name=booking-api-migrate | grep -m1 -A1 'exec:'
+<span class="out">… exec: "server.js": executable file not found in $PATH</span></pre>
+          <p class="mt-2">In Kubernetes, <code class="inline">command</code> replaces the image's entrypoint
+          (<code class="inline">node</code>) and <code class="inline">args</code> replaces its default arguments. ECS's
+          <code class="inline">command</code> is Kubernetes' <code class="inline">args</code>. The container tried to execute
+          <code class="inline">server.js</code> as a program and never started. Because the Job is in wave −1, the sync
+          stopped there and wave 0 (the new Deployment) was never applied: the waves did exactly their job. Recover with
+          <code class="inline">git revert --no-edit HEAD &amp;&amp; git push</code> and a refresh, then ship 1.1.0 again with only
+          the tag change. Never "fix" it with <code class="inline">kubectl</code>: self-heal would undo you, and Git would
+          still be wrong.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">11</div><div class="step-body">
+        <strong>Clean up.</strong> Deleting the root Application first lets the finalizers remove the child apps and their
+        objects in order, which is the habit you need on EKS (where a forgotten Ingress leaves an ALB behind). Then delete
+        the cluster and the repository.
+        <pre class="code">kubectl -n argocd delete application root --wait
+kubectl get ns booking                            <span class="cm"># repeat until it is gone (a minute or so)</span>
+<span class="out">Error from server (NotFound): namespaces "booking" not found</span>
+kind delete cluster --name lab-ks10
+gh auth refresh -s delete_repo                    <span class="cm"># once: allows gh to delete repositories</span>
+gh repo delete $ME/lab-$ME-clinic-gitops --yes
+cd ~/labs/ks10 &amp;&amp; rm -rf lab-$ME-clinic-gitops</pre>
+        Keep the repository instead if you go on to <a href="./ks14.html" class="text-viol underline decoration-viol/40">KS14</a>
+        the same week; its layout is the starting point there.
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
