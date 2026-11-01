@@ -2,7 +2,8 @@
 
 The third program on the site (`devops/`). Pages use the same markup vocabulary as AIFDE and the
 internship, so everything in `PATTERNS.md` applies. The page shape is the internship shape from
-`INTERN-SPEC.md` (4 Parts, Claude Code section, no labs), with the differences below. Where the
+`INTERN-SPEC.md` (4 Parts, Claude Code section, no lab cards or modals), plus a mandatory inline
+**Hands-on lab** section, with the differences below. Where the
 documents disagree, this one wins for `devops/`.
 
 ## Audience and voice
@@ -45,6 +46,8 @@ documents disagree, this one wins for `devops/`.
   `gha-clinic-infra-apply`; shared workflows repo `golden-owl/gha-platform`; modules repo `golden-owl/terraform-modules`.
 - Prod subnets: public `10.20.0.0/24`–`10.20.2.0/24`, private `10.20.32.0/19`, `10.20.64.0/19`, `10.20.96.0/19`,
   isolated `10.20.200.0/24`–`10.20.202.0/24`. gol-shared VPC `10.0.0.0/16`.
+- Sandbox (labs only): hosted zone `sandbox.clinic.example.com` in gol-sandbox for optional HTTPS steps
+  (learners use `$ME.sandbox.clinic.example.com`); labs work over plain HTTP on the ALB DNS name without it.
 - Buckets `gol-<env>-clinic-uploads`, `gol-prod-clinic-web-assets`. Service Connect namespace `clinic.internal`.
 - Terraform owns infra; the deploy pipeline owns the running image (Terraform ignores `task_definition`
   / `desired_count` on ECS services). Share values between states via SSM parameters, not `terraform_remote_state`.
@@ -74,27 +77,105 @@ Gateway API `v1`; Argo CD 3.x; Helm 3; GitHub Actions authenticating to AWS via 
    **"Why it matters in production:"**.
 2. **Exactly 4 Parts** with the Part I–IV kicker classes (PATTERNS §1). Each Part ≥ 3 `h3`s
    (QA enforces ≥ 2).
-3. `<h2>Working with Claude Code</h2>`: 2–4 prompts in `<pre class="code">`, the two-up grid
+3. `<h2>Hands-on lab: <title></h2>` — a step-by-step practical a newcomer can complete alone. See
+   "Hands-on lab contract" below. This is the part of the page that turns reading into skill.
+4. `<h2>Working with Claude Code</h2>`: 2–4 prompts in `<pre class="code">`, the two-up grid
    **"Let the agent do"** / **"You must check"**, and a `callout-warn` of red flags in AI-written
    infra for this topic.
-4. `Skill ladder: what each score looks like` (labels 0 No exposure · 1 Awareness · 2 Works with
+5. `Skill ladder: what each score looks like` (labels 0 No exposure · 1 Awareness · 2 Works with
    support · 3 Works independently · 4 Leads &amp; coaches; `.target` on 3 for Core, 2 for Elective),
    then `callout-tip` "Self-check before claiming 3:" (or 2).
-5. `Pitfalls &amp; pro tips`: 4–6 cards, ✗ first then ✓.
-6. `Evidence checklist`: 4–6 `evidence-box` items with stable lowercase `data-key`s. The **last** item
+6. `Pitfalls &amp; pro tips`: 4–6 cards, ✗ first then ✓.
+7. `Evidence checklist`: 4–6 `evidence-box` items with stable lowercase `data-key`s. The **last** item
    is `font-semibold`, ends with `(mentor evidence ✓)` and is a practice task of a few hours that
    produces a showable artifact (PR, `terraform plan`, Grafana screenshot, runbook, URL).
-7. `Resources`: 5–8 links, official docs only (`docs.aws.amazon.com`, `aws.amazon.com/blogs`,
+8. `Resources`: 5–8 links, official docs only (`docs.aws.amazon.com`, `aws.amazon.com/blogs`,
    `developer.hashicorp.com`, `registry.terraform.io`, `kubernetes.io`, `docs.github.com`,
    `argo-cd.readthedocs.io`, `docs.docker.com`, `boto3.amazonaws.com`, `docs.ansible.com`, `backstage.io`, `docs.claude.com`, `karpenter.sh`, `helm.sh`, `prometheus.io`, `grafana.com/docs`,
    `docs.datadoghq.com`, `opentelemetry.io`, `sre.google`, `dora.dev`, `github.com/<org>` READMEs).
 
 No lab cards, no `<dialog>`, no "In the field" section.
 
+## Hands-on lab contract (every module)
+The reader is a newcomer following along at a keyboard. "Theory only" pages are a bug. The lab must
+be something they can actually run, today, with the tools below, and know for certain whether it worked.
+
+**Where labs run.** Prefer local (Docker, `kind`, Terraform with a local backend) whenever the topic
+allows it. When AWS is needed, labs run in the learner's sandbox: account `gol-sandbox` 888899990000
+via `aws sso login --profile gol-sandbox` (permission set `SandboxAdmin`), or their own personal AWS
+account, always in `ap-southeast-1`. Every lab starts with `export ME=<your-github-handle> AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1`
+(so commands and the Terraform provider need no `--profile`/`profile =`) and names
+every resource `lab-$ME-<thing>`, tagged `Owner=$ME` and `Lab=<CODE>`, so ten people can share one
+sandbox account. Never use the real `gol-dev/staging/prod` accounts in a lab.
+
+**Toolchain** (set up once, listed on `devops/index.html#lab-setup`): AWS CLI v2, Terraform ≥ 1.10,
+Docker with buildx, `kind` ≥ 0.27, `kubectl` 1.33, Helm 3, `k9s`, `jq`, `yq`, `gh`, the `argocd` CLI,
+`stern`, `k6`. A lab that needs anything else installs it in step 1.
+
+**Lab app.** The lab kit in `devops/lab-kit/` (served at `../lab-kit/` from a module page) is a real,
+runnable stand-in for the clinic platform. Labs use it instead of inventing app code:
+- `booking-api/server.js` — Node 22, port 8080. `GET /healthz` (liveness, process only), `GET /readyz`
+  (readiness, checks Postgres; 503 while draining), `GET|POST /bookings` (JSON `{patient, slot}`).
+  `node server.js migrate` (container command `["server.js","migrate"]`) creates the schema and exits —
+  use it for the migration run-task / Job; `MIGRATE_ON_START=false` stops the server migrating itself.
+  Env: `DATABASE_URL` (in-memory store if unset), `DATABASE_SSL=true` for RDS, `QUEUE_URL` (sends a
+  `booking.created` SQS message on POST), `APP_VERSION`, `DRAIN_MS` (default 5000).
+  `CHAOS=on` enables drill endpoints: `/admin/leak` (+50 MiB per call → OOMKilled drills),
+  `/admin/burn?ms=2000` (pins a core → HPA/latency drills), `/admin/crash` (exit 1 → CrashLoopBackOff).
+  Logs are one JSON object per line (`ts, level, msg, service, version, method, path, status, ms`).
+  Distroless image; the health check is `["CMD", "/nodejs/bin/node", "healthcheck.js"]`.
+- `booking-worker/worker.js` — long-polls `QUEUE_URL`, logs `reminder sent`, deletes after work, stops
+  cleanly on SIGTERM. Needs `sqs:ReceiveMessage`, `sqs:DeleteMessage`.
+- `booking-web/` — nginx-unprivileged on 8080, static page, proxies `/api/*` to `API_UPSTREAM`
+  (default `http://booking-api:8080`), `/healthz`.
+- `compose.yaml` — Postgres 16 + api + web on `localhost:3000` / `:8080`.
+- Get it with `bash fetch.sh <site>/devops/lab-kit` or by copying the files; the folder is called
+  `clinic-app/` in labs. Images are built `--platform linux/arm64` and pushed to the learner's own
+  ECR repo `lab-$ME/booking-api` in the sandbox account.
+
+**Reference implementation:** the CN1 lab (`devops_src/cn1.html`). Match its shape and tone.
+
+**Markup** (after Part IV, before Working with Claude Code):
+```html
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Put booking-api on Fargate behind an ALB</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">What you will build and why, in 2–3 sentences.</p>
+      <!-- a small table (scroll wrapper) with rows: Goal · Time · Where · Cost · You need -->
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up.</strong> One or two sentences.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login</pre>
+      </div></div>
+      …
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> 3–5 concrete, checkable results …</div>
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>   <!-- strongly recommended -->
+      …
+      <div class="step"><div class="step-n">N</div><div class="step-body"><strong>Clean up.</strong> …</div></div>
+```
+Rules:
+- **≥ 6 numbered steps**, numbered 1..N in order. Each step is one action with the exact command or
+  file to write, and the expected output (`<span class="out">`) whenever a command prints something
+  the learner should compare against. No "configure X appropriately": give the value.
+- Files the learner writes are shown in full (or as a complete diff), under ~30 lines per block.
+- A **`Done when:`** `callout-tip` with 3–5 checks the learner can run themselves.
+- A **"Break it, then fix it"** block: inject one realistic fault (wrong role, bad probe, missing
+  route, `CHAOS` endpoint…), show the symptom they will see, and let them find the cause with the tools
+  taught in the module. Put the answer in a `<details>` element so they try first.
+- The **last step is "Clean up"**: exact teardown commands in the right order (e.g. delete Ingress
+  before destroying the cluster, empty buckets before deleting them) and how to confirm nothing is
+  left billing. AWS labs add a `callout-warn` with the hourly cost of what they created.
+- Labs build on earlier labs where natural ("the VPC from the AW2 lab"), but each lab says how to
+  recreate what it depends on in one or two commands if the learner tore it down.
+- Target 120–260 lines for the lab section. The two end-to-end modules (CN3, KS14) are labs in their
+  entirety: their four Parts are the build phases and their Hands-on lab is a rollback / failure drill.
+
 ## Density gates (`qa.py --program devops`)
-- 600–1,400 lines once built (aim ~900–1,200)
+- 600–1,800 lines once built (aim ~1,000–1,400 including the lab)
 - ≥ 3 diagrams (SVG `role="img"` in `.diagram-card` and/or Mermaid) — aim for 4
 - ≥ 3 tables · ≥ 8 code blocks · ≥ 5 callouts incl. ≥ 1 `callout-warn` · 5–8 resources
+- Hands-on lab: present, between Part IV and Working with Claude Code, ≥ 6 steps numbered 1..N,
+  contains `Done when:` and a final `Clean up` step
 
 ## Links
 - In-program: `<a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>`. Link to
@@ -128,6 +209,7 @@ Each module owns the topics listed. A neighbour writes one sentence and a link.
 | CI3 | Secrets Manager vs SSM Parameter Store, KMS keys, envelope encryption, key policies, rotation, injecting secrets into ECS/EKS/Lambda/GitHub Actions, External Secrets Operator (hand-off to KS7 for the EKS details), `.env` hygiene, secret scanning and leaked-key response |
 | CI4 | ECR repositories, lifecycle policies, immutable tags, cross-account pull, image scanning (ECR enhanced/Inspector, Trivy), SBOM (Syft), signing (cosign / AWS Signer), provenance and SLSA levels, dependency pinning and Dependabot/Renovate |
 | CN1 | ECS concepts (cluster, task definition, task, service), Fargate vs EC2 launch type, task role vs execution role, networking mode awsvpc, ALB integration, logging with awslogs/FireLens, ECS Exec, Terraform for an ECS service |
+| CN3 | **End-to-end hands-on build of the whole clinic platform on ECS Fargate** in the sandbox: Terraform layout by layer (network → data → ECS platform → services), ECR repos and first arm64 push, RDS + Valkey + SQS + S3, secrets in Secrets Manager, ALB with host/path rules and ACM, the three services (api, web, worker) with roles, Service Connect between web and api, DB migrations as a one-off `run-task`, the GitHub Actions build-and-deploy pipeline with OIDC, verification checklist (curl, logs, metrics, alarms), rollback, and ordered teardown. Assembles CN1/CN2/AW*/IA*/CI*; links to them for concepts and never re-teaches them |
 | CN2 | ECS deployment types (rolling with circuit breaker, blue/green with CodeDeploy, ECS native blue/green), Service Auto Scaling (target tracking, step, scheduled), capacity providers and Fargate Spot, Service Connect, ECS on EC2 when needed, ECS vs EKS decision table |
 | KS1 | Why Kubernetes, the control loop / desired state, control plane components (API server, etcd, scheduler, controller manager) and node components (kubelet, kube-proxy, container runtime), Pods, ReplicaSets, Deployments, Services, Namespaces, labels/selectors, `kubectl` fluency, local clusters (kind) |
 | KS2 | Deployments vs StatefulSets vs DaemonSets vs Jobs/CronJobs, rollout strategy fields, ConfigMaps and Secrets (as objects), env vs volume mounts, probes (liveness/readiness/startup), requests/limits, QoS classes, LimitRange/ResourceQuota, PodDisruptionBudgets, affinity/anti-affinity, taints/tolerations, topology spread, graceful shutdown |
@@ -140,6 +222,8 @@ Each module owns the topics listed. A neighbour writes one sentence and a link.
 | KS9 | Helm charts (structure, templates, values, helpers, dependencies), chart versioning and OCI registries (ECR), `helm diff`, helmfile mention, Kustomize bases/overlays/patches, when to use which, rendering and validating manifests in CI (kubeconform) |
 | KS10 | GitOps principles, Argo CD architecture, Applications, Projects, sync policies and waves/hooks, app-of-apps and ApplicationSets for multi-env/multi-cluster, image updater, repo layout for `clinic-gitops`, Argo Rollouts canary/blue-green with analysis, secrets in GitOps |
 | KS11 | EKS version upgrades (control plane, add-ons, nodes, API deprecations, `pluto`/upgrade insights), node rotation, troubleshooting playbook (Pending, CrashLoopBackOff, ImagePullBackOff, OOMKilled, DNS, networking, 5xx at the ALB), `kubectl debug`, events, cluster backups, runbooks |
+| KS14 | **End-to-end hands-on build of the whole clinic platform on EKS** in the sandbox: rehearse locally on `kind` first, then Terraform VPC + EKS (Auto Mode or managed nodes + Karpenter), add-ons (AWS LB Controller, ExternalDNS, External Secrets, metrics-server) with Pod Identity, the data layer, one Helm chart for the three services (probes, resources, PDB, HPA, ServiceAccount), Ingress with ACM, migrations as an Argo CD PreSync Job, Argo CD app-of-apps from `clinic-gitops`, the CI pipeline that builds, pushes and bumps the image tag in Git, verification, rollback via Git revert, and ordered teardown (Ingress/LBs before the cluster). Assembles KS1–KS11; links to them for concepts |
+| KS15 | **Operating production Kubernetes day to day**: the access model (Identity Center → access entries, read-only by default, time-boxed break-glass, kubeconfig contexts and a prod-safe shell prompt), safe `kubectl` habits (`--context`/`-n` always, `diff`, `--dry-run=server`, never `edit` under GitOps, Argo self-heal), the debugging toolbox (k9s, stern, `kubectl debug` ephemeral containers and node debug, `port-forward`, `events`, `top`, Logs Insights / Loki queries), a triage workflow (scope → what changed → layer → mitigate → fix → verify), mitigation vs fix patterns (Git revert / Argo rollback, `rollout undo` only as break-glass then reconcile Git, scale, cordon/drain, restart, feature flag), capturing evidence for the postmortem, and a 10-scenario break-and-fix drill set on `kind` using the lab kit's CHAOS endpoints. KS11 keeps upgrades and the failure-mode reference; KS15 is the hands-on operating handbook |
 | KS12 | Kubernetes API extension model, CRDs, controllers and reconcile loops, operators (when to adopt vs build), Kubebuilder/controller-runtime basics, admission webhooks, ACK (AWS Controllers for Kubernetes) and Crossplane for AWS resources |
 | KS13 | Service mesh concepts (sidecar vs ambient), Istio on EKS, mTLS, traffic splitting, retries/timeouts at the mesh, observability from the mesh, multi-cluster topologies (per-env, per-region), cross-cluster service discovery, when not to adopt a mesh |
 | OB1 | Three pillars and the observability vs monitoring distinction, CloudWatch metrics/dimensions/namespaces, Logs and Logs Insights, metric filters, alarms and composite alarms, dashboards, Container Insights for ECS/EKS, X-Ray / Application Signals, log retention and cost |

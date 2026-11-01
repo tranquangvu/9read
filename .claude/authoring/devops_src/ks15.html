@@ -1,0 +1,1485 @@
+<!-- meta: days=4 -->
+        <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">Production Kubernetes: Access, Debugging &amp; Fixing Live Issues</h1>
+        <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
+          <a href="./ks14.html" class="text-viol underline decoration-viol/40">KS14</a> built the clinic platform on
+          <code class="inline">clinic-prod-eks</code>. This module is about the years after that: how you reach the cluster
+          safely, which commands you run when <code class="inline">booking</code> misbehaves, and how you stop the bleeding
+          and then fix the cause without fighting Argo CD. It is an operating handbook. You will set up read-only prod
+          access with a time-boxed break-glass path, build habits that make "I ran it against prod by mistake" hard, learn a
+          triage workflow that ends in a Git commit rather than a <code class="inline">kubectl edit</code>, and then practise
+          it on ten faults injected at random into a local copy of the system.
+        </p>
+        <div class="mt-6 callout callout-why">
+          <strong>Why it matters in production:</strong> most Kubernetes outages at client sites are not exotic. They are a
+          probe pointing at the wrong path, a limit someone lowered, a Secret that changed, a PDB that blocks a node
+          rotation, or a hand-made fix that Argo CD quietly reverted at 3 a.m. The engineer who handles them well is not
+          the one who knows the most flags. It is the one who logs in with the least privilege, looks before touching,
+          restores service in minutes with a reversible action, and leaves Git and the cluster agreeing afterwards. That is
+          a habit, and habits come from practice, which is why half of this module is drills.
+        </div>
+<!-- @@BODY@@ -->
+
+      <!-- ═══════════════ PART I ═══════════════ -->
+      <div class="kicker text-sky-600 dark:text-sky-400 mt-12">Part I · Getting in</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Read-only by default; write access is a one-hour exception with a paper trail</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        <a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a> explained how EKS authenticates you
+        (IAM) and authorises you (access policies and RBAC). This Part turns that into a daily routine: which identity you
+        use for what, how your laptop is configured so that the safe identity is the easy one, and what happens when you
+        genuinely need to change something in prod during an incident.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">The access path, and the three tiers on it</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Every human reaches <code class="inline">clinic-prod-eks</code> the same way: sign in to IAM Identity Center
+        (<a href="./aw1.html" class="text-viol underline decoration-viol/40">AW1</a>), pick a permission set, which gives
+        you an IAM role session in <code class="inline">gol-prod</code> (444455556666), which an EKS
+        <strong>access entry</strong> maps to Kubernetes permissions. No access entry, no access. The tiers differ only in
+        which role you end up with and how long you keep it.
+      </p>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 270" class="w-full min-w-[640px]" role="img" aria-label="Access path from engineer through Identity Center and IAM roles to EKS access entries, with a read-only daily path and a time-boxed break-glass path">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">HOW A HUMAN REACHES clinic-prod-eks · namespace booking</text>
+          <g class="anim-pulse"><rect x="10" y="50" width="120" height="52" rx="9" fill="#37474F"/>
+            <text x="70" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Engineer</text>
+            <text x="70" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">aws sso login + MFA</text></g>
+          <g class="anim-pulse d1"><rect x="155" y="50" width="130" height="52" rx="9" fill="#2563EB"/>
+            <text x="220" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Identity Center</text>
+            <text x="220" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">permission set BookingOncall</text></g>
+          <g class="anim-pulse d2"><rect x="310" y="50" width="140" height="52" rx="9" fill="#6d5acd"/>
+            <text x="380" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">IAM role session</text>
+            <text x="380" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">AWSReservedSSO_Booking…</text></g>
+          <g class="anim-pulse d3"><rect x="475" y="50" width="235" height="52" rx="9" fill="#0D9488"/>
+            <text x="592" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Access entry → AmazonEKSViewPolicy</text>
+            <text x="592" y="88" text-anchor="middle" fill="#ffffffbb" font-size="9">scope: namespace booking · no Secrets · no exec</text></g>
+          <line x1="130" y1="76" x2="155" y2="76" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="285" y1="76" x2="310" y2="76" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="450" y1="76" x2="475" y2="76" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="380" y1="102" x2="380" y2="150" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <text x="388" y="132" font-size="9" fill="#6E6B64">sts:AssumeRole, only during an incident</text>
+          <g class="anim-pulse d4"><rect x="310" y="150" width="140" height="52" rx="9" fill="#DB2777"/>
+            <text x="380" y="172" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-breakglass</text>
+            <text x="380" y="188" text-anchor="middle" fill="#ffffffbb" font-size="9">max session 1 h</text></g>
+          <g class="anim-pulse d1"><rect x="475" y="150" width="235" height="52" rx="9" fill="#D97757"/>
+            <text x="592" y="172" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Access entry → AmazonEKSEditPolicy</text>
+            <text x="592" y="188" text-anchor="middle" fill="#ffffffbb" font-size="9">scope: booking · + group booking-debug</text></g>
+          <line x1="450" y1="176" x2="475" y2="176" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d2"><rect x="10" y="150" width="275" height="52" rx="9" fill="#37474F"/>
+            <text x="147" y="172" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">CloudTrail AssumeRole → EventBridge</text>
+            <text x="147" y="188" text-anchor="middle" fill="#ffffffbb" font-size="9">alert in #clinic-incidents · reviewed within 24 h</text></g>
+          <line x1="310" y1="176" x2="285" y2="176" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <text x="360" y="245" text-anchor="middle" font-size="10" fill="#A8A49B" class="anim-bounce">cluster-admin (PlatformAdmin, eks-breakglass from KS7) is a third tier you should almost never need</text>
+        </svg>
+      </div>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Tier</th><th class="px-4 py-3">Identity</th><th class="px-4 py-3">EKS access policy and scope</th><th class="px-4 py-3">Used for</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Daily / on-call</td><td class="px-4 py-3">Permission set <code class="inline">BookingOncall</code>, 8 h session</td><td class="px-4 py-3"><code class="inline">AmazonEKSViewPolicy</code> on <code class="inline">booking</code>, plus the <code class="inline">oncall-operator</code> RBAC from KS7 (restart, delete a Pod)</td><td class="px-4 py-3">Looking: get, describe, events, logs, top. 95% of every incident. The two KS7 verbs are mitigations, and the guard treats them so</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Break-glass (app)</td><td class="px-4 py-3">IAM role <code class="inline">booking-breakglass</code>, 1 h session, assumed from BookingOncall</td><td class="px-4 py-3"><code class="inline">AmazonEKSEditPolicy</code> on <code class="inline">booking</code>, plus ephemeral containers</td><td class="px-4 py-3"><code class="inline">rollout undo</code>, scale, <code class="inline">kubectl debug</code>, patching a live object while Git catches up</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Platform admin</td><td class="px-4 py-3"><code class="inline">PlatformAdmin</code> or KS7's <code class="inline">eks-breakglass</code></td><td class="px-4 py-3"><code class="inline">AmazonEKSClusterAdminPolicy</code>, cluster</td><td class="px-4 py-3">Nodes, add-ons, cluster-wide objects. Two named people; planned changes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Notice what is missing: nobody has <code class="inline">AmazonEKSEditPolicy</code> on prod as a standing permission.
+        Changes reach prod through a <code class="inline">clinic-gitops</code> PR and Argo CD
+        (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>). Edit access exists only for the
+        minutes when a PR is too slow for the patients waiting on the other side.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Break-glass: time-boxed, approved, and loud</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The break-glass role is ordinary Terraform in <code class="inline">clinic-infra</code>. Three properties make it
+        safe: only the on-call permission set can assume it, the session dies after one hour, and every assumption is an
+        alert (the EventBridge rule from KS7, pointed at this role too). Approval is procedural and recorded: the incident
+        commander says "approved" in the incident channel, and you paste that message link into the incident timeline
+        (<a href="./sr2.html" class="text-viol underline decoration-viol/40">SR2</a>). Clients that need enforced
+        approval use time-bound Identity Center assignments from a request tool such as AWS's TEAM sample instead.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-infra/envs/prod/eks/breakglass.tf</span>
+        <pre class="code">resource "aws_iam_role" "booking_breakglass" {
+  name                 = "booking-breakglass"
+  max_session_duration = 3600                  <span class="cm"># the time box: one hour, then ask again</span>
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { AWS = "arn:aws:iam::444455556666:root" }
+      Condition = { ArnLike = {                 <span class="cm"># only on-call SSO sessions (ARN with path here)</span>
+        "aws:PrincipalArn" = "arn:aws:iam::444455556666:role/aws-reserved/sso.amazonaws.com/ap-southeast-1/AWSReservedSSO_BookingOncall_*"
+      } }
+    }]
+  })
+}
+resource "aws_eks_access_entry" "booking_breakglass" {
+  cluster_name      = "clinic-prod-eks"
+  principal_arn     = aws_iam_role.booking_breakglass.arn
+  kubernetes_groups = ["booking-debug"]       <span class="cm"># RBAC below adds kubectl debug</span>
+}
+resource "aws_eks_access_policy_association" "booking_breakglass" {
+  cluster_name  = "clinic-prod-eks"
+  principal_arn = aws_iam_role.booking_breakglass.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
+  access_scope {
+    type       = "namespace"
+    namespaces = ["booking"]                   <span class="cm"># never cluster-wide for app on-call</span>
+  }
+}</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/platform/rbac/booking-debug.yaml</span>
+        <pre class="code">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: booking-debug, namespace: booking }
+rules:
+  - apiGroups: [""]
+    resources: ["pods/ephemeralcontainers"]
+    verbs: ["patch", "update"]                 <span class="cm"># kubectl debug adds a container to a live Pod</span>
+  - apiGroups: [""]
+    resources: ["pods/attach"]
+    verbs: ["create", "get"]                   <span class="cm"># and attaches your terminal to it</span>
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: booking-debug, namespace: booking }
+subjects: [{ kind: Group, name: booking-debug, apiGroup: rbac.authorization.k8s.io }]
+roleRef: { kind: Role, name: booking-debug, apiGroup: rbac.authorization.k8s.io }</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The audit trail has two halves. CloudTrail records <em>who assumed the role</em>; the EKS audit log (control-plane
+        logging, <a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>) records <em>what they did
+        with it</em>. Setting <code class="inline">role_session_name</code> to your own name in the AWS profile (next
+        section) is what joins the two, because the session name appears in both.
+      </p>
+      <pre class="code mt-3"><span class="cm"># who used break-glass in the last day? (CloudTrail, gol-prod, region where it was assumed)</span>
+aws cloudtrail lookup-events --region ap-southeast-1 --max-results 20 \
+  --lookup-attributes AttributeKey=ResourceName,AttributeValue=arn:aws:iam::444455556666:role/booking-breakglass \
+  --query 'Events[].[EventTime,EventName,Username]' --output text
+<span class="out">2026-10-30T02:21:07+07:00   AssumeRole   AWSReservedSSO_BookingOncall_5c1e2a9f0b3d7e41/linh.nguyen</span></pre>
+
+      <h3 class="font-semibold text-lg mt-8">One context per environment and tier, and a prompt that shouts</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Your laptop holds AWS profiles and kubeconfig contexts. Name both so that the dangerous one is obviously
+        dangerous, and so that the default is read-only. The break-glass profile chains from the on-call SSO profile, so it
+        needs no separate login and cannot be used without one.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/.aws/config — prod profiles</span>
+        <pre class="code">[sso-session goldenowl]
+sso_start_url = https://goldenowl.awsapps.com/start
+sso_region = ap-southeast-1
+sso_registration_scopes = sso:account:access
+
+[profile gol-prod-oncall]
+sso_session = goldenowl
+sso_account_id = 444455556666
+sso_role_name = BookingOncall
+region = ap-southeast-1
+
+[profile gol-prod-breakglass]
+source_profile = gol-prod-oncall                 <span class="cm"># chains from your SSO session</span>
+role_arn = arn:aws:iam::444455556666:role/booking-breakglass
+role_session_name = linh.nguyen                  <span class="cm"># your name: joins CloudTrail to EKS audit</span>
+duration_seconds = 3600</pre>
+      </div>
+      <pre class="code mt-3">aws sso login --sso-session goldenowl
+aws eks update-kubeconfig --name clinic-prod-eks --region ap-southeast-1 \
+  --profile gol-prod-breakglass --alias clinic-prod-breakglass --user-alias clinic-prod-breakglass
+aws eks update-kubeconfig --name clinic-prod-eks --region ap-southeast-1 \
+  --profile gol-prod-oncall --alias clinic-prod --user-alias clinic-prod-oncall
+<span class="out">Updated context clinic-prod in /Users/linh/.kube/config</span>
+kubectl config use-context clinic-staging       <span class="cm"># update-kubeconfig switched you to prod: switch away</span>
+kubectl --context clinic-prod auth can-i get secrets -n booking
+<span class="out">no</span>
+kubectl --context clinic-prod auth can-i create pods --subresource=exec -n booking
+<span class="out">no</span>                                              <span class="cm"># correct: the daily context only looks (and restarts)</span></pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The kubeconfig that <code class="inline">update-kubeconfig</code> writes contains no secret: it runs
+        <code class="inline">aws eks get-token</code> with the named profile each time. Sharing <em>that</em> file is
+        harmless but pointless. What you must never share or create is a kubeconfig holding a static bearer token, for
+        example from <code class="inline">kubectl create token … --duration=8760h</code> or a legacy ServiceAccount token
+        Secret. It is a password to prod that never expires, never passes MFA, and shows up in the audit log as a robot.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Now make the prompt show where you are. With <a class="text-coral underline" href="https://starship.rs/config/#kubernetes" target="_blank" rel="noopener">starship</a>
+        the snippet below turns any context containing <code class="inline">prod</code> red. With kube-ps1, source its
+        script and add <code class="inline">$(kube_ps1)</code> to <code class="inline">PROMPT</code>; it shows the same
+        context and namespace, without the colour rule.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/.config/starship.toml</span>
+        <pre class="code">[kubernetes]
+disabled = false
+format = '[⎈ $context( \($namespace\))]($style) '
+style = "cyan"
+
+[[kubernetes.contexts]]
+context_pattern = ".*prod.*"                     <span class="cm"># clinic-prod, clinic-prod-breakglass</span>
+style = "bold white bg:red"</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">A shell guard for the commands that change things</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A prompt only helps if you look at it. The function below wraps <code class="inline">kubectl</code> in your
+        interactive shell (bash or zsh). For mutating verbs against a context that matches
+        <code class="inline">KUBE_GUARD_RE</code>, it stops and asks you to type the context name. Reading is never
+        slowed down. It is a seatbelt, not a lock: scripts call the real binary and bypass it, so RBAC remains the actual
+        control.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/.zshrc or ~/.bashrc</span>
+        <pre class="code">KUBE_GUARD_RE='prod'                             <span class="cm"># regex of contexts that need confirmation</span>
+kubectl() {
+  local ctx="" verb="" prev="" a answer
+  for a in "$@"; do
+    case "$a" in
+      --context=*) ctx="${a#--context=}" ;;
+      -*) ;;
+      *) if [ "$prev" = "--context" ]; then ctx="$a"
+         elif [ -z "$verb" ] &amp;&amp; [ "$prev" != "-n" ] &amp;&amp; [ "$prev" != "--namespace" ]; then verb="$a"; fi ;;
+    esac
+    prev="$a"
+  done
+  [ -n "$ctx" ] || ctx="$(command kubectl config current-context 2&gt;/dev/null)"
+  case "$verb" in
+    apply|create|delete|edit|patch|replace|scale|set|rollout|drain|cordon|uncordon|debug|exec|label|annotate|taint)
+      if [[ "$ctx" =~ $KUBE_GUARD_RE ]]; then
+        printf '\033[1;31m%s is guarded.\033[0m Type the context name to run: kubectl %s\n&gt; ' "$ctx" "$*"
+        read -r answer
+        [ "$answer" = "$ctx" ] || { echo "aborted"; return 1; }
+      fi ;;
+  esac
+  command kubectl "$@"
+}</pre>
+      </div>
+      <pre class="code mt-3">kubectl --context clinic-prod-breakglass -n booking rollout restart deploy/booking-api
+<span class="out">clinic-prod-breakglass is guarded. Type the context name to run: kubectl --context clinic-prod-breakglass -n booking rollout restart deploy/booking-api
+&gt; clinic-prdo
+aborted</span></pre>
+      <div class="mt-4 callout callout-tip"><strong>Score-4 move:</strong> make the guard and the prompt part of the team's
+        dotfiles repo and the on-call onboarding checklist, not a personal preference. The incidents they prevent happen to
+        tired people, and tired people do not configure their shell at 2 a.m.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Reaching a private endpoint, and access for CI and agents</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The prod API endpoint is private only (<a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a>).
+        Off the Client VPN, every command ends in <code class="inline">dial tcp 10.20.x.x:443: i/o timeout</code>, which
+        is a network answer, not an auth one. Connect the VPN (<a href="./aw2.html" class="text-viol underline decoration-viol/40">AW2</a>)
+        and retry. If the VPN itself is down during an incident, the fallback is an SSM port-forward through any managed
+        instance in the prod VPC; you then need a kubeconfig cluster entry with
+        <code class="inline">server: https://127.0.0.1:8443</code> and <code class="inline">tls-server-name</code> set to the
+        endpoint host, so TLS still validates. Write that entry before you need it.
+      </p>
+      <pre class="code mt-3">aws ssm start-session --profile gol-prod-oncall --target i-0a1b2c3d4e5f60718 \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["4F1C2A9B7D3E.gr7.ap-southeast-1.eks.amazonaws.com"],"portNumber":["443"],"localPortNumber":["8443"]}'
+<span class="cm"># then, in another terminal: kubectl --context clinic-prod-ssm get pods -n booking</span></pre>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Caller</th><th class="px-4 py-3">Access to clinic-prod-eks</th><th class="px-4 py-3">Why</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">CI (GitHub Actions)</td><td class="px-4 py-3">None. <code class="inline">gha-clinic-app-deploy</code> writes a tag to <code class="inline">clinic-gitops</code>; Argo CD pulls</td><td class="px-4 py-3">A compromised workflow cannot touch the cluster (KS10)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Argo CD</td><td class="px-4 py-3">In-cluster ServiceAccount, scoped by AppProject</td><td class="px-4 py-3">The only routine writer to <code class="inline">booking</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Humans</td><td class="px-4 py-3">The three tiers above, via Identity Center</td><td class="px-4 py-3">Named, MFA-backed, time-limited sessions</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">AI agents</td><td class="px-4 py-3">A dedicated role with <code class="inline">AmazonEKSViewPolicy</code> on <code class="inline">booking</code>, never break-glass</td><td class="px-4 py-3">Agents investigate; humans mitigate (<a href="./ar6.html" class="text-viol underline decoration-viol/40">AR6</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART II ═══════════════ -->
+      <div class="kicker text-viol mt-14">Part II · Safe habits &amp; the toolbox</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Look first, write through Git, and never type a command without a context</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Access controls limit the damage you <em>can</em> do. Habits limit the damage you <em>do</em>. The habits below are
+        small, cost seconds, and each one maps to a real incident someone on a Golden Owl project has caused. After them
+        comes the toolbox: the commands that answer an on-call engineer's questions, in the order you need them.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">Five habits that prevent most self-inflicted incidents</h3>
+      <ul class="mt-3 space-y-2 text-[15px] leading-relaxed list-disc pl-5">
+        <li><strong>Always pass <code class="inline">--context</code> and <code class="inline">-n</code>.</strong> Your current
+          context is whatever you last touched, possibly in another terminal tab. A command copied into a runbook or a
+          ticket without them is ambiguous, so it is wrong.</li>
+        <li><strong>Read before you write.</strong> Run <code class="inline">get</code>, <code class="inline">describe</code>
+          and <code class="inline">events</code> on the object you are about to change, in the same context, and say out
+          loud what you expect to happen.</li>
+        <li><strong>Preview every write.</strong> <code class="inline">kubectl diff</code> shows what an apply would change;
+          <code class="inline">--dry-run=server</code> runs admission (PSA, Kyverno, quotas) without persisting anything.
+          Both need the same RBAC as the real write, so in prod use <code class="inline">argocd app diff</code> instead.</li>
+        <li><strong>Never <code class="inline">kubectl edit</code> or <code class="inline">apply</code> an object Argo CD
+          manages.</strong> Either it is reverted in seconds (self-heal) or, worse, it is not, and Git now lies. The next
+          section shows what to do when you truly must.</li>
+        <li><strong>Prefer reversible actions.</strong> Scale up, roll back, cordon. Avoid delete, drain with
+          <code class="inline">--force</code>, or anything that throws away evidence such as a crashed Pod's logs.</li>
+      </ul>
+      <pre class="code mt-3"><span class="cm"># preview a manifest change against staging: what would change, and would admission accept it?</span>
+kubectl --context clinic-staging -n booking diff -f booking-api-patch.yaml
+<span class="out">-          image: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-api:1.8.2
++          image: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/booking-api:1.8.3</span>
+kubectl --context clinic-staging -n booking apply -f booking-api-patch.yaml --dry-run=server
+<span class="out">deployment.apps/booking-api configured (server dry run)</span>
+<span class="cm"># in prod, ask Argo CD what Git would change instead (read-only for you)</span>
+argocd app diff booking-api-prod --revision 8d41e07</pre>
+
+      <h3 class="font-semibold text-lg mt-8">Argo CD will undo your hotfix, and that is the point</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Prod Applications run with <code class="inline">selfHeal: true</code>
+        (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>). Argo CD compares the live object
+        with the rendered Git state, sees your change as drift, and re-applies Git, usually within seconds. People
+        rediscover this every few months, in the middle of an incident, as "my fix stopped working".
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Y as You (break-glass)
+    participant K as booking-api Deployment
+    participant A as Argo CD
+    participant G as clinic-gitops (main)
+    Y->>K: kubectl set resources --limits=memory=512Mi
+    K-->>Y: OOMKills stop
+    A->>K: compare live vs Git: OutOfSync (drift)
+    A->>K: self-heal: memory back to 256Mi
+    K-->>Y: OOMKills return, rollout of old spec
+    Note over Y,G: the right order: Git first, or pause sync,<br/>fix live, then make Git agree before re-enabling
+        </pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        If a Git revert is fast enough (it usually is: a revert PR needs no new build), do that and let Argo CD apply it.
+        If it is not, pause automated sync for that one Application, make the live change, and reconcile Git before you
+        re-enable sync (Part III has the exact sequence). One catch: our Applications are generated by the
+        <code class="inline">booking</code> ApplicationSet, whose controller rewrites any Application field you change.
+        Pausing only works if the ApplicationSet allows it:
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/appsets/booking.yaml — addition</span>
+        <pre class="code">spec:
+  ignoreApplicationDifferences:
+    - jsonPointers: [/spec/syncPolicy]      <span class="cm"># on-call may pause sync; the AppSet won't revert it</span></pre>
+      </div>
+      <pre class="code mt-3">argocd app set booking-api-prod --sync-policy none        <span class="cm"># pause: drift is shown, not corrected</span>
+argocd app get booking-api-prod | grep 'Sync Status'
+<span class="out">Sync Status:        OutOfSync from main (3f9c2ab)</span>        <span class="cm"># your live change, as expected</span></pre>
+      <div class="mt-4 callout callout-warn"><strong>A paused Application is an open incident.</strong> Every minute auto-sync is
+        off, a merged PR silently does not deploy. Post "booking-api-prod sync paused by &lt;you&gt;" in the incident
+        channel, and make re-enabling it a line in the incident's exit checklist. Do not use
+        <code class="inline">argocd app rollback</code> as the pause: it disables auto-sync as a side effect and leaves Git
+        pointing at the bad version (KS10).</div>
+
+      <h3 class="font-semibold text-lg mt-8">The read-only toolbox: events, describe, logs, stern, k9s</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        These all work with the daily on-call identity. <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a>
+        explains how to read what they print for each failure mode; here is how to drive them fast.
+      </p>
+      <pre class="code mt-3"><span class="cm"># warnings in the namespace, oldest first; kubectl events sorts by time correctly</span>
+kubectl --context clinic-prod -n booking events --types=Warning
+kubectl --context clinic-prod -n booking events --for pod/booking-api-7c9f8d6b5-m8tzr
+<span class="cm"># the classic form, if you need -o wide or older clusters</span>
+kubectl --context clinic-prod -n booking get events --sort-by=.metadata.creationTimestamp | tail -20
+
+<span class="cm"># why did the last container die? logs of the PREVIOUS container, not the fresh one</span>
+kubectl --context clinic-prod -n booking logs booking-api-7c9f8d6b5-m8tzr -c api --previous --tail=50
+
+<span class="cm"># every booking-api Pod at once, only 5xx lines, from the lab-kit JSON log fields</span>
+stern --context clinic-prod -n booking booking-api --since 15m -o raw \
+  | jq -cR 'fromjson? | select(.status &gt;= 500) | {ts, path, status, ms, version}'
+<span class="out">{"ts":"2026-10-30T02:14:09.311Z","path":"/bookings","status":500,"ms":5012,"version":"1.8.3"}</span>
+
+<span class="cm"># k9s for browsing, in read-only mode so a stray ctrl-d cannot delete a Pod</span>
+k9s --context clinic-prod -n booking --readonly</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two details matter under pressure. <code class="inline">kubectl logs deploy/booking-api</code> shows
+        <em>one</em> Pod chosen for you; use stern or <code class="inline">-l</code> with <code class="inline">--prefix</code>
+        to see them all. And events expire after one hour, so if the incident started a while ago, go straight to the
+        exported events in Loki (KS11) rather than concluding "no events, nothing happened".
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Getting closer: kubectl debug, port-forward, top</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        These need more than view access, and each one is a deliberate step up. <code class="inline">kubectl top</code> is
+        read-only. <code class="inline">port-forward</code> needs <code class="inline">pods/portforward</code>, which
+        the edit policy has and view does not. <code class="inline">kubectl debug</code> needs the
+        <code class="inline">booking-debug</code> Role from Part I. The mechanics of ephemeral containers and node
+        debugging are in KS11; what follows is the prod-safe way to use them.
+      </p>
+      <pre class="code mt-3"><span class="cm"># is anything starving? (metrics-server; numbers lag ~15 s)</span>
+kubectl --context clinic-prod -n booking top pod -l app.kubernetes.io/name=booking-api --containers
+<span class="out">POD                            NAME   CPU(cores)   MEMORY(bytes)
+booking-api-7c9f8d6b5-m8tzr    api    998m         212Mi</span>        <span class="cm"># 998m against a 1-core limit: throttled</span>
+
+<span class="cm"># talk to ONE Pod directly, bypassing the ALB and Service: is it the Pod or the path?</span>
+kubectl --context clinic-prod-breakglass -n booking port-forward pod/booking-api-7c9f8d6b5-m8tzr 18080:8080 &amp;
+curl -s localhost:18080/readyz
+<span class="out">{"ready":true}</span>
+
+<span class="cm"># tools inside a distroless Pod, sharing its network and process namespace; nothing restarts</span>
+kubectl --context clinic-prod-breakglass -n booking debug -it booking-api-7c9f8d6b5-m8tzr \
+  --image=nicolaka/netshoot:v0.13 --target=api --profile=general</pre>
+      <div class="mt-4 callout callout-info"><strong>Ephemeral containers stay until the Pod dies.</strong> You cannot remove
+        one, and it shows in <code class="inline">kubectl describe</code> forever after. That is fine (it is evidence),
+        but it means a debug session on a prod Pod is visible to the next person; note it in the incident timeline. Node
+        debugging (<code class="inline">kubectl debug node/…</code>) creates a privileged Pod and is a platform-admin
+        action on our clusters.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Fleet-wide logs: query the JSON fields, not the text</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">kubectl logs</code> sees only the Pods alive now. For "since when, which version, how many",
+        query the log store. The lab-kit API logs one JSON object per line with <code class="inline">ts</code>,
+        <code class="inline">level</code>, <code class="inline">msg</code>, <code class="inline">service</code>,
+        <code class="inline">version</code>, <code class="inline">method</code>, <code class="inline">path</code>,
+        <code class="inline">status</code> and <code class="inline">ms</code>, so you filter on fields
+        (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>,
+        <a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>).
+      </p>
+      <pre class="code mt-3"><span class="cm"># CloudWatch Logs Insights, Container Insights log group. Fluent Bit's Merge_Log puts the</span>
+<span class="cm"># parsed JSON under log_processed; check one raw event first if your config differs</span>
+fields @timestamp, log_processed.version, log_processed.status
+| filter kubernetes.namespace_name = "booking" and kubernetes.container_name = "api"
+| filter log_processed.msg = "request" and log_processed.status &gt;= 500
+| stats count(*) as errors by bin(1m), log_processed.version
+
+<span class="cm"># Loki (LogQL): 5xx per minute by version, same fields</span>
+sum by (version) (count_over_time({namespace="booking", container="api"} | json | status &gt;= 500 [1m]))
+
+<span class="cm"># EKS audit log (Logs Insights on /aws/eks/clinic-prod-eks/cluster): who changed booking-api?</span>
+fields @timestamp, user.username, verb, objectRef.resource, objectRef.subresource
+| filter @logStream like /kube-apiserver-audit/ and objectRef.namespace = "booking"
+| filter objectRef.name = "booking-api" and verb in ["patch", "update", "delete", "create"]
+| sort @timestamp desc | limit 20</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        A per-version split is the fastest way to answer "did the deploy do it?": if the 5xx rate is high only for
+        <code class="inline">version=1.8.3</code>, you have your mitigation (roll back) before you have your root cause.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The cheat sheet: commands by question</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        On call, you start from a question, not a command. Every row works with the daily read-only identity unless
+        marked. Replace <code class="inline">-l app=…</code> with your chart's labels
+        (<code class="inline">app.kubernetes.io/name=booking-api</code> in prod).
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Question</th><th class="px-4 py-3">Command</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Where am I, as whom?</td><td class="px-4 py-3"><code class="inline">kubectl config current-context; kubectl --context X auth whoami</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Am I allowed to?</td><td class="px-4 py-3"><code class="inline">kubectl auth can-i patch deployments -n booking</code> · <code class="inline">auth can-i --list -n booking</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">What is broken right now?</td><td class="px-4 py-3"><code class="inline">kubectl -n booking get pods -o wide</code> · <code class="inline">kubectl -n booking events --types=Warning</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">What changed?</td><td class="px-4 py-3"><code class="inline">argocd app history booking-api-prod</code> · <code class="inline">kubectl -n booking rollout history deploy/booking-api</code> · <code class="inline">get rs -l app=booking-api --sort-by=.metadata.creationTimestamp</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">What exactly is in revision N?</td><td class="px-4 py-3"><code class="inline">kubectl -n booking rollout history deploy/booking-api --revision=N</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Why is it not Ready?</td><td class="px-4 py-3"><code class="inline">kubectl -n booking describe pod P</code> (Readiness probe failed …) · EndpointSlices of the Service</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Why did it restart?</td><td class="px-4 py-3"><code class="inline">get pod P -o jsonpath='{.status.containerStatuses[0].lastState}'</code> · <code class="inline">logs P --previous</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Who restarted or changed it?</td><td class="px-4 py-3"><code class="inline">get deploy D -o yaml --show-managed-fields</code> (manager <code class="inline">kubectl-rollout</code>, <code class="inline">kubectl-edit</code>, <code class="inline">argocd-controller</code>) · EKS audit log query above</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Does the Service reach Pods?</td><td class="px-4 py-3"><code class="inline">get endpointslices -l kubernetes.io/service-name=booking-api -o yaml</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Is it starving?</td><td class="px-4 py-3"><code class="inline">top pod --containers</code> · throttling ratio in Grafana</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">What else is on that node?</td><td class="px-4 py-3"><code class="inline">get pods -A --field-selector spec.nodeName=N</code> (cluster-wide list: platform tier) · <code class="inline">describe node N</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Is it the Pod or the path? (break-glass)</td><td class="px-4 py-3"><code class="inline">port-forward pod/P 18080:8080</code> then <code class="inline">curl localhost:18080/readyz</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART III ═══════════════ -->
+      <div class="kicker text-teal-600 dark:text-teal-400 mt-14">Part III · From alert to fix</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Mitigate with a reversible action first; fix the cause in Git second</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An incident has two clocks. The patient-facing clock stops when bookings work again; the engineering clock stops
+        when the cause is fixed and cannot recur. Mixing them is the classic on-call mistake: debugging the root cause for
+        forty minutes while a one-command rollback would have restored service in two. The workflow below keeps them
+        apart.
+      </p>
+      <div class="mt-3 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card">
+        <pre class="mermaid">
+flowchart LR
+    A["Alert or report"] --> S["1 · Scope<br/>one Pod? one service?<br/>one node? everything?"]
+    S --> C["2 · What changed?<br/>Argo history · rollout history<br/>merged PRs · node events"]
+    C --> L["3 · Name the layer<br/>KS11 flowchart"]
+    L --> M["4 · Mitigate<br/>revert · scale · cordon<br/>restart · flag · shift traffic"]
+    M --> V1{"SLO back<br/>to normal?"}
+    V1 -->|no| L
+    V1 -->|yes| R["5 · Root cause<br/>calm, with evidence"]
+    R --> F["6 · Fix through Git<br/>PR · Argo sync"]
+    F --> V2["7 · Verify<br/>SLO + logs by version"]
+    V2 --> E["8 · Evidence<br/>timeline · postmortem (SR2)"]
+        </pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Scope it, then ask what changed</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Scope decides who you call and where you look. <strong>One Pod</strong> misbehaving while its siblings are fine
+        points at that Pod's node or its data (a poison message, a hot tenant). <strong>One service</strong> points at its
+        last release or its config. <strong>Everything on one node</strong> points at the node.
+        <strong>Everything</strong> points at a shared dependency: DNS, the database, the ingress, the cluster itself.
+        Then ask what changed, because most incidents follow a change by minutes to hours.
+      </p>
+      <pre class="code mt-3"><span class="cm"># releases: what Argo CD synced, and when (revision = Git SHA or chart version)</span>
+argocd app history booking-api-prod
+<span class="cm"># what the Deployment actually rolled through; --revision shows the full Pod template</span>
+kubectl --context clinic-prod -n booking rollout history deploy/booking-api
+<span class="out">REVISION  CHANGE-CAUSE
+14        &lt;none&gt;
+15        &lt;none&gt;</span>
+kubectl --context clinic-prod -n booking get rs -l app.kubernetes.io/name=booking-api \
+  --sort-by=.metadata.creationTimestamp -o custom-columns=RS:.metadata.name,CREATED:.metadata.creationTimestamp,READY:.status.readyReplicas
+<span class="cm"># config changes do not create revisions: check merged PRs too</span>
+gh pr list --repo golden-owl/clinic-gitops --state merged --limit 5
+<span class="cm"># platform tier: did nodes come and go? (Karpenter consolidation, Spot interruptions)</span>
+kubectl --context clinic-prod get events -A --field-selector involvedObject.kind=Node --sort-by=.metadata.creationTimestamp | tail</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        "Nothing changed" is almost never true; it means the change was somewhere you did not look: a Secret rotated by
+        External Secrets, a ConfigMap edited by hand, a node replaced overnight so every Pod restarted with new config, a
+        traffic pattern, or a dependency's own deploy. Then name the layer with the KS11 flowchart and pick a mitigation.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">The mitigation menu</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        A mitigation is anything that restores service without needing to understand the cause. Prefer the top of the
+        table: it is reversible and leaves Git honest.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Mitigation</th><th class="px-4 py-3">Use when</th><th class="px-4 py-3">How</th><th class="px-4 py-3">Git afterwards</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Git revert</td><td class="px-4 py-3">A release or config PR correlates with the start</td><td class="px-4 py-3"><code class="inline">git revert</code> PR in <code class="inline">clinic-gitops</code>, Argo syncs</td><td class="px-4 py-3">Already honest. The default</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Feature flag off</td><td class="px-4 py-3">The bad behaviour sits behind a flag</td><td class="px-4 py-3">Flag service, no deploy (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>)</td><td class="px-4 py-3">Nothing to reconcile</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Abort a canary</td><td class="px-4 py-3">An Argo Rollout is mid-way</td><td class="px-4 py-3"><code class="inline">kubectl argo rollouts abort booking-api</code> (KS10)</td><td class="px-4 py-3">Revert the tag bump right after</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Scale up</td><td class="px-4 py-3">Saturation: CPU, queue depth, connection pool</td><td class="px-4 py-3">Raise HPA <code class="inline">minReplicas</code> in Git; break-glass <code class="inline">kubectl scale</code> if no HPA</td><td class="px-4 py-3">PR with the new floor</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cordon / drain a node</td><td class="px-4 py-3">Errors only from Pods on one node</td><td class="px-4 py-3">Platform tier: <code class="inline">kubectl cordon</code>, then drain; Karpenter replaces it</td><td class="px-4 py-3">None; file the node evidence</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Restart</td><td class="px-4 py-3">Stuck state: leaked connections, a wedged worker</td><td class="px-4 py-3"><code class="inline">kubectl rollout restart</code> (on-call RBAC from KS7)</td><td class="px-4 py-3">None, but it hides the cause: capture evidence first</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Shift traffic</td><td class="px-4 py-3">One region, cluster or stack is bad</td><td class="px-4 py-3">ALB weights or Route 53 weighted records (<a href="./aw7.html" class="text-viol underline decoration-viol/40">AW7</a>)</td><td class="px-4 py-3">Terraform PR for the weights</td></tr>
+            <tr><td class="px-4 py-3 font-semibold"><code class="inline">kubectl rollout undo</code></td><td class="px-4 py-3">Bad release, and a Git revert would take too long</td><td class="px-4 py-3">Break-glass, with sync paused (next section)</td><td class="px-4 py-3">Mandatory revert PR before closing</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 callout callout-danger"><strong>A restart destroys evidence.</strong> The crashed container's logs,
+        the heap that was leaking, the connection count that was exhausted: all gone after
+        <code class="inline">rollout restart</code>. Spend sixty seconds running the capture script below first, unless
+        patients are failing to book right now and the restart is the fastest fix. Then run it anyway, straight after.</div>
+
+      <h3 class="font-semibold text-lg mt-8">When <code class="inline">rollout undo</code> is acceptable, and how to reconcile Git</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">kubectl rollout undo</code> switches a Deployment back to the previous ReplicaSet in seconds,
+        with no image build and no PR. It is acceptable only when all of these hold: patients are affected now, the Git
+        revert path is blocked or slow (CI outage, Argo CD unhealthy, no reviewer awake), you are on the break-glass role
+        with the incident commander's approval, and you have paused sync so Argo CD does not undo your undo. (For a
+        service running as an Argo Rollout, the equivalent is <code class="inline">kubectl argo rollouts undo</code>.)
+      </p>
+      <pre class="code mt-3"><span class="cm"># 1. stop Argo CD re-applying the bad version from Git</span>
+argocd app set booking-api-prod --sync-policy none
+<span class="cm"># 2. mitigate by hand, on the break-glass context (the guard will ask you to confirm)</span>
+kubectl --context clinic-prod-breakglass -n booking rollout undo deploy/booking-api
+kubectl --context clinic-prod-breakglass -n booking rollout status deploy/booking-api --timeout=5m
+<span class="out">deployment "booking-api" successfully rolled out</span>
+<span class="cm"># 3. make Git say the same thing: revert the release commit</span>
+git -C clinic-gitops switch -c incident/revert-booking-api-1.8.3
+git -C clinic-gitops revert --no-edit 8d41e07 &amp;&amp; git -C clinic-gitops push -u origin HEAD
+gh pr create --repo golden-owl/clinic-gitops --fill --label incident
+<span class="cm"># 4. after merge: Git and cluster must agree before auto-sync comes back</span>
+argocd app diff booking-api-prod --refresh &amp;&amp; echo "no diff"
+<span class="out">no diff</span>
+argocd app set booking-api-prod --sync-policy automated --self-heal --auto-prune</pre>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        <code class="inline">argocd app diff</code> exits non-zero when it finds differences, so "no diff" prints only when
+        the reverted Git state matches what you put in by hand. If it shows a diff, the revert and the undo landed on
+        different revisions; resolve that in Git, not by re-enabling sync and hoping. The same pattern applies to any
+        live change (scale, patched env var, resource limits): pause, change, PR, diff clean, resume.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Root cause, the permanent fix, and evidence for the postmortem</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Once the SLO is green, slow down. The permanent fix is always a reviewed PR: to <code class="inline">clinic-app</code>
+        for code, <code class="inline">clinic-gitops</code> for manifests and values, <code class="inline">clinic-infra</code>
+        for the platform. Verify it with the same signal that paged you (5xx ratio and latency per
+        <code class="inline">version</code>, <a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a>),
+        not with "the Pods are Running". And collect evidence <em>early</em>, because events expire in an hour and
+        restarted Pods lose their logs.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-gitops/runbooks/tools/capture.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># capture.sh CONTEXT SELECTOR — snapshot namespace booking for the incident ticket (read-only)</span>
+set -uo pipefail                                     <span class="cm"># no -e: keep going if one command fails</span>
+CTX=${1:?context}; SEL=${2:?label selector, e.g. app.kubernetes.io/name=booking-api}
+D="incident-$(date -u +%Y%m%dT%H%MZ)"; mkdir -p "$D"
+k() { kubectl --context "$CTX" -n booking "$@"; }
+k get pods -o wide                          &gt; "$D/pods.txt"
+k get deploy,rs,hpa,pdb -o wide             &gt; "$D/workloads.txt"
+k events --types=Warning                    &gt; "$D/events.txt"
+k describe pods -l "$SEL"                   &gt; "$D/describe.txt"
+k get endpointslices -o wide                &gt; "$D/endpointslices.txt"
+k top pod --containers                      &gt; "$D/top.txt" 2&gt;&amp;1
+k logs -l "$SEL" --all-containers --prefix --since=1h --max-log-requests=20 &gt; "$D/logs.txt"
+k logs -l "$SEL" --all-containers --prefix --previous --max-log-requests=20 &gt; "$D/logs-previous.txt" 2&gt;&amp;1
+k rollout history deploy -l "$SEL"          &gt; "$D/rollout-history.txt"
+echo "saved to $D: attach it to the incident ticket, not to chat"</pre>
+      </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Add three things by hand to the timeline as you go: the time and text of each decision ("02:21 IC approved
+        break-glass; 02:23 rollout undo"), every live change and the PR that reconciled it, and the query or command that
+        found the cause. Those become the postmortem's timeline and its best action items
+        (<a href="./sr2.html" class="text-viol underline decoration-viol/40">SR2</a>).
+      </p>
+
+      <h3 class="font-semibold text-lg mt-8">Production bug patterns you will meet, with mitigation and fix</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        These seven cover most of what pages the clinic platform's on-call. How to diagnose each failure mode in depth
+        (exit codes, scheduler messages, DNS tests, ALB codes) is in
+        <a href="./ks11.html" class="text-viol underline decoration-viol/40">KS11</a>; this table is about what you
+        <em>do</em>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">Pattern</th><th class="px-4 py-3">Tell-tale sign</th><th class="px-4 py-3">Mitigate</th><th class="px-4 py-3">Permanent fix</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">Config or Secret drift</td><td class="px-4 py-3">Only Pods that restarted are broken; no new revision in rollout history</td><td class="px-4 py-3">Restore the value (Secrets Manager, or Git), restart</td><td class="px-4 py-3">Checksum annotation on the Pod template so config changes roll out (and fail) like releases (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>); ESO status alerts (KS7)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Bad probe</td><td class="px-4 py-3">New Pods Running 0/1, or restarts with exit 137 and no OOMKilled</td><td class="px-4 py-3">Revert the release</td><td class="px-4 py-3">Readiness checks what the Pod needs to serve; liveness checks only the process (<a href="./ks2.html" class="text-viol underline decoration-viol/40">KS2</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Limits too low</td><td class="px-4 py-3">OOMKilled (memory) or latency with CPU pinned at the limit (CPU)</td><td class="px-4 py-3">Raise the limit in Git</td><td class="px-4 py-3">Size from real p99 usage; find the leak if usage climbs (<a href="./ks8.html" class="text-viol underline decoration-viol/40">KS8</a>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">PDB blocks a drain</td><td class="px-4 py-3">Node stuck cordoned; <code class="inline">DisruptionBlocked</code> events; ALLOWED DISRUPTIONS 0</td><td class="px-4 py-3">Scale the workload up by one</td><td class="px-4 py-3">Replicas ≥ 3 with <code class="inline">maxUnavailable: 1</code>; never delete the PDB</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Node pressure</td><td class="px-4 py-3">Evictions and restarts on one node only; DiskPressure or MemoryPressure</td><td class="px-4 py-3">Cordon and drain that node</td><td class="px-4 py-3">Bigger root volume, honest requests so the scheduler stops overpacking</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">DNS <code class="inline">ndots</code> fan-out</td><td class="px-4 py-3">Intermittent 5 s delays on outbound calls; CoreDNS busy</td><td class="px-4 py-3">Scale CoreDNS</td><td class="px-4 py-3"><code class="inline">dnsConfig</code> ndots 2, trailing dots, NodeLocal DNSCache (KS11)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">RDS connection exhaustion</td><td class="px-4 py-3"><code class="inline">sorry, too many clients already</code> after a scale-out</td><td class="px-4 py-3">Cap HPA <code class="inline">maxReplicas</code>; restart the worst offender</td><td class="px-4 py-3">Pool size × max Pods &lt; <code class="inline">max_connections</code>; RDS Proxy (<a href="./aw5.html" class="text-viol underline decoration-viol/40">AW5</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ═══════════════ PART IV ═══════════════ -->
+      <div class="kicker text-amber-600 dark:text-amber-400 mt-14">Part IV · A drills environment</div>
+      <h2 class="font-display text-2xl font-bold mt-2">Practise on a copy that fails the way prod fails</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        Nobody gets good at incidents by reading about them, and you cannot practise on <code class="inline">clinic-prod-eks</code>.
+        The answer is a local cluster that copies the parts of prod that shape how failures look (namespace, probes,
+        rollout strategy, PDB, a database dependency, a read-only on-call identity) and drops the parts that only cost
+        money. A fault injector then breaks it in a way you did not choose, so you practise the whole loop: notice,
+        scope, name the layer, mitigate, fix, verify. The Hands-on lab below uses exactly these files.
+      </p>
+
+      <h3 class="font-semibold text-lg mt-7">What to copy from prod, and what to leave out</h3>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <thead><tr class="text-left text-xs uppercase tracking-wide text-mute dark:text-mutedark border-b border-line dark:border-linedark">
+            <th class="px-4 py-3">In clinic-prod-eks</th><th class="px-4 py-3">In the drill cluster</th><th class="px-4 py-3">Why it is good enough</th></tr></thead>
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold">EKS 1.33, Karpenter nodes</td><td class="px-4 py-3">kind <code class="inline">ks15</code>, Kubernetes 1.33.1, one control plane + two workers</td><td class="px-4 py-3">Scheduling, eviction, drains and PDBs behave the same</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">booking-api, booking-web from ECR</td><td class="px-4 py-3">Lab-kit images loaded with <code class="inline">kind load</code>, same probes and strategy</td><td class="px-4 py-3">Real health endpoints, real JSON logs, <code class="inline">CHAOS=on</code> drill endpoints</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">RDS Postgres, ESO Secret</td><td class="px-4 py-3">Postgres 16 Pod pinned off the app nodes; a plain Secret</td><td class="px-4 py-3">Readiness depends on the DB exactly as in prod</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">ALB + Ingress</td><td class="px-4 py-3">A <code class="inline">toolbox</code> Pod curling <code class="inline">booking-web</code></td><td class="px-4 py-3">nginx returns 502 where the ALB would return 502 or 503 (KS11)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">BookingOncall access entry</td><td class="px-4 py-3">ServiceAccount <code class="inline">ops/oncall</code> bound to <code class="inline">view</code> in <code class="inline">booking</code></td><td class="px-4 py-3">You hit the same "Forbidden" walls on-call hits</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Break-glass role</td><td class="px-4 py-3">The admin context <code class="inline">kind-ks15</code>, behind the shell guard</td><td class="px-4 py-3">Switching identity is a deliberate act you say out loud</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Git + Argo CD</td><td class="px-4 py-3">The YAML files in <code class="inline">~/labs/ks15</code>; <code class="inline">reset.sh</code> plays the sync</td><td class="px-4 py-3">"Is the cluster what Git says?" stays a question you must answer</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">booking-worker + SQS</td><td class="px-4 py-3">Left out</td><td class="px-4 py-3">It needs a real queue; its failure modes (crash, OOM) are covered by the API's</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5 diagram-card overflow-x-auto">
+        <svg viewBox="0 0 720 280" class="w-full min-w-[640px]" role="img" aria-label="The kind drill cluster: a control-plane node with Postgres and the toolbox, two workers with booking-api and booking-web, an on-call read-only identity and an admin identity, and the fault injector">
+          <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">kind cluster ks15 · namespace booking · CHAOS=on</text>
+          <rect x="10" y="40" width="200" height="150" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <text x="110" y="58" text-anchor="middle" font-size="10" fill="#6E6B64">ks15-control-plane</text>
+          <g class="anim-pulse"><rect x="25" y="70" width="170" height="46" rx="9" fill="#37474F"/>
+            <text x="110" y="90" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">postgres</text>
+            <text x="110" y="105" text-anchor="middle" fill="#ffffffbb" font-size="9">stands in for RDS</text></g>
+          <g class="anim-pulse d1"><rect x="25" y="128" width="170" height="46" rx="9" fill="#6d5acd"/>
+            <text x="110" y="148" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">toolbox</text>
+            <text x="110" y="163" text-anchor="middle" fill="#ffffffbb" font-size="9">probe.sh: the patient's view</text></g>
+          <rect x="250" y="40" width="200" height="150" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <text x="350" y="58" text-anchor="middle" font-size="10" fill="#6E6B64">ks15-worker</text>
+          <g class="anim-pulse d2"><rect x="265" y="70" width="170" height="46" rx="9" fill="#0D9488"/>
+            <text x="350" y="90" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-web</text>
+            <text x="350" y="105" text-anchor="middle" fill="#ffffffbb" font-size="9">nginx → API_UPSTREAM</text></g>
+          <g class="anim-pulse d3"><rect x="265" y="128" width="170" height="46" rx="9" fill="#2563EB"/>
+            <text x="350" y="148" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api</text>
+            <text x="350" y="163" text-anchor="middle" fill="#ffffffbb" font-size="9">/readyz checks Postgres</text></g>
+          <rect x="490" y="40" width="200" height="150" rx="12" fill="none" stroke="#A8A49B" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <text x="590" y="58" text-anchor="middle" font-size="10" fill="#6E6B64">ks15-worker2</text>
+          <g class="anim-pulse d2"><rect x="505" y="70" width="170" height="46" rx="9" fill="#0D9488"/>
+            <text x="590" y="90" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-web</text>
+            <text x="590" y="105" text-anchor="middle" fill="#ffffffbb" font-size="9">replica 2</text></g>
+          <g class="anim-pulse d3"><rect x="505" y="128" width="170" height="46" rx="9" fill="#2563EB"/>
+            <text x="590" y="148" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">booking-api</text>
+            <text x="590" y="163" text-anchor="middle" fill="#ffffffbb" font-size="9">replica 2 · PDB maxUnavailable 1</text></g>
+          <line x1="195" y1="151" x2="265" y2="93" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="350" y1="116" x2="350" y2="128" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <line x1="265" y1="151" x2="195" y2="93" stroke="#D97757" stroke-width="2" class="anim-flow"/>
+          <g class="anim-pulse d4"><rect x="25" y="215" width="200" height="40" rx="9" fill="#0D9488"/>
+            <text x="125" y="232" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ks15-oncall (view)</text>
+            <text x="125" y="246" text-anchor="middle" fill="#ffffffbb" font-size="9">you, investigating</text></g>
+          <g class="anim-pulse d1"><rect x="260" y="215" width="200" height="40" rx="9" fill="#DB2777"/>
+            <text x="360" y="232" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">kind-ks15 (admin)</text>
+            <text x="360" y="246" text-anchor="middle" fill="#ffffffbb" font-size="9">your "break-glass", guarded</text></g>
+          <g class="anim-pulse d2"><rect x="495" y="215" width="195" height="40" rx="9" fill="#D97757"/>
+            <text x="592" y="232" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">break.sh / reset.sh</text>
+            <text x="592" y="246" text-anchor="middle" fill="#ffffffbb" font-size="9">one random fault · back to "Git"</text></g>
+        </svg>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">The cluster and the system, as files</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Five files describe the system. They are deliberately close to what the KS14 Helm chart renders: the same
+        rollout strategy (<code class="inline">maxUnavailable: 0</code>, so a bad release stalls instead of taking
+        capacity away), readiness on <code class="inline">/readyz</code>, liveness on <code class="inline">/healthz</code>,
+        requests and limits, a PDB, and migrations as a Job with <code class="inline">MIGRATE_ON_START=false</code>.
+        Postgres and the toolbox are pinned to the control-plane node so that the drain drill cannot take the database
+        with it. All of them validate against the Kubernetes 1.33 schemas.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks15/kind.yaml</span>
+        <pre class="code">kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ks15
+nodes:
+  - role: control-plane      <span class="cm"># also hosts Postgres and the toolbox, so drains never touch them</span>
+  - role: worker             <span class="cm"># ks15-worker</span>
+  - role: worker             <span class="cm"># ks15-worker2</span></pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks15/postgres.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: Namespace
+metadata: { name: booking }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: booking-db, namespace: booking }
+stringData: { url: "postgres://clinic:clinic@postgres:5432/clinic" }   <span class="cm"># stands in for ESO + Secrets Manager</span>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: postgres, namespace: booking }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      nodeSelector: { node-role.kubernetes.io/control-plane: "" }   <span class="cm"># stands in for RDS: off the app nodes</span>
+      tolerations: [{ key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }]
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: clinic }
+            - { name: POSTGRES_PASSWORD, value: clinic }
+            - { name: POSTGRES_DB, value: clinic }
+          ports: [{ containerPort: 5432 }]
+          readinessProbe: { exec: { command: ["pg_isready", "-U", "clinic"] }, periodSeconds: 5 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: booking }
+spec: { selector: { app: postgres }, ports: [{ port: 5432 }] }</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks15/migrate.yaml</span>
+        <pre class="code">apiVersion: batch/v1
+kind: Job
+metadata: { name: booking-migrate, namespace: booking }
+spec:
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: booking-api:ks15
+          args: ["server.js", "migrate"]          <span class="cm"># creates the bookings table, then exits 0</span>
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: booking-db, key: url } }</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks15/api.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: ConfigMap
+metadata: { name: booking-api-config, namespace: booking }
+data: { MIGRATE_ON_START: "false", DRAIN_MS: "5000", CHAOS: "on" }   <span class="cm"># CHAOS=on: drills only, never prod</span>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-api, namespace: booking }
+spec:
+  replicas: 2
+  progressDeadlineSeconds: 120              <span class="cm"># report a stuck rollout after 2 minutes</span>
+  strategy: { rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }
+  selector: { matchLabels: { app: booking-api } }
+  template:
+    metadata: { labels: { app: booking-api } }
+    spec:
+      containers:
+        - name: api
+          image: booking-api:ks15
+          ports: [{ name: http, containerPort: 8080 }]
+          env:
+            - { name: APP_VERSION, value: "1.0.0" }
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: booking-db, key: url } }
+          envFrom: [{ configMapRef: { name: booking-api-config } }]
+          readinessProbe: { httpGet: { path: /readyz, port: http }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 10 }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: booking-api, namespace: booking }
+spec: { selector: { app: booking-api }, ports: [{ port: 8080, targetPort: http }] }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: booking-api, namespace: booking }
+spec: { maxUnavailable: 1, selector: { matchLabels: { app: booking-api } } }</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks15/web.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-web, namespace: booking }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: booking-web } }
+  template:
+    metadata: { labels: { app: booking-web } }
+    spec:
+      containers:
+        - name: web
+          image: booking-web:ks15
+          ports: [{ name: http, containerPort: 8080 }]
+          env: [{ name: API_UPSTREAM, value: "http://booking-api:8080" }]   <span class="cm"># nginx proxies /api/* here</span>
+          readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 5 }
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 128Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: booking-web, namespace: booking }
+spec: { selector: { app: booking-web }, ports: [{ port: 8080, targetPort: http }] }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: toolbox, namespace: booking }        <span class="cm"># plays the patient: curl from inside the cluster</span>
+spec:
+  nodeSelector: { node-role.kubernetes.io/control-plane: "" }
+  tolerations: [{ key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }]
+  containers: [{ name: curl, image: "curlimages/curl:8.11.1", command: ["sleep", "infinity"] }]</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">An on-call identity that can only look</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        The drills are worth much less if you investigate as cluster-admin, because in prod you will not be one. This
+        ServiceAccount gets the built-in <code class="inline">view</code> ClusterRole in <code class="inline">booking</code>
+        only (the same thing <code class="inline">AmazonEKSViewPolicy</code> scoped to a namespace gives you: no Secrets,
+        no exec, no writes), plus read access to nodes, metrics and EndpointSlices. Lab step 4 turns it into a kubeconfig
+        context with a short-lived token.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks15/oncall.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: Namespace
+metadata: { name: ops }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: oncall, namespace: ops }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: oncall-view, namespace: booking }   <span class="cm"># = AmazonEKSViewPolicy scoped to booking</span>
+subjects: [{ kind: ServiceAccount, name: oncall, namespace: ops }]
+roleRef: { kind: ClusterRole, name: view, apiGroup: rbac.authorization.k8s.io }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: oncall-cluster-read }
+rules:
+  - { apiGroups: [""], resources: ["nodes"], verbs: ["get", "list", "watch"] }
+  - { apiGroups: ["metrics.k8s.io"], resources: ["nodes", "pods"], verbs: ["get", "list"] }
+  - { apiGroups: ["discovery.k8s.io"], resources: ["endpointslices"], verbs: ["get", "list", "watch"] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: oncall-cluster-read }
+subjects: [{ kind: ServiceAccount, name: oncall, namespace: ops }]
+roleRef: { kind: ClusterRole, name: oncall-cluster-read, apiGroup: rbac.authorization.k8s.io }</pre>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-8">A fault injector you cannot peek at, and a reset</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        <code class="inline">break.sh</code> holds ten faults, each a realistic bad change: a ConfigMap edited by hand, a
+        lowered limit, a tag that was never pushed, a rotated password, a wrong selector, a bad probe in a new release, a
+        too-strict PDB. With no argument it picks one at random and hides its own output, so the only way to find out is
+        to investigate. <code class="inline">probe.sh</code> is what a patient sees. <code class="inline">reset.sh</code>
+        deletes and re-creates the app objects from the files rather than just re-applying them, for a reason drill 1
+        teaches: <code class="inline">kubectl apply</code> does not remove a field someone added by hand.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks15/probe.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># probe.sh [PATH] — what a patient sees: HTTP status and total time, through booking-web</span>
+kubectl --context kind-ks15 -n booking exec toolbox -- \
+  curl -s -o /dev/null -m 60 -w '%{http_code} %{time_total}s\n' "http://booking-web:8080${1:-/api/bookings}"</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks15/break.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># break.sh [1-10|reveal] — inject one fault into booking. No argument: a random one, and you are not told which.</span>
+set -euo pipefail
+k() { kubectl --context kind-ks15 -n booking "$@" &gt; /dev/null; }     <span class="cm"># silent: the output would give it away</span>
+if [ "${1:-}" = reveal ]; then cat .last-fault; exit 0; fi
+n=${1:-$(( RANDOM % 10 + 1 ))}
+case $n in
+  1) k patch configmap booking-api-config --type=merge -p '{"data":{"NODE_OPTIONS":"--require=/otel/auto.js"}}'
+     k delete pod -l app=booking-api --wait=false ;;                  <span class="cm"># "the nodes were recycled overnight"</span>
+  2) k set resources deploy/booking-api -c api --limits=cpu=1,memory=128Mi
+     k rollout status deploy/booking-api --timeout=180s
+     for i in 1 2 3 4 5 6; do k exec toolbox -- curl -s -m 5 http://booking-api:8080/admin/leak || true; done ;;
+  3) k set image deploy/booking-api api=booking-api:1.0.1 ;;
+  4) k set resources deploy/booking-api -c api --requests=cpu=64,memory=128Mi --limits=cpu=64,memory=256Mi ;;
+  5) k patch secret booking-db --type=merge -p '{"stringData":{"url":"postgres://clinic:rotated@postgres:5432/clinic"}}'
+     k delete pod -l app=booking-api --wait=false ;;
+  6) k patch service booking-api -p '{"spec":{"selector":{"app":"booking-api-v2"}}}' ;;
+  7) k set env deploy/booking-web API_UPSTREAM=http://postgres:5432 ;;
+  8) k set resources deploy/booking-api -c api --limits=cpu=100m,memory=256Mi ;;
+  9) k patch deploy booking-api --type=json -p '[
+       {"op":"replace","path":"/spec/template/spec/containers/0/env/0/value","value":"1.1.0"},
+       {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/ready"}]' ;;
+  10) k patch pdb booking-api --type=merge -p '{"spec":{"maxUnavailable":null,"minAvailable":2}}'
+      node=$(kubectl --context kind-ks15 -n booking get pod -l app=booking-api -o jsonpath='{.items[0].spec.nodeName}')
+      echo "TICKET: the platform team needs $node drained for maintenance today. Please drain it." ;;
+  *) echo "usage: $0 [1-10|reveal]"; exit 2 ;;
+esac
+echo "$n" &gt; .last-fault
+echo "Fault injected. Start where a patient would: ./probe.sh"</pre>
+      </div>
+      <div class="mt-4">
+        <span class="code-label">~/labs/ks15/reset.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># reset.sh — put booking back to the baseline. The YAML files in this folder play the role of Git.</span>
+set -euo pipefail
+K="kubectl --context kind-ks15"
+$K -n booking delete deploy/booking-api deploy/booking-web svc/booking-api pdb/booking-api \
+  configmap/booking-api-config secret/booking-db --ignore-not-found
+$K get nodes -o name | xargs -n1 $K uncordon
+$K apply -f postgres.yaml -f api.yaml -f web.yaml
+for d in postgres booking-api booking-web; do $K -n booking rollout status deploy/$d --timeout=180s; done
+rm -f .last-fault
+./probe.sh</pre>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>CHAOS=on and the toolbox exist only in the drill cluster.</strong> The
+        <code class="inline">/admin/*</code> endpoints let anyone who can reach the API crash it or fill its memory. If you
+        copy these manifests as a starting point for a real environment, the ConfigMap's <code class="inline">CHAOS</code>
+        line and the toolbox Pod are the first things to delete.</div>
+
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Ten break-and-fix drills on a prod-shaped cluster</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will build the Part IV drill cluster on your laptop, give yourself a read-only on-call identity and the shell
+        guard, record what "healthy" looks like, and then work through ten faults: first in order with hints, then at
+        random against the clock. For every fault you investigate as on-call, switch to the admin context only to
+        mitigate, write one line in your incident notes, and confirm the cluster matches "Git" again. Nothing here touches
+        AWS.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">Diagnose and fix ten production-style faults using the least privilege that works, leaving notes a postmortem could use</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">1 hour of setup, then 15–30 minutes per drill; plan two sessions</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop: kind cluster <code class="inline">ks15</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">USD 0. Give Docker about 6 GB of memory and 4 CPUs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>): Docker, <code class="inline">kind</code> 0.29 or newer, <code class="inline">kubectl</code> 1.33, <code class="inline">jq</code>, <code class="inline">stern</code>, <code class="inline">k9s</code>; the lab kit in <code class="inline">~/clinic-app</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up the folder and save the Part IV files.</strong> If <code class="inline">~/clinic-app</code> is
+        missing, fetch the lab kit first. Then save the nine files from Part IV (<code class="inline">kind.yaml</code>,
+        <code class="inline">postgres.yaml</code>, <code class="inline">migrate.yaml</code>, <code class="inline">api.yaml</code>,
+        <code class="inline">web.yaml</code>, <code class="inline">oncall.yaml</code>, <code class="inline">probe.sh</code>,
+        <code class="inline">break.sh</code>, <code class="inline">reset.sh</code>) into <code class="inline">~/labs/ks15</code>.
+        <pre class="code">kind version
+<span class="out">kind v0.29.0 go1.24.2 darwin/arm64</span>
+ls ~/clinic-app || (cd ~ &amp;&amp; curl -fsSLO https://&lt;this-site&gt;/devops/lab-kit/fetch.sh &amp;&amp; bash fetch.sh https://&lt;this-site&gt;/devops/lab-kit)
+mkdir -p ~/labs/ks15 &amp;&amp; cd ~/labs/ks15
+<span class="cm"># … save the nine files here …</span>
+chmod +x probe.sh break.sh reset.sh &amp;&amp; ls
+<span class="out">api.yaml  break.sh  kind.yaml  migrate.yaml  oncall.yaml  postgres.yaml  probe.sh  reset.sh  web.yaml</span>
+echo "# KS15 incident notes" &gt; notes.md       <span class="cm"># one line per decision, like a real timeline</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create the cluster and add metrics-server.</strong> kind does not ship metrics-server, and
+        <code class="inline">kubectl top</code> needs it. On kind the kubelet certificates are self-signed, so the
+        standard install needs one extra flag.
+        <pre class="code">kind create cluster --config kind.yaml --image kindest/node:v1.33.1
+kubectl --context kind-ks15 get nodes
+<span class="out">NAME                 STATUS   ROLES           AGE   VERSION
+ks15-control-plane   Ready    control-plane   70s   v1.33.1
+ks15-worker          Ready    &lt;none&gt;          50s   v1.33.1
+ks15-worker2         Ready    &lt;none&gt;          50s   v1.33.1</span>
+kubectl --context kind-ks15 apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+kubectl --context kind-ks15 -n kube-system patch deployment metrics-server --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl --context kind-ks15 -n kube-system rollout status deploy/metrics-server --timeout=120s
+<span class="out">deployment "metrics-server" successfully rolled out</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Build the two images and load them into the nodes.</strong> The tag <code class="inline">ks15</code> is the
+        only one the nodes will ever have, which matters in drill 3.
+        <pre class="code">docker build -t booking-api:ks15 ~/clinic-app/booking-api
+docker build -t booking-web:ks15 ~/clinic-app/booking-web
+kind load docker-image booking-api:ks15 booking-web:ks15 --name ks15
+<span class="out">Image: "booking-api:ks15" with ID "sha256:…" not yet present on node "ks15-worker", loading...</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Deploy in dependency order and check the patient's view.</strong> Database first, then the migration Job,
+        then the app. The <code class="inline">toolbox</code> Pod is created with <code class="inline">web.yaml</code>.
+        <pre class="code">kubectl --context kind-ks15 apply -f postgres.yaml
+kubectl --context kind-ks15 -n booking rollout status deploy/postgres --timeout=180s
+kubectl --context kind-ks15 apply -f migrate.yaml
+kubectl --context kind-ks15 -n booking wait --for=condition=complete job/booking-migrate --timeout=180s
+<span class="out">job.batch/booking-migrate condition met</span>
+kubectl --context kind-ks15 apply -f api.yaml -f web.yaml
+kubectl --context kind-ks15 -n booking rollout status deploy/booking-api --timeout=180s
+kubectl --context kind-ks15 -n booking wait --for=condition=Ready pod/toolbox --timeout=120s
+kubectl --context kind-ks15 -n booking exec toolbox -- curl -s -XPOST http://booking-web:8080/api/bookings \
+  -H 'content-type: application/json' -d '{"patient":"An","slot":"2026-11-02T09:00"}'
+<span class="out">{"id":1,"patient":"An","slot":"2026-11-02T09:00:00.000Z","created_at":"…"}</span>
+./probe.sh
+<span class="out">200 0.012s</span></pre>
+        Optional: <code class="inline">kubectl --context kind-ks15 -n booking port-forward svc/booking-web 3000:8080</code>
+        and open <code class="inline">http://localhost:3000</code> to see the page. A Service port-forward pins one Pod,
+        so it breaks when that Pod dies; that is why the drills use <code class="inline">probe.sh</code> instead.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Create your on-call identity and arm the guard.</strong> The token lasts 8 hours; re-run the
+        <code class="inline">set-credentials</code> line in your next session. Then load the Part I guard function in
+        this shell with the lab's admin context added to the pattern.
+        <pre class="code">kubectl --context kind-ks15 apply -f oncall.yaml
+kubectl config set-credentials ks15-oncall \
+  --token="$(kubectl --context kind-ks15 -n ops create token oncall --duration=8h)"
+kubectl config set-context ks15-oncall --cluster=kind-ks15 --user=ks15-oncall --namespace=booking
+kubectl --context ks15-oncall auth whoami | grep Username
+<span class="out">Username    system:serviceaccount:ops:oncall</span>
+kubectl --context ks15-oncall auth can-i patch deployments; kubectl --context ks15-oncall auth can-i get secrets
+<span class="out">no
+no</span>
+export KUBE_GUARD_RE='prod|kind-ks15'          <span class="cm"># after pasting the kubectl() function from Part I</span>
+kubectl --context kind-ks15 -n booking scale deploy/booking-api --replicas=2
+<span class="out">kind-ks15 is guarded. Type the context name to run: kubectl --context kind-ks15 -n booking scale deploy/booking-api --replicas=2
+&gt; kind-ks15
+deployment.apps/booking-api scaled</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Record a healthy baseline, read-only.</strong> You cannot recognise "wrong" without knowing "right". Run
+        these as on-call and paste the key numbers into <code class="inline">notes.md</code>.
+        <pre class="code">kubectl --context ks15-oncall get pods -o wide
+<span class="out">NAME                           READY   STATUS    RESTARTS   AGE   IP           NODE
+booking-api-7d6c9b8f5d-4kq9z   1/1     Running   0          6m    10.244.1.4   ks15-worker
+booking-api-7d6c9b8f5d-x8m2r   1/1     Running   0          6m    10.244.2.4   ks15-worker2
+booking-web-6b7f9c5d8-9tq4l    1/1     Running   0          6m    10.244.2.5   ks15-worker2
+…</span>
+kubectl --context ks15-oncall rollout history deploy/booking-api
+kubectl --context ks15-oncall top pod -l app=booking-api
+<span class="out">NAME                           CPU(cores)   MEMORY(bytes)
+booking-api-7d6c9b8f5d-4kq9z   1m           48Mi</span>
+kubectl --context ks15-oncall logs -l app=booking-api --prefix --tail=2 | cut -c1-120
+./probe.sh '/api/admin/burn?ms=300'
+<span class="out">200 0.31s</span>                                      <span class="cm"># 300 ms of CPU, done in 300 ms</span>
+stern --context ks15-oncall -n booking booking-api -o raw --tail 0 | jq -cR 'fromjson? | {path,status,ms}'
+<span class="cm"># leave stern running in a second terminal for the drills; ctrl-c to stop</span></pre>
+      </div></div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it: ten drills</h3>
+      <p class="mt-2 text-[15px] leading-relaxed">
+        Each drill is the same loop. <strong>Inject</strong> with <code class="inline">./break.sh N</code>.
+        <strong>Investigate</strong> only as <code class="inline">ks15-oncall</code> until you can say the layer and the
+        cause in one sentence. <strong>Mitigate</strong>: write the decision in <code class="inline">notes.md</code>, then
+        act on <code class="inline">kind-ks15</code> (your break-glass). <strong>Verify</strong> with
+        <code class="inline">./probe.sh</code>. <strong>Reset</strong> with <code class="inline">./reset.sh</code> before
+        the next drill. Open the answer only after you have written your own.
+      </p>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Drill 1: everything is down, and nothing was deployed.</strong> Run <code class="inline">./break.sh 1</code>.
+        Within a minute <code class="inline">./probe.sh</code> returns <code class="inline">502</code> and both API Pods
+        show <code class="inline">CrashLoopBackOff</code>. <em>Hint:</em> <code class="inline">rollout history</code> has no
+        new revision, so the Pod template did not change. What else does a container read when it starts?
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall logs deploy/booking-api --previous | grep -m1 Error
+<span class="out">Error: Cannot find module '/otel/auto.js'</span>
+kubectl --context ks15-oncall get configmap booking-api-config -o jsonpath='{.data}{"\n"}'
+<span class="out">{"CHAOS":"on","DRAIN_MS":"5000","MIGRATE_ON_START":"false","NODE_OPTIONS":"--require=/otel/auto.js"}</span>
+kubectl --context kind-ks15 diff -f api.yaml; echo "exit $?"
+<span class="out">exit 0</span>                                         <span class="cm"># diff is blind to a key added by hand</span>
+kubectl --context kind-ks15 -n booking patch configmap booking-api-config --type=json \
+  -p '[{"op":"remove","path":"/data/NODE_OPTIONS"}]'
+kubectl --context kind-ks15 -n booking rollout restart deploy/booking-api</pre>
+          <p class="mt-2">Someone added <code class="inline">NODE_OPTIONS</code> to the ConfigMap by hand (a half-finished
+          OpenTelemetry rollout), and every Pod that restarted afterwards crashed. Config consumed through
+          <code class="inline">envFrom</code> is read only at container start, so the damage waits for the next restart:
+          a node rotation at night is enough. Notice that <code class="inline">kubectl diff</code> exits 0, because
+          apply-style diffs compare only the fields your file manages; Argo CD's default diff has the same blind spot.
+          Permanent fix: config changes go through Git with a checksum annotation on the Pod template (KS9), so a bad
+          value fails as a stalled rollout instead of a midnight outage.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Drill 2: Pods restart now and then.</strong> Run <code class="inline">./break.sh 2</code> (it takes about
+        a minute). <code class="inline">./probe.sh</code> mostly answers 200, but the RESTARTS column has moved.
+        <em>Hint:</em> read the last termination of a restarted container, then compare the newest revision with the one
+        before it.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall get pods -l app=booking-api -o custom-columns=\
+POD:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,\
+LAST:.status.containerStatuses[0].lastState.terminated.reason,EXIT:.status.containerStatuses[0].lastState.terminated.exitCode
+<span class="out">POD                            RESTARTS   LAST        EXIT
+booking-api-5d9c7b6f4-7xq2m    1          OOMKilled   137</span>
+kubectl --context ks15-oncall rollout history deploy/booking-api --revision=2 | grep -A2 Limits
+<span class="out">    Limits:
+      cpu:	1
+      memory:	128Mi</span>                                 <span class="cm"># was 256Mi in revision 1</span>
+kubectl --context ks15-oncall logs booking-api-5d9c7b6f4-7xq2m --previous | jq -c 'select(.path) | {path,status}' | tail -2
+<span class="out">{"path":"/admin/leak","status":200}
+{"path":"/admin/leak","status":200}</span>
+kubectl --context kind-ks15 -n booking rollout undo deploy/booking-api</pre>
+          <p class="mt-2">Two causes, as usual. A release halved the memory limit, and an endpoint retains 50 MiB per call
+          (a leak). Exit 137 with reason <code class="inline">OOMKilled</code> means the kernel killed it at the limit.
+          Rolling back mitigates; the permanent fix is the leak in code, plus a limit sized from real peak usage. Raising
+          the limit alone only moves the crash further out (KS11).</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Drill 3: the deploy pipeline says "timed out".</strong> Run <code class="inline">./break.sh 3</code>.
+        Patients are fine (<code class="inline">./probe.sh</code> says 200), but a new Pod is not starting, and after two
+        minutes <code class="inline">kubectl --context ks15-oncall rollout status deploy/booking-api</code> reports a
+        progress deadline. <em>Hint:</em> this Pod has no logs; look at its events.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall events --types=Warning | grep -m1 'Failed to pull'
+<span class="out">… Failed to pull image "booking-api:1.0.1": … pull access denied, repository does not exist or may require authorization …</span>
+kubectl --context ks15-oncall get deploy booking-api \
+  -o jsonpath='{.status.conditions[?(@.type=="Progressing")].reason}{"\n"}'
+<span class="out">ProgressDeadlineExceeded</span>
+kubectl --context kind-ks15 -n booking rollout undo deploy/booking-api</pre>
+          <p class="mt-2">The tag <code class="inline">1.0.1</code> was never loaded into the nodes, which in prod means
+          CI never pushed it to ECR (the build failed after the tag bump, or someone typed the tag). Patients were
+          protected by <code class="inline">maxUnavailable: 0</code>: the old Pods kept serving. That is also why this
+          kind of failure should alert on <code class="inline">ProgressDeadlineExceeded</code> or a degraded Argo CD
+          app, because no 5xx will ever fire. In prod: revert the tag-bump PR.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Drill 4: a Pod waits forever.</strong> Run <code class="inline">./break.sh 4</code>. Again patients are
+        fine, and one new API Pod stays <code class="inline">Pending</code>. <em>Hint:</em> the scheduler explains itself
+        in exactly one event.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall events --types=Warning | grep -m1 FailedScheduling
+<span class="out">… FailedScheduling … 0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: },
+2 Insufficient cpu. preemption: 0/3 nodes are available: 1 Preemption is not helpful for scheduling, 2 No preemption victims found for incoming pod.</span>
+kubectl --context ks15-oncall get node ks15-worker -o jsonpath='{.status.allocatable.cpu}{"\n"}'
+<span class="out">8</span>                                              <span class="cm"># your laptop's CPU count</span>
+kubectl --context ks15-oncall get deploy booking-api -o jsonpath='{.spec.template.spec.containers[0].resources.requests}{"\n"}'
+<span class="out">{"cpu":"64","memory":"128Mi"}</span>
+kubectl --context kind-ks15 -n booking rollout undo deploy/booking-api</pre>
+          <p class="mt-2">A request of 64 CPUs (a typo for <code class="inline">64m</code>, or a copy from a batch job) fits
+          no node. On EKS, Karpenter would try to launch a node for it and fail with "no instance type satisfied
+          resources", or worse, succeed and bill you for it. A Pending Pod usually means the manifest is wrong, not that
+          the cluster is full.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">11</div><div class="step-body">
+        <strong>Drill 5: 502 everywhere, Pods Running, zero restarts.</strong> Run <code class="inline">./break.sh 5</code>.
+        <code class="inline">./probe.sh</code> returns <code class="inline">502</code>; the API Pods are
+        <code class="inline">Running</code> but <code class="inline">0/1</code>. <em>Hint:</em> does the Service have any
+        Ready endpoint? Then ask the app why it says it is not ready.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall get endpointslices -l kubernetes.io/service-name=booking-api \
+  -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]} ready={.conditions.ready}{"\n"}{end}'
+<span class="out">10.244.1.7 ready=false
+10.244.2.9 ready=false</span>
+kubectl --context ks15-oncall logs deploy/booking-api | jq -c 'select(.level=="error") | {path,err}' | tail -1
+<span class="out">{"path":"/readyz","err":"password authentication failed for user \"clinic\""}</span>
+kubectl --context ks15-oncall get secret booking-db
+<span class="out">Error from server (Forbidden): secrets "booking-db" is forbidden: User "system:serviceaccount:ops:oncall" cannot get resource "secrets" …</span>
+kubectl --context kind-ks15 -n booking patch secret booking-db --type=merge \
+  -p '{"stringData":{"url":"postgres://clinic:clinic@postgres:5432/clinic"}}'
+kubectl --context kind-ks15 -n booking rollout restart deploy/booking-api</pre>
+          <p class="mt-2">The database password in the Secret no longer matches the database: a rotation that updated
+          one side only. Pods that restarted picked up the new value, failed readiness (<code class="inline">/readyz</code>
+          runs <code class="inline">SELECT 1</code>), and the Service was left with no Ready endpoints, so nginx answered
+          502 (the ALB would answer 503). On-call cannot read the Secret, and should not: the fix belongs to whoever owns
+          the rotation. In prod, correct the value in Secrets Manager and force a resync with
+          <code class="inline">kubectl annotate externalsecret booking-db force-sync=$(date +%s) --overwrite</code> (KS7).</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">12</div><div class="step-body">
+        <strong>Drill 6: 502, and every Pod is Ready.</strong> Run <code class="inline">./break.sh 6</code>. Every API Pod
+        is <code class="inline">1/1</code> with no restarts, and there is no new revision. <em>Hint:</em> compare what the
+        Service selects with what the Pods are labelled.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall get endpointslices -l kubernetes.io/service-name=booking-api \
+  -o jsonpath='{.items[*].endpoints}{"\n"}'
+<span class="out"></span>                                               <span class="cm"># empty: the Service selects nothing</span>
+kubectl --context ks15-oncall get svc booking-api -o jsonpath='{.spec.selector}{"\n"}'
+<span class="out">{"app":"booking-api-v2"}</span>
+kubectl --context ks15-oncall get pods -l app=booking-api --show-labels | head -2
+kubectl --context kind-ks15 -n booking patch service booking-api -p '{"spec":{"selector":{"app":"booking-api"}}}'</pre>
+          <p class="mt-2">Ready Pods with an empty EndpointSlice always means a selector mismatch (or a wrong
+          <code class="inline">targetPort</code>, which shows endpoints but refused connections). In Helm charts it usually
+          arrives with a refactor of the label helpers (KS9). <code class="inline">kubectl diff -f api.yaml</code> would
+          have caught this one, because <code class="inline">selector.app</code> is a field the file manages.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">13</div><div class="step-body">
+        <strong>Drill 7: the API is healthy, the website is not.</strong> Run <code class="inline">./break.sh 7</code>.
+        <code class="inline">./probe.sh</code> returns 502, but <code class="inline">./probe.sh /healthz</code> returns 200,
+        and the API's endpoints are all Ready. <em>Hint:</em> the error is produced by nginx; read its log, and look for a
+        port number.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall logs deploy/booking-web | grep -m1 'upstream:'
+<span class="out">… [error] … upstream prematurely closed connection while reading response header from upstream, …
+request: "GET /api/bookings HTTP/1.1", upstream: "http://10.96.142.17:5432/bookings", …</span>
+kubectl --context ks15-oncall get deploy booking-web -o jsonpath='{.spec.template.spec.containers[0].env}{"\n"}'
+<span class="out">[{"name":"API_UPSTREAM","value":"http://postgres:5432"}]</span>
+kubectl --context kind-ks15 -n booking rollout undo deploy/booking-web</pre>
+          <p class="mt-2">The new web release proxies <code class="inline">/api/*</code> to Postgres, which drops the HTTP
+          request. The exact nginx wording can differ (<code class="inline">Connection reset by peer</code>); port 5432 is
+          the clue. The rollout succeeded because web's readiness only checks nginx itself. The permanent fix is a
+          post-deploy smoke test through the real path (<code class="inline">/api/bookings</code>), as an Argo CD
+          PostSync hook or an analysis step (KS10), so a broken path fails the release instead of the patients.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">14</div><div class="step-body">
+        <strong>Drill 8: slow, not broken.</strong> Run <code class="inline">./break.sh 8</code>, wait for the rollout,
+        then run <code class="inline">for i in 1 2 3 4 5 6; do ./probe.sh '/api/admin/burn?ms=300'; done</code>. Each call
+        that took 0.31 s at baseline now takes about 3 s, with no errors. <em>Hint:</em> run
+        <code class="inline">kubectl top</code> while the loop runs, and compare with the limits.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall top pod -l app=booking-api
+<span class="out">NAME                           CPU(cores)   MEMORY(bytes)
+booking-api-6f4d8c7b9-2lmxw    100m         51Mi</span>             <span class="cm"># flat at exactly the limit</span>
+kubectl --context ks15-oncall get deploy booking-api \
+  -o jsonpath='{.spec.template.spec.containers[0].resources.limits}{"\n"}'
+<span class="out">{"cpu":"100m","memory":"256Mi"}</span>
+kubectl --context kind-ks15 -n booking rollout undo deploy/booking-api</pre>
+          <p class="mt-2">A 100m limit gives the container 10 ms of CPU per 100 ms period, so 300 ms of work takes about
+          3 s of wall time. CPU limits cause latency, never errors, which makes them easy to miss. In prod, graph the
+          throttling ratio (<code class="inline">container_cpu_cfs_throttled_periods_total</code> over
+          <code class="inline">container_cpu_cfs_periods_total</code>, <a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>).
+          Keep the loop running longer and liveness probes start timing out too, so throttling turns into restarts.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">15</div><div class="step-body">
+        <strong>Drill 9: a release that never finishes.</strong> Run <code class="inline">./break.sh 9</code>. Patients
+        are fine, but <code class="inline">kubectl --context ks15-oncall rollout status deploy/booking-api</code> waits on
+        "1 out of 2 new replicas have been updated" and then fails. Treat it as a real incident: diagnose read-only, get
+        "approval" (write it in your notes), use <code class="inline">rollout undo</code> as break-glass, and prove the
+        cluster matches "Git" afterwards.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall events --types=Warning | grep -m1 Readiness
+<span class="out">… Readiness probe failed: HTTP probe failed with statuscode: 404</span>
+kubectl --context ks15-oncall rollout history deploy/booking-api --revision=2 | grep -E 'APP_VERSION|Readiness'
+<span class="out">    Readiness:	http-get http://:http/ready delay=0s timeout=1s period=5s #success=1 #failure=3
+      APP_VERSION:	1.1.0</span>
+echo "$(date -u +%H:%M) IC approved break-glass; rollout undo booking-api (1.1.0 readiness /ready 404)" &gt;&gt; notes.md
+kubectl --context kind-ks15 -n booking rollout undo deploy/booking-api
+kubectl --context kind-ks15 -n booking diff -f api.yaml; echo "exit $?"
+<span class="out">exit 0</span>                                         <span class="cm"># live == "Git": reconciled</span></pre>
+          <p class="mt-2">Release 1.1.0 changed the readiness path to <code class="inline">/ready</code>, which the app
+          does not serve. With <code class="inline">maxUnavailable: 0</code> the old Pods kept serving and the rollout
+          stalled. Here "Git" (your <code class="inline">api.yaml</code>) already holds the good version, so the diff is
+          clean. In prod Git would still hold 1.1.0, Argo CD would re-apply it within seconds, and you would need the
+          Part III sequence: pause sync, undo, revert PR, clean <code class="inline">argocd app diff</code>, resume.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">16</div><div class="step-body">
+        <strong>Drill 10: the node that will not drain.</strong> Run <code class="inline">./break.sh 10</code>; it prints a
+        ticket naming a node. As the platform engineer (admin context), drain it. The command never finishes.
+        <em>Hint:</em> the message tells you which object is refusing; read it as on-call before you touch anything.
+        <pre class="code">kubectl --context kind-ks15 drain ks15-worker --ignore-daemonsets --delete-emptydir-data --timeout=60s
+<span class="out">node/ks15-worker cordoned
+evicting pod booking/booking-api-7d6c9b8f5d-4kq9z
+error when evicting pods/"booking-api-7d6c9b8f5d-4kq9z" -n "booking" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl --context ks15-oncall get pdb
+<span class="out">NAME          MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+booking-api   2               N/A               0                     14m</span>
+kubectl --context kind-ks15 -n booking scale deploy/booking-api --replicas=3
+kubectl --context ks15-oncall get pdb booking-api -o jsonpath='{.status.disruptionsAllowed}{"\n"}'
+<span class="out">1</span>
+kubectl --context kind-ks15 drain ks15-worker --ignore-daemonsets --delete-emptydir-data --timeout=120s
+<span class="out">node/ks15-worker drained</span>
+kubectl --context kind-ks15 uncordon ks15-worker              <span class="cm"># maintenance "done"</span></pre>
+          <p class="mt-2">A PDB of <code class="inline">minAvailable: 2</code> on a 2-replica Deployment allows zero
+          disruptions, so every eviction is refused for ever. Scaling up by one gives the PDB room and the drain completes
+          without losing capacity. The permanent fix in Git is three replicas with <code class="inline">maxUnavailable: 1</code>.
+          Deleting the PDB or draining with <code class="inline">--disable-eviction</code> would also "work", by removing
+          the very protection that keeps patients served during node rotations (KS11).</p>
+        </details>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">kubectl --context ks15-oncall auth can-i patch deployments</code> prints
+        <code class="inline">no</code> and you solved all ten drills with it; <code class="inline">notes.md</code> has, per
+        drill, the symptom, the layer, the command that proved the cause, the mitigation and the permanent fix; after each
+        <code class="inline">./reset.sh</code>, <code class="inline">./probe.sh</code> prints <code class="inline">200</code>
+        and <code class="inline">kubectl --context kind-ks15 diff -f api.yaml -f web.yaml</code> exits 0; and in a second
+        pass you ran <code class="inline">./break.sh</code> three times with no number and named each fault within ten
+        minutes, before <code class="inline">./break.sh reveal</code>.</div>
+
+      <div class="step"><div class="step-n">17</div><div class="step-body">
+        <strong>Clean up.</strong> Deleting the cluster also removes its <code class="inline">kind-ks15</code> context; the
+        on-call context and user you added by hand need removing separately. Then set the guard back to prod only.
+        <pre class="code">kind delete cluster --name ks15
+<span class="out">Deleting cluster "ks15" ...
+Deleted nodes: ["ks15-worker" "ks15-control-plane" "ks15-worker2"]</span>
+kubectl config delete-context ks15-oncall &amp;&amp; kubectl config delete-user ks15-oncall
+docker image rm booking-api:ks15 booking-web:ks15
+kind get clusters
+<span class="out">No kind clusters found.</span>
+export KUBE_GUARD_RE='prod'</pre>
+        Keep <code class="inline">~/labs/ks15</code> and <code class="inline">notes.md</code>: the folder rebuilds the
+        whole environment in about ten minutes (steps 2–5), and the notes are your evidence for the checklist below.
+      </div></div>
+
+      <!-- ═══════════════ claude code ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
+      <p class="mt-4 text-[15px] leading-relaxed">
+        An agent is a good second pair of eyes during an incident: it reads a 400-line <code class="inline">describe</code>
+        faster than you and does not get tired. Give it the same access as a daily on-call engineer, never more: a
+        kubeconfig context backed by <code class="inline">AmazonEKSViewPolicy</code> on <code class="inline">booking</code>,
+        and an instruction that it proposes mitigations for you to run. How to enforce that with hooks and MCP server
+        flags is in <a href="./ar6.html" class="text-viol underline decoration-viol/40">AR6</a>.
+      </p>
+      <pre class="code mt-3">Context clinic-prod (read-only), namespace booking. booking-api 5xx started at 02:10.
+Using only get, describe, events, logs and rollout history, tell me: the scope (pod, service,
+node, cluster), what changed in the 2 hours before 02:10, and which layer owns the symptom.
+Quote the exact command output that supports each claim. Do not suggest fixes yet.</pre>
+      <pre class="code mt-3">Here is my capture.sh folder from the incident and the timeline in notes.md. Draft the
+postmortem timeline and list every live change we made that still needs a clinic-gitops PR.
+For each, write the PR title and the exact YAML change. Flag anything Argo CD would revert.</pre>
+      <pre class="code mt-3">Review this break.sh fault list for our drills cluster. For each fault, check that reset.sh
+really removes it (remember kubectl apply does not delete fields added by patch), and propose
+two new realistic faults for booking-api that use only its real endpoints and env vars.</pre>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-teal-600 dark:text-teal-400">Let the agent do</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>Run read-only triage commands and summarise them by layer</li>
+            <li>Correlate the incident start with Argo CD history and merged PRs</li>
+            <li>Draft the revert PR and the reconciliation PR for live changes</li>
+            <li>Turn notes and captured evidence into a postmortem timeline</li>
+          </ul>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-4">
+          <div class="font-semibold text-coral">You must check</div>
+          <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
+            <li>The context and identity every command ran under (<code class="inline">auth whoami</code>)</li>
+            <li>That the cause it names is supported by output it quoted, not by pattern-matching</li>
+            <li>That the proposed mitigation is reversible and that Git is reconciled after it</li>
+            <li>That no step reads Secrets, execs into Pods or needs break-glass</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mt-4 callout callout-warn"><strong>Red flags in AI-suggested incident actions:</strong>
+        <code class="inline">kubectl edit</code> or <code class="inline">patch</code> on an Argo CD-managed object with no
+        PR; <code class="inline">argocd app rollback</code> as the fix; <code class="inline">kubectl delete pdb</code> or
+        <code class="inline">drain --disable-eviction</code> to unblock a node; deleting crash-looping Pods before their
+        logs are captured; doubling memory or CPU limits as the root-cause fix; a long-lived token or a shared
+        kubeconfig "so the agent can access prod"; any command without <code class="inline">--context</code>; and asking
+        for cluster-admin to "investigate faster".</div>
+
+      <!-- ═══════════════ skill ladder ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Skill ladder: what each score looks like</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Uses whichever kubeconfig works, as admin; fixes things with <code class="inline">kubectl edit</code> and is surprised when they come back.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Knows prod access is read-only by default and that Argo CD reverts live changes; can name the common Pod failure states.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Has the contexts, prompt and guard set up; diagnoses single-layer faults read-only; needs a senior to decide on mitigation and to reconcile Git afterwards.</div></div>
+        <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Runs an incident from alert to fix: scopes it, finds what changed, names the layer, picks a reversible mitigation, uses break-glass correctly when needed, leaves Git and the cluster agreeing, and hands over evidence for the postmortem.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Designs the access tiers and break-glass process for a client, runs drill days for the on-call rotation with new faults, and turns every incident into a better runbook, alert or guardrail.</div></div>
+      </div>
+      <div class="mt-4 callout callout-tip"><strong>Self-check before claiming 3:</strong> with a mentor injecting faults
+        you have not seen (their own, not <code class="inline">break.sh</code>), resolve three in a row on the drill cluster:
+        each with read-only diagnosis first, at most one break-glass action, a written timeline, and a clean
+        <code class="inline">kubectl diff</code> against "Git" at the end. Then explain, without notes, what you would do
+        differently on <code class="inline">clinic-prod-eks</code> with Argo CD self-heal on.</div>
+
+      <!-- ═══════════════ pitfalls ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Pitfalls &amp; pro tips</h2>
+      <div class="mt-4 grid md:grid-cols-2 gap-4 text-sm">
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Investigating as admin "to save time"</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">The one command you mistype is the one that deletes something. Read-only finds the cause in nearly every incident; escalate when you have a specific action to take, not before.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Fixing live and forgetting Git</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A paused Application or a hand-patched object is a time bomb: the next unrelated merge or sync brings the bad state back. No incident closes until the reconciling PR is merged and the diff is clean.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Restarting before capturing</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark"><code class="inline">rollout restart</code> wipes previous-container logs and resets the memory curve that would have shown the leak. Sixty seconds of <code class="inline">capture.sh</code> first, unless patients are failing right now.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-rose-500">✗ Trusting <code class="inline">kubectl diff</code> to find all drift</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Apply-style diffs ignore fields your manifest does not manage, as drill 1 showed. When "nothing changed", compare the live object with Git field by field, and check managed fields for <code class="inline">kubectl-edit</code> or <code class="inline">kubectl-patch</code>.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Split the two clocks</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Say out loud "mitigating now, root cause later", pick the most reversible action that could work, and only then dig in. The incident commander can track one clock at a time.</p>
+        </div>
+        <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
+          <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Drill monthly, not once</div>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Thirty minutes of random <code class="inline">break.sh</code> per on-call engineer per month keeps the commands in muscle memory. Add a new fault to the script after every real incident.</p>
+        </div>
+      </div>
+
+      <!-- ═══════════════ evidence & resources ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Evidence checklist</h2>
+      <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark p-6 space-y-3 text-sm">
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="access-tiers"> <span>I can draw the path from Identity Center to an EKS access entry and explain the daily, break-glass and platform tiers, including how a break-glass session is time-boxed, approved and audited.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="workstation"> <span>My laptop has per-environment contexts named by <code class="inline">--alias</code>, a prompt that marks prod, and the shell guard; my default prod context answers <code class="inline">no</code> to <code class="inline">auth can-i get secrets</code> and to exec.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="gitops-reconcile"> <span>I can explain why <code class="inline">kubectl edit</code> under self-heal fails, and walk through pause sync → <code class="inline">rollout undo</code> → revert PR → clean <code class="inline">argocd app diff</code> → resume.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="triage"> <span>Given a symptom, I scope it, find what changed, name the layer and choose a mitigation from the menu, and I can say when <code class="inline">rollout undo</code> is acceptable.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="drills-lab"> <span class="font-semibold">Completed all ten drills of the Hands-on lab as the read-only on-call identity, plus three random ones under ten minutes each, and shared my notes.md (symptom, layer, proving command, mitigation, permanent fix per drill) and one new fault I added to break.sh with its reset, reviewed by a mentor (mentor evidence ✓).</span></label>
+      </div>
+
+      <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
+      <ul class="mt-4 space-y-2 text-sm list-disc pl-5">
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/access-entries.html" target="_blank" rel="noopener">AWS — Grant IAM users access to Kubernetes with EKS access entries</a> — access entries, access policies and namespace scopes behind Part I.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/eks/latest/userguide/create-kubeconfig.html" target="_blank" rel="noopener">AWS — Connect kubectl to an EKS cluster</a> — <code class="inline">update-kubeconfig</code>, aliases and profiles.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/" target="_blank" rel="noopener">Kubernetes — Debug running Pods</a> — ephemeral containers, <code class="inline">--target</code>, profiles and node debugging.</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/" target="_blank" rel="noopener">Kubernetes — Safely drain a node</a> — eviction, PDBs and why drains hang (drill 10).</li>
+        <li><a class="text-coral underline" href="https://kubernetes.io/docs/reference/kubectl/quick-reference/" target="_blank" rel="noopener">Kubernetes — kubectl quick reference</a> — jsonpath, custom columns and the commands in the cheat sheet.</li>
+        <li><a class="text-coral underline" href="https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/" target="_blank" rel="noopener">Argo CD — Automated sync policy</a> — self-heal, and why live changes are reverted.</li>
+        <li><a class="text-coral underline" href="https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Controlling-Resource-Modification/" target="_blank" rel="noopener">Argo CD — Controlling ApplicationSet resource modification</a> — <code class="inline">ignoreApplicationDifferences</code>, so on-call can pause sync.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html" target="_blank" rel="noopener">AWS — CloudWatch Logs Insights query syntax</a> — the queries in Part II, for app and EKS audit logs.</li>
+      </ul>

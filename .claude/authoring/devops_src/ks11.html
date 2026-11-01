@@ -714,6 +714,249 @@ aws elbv2 describe-target-health --target-group-arn "$TG" \
         the command that actually found the cause, and delete the steps nobody used. A runbook that grows only by
         addition becomes a document nobody reads at 3 a.m.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Five failure modes and an upgrade rehearsal on kind</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will cause, one at a time, the five failures from Part III (Pending, CrashLoopBackOff, OOMKilled,
+        ImagePullBackOff and a DNS outage) and, for each, find the one line of evidence that names the cause. Then you
+        rehearse the parts of an upgrade you can practise locally: a drain blocked by a PodDisruptionBudget, and an API
+        removal caught by <code class="inline">pluto</code> before a newer cluster rejects it. The goal is the reflex of
+        reading the right field, not speed. The timed, mixed-scenario operating drill with production access habits is
+        <a href="./ks15.html" class="text-viol underline decoration-viol/40">KS15</a>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">For each failure, write down the symptom, the command that revealed the cause, and the exact field or event text</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop: <code class="inline">kind</code> v0.29 or later (three small clusters over the lab)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free. Give Docker at least 6 GiB of memory</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>), the lab kit in <code class="inline">~/clinic-app/</code>, and <code class="inline">pluto</code> (step 8 installs it)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Build a healthy baseline.</strong> Two booking-api replicas with chaos endpoints, and a
+        <code class="inline">toolbox</code> Deployment (netshoot: curl, dig, ss) to send requests from inside the cluster.
+        Keep a notes file open: one line per failure.
+        <pre class="code">mkdir -p ~/labs/ks11 &amp;&amp; cd ~/labs/ks11
+printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes: [{role: control-plane}, {role: worker}, {role: worker}]\n' &gt; kind.yaml
+kind create cluster --name lab-ks11 --image kindest/node:v1.33.1 --config kind.yaml
+docker build -t booking-api:lab ~/clinic-app/booking-api &amp;&amp; kind load docker-image booking-api:lab --name lab-ks11
+kubectl create namespace booking &amp;&amp; kubectl config set-context --current --namespace=booking
+kubectl create deployment toolbox --image=nicolaka/netshoot:v0.13 -- sleep infinity</pre>
+        <span class="code-label">~/labs/ks11/api.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-api }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: booking-api } }
+  template:
+    metadata: { labels: { app: booking-api } }
+    spec:
+      containers:
+        - name: api
+          image: booking-api:lab
+          env: [{ name: CHAOS, value: "on" }]
+          ports: [{ containerPort: 8080 }]
+          livenessProbe: { httpGet: { path: /healthz, port: 8080 } }
+          readinessProbe: { httpGet: { path: /readyz, port: 8080 }, periodSeconds: 5 }
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 128Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: booking-api }
+spec: { selector: { app: booking-api }, ports: [{ port: 80, targetPort: 8080 }] }</pre>
+        <pre class="code">kubectl apply -f api.yaml &amp;&amp; kubectl rollout status deploy/booking-api
+kubectl exec deploy/toolbox -- curl -s booking-api/healthz
+<span class="out">{"ok":true,"version":"dev"}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Pending.</strong> A typo asks for 64 CPUs instead of 64 millicores. Notice that the old Pods keep serving
+        while the new one waits: a rolling update never removes capacity it cannot replace.
+        <pre class="code">kubectl set resources deploy/booking-api --requests=cpu=64
+kubectl get pods -l app=booking-api
+<span class="out">booking-api-58d9c7b6f4-x2kqv   0/1   Pending   0   20s</span>
+kubectl describe pod -l app=booking-api | grep -A2 FailedScheduling
+<span class="out">Warning  FailedScheduling  …  0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: },
+2 Insufficient cpu. preemption: 0/3 nodes are available: …</span>
+kubectl rollout undo deploy/booking-api</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>CrashLoopBackOff.</strong> Crash the API a few times through the Service. The status column is only the
+        kubelet's back-off; the cause is in the last termination record and the previous container's logs.
+        <pre class="code">for i in 1 2 3 4 5; do kubectl exec deploy/toolbox -- curl -s -m 2 booking-api/admin/crash; sleep 10; done
+kubectl get pods -l app=booking-api
+<span class="out">booking-api-6c7f9d8b5-k2v9d   0/1   CrashLoopBackOff   3 (12s ago)   6m</span>    <span class="cm"># or Running with restarts</span>
+POD=$(kubectl get pods -l app=booking-api --sort-by='.status.containerStatuses[0].restartCount' -o name | tail -1)
+kubectl get $POD -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode} {.status.containerStatuses[0].lastState.terminated.reason}{"\n"}'
+<span class="out">1 Error</span>                                         <span class="cm"># the app exited on its own</span>
+kubectl logs $POD --previous | tail -1
+<span class="out">{"ts":"…","level":"error","msg":"crash requested","service":"booking-api","version":"dev"}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>OOMKilled.</strong> Send <code class="inline">/admin/leak</code> to one Pod directly (by Pod IP, not through the
+        Service) until it exceeds its 128 MiB limit. Same restart symptom as step 3, different killer.
+        <pre class="code">POD=$(kubectl get pods -l app=booking-api -o name | head -1)
+IP=$(kubectl get $POD -o jsonpath='{.status.podIP}')
+for i in 1 2 3; do kubectl exec deploy/toolbox -- curl -s -m 5 $IP:8080/admin/leak; echo; done
+<span class="out">{"leakedMiB":50}
+                                                <span class="cm"># no answer: the process is gone</span></span>
+kubectl get $POD -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode} {.status.containerStatuses[0].lastState.terminated.reason}{"\n"}'
+<span class="out">137 OOMKilled</span>                                   <span class="cm"># the kernel killed it at the limit</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>ImagePullBackOff.</strong> Deploy a tag that does not exist. Read the event message, not the status: it
+        names the registry the node tried and why it failed.
+        <pre class="code">kubectl set image deploy/booking-api api=booking-api:9.9.9
+kubectl get events --field-selector reason=Failed --sort-by=.lastTimestamp | tail -1 | cut -c1-200
+<span class="out">… Failed to pull image "booking-api:9.9.9": failed to pull and unpack image "docker.io/library/booking-api:9.9.9":
+failed to resolve reference …: pull access denied, repository does not exist or may require authorization …</span>
+kubectl rollout undo deploy/booking-api</pre>
+        On kind, an image name without a registry means Docker Hub, which is why the node went there. On EKS the same
+        mistake shows the ECR host, and the message tells you whether it is "not found" (a tag CI never pushed) or "403"
+        (pull permissions).
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>DNS outage.</strong> Take CoreDNS away, then prove it is DNS and not the network: the name fails, the Pod
+        IP works. Then look from inside a distroless booking-api Pod with <code class="inline">kubectl debug</code>.
+        <pre class="code">kubectl -n kube-system scale deploy coredns --replicas=0
+kubectl exec deploy/toolbox -- curl -s -m 5 booking-api/healthz; echo " exit=$?"
+<span class="out"> exit=6</span>                                         <span class="cm"># curl 6 = could not resolve host</span>
+kubectl exec deploy/toolbox -- curl -s -m 5 $(kubectl get pods -l app=booking-api -o jsonpath='{.items[0].status.podIP}'):8080/healthz
+<span class="out">{"ok":true,"version":"dev"}</span>                     <span class="cm"># the network is fine</span>
+kubectl debug -it $(kubectl get pods -l app=booking-api -o name | head -1) --image=nicolaka/netshoot:v0.13 \
+  --target=api --profile=general -- dig +time=2 +tries=1 booking-api.booking.svc.cluster.local
+<span class="out">;; communications error to 10.96.0.10#53: …
+;; no servers could be reached</span>
+kubectl -n kube-system get endpointslices -l kubernetes.io/service-name=kube-dns
+<span class="out">NAME             ADDRESSTYPE   PORTS     ENDPOINTS   AGE
+kube-dns-7x2kp   IPv4          &lt;unset&gt;   &lt;unset&gt;     40m</span>      <span class="cm"># the DNS Service has no backends</span>
+kubectl -n kube-system scale deploy coredns --replicas=2</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Rehearse a drain that a PDB blocks.</strong> Node rotation during an upgrade is a series of drains. A PDB
+        with <code class="inline">minAvailable</code> equal to the replica count makes every drain wait forever.
+        <pre class="code">kubectl create poddisruptionbudget booking-api --selector=app=booking-api --min-available=2
+NODE=$(kubectl get pods -l app=booking-api -o jsonpath='{.items[0].spec.nodeName}')
+kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --timeout=45s
+<span class="out">evicting pod booking/booking-api-6c7f9d8b5-k2v9d
+error when evicting pods/"booking-api-6c7f9d8b5-k2v9d" -n "booking" (will retry after 5s): Cannot evict pod as it
+would violate the pod's disruption budget.
+…
+error: unable to drain node "lab-ks11-worker" due to error: … global timeout reached: 45s</span>
+kubectl delete pdb booking-api &amp;&amp; kubectl create poddisruptionbudget booking-api --selector=app=booking-api --max-unavailable=1
+kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --timeout=90s
+<span class="out">node/lab-ks11-worker drained</span>
+kubectl uncordon $NODE</pre>
+        <code class="inline">maxUnavailable: 1</code> keeps the protection (never two down at once) without making the node
+        impossible to drain. On EKS, Karpenter and managed node groups hit the same wall, just more slowly (Part II).
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Find a removed API before upgrading.</strong> Create a 1.31 cluster and apply a manifest that uses
+        <code class="inline">flowcontrol.apiserver.k8s.io/v1beta3</code>, removed in 1.32. The API server warns, counts the
+        call, and <code class="inline">pluto</code> flags the file. (We use 1.31 → 1.32 because it has a clean removal to
+        practise on; the method is the same for every minor version.)
+        <span class="code-label">~/labs/ks11/legacy/flowschema.yaml</span>
+        <pre class="code">apiVersion: flowcontrol.apiserver.k8s.io/v1beta3
+kind: FlowSchema
+metadata: { name: booking-reports }
+spec:
+  priorityLevelConfiguration: { name: workload-low }
+  matchingPrecedence: 9000
+  distinguisherMethod: { type: ByUser }
+  rules:
+    - subjects: [{ kind: ServiceAccount, serviceAccount: { name: booking-worker, namespace: booking } }]
+      resourceRules: [{ verbs: ["list"], apiGroups: [""], resources: ["pods"], namespaces: ["booking"] }]</pre>
+        <pre class="code">kind create cluster --name lab-ks11-old --image kindest/node:v1.31.9
+kubectl --context kind-lab-ks11-old apply -f legacy/flowschema.yaml
+<span class="out">Warning: flowcontrol.apiserver.k8s.io/v1beta3 FlowSchema is deprecated in v1.29+, unavailable in v1.32+; use flowcontrol.apiserver.k8s.io/v1 FlowSchema
+flowschema.flowcontrol.apiserver.k8s.io/booking-reports created</span>
+kubectl --context kind-lab-ks11-old get --raw /metrics | grep '^apiserver_requested_deprecated_apis'
+<span class="out">apiserver_requested_deprecated_apis{group="flowcontrol.apiserver.k8s.io",removed_release="1.32",resource="flowschemas",…,version="v1beta3"} 1</span>
+brew install FairwindsOps/tap/pluto                <span class="cm"># Linux: release binary from github.com/FairwindsOps/pluto</span>
+pluto detect-files -d legacy -t k8s=v1.32.0
+<span class="out">NAME              KIND         VERSION                                REPLACEMENT                       REMOVED   DEPRECATED
+booking-reports   FlowSchema   flowcontrol.apiserver.k8s.io/v1beta3   flowcontrol.apiserver.k8s.io/v1   true      true</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>See what the newer API server does, then fix the manifest.</strong> kind cannot upgrade a cluster in place,
+        so create a 1.32 cluster next to the old one, which is also how a blue/green cluster upgrade feels. The old object
+        on the 1.31 cluster would survive an in-place upgrade; it is the next <code class="inline">apply</code> of the file
+        that fails.
+        <pre class="code">kind create cluster --name lab-ks11-new --image kindest/node:v1.32.5
+kubectl --context kind-lab-ks11-new apply -f legacy/flowschema.yaml
+<span class="out">error: resource mapping not found for name: "booking-reports" namespace: "" from "legacy/flowschema.yaml": no matches for kind
+"FlowSchema" in version "flowcontrol.apiserver.k8s.io/v1beta3"
+ensure CRDs are installed first</span>
+sed -i.bak 's#flowcontrol.apiserver.k8s.io/v1beta3#flowcontrol.apiserver.k8s.io/v1#' legacy/flowschema.yaml &amp;&amp; rm legacy/*.bak
+for c in old new; do kubectl --context kind-lab-ks11-$c apply -f legacy/flowschema.yaml; done
+<span class="out">flowschema.flowcontrol.apiserver.k8s.io/booking-reports configured
+flowschema.flowcontrol.apiserver.k8s.io/booking-reports created</span>
+pluto detect-files -d legacy -t k8s=v1.32.0; echo "exit=$?"
+<span class="out">There were no resources found with known deprecated apiVersions.
+exit=0</span>
+kind delete cluster --name lab-ks11-old &amp;&amp; kind delete cluster --name lab-ks11-new
+kubectl config use-context kind-lab-ks11              <span class="cm"># back to the main lab cluster</span></pre>
+        Writing the fixed manifest to <em>both</em> versions first is the safe order: the new API version is already served
+        by the old cluster, so the PR can merge before the upgrade.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> your notes have one line per failure with the field or
+        event that proved the cause (<code class="inline">FailedScheduling … Insufficient cpu</code>,
+        <code class="inline">1 Error</code> + <code class="inline">crash requested</code>, <code class="inline">137 OOMKilled</code>,
+        <code class="inline">pull access denied</code>, empty <code class="inline">kube-dns</code> endpoints);
+        <code class="inline">kubectl get pods</code> shows two Ready booking-api Pods again; the drain succeeded with a
+        <code class="inline">maxUnavailable</code> PDB; and <code class="inline">pluto</code> exits 0 on the fixed manifest.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>A mystery change.</strong> The patch below is base64-encoded so you cannot read it first, as on call when a
+        deploy you did not write goes wrong. After it, <code class="inline">kubectl rollout status</code> hangs, one new Pod is
+        <code class="inline">Running</code> but <code class="inline">0/1</code> Ready, and yet
+        <code class="inline">curl booking-api/healthz</code> from the toolbox still works. Find the cause and explain why there is
+        no outage before you open the answer.
+        <pre class="code">kubectl patch deploy/booking-api --type json -p "$(echo W3sib3AiOiJyZXBsYWNlIiwicGF0aCI6Ii9zcGVjL3RlbXBsYXRlL3NwZWMvY29udGFpbmVycy8wL3JlYWRpbmVzc1Byb2JlL2h0dHBHZXQvcG9ydCIsInZhbHVlIjo4MDgxfV0= | base64 -d)"
+kubectl rollout status deploy/booking-api --timeout=60s
+<span class="out">Waiting for deployment "booking-api" rollout to finish: 1 out of 2 new replicas have been updated...
+error: timed out waiting for the condition</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl get events --field-selector reason=Unhealthy --sort-by=.lastTimestamp | tail -1
+<span class="out">… Readiness probe failed: Get "http://10.244.2.9:8081/readyz": dial tcp 10.244.2.9:8081: connect: connection refused</span>
+kubectl rollout history deploy/booking-api --revision=$(kubectl get deploy booking-api \
+  -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}') | grep -A1 Readiness
+<span class="out">    Readiness:	http-get http://:8081/readyz delay=0s timeout=1s period=5s #success=1 #failure=3</span></pre>
+          <p class="mt-2">The patch moved the readiness probe to port 8081, where nothing listens. The new Pod never becomes
+          Ready, so it never joins the Service, and the rollout cannot continue: with two replicas, the default
+          <code class="inline">maxUnavailable</code> of 25% rounds down to 0, so both old Pods keep serving. Readiness is
+          what made this a stuck deploy instead of an outage; a <em>liveness</em> probe on the wrong port would have restarted
+          the new Pod in a loop instead. Fix with <code class="inline">kubectl rollout undo deploy/booking-api</code> here. On a
+          GitOps cluster you would revert the commit instead
+          (<a href="./ks10.html" class="text-viol underline decoration-viol/40">KS10</a>,
+          <a href="./ks15.html" class="text-viol underline decoration-viol/40">KS15</a>).</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">11</div><div class="step-body">
+        <strong>Clean up.</strong> Delete the main cluster and confirm the two rehearsal clusters from step 9 are gone too.
+        <pre class="code">kind delete cluster --name lab-ks11
+kind get clusters
+<span class="out">No kind clusters found.</span>
+docker image rm booking-api:lab</pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

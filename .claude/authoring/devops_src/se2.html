@@ -640,6 +640,240 @@ sys.exit(1 <span class="kw">if</span> missing <span class="kw">or</span> expired
         </table>
       </div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Build a security gate, watch it fail, and get through it honestly</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will put the lab kit and your CN1 Terraform in a private GitHub repository and add one workflow with six
+        jobs: the exception register check, gitleaks over the whole history, Semgrep, Checkov plus Trivy config on the
+        Terraform, Trivy on the built image, and a ZAP baseline against the running stack. The first pull request goes
+        red on real findings. You then do what Part IV asks: fix what you can, suppress what does not apply, and register
+        the rest as owned, expiring exceptions, until the gate is green for the right reasons.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A PR that went red on real findings and green after fixes plus registered, expiring exceptions</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your personal GitHub account (private repo, GitHub-hosted runners) and Docker on your laptop</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free: a few runner-minutes per push, well inside the free allowance</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3"><code class="inline">gh</code> logged in, Docker, the lab kit in <code class="inline">~/clinic-app</code>, the CN1 lab's <code class="inline">*.tf</code> files (copy them from the <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a> lab if you deleted them)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Create the repository.</strong> App code at the root, Terraform under <code class="inline">infra/</code>.
+        Keep it private: you are about to publish a list of its weaknesses.
+        <pre class="code">export ME=yourhandle
+mkdir -p ~/labs/se2 &amp;&amp; cd ~/labs/se2
+cp -r ~/clinic-app/. . &amp;&amp; mkdir -p infra &amp;&amp; cp ~/labs/cn1/*.tf infra/
+printf 'node_modules/\n.terraform/\n*.tfstate*\n' &gt; .gitignore
+git init -b main &amp;&amp; git add -A &amp;&amp; git commit -qm "lab kit + CN1 infra"
+gh repo create lab-$ME-se2 --private --source . --push
+<span class="out">✓ Created repository yourhandle/lab-yourhandle-se2 on GitHub</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Write the exception register and its checker first.</strong> The register starts empty, so it passes.
+        Copy <code class="inline">scripts/check_exceptions.py</code> exactly as it is shown in Part IV.
+        <pre class="code">git switch -c security-gate
+echo "[]" &gt; security-exceptions.yaml
+mkdir -p scripts &amp;&amp; $EDITOR scripts/check_exceptions.py     <span class="cm"># paste the Part IV script</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Write the workflow.</strong> Every scanner runs from a pinned container image or release, so a new
+        scanner version cannot change your gate overnight. In a real repo you would also pin
+        <code class="inline">actions/checkout</code> and the ZAP action by commit SHA (<a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a>).
+        <span class="code-label">~/labs/se2/.github/workflows/security.yml</span>
+        <pre class="code">name: security
+on: { pull_request: {}, push: { branches: [main] } }
+permissions: { contents: read }
+jobs:
+  exceptions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker run --rm -v "$PWD:/src" -w /src python:3.12-slim
+             sh -c "pip install -q pyyaml==6.0.2 &amp;&amp; python scripts/check_exceptions.py"
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }                  <span class="cm"># whole history, not just the tip</span>
+      - run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/gitleaks_8.30.0_linux_x64.tar.gz | tar xz gitleaks
+          ./gitleaks git --redact -v .
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:1.180.0
+             semgrep scan --config p/javascript --config p/dockerfile --error --metrics=off .</pre>
+        <span class="code-label">~/labs/se2/.github/workflows/security.yml (continued)</span>
+        <pre class="code">  iac:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker run --rm -v "$PWD:/src" bridgecrew/checkov:3.3.26 -d /src/infra --framework terraform
+             --compact --quiet $( [ -f infra/.checkov.baseline ] &amp;&amp; echo --baseline /src/infra/.checkov.baseline )
+      - run: docker run --rm -v "$PWD:/src" -w /src aquasec/trivy:0.75.0 config --severity HIGH,CRITICAL
+             --exit-code 1 $( [ -f .trivyignore.yaml ] &amp;&amp; echo --ignorefile .trivyignore.yaml ) .
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t booking-api:ci booking-api
+      - run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.75.0
+             image --severity CRITICAL --ignore-unfixed --exit-code 1 booking-api:ci
+  dast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up --build -d --wait
+      - uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: http://localhost:3000
+          allow_issue_writing: false              <span class="cm"># report only: an artifact, no GitHub issue</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Open the PR and watch it go red.</strong>
+        <pre class="code">git add -A &amp;&amp; git commit -qm "ci: security gate" &amp;&amp; git push -u origin security-gate
+gh pr create --fill &amp;&amp; gh pr checks --watch
+<span class="out">dast        pass   2m31s
+exceptions  pass   21s
+iac         fail   48s
+image       pass   1m52s
+sast        fail   1m04s
+secrets     pass   11s</span>                         <span class="cm"># if image fails too, triage it the same way</span>
+RUN=$(gh run list -b security-gate -L 1 --json databaseId -q '.[0].databaseId')
+gh run view $RUN --log-failed | grep -E 'Check: CKV|blocking|AWS-0|DS-0|bypass-tls' | sort -u | head
+<span class="out">Check: CKV_AWS_131: "Ensure that ALB drops HTTP headers"
+Check: CKV_AWS_2: "Ensure ALB protocol is HTTPS"
+…                                                  (19 Checkov checks in all)
+DS-0002 (HIGH): Specify at least 1 USER command in Dockerfile with non-root user as argument
+AWS-0052 (HIGH): Application load balancer is not set to drop invalid headers.
+AWS-0054 (CRITICAL): Listener for application load balancer does not use HTTPS.
+…bypass-tls-verification … Blocking</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Triage with the Part IV flowchart: fix first.</strong> Two findings are cheap and real: the ALB should drop
+        invalid headers (Checkov <code class="inline">CKV_AWS_131</code> and Trivy <code class="inline">AWS-0052</code>
+        are the same thing), and <code class="inline">booking-web</code> should say which user it runs as. Its base image
+        already runs as uid 101, so <code class="inline">DS-0002</code> is half a false positive, but stating the user
+        explicitly costs one line and survives a base-image change.
+        <pre class="code"><span class="cm"># infra/alb.tf, inside resource "aws_lb" "this":</span>
+  drop_invalid_header_fields = true
+<span class="cm"># booking-web/Dockerfile, last line:</span>
+USER 101</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Register what you accept, with an owner and an expiry.</strong> The rest are the CN1 lab's deliberate
+        shortcuts (HTTP only, public IPs, no WAF) and one real app finding that cannot be fixed today:
+        <code class="inline">rejectUnauthorized: false</code> for RDS, which needs the RDS CA bundle in the image. Each
+        gets a register entry; the scanners' own suppressions point back to it. Set every <code class="inline">expires</code>
+        within 90 days of today, or the checker fails.
+        <span class="code-label">~/labs/se2/security-exceptions.yaml</span>
+        <pre class="code">- id: SEC-LAB-1
+  scanner: semgrep
+  rule: bypass-tls-verification
+  reason: RDS connections skip CA verification; fix needs the RDS CA bundle baked into the image.
+  owner: "@yourhandle"
+  ticket: SEC-LAB-1
+  expires: 2027-01-15
+- id: SEC-LAB-2
+  scanner: checkov+trivy
+  rule: CN1 lab shortcuts (HTTP listener, public tasks, open egress, no WAF/logging)
+  reason: Throwaway sandbox stack; CN3 replaces it with private subnets, ACM and WAF.
+  owner: "@yourhandle"
+  ticket: SEC-LAB-2
+  expires: 2027-01-15</pre>
+        <span class="code-label">~/labs/se2/.trivyignore.yaml</span>
+        <pre class="code">misconfigurations:                    <span class="cm"># every entry: SEC-LAB-2</span>
+  - { id: AWS-0053, paths: ["infra/alb.tf"], expired_at: 2027-01-15 }
+  - { id: AWS-0054, paths: ["infra/alb.tf"], expired_at: 2027-01-15 }
+  - { id: AWS-0104, paths: ["infra/network.tf"], expired_at: 2027-01-15 }</pre>
+        <pre class="code"><span class="cm"># Semgrep: an inline suppression on the line above the finding in booking-api/server.js</span>
+      // nosemgrep: bypass-tls-verification -- SEC-LAB-1 in security-exceptions.yaml
+<span class="cm"># Checkov: a baseline, so only NEW findings fail from now on</span>
+docker run --rm -v "$PWD:/src" bridgecrew/checkov:3.3.26 -d /src/infra --framework terraform --create-baseline --quiet &gt;/dev/null
+ls infra/.checkov.baseline
+<span class="out">infra/.checkov.baseline</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Push, go green, and read the DAST report.</strong> ZAP is report-only here, as Part IV recommends for a
+        first rollout, so read what it would have blocked.
+        <pre class="code">git add -A &amp;&amp; git commit -qm "fix 2 findings, register SEC-LAB-1/2" &amp;&amp; git push
+gh pr checks --watch
+<span class="out">dast        pass   2m27s
+exceptions  pass   19s
+iac         pass   44s
+image       pass   1m49s
+sast        pass   58s
+secrets     pass   10s</span>
+gh run download -n zap_scan -D zap
+jq -r '.site[].alerts[] | "\(.riskdesc)\t\(.name)"' zap/report_json.json | sort -u | head -4
+<span class="out">Low (Medium)	X-Content-Type-Options Header Missing
+Medium (High)	Content Security Policy (CSP) Header Not Set
+Medium (Medium)	Missing Anti-clickjacking Header</span></pre>
+        Each ZAP warning is one <code class="inline">add_header</code> line in <code class="inline">booking-web/nginx.conf</code>.
+        Fix one of them and note the others in the PR description as follow-ups.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        the PR shows a red run followed by a green one; every suppression in the repo (nosemgrep, Checkov baseline,
+        <code class="inline">.trivyignore.yaml</code>) maps to an entry in <code class="inline">security-exceptions.yaml</code>
+        with an owner, a ticket and an expiry; changing one <code class="inline">expires</code> to yesterday makes the
+        <code class="inline">exceptions</code> job fail; and you fixed at least three findings for real.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>The secret that was "already removed".</strong> A teammate commits a deploy file with an AWS key ID, notices,
+        and deletes it in the next commit. The key below is made up. The <code class="inline">secrets</code> job goes red
+        anyway. Find out why, and decide what has to happen before this PR may merge.
+        <pre class="code">echo 'export AWS_ACCESS_KEY_ID=AKIAQX4PLM7ZT3RV5WNB' &gt; deploy.env
+git add deploy.env &amp;&amp; git commit -qm "add deploy env"
+git rm -q deploy.env &amp;&amp; git commit -qm "oops, remove env" &amp;&amp; git push
+gh pr checks
+<span class="out">secrets     fail   12s</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">gh run view $(gh run list -b security-gate -L 1 --json databaseId -q '.[0].databaseId') --log-failed \
+  | grep -E 'RuleID|File|Commit|Fingerprint'
+<span class="out">RuleID:      aws-access-token
+File:        deploy.env
+Commit:      57e607ff4d10…
+Fingerprint: 57e607ff4d10…:deploy.env:aws-access-token:1</span></pre>
+          <p class="mt-2">The job scans the whole history (<code class="inline">fetch-depth: 0</code> and
+          <code class="inline">gitleaks git</code>), and the key is still in the first commit. Deleting the file only hides
+          it from the tip; anyone with the repo can read it. Two steps, in order: if the key were real, deactivate and
+          rotate it now (the <a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a> runbook), because it
+          is already on GitHub. Then, since the branch is not merged, remove the commits from history:
+          <code class="inline">git reset --hard HEAD~2 &amp;&amp; git push --force-with-lease</code>. Had it reached
+          <code class="inline">main</code>, you would rotate, then add the fingerprint to a
+          <code class="inline">.gitleaksignore</code> with a register entry, because rewriting a shared branch is worse
+          than a documented, dead key.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Close the PR and delete the repository (deleting needs the
+        <code class="inline">delete_repo</code> scope, which <code class="inline">gh</code> asks for once).
+        <pre class="code">gh pr close security-gate --delete-branch
+gh auth refresh -h github.com -s delete_repo
+gh repo delete $ME/lab-$ME-se2 --yes
+<span class="out">✓ Deleted repository yourhandle/lab-yourhandle-se2</span>
+gh repo list --limit 100 | grep -c lab-$ME-se2
+<span class="out">0</span></pre>
+        Keep a screenshot of the red-then-green checks and your <code class="inline">security-exceptions.yaml</code> as
+        evidence before you delete.
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

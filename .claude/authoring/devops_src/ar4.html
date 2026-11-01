@@ -614,9 +614,18 @@ sequenceDiagram
   action {
     type = <span class="st">"forward"</span>
     forward {
-      target_group { arn = aws_lb_target_group.legacy.arn,      weight = 100 - var.booking_api_weight }
-      target_group { arn = aws_lb_target_group.booking_api.arn, weight = var.booking_api_weight }
-      stickiness { enabled = true, duration = 600 }   <span class="cm"># a user stays on one side for 10 min</span>
+      target_group {
+        arn    = aws_lb_target_group.legacy.arn
+        weight = 100 - var.booking_api_weight
+      }
+      target_group {
+        arn    = aws_lb_target_group.booking_api.arn
+        weight = var.booking_api_weight
+      }
+      stickiness {   <span class="cm"># a user stays on one side for 10 min</span>
+        enabled  = true
+        duration = 600
+      }
     }
   }
 }</pre>
@@ -708,6 +717,224 @@ dig +short app.clinic.example.com @1.1.1.1
         When the client asks to rewrite bookings in the same project, show them the wave plan with and without it. In
         the clinic's case it was six weeks versus five months, against a rack contract ending in five. Agree to the
         rewrite as wave 3, and stick to that order.</div>
+
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Migrate booking-api and its database with a measured cutover</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will run a full wave-1 migration on your laptop. A "legacy" booking-api runs on a hand-built box against
+        Postgres 12. You stream its data into Postgres 17 with logical replication while traffic keeps flowing, cut over
+        to the containerised service with a written runbook, and measure the downtime from a client's point of view.
+        Then you rehearse the rollback, and it fails in the way real rollbacks fail.
+      </p>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Each container stands in for an AWS piece: <code class="inline">src</code> is the client's on-premises Postgres 12,
+        <code class="inline">dst</code> is RDS for PostgreSQL 17, <code class="inline">legacy-app</code> is the hand-built VM,
+        <code class="inline">api-new</code> is the ECS service, and <code class="inline">web</code> is the ALB/DNS switch.
+        Native logical replication stands in for DMS full load + CDC: the same idea (copy everything, then stream changes
+        from the WAL) with the same traps.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">Traffic served by the new container from Postgres 17, a downtime number measured by a client, and a reverse replication path you have tested</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop. No AWS</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">USD 0</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">Docker, <code class="inline">jq</code>, the lab kit in <code class="inline">~/clinic-app/</code>, two terminals</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Start the source and target databases.</strong> Both need <code class="inline">wal_level=logical</code>:
+        the source to publish changes now, the target to publish them back during rollback. On a real source that setting
+        needs a restart, which is why Part III schedules it in week 1.
+        <pre class="code">mkdir -p ~/labs/ar4 &amp;&amp; cd ~/labs/ar4 &amp;&amp; docker network create mig
+for v in src:12 dst:17; do docker run -d --name ${v%%:*} --network mig -e POSTGRES_USER=clinic \
+  -e POSTGRES_PASSWORD=clinic -e POSTGRES_DB=clinic postgres:${v##*:}-alpine -c wal_level=logical; done
+q() { docker exec "$1" psql -U clinic -d clinic -tAc "$2"; }     <span class="cm"># run SQL on src or dst</span>
+until q src 'SELECT 1' &gt;/dev/null 2&gt;&amp;1 &amp;&amp; q dst 'SELECT 1' &gt;/dev/null 2&gt;&amp;1; do sleep 1; done
+q src 'SHOW server_version'; q dst 'SHOW server_version'
+<span class="out">12.22
+17.6</span>                                       <span class="cm"># minor versions may differ</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Build the legacy box and put a router in front of it.</strong> The old way: code copied onto a machine,
+        dependencies installed in place, no image. <code class="inline">web</code> plays the load balancer.
+        <pre class="code">docker create --name legacy-app --network mig -w /app -e APP_VERSION=legacy \
+  -e DATABASE_URL=postgres://clinic:clinic@src:5432/clinic node:22-bookworm-slim \
+  sh -c 'npm install --omit=dev --no-audit --no-fund &amp;&amp; exec node server.js'
+docker cp ~/clinic-app/booking-api/. legacy-app:/app                <span class="cm"># the "scp to the VM" step</span>
+docker start legacy-app
+docker build -q -t lab/booking-web ~/clinic-app/booking-web
+docker run -d --name web --network mig -p 3000:8080 -e API_UPSTREAM=http://legacy-app:8080 lab/booking-web
+until curl -sf localhost:3000/api/healthz; do sleep 2; done; echo
+<span class="out">{"ok":true,"version":"legacy"}</span>
+for i in $(seq 300); do curl -s -o /dev/null -XPOST localhost:3000/api/bookings \
+  -H 'content-type: application/json' -d "{\"patient\":\"seed-$i\",\"slot\":\"2026-11-02T09:00\"}"; done
+q src 'SELECT count(*), max(id) FROM bookings'
+<span class="out">300|300</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Start a client that measures downtime.</strong> It books an appointment every 0.25 s through the router
+        and logs the time and the HTTP status. Run it in your second terminal and leave it running to the end.
+        <span class="code-label">~/labs/ar4/meter.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># one booking every 0.25 s through the router; logs "HH:MM:SS status"</span>
+i=0
+while true; do
+  i=$((i+1))
+  code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' -XPOST localhost:3000/api/bookings \
+    -H 'content-type: application/json' -d "{\"patient\":\"meter-$i\",\"slot\":\"2026-11-02T10:00\"}")
+  echo "$(date +%T) $code" &gt;&gt; meter.log
+  sleep 0.25
+done</pre>
+        <pre class="code">cd ~/labs/ar4 &amp;&amp; chmod +x meter.sh &amp;&amp; ./meter.sh       <span class="cm"># terminal 2</span>
+tail -3 meter.log                                       <span class="cm"># terminal 1</span>
+<span class="out">10:31:07 201
+10:31:07 201
+10:31:08 201</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Create the schema on the target and start the change stream.</strong> Logical replication copies rows,
+        not schema, so the new service's own migration command creates the table first. The subscription then copies the
+        existing rows and streams every new insert.
+        <pre class="code">docker build -q -t lab/booking-api:2.0.0 ~/clinic-app/booking-api
+docker run --rm --network mig -e DATABASE_URL=postgres://clinic:clinic@dst:5432/clinic \
+  lab/booking-api:2.0.0 server.js migrate
+<span class="out">{"ts":"…","level":"info","msg":"migration ok","service":"booking-api","version":"dev"}</span>
+q src "CREATE PUBLICATION fwd FOR TABLE bookings"
+<span class="out">CREATE PUBLICATION</span>
+q dst "CREATE SUBSCRIPTION fwd CONNECTION 'host=src dbname=clinic user=clinic password=clinic' PUBLICATION fwd"
+<span class="out">NOTICE:  created replication slot "fwd" on publisher
+CREATE SUBSCRIPTION</span>
+sleep 5; for db in src dst; do echo "$db $(q $db 'SELECT count(*), max(id) FROM bookings')"; done
+<span class="out">src 512|512
+dst 512|512</span>                <span class="cm"># the meter keeps adding rows; dst follows within a second</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Start the new service beside the old one, without traffic.</strong> It reads from the target, so you can
+        smoke-test it before cutover. Only read: a write here would take an id the source is about to use.
+        <pre class="code">docker run -d --name api-new --network mig -p 8082:8080 -e APP_VERSION=2.0.0 -e MIGRATE_ON_START=false \
+  -e DATABASE_URL=postgres://clinic:clinic@dst:5432/clinic lab/booking-api:2.0.0
+curl -s localhost:8082/healthz; echo; curl -s localhost:8082/bookings | jq '.[0].patient'
+<span class="out">{"ok":true,"version":"2.0.0"}
+"meter-231"</span>                         <span class="cm"># live data, replicated a moment ago</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Write the runbook before you touch anything.</strong> Owners, checks and a hard stop, as in Part IV. Then
+        put the steps in a script so the cutover runs the same way every rehearsal.
+        <span class="code-label">~/labs/ar4/cutover.md</span>
+        <pre class="code">| Step | Action                                   | Check                                   |
+|------|------------------------------------------|-----------------------------------------|
+| 0    | Go/no-go: dst max(id) within 1 s of src  | for-loop from step 4                    |
+| 1    | Stop writes: stop legacy-app             | meter shows non-201                     |
+| 2    | Wait for replication to catch up         | max(id) equal on src and dst            |
+| 3    | Reset the sequence on dst                | setval prints the max id                |
+| 4    | Drop fwd; start reverse replication      | CREATE SUBSCRIPTION rev on src          |
+| 5    | Switch the router to api-new             | /api/healthz says 2.0.0; meter 201 again|
+HARD STOP: not at step 5 within 2 minutes of step 1 → roll back (step 9 of the lab).
+Measured downtime (fill in): ___ s</pre>
+        <span class="code-label">~/labs/ar4/cutover.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+set -euo pipefail
+q() { docker exec "$1" psql -U clinic -d clinic -tAc "$2"; }
+echo "$(date +%T) T0 stop writes"; docker stop legacy-app &gt;/dev/null
+until [ "$(q src 'SELECT max(id) FROM bookings')" = "$(q dst 'SELECT max(id) FROM bookings')" ]; do sleep 0.5; done
+echo "$(date +%T) caught up"
+q dst "SELECT setval('bookings_id_seq', (SELECT max(id) FROM bookings))"   <span class="cm"># sequences do not replicate</span>
+q dst "DROP SUBSCRIPTION fwd"
+q dst "CREATE PUBLICATION rev FOR TABLE bookings"
+q src "CREATE SUBSCRIPTION rev CONNECTION 'host=dst dbname=clinic user=clinic password=clinic'
+       PUBLICATION rev WITH (copy_data = false)"                         <span class="cm"># the way back, from second one</span>
+docker rm -f web &gt;/dev/null
+docker run -d --name web --network mig -p 3000:8080 -e API_UPSTREAM=http://api-new:8080 lab/booking-web &gt;/dev/null
+until curl -sf localhost:3000/api/healthz &gt;/dev/null; do sleep 0.2; done
+echo "$(date +%T) T1 $(curl -s localhost:3000/api/healthz)"</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Cut over, then measure what the client saw.</strong>
+        <pre class="code">chmod +x cutover.sh &amp;&amp; ./cutover.sh
+<span class="out">10:42:05 T0 stop writes
+10:42:11 caught up
+1873
+NOTICE:  dropped replication slot "fwd" on publisher
+DROP SUBSCRIPTION
+CREATE PUBLICATION
+NOTICE:  created replication slot "rev" on publisher
+CREATE SUBSCRIPTION
+10:42:14 T1 {"ok":true,"version":"2.0.0"}</span>
+awk '$2!=201 {n++; if (!f) f=$1; l=$1} END {print "failed:", n+0, " first:", f, " last:", l}' meter.log
+<span class="out">failed: 14  first: 10:42:10  last: 10:42:14</span>
+for db in src dst; do echo "$db $(q $db 'SELECT count(*), max(id) FROM bookings')"; done
+<span class="out">src 1921|1921
+dst 1921|1921</span>              <span class="cm"># new writes on dst are flowing back to src</span></pre>
+        The old box kept serving for 5 s after <code class="inline">docker stop</code> because booking-api drains for
+        <code class="inline">DRAIN_MS</code> before it closes. Client-visible downtime is <em>last − first + 1</em>, about
+        5 s here. Write your number into <code class="inline">cutover.md</code>.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">curl localhost:3000/api/healthz</code>
+        returns <code class="inline">"version":"2.0.0"</code>; the meter logs only 201s again; your measured downtime is in
+        <code class="inline">cutover.md</code> and is under 30 s; and <code class="inline">count(*)</code> is equal on
+        <code class="inline">src</code> and <code class="inline">dst</code> a minute after cutover, which proves the reverse
+        path works.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Rehearse the rollback.</strong> Pretend the new service's error rate went over the threshold. Stop it,
+        wait for the reverse stream to catch up, and send traffic back to the old box. The meter turns red and stays red.
+        Find out why from the old box's logs before you open the answer.
+        <pre class="code">docker stop api-new &gt;/dev/null
+until [ "$(q src 'SELECT max(id) FROM bookings')" = "$(q dst 'SELECT max(id) FROM bookings')" ]; do sleep 0.5; done
+q src "DROP SUBSCRIPTION rev"
+docker start legacy-app &gt;/dev/null; docker rm -f web &gt;/dev/null
+docker run -d --name web --network mig -p 3000:8080 -e API_UPSTREAM=http://legacy-app:8080 lab/booking-web &gt;/dev/null
+sleep 15; tail -3 meter.log
+<span class="out">10:51:40 500
+10:51:40 500
+10:51:41 500</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">docker logs legacy-app 2&gt;&amp;1 | grep '"level":"error"' | tail -1
+<span class="out">{"ts":"…","level":"error","msg":"request failed","service":"booking-api","version":"legacy","path":"/bookings","err":"duplicate key value violates unique constraint \"bookings_pkey\""}</span>
+q src "SELECT max(id) FROM bookings"; q src "SELECT last_value FROM bookings_id_seq"
+<span class="out">3790
+1912</span>
+q src "SELECT setval('bookings_id_seq', (SELECT max(id) FROM bookings))"
+<span class="out">3790</span></pre>
+          <p class="mt-2">The rows written on the new side came back to the source, but the source's sequence never
+          moved, so the old app hands out ids that already exist. Your forward script had the
+          <code class="inline">setval</code> step; your rollback didn't. Left alone, the errors would stop only after about
+          1,900 failed bookings (one per row the new side wrote), because each failed insert still burns one sequence
+          value. Don't rely on that. The
+          lesson: the rollback path needs its own runbook with the same data steps as the forward one, and you only find
+          the missing step by rehearsing it. DMS has the same trap: it does not migrate sequences either.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Stop the meter with Ctrl-C in terminal 2, then remove the containers, the network and
+        the images. Keep <code class="inline">cutover.md</code>, <code class="inline">cutover.sh</code> and
+        <code class="inline">meter.log</code>.
+        <pre class="code">docker rm -f web api-new legacy-app src dst &gt;/dev/null
+docker network rm mig &gt;/dev/null
+docker image rm lab/booking-api:2.0.0 lab/booking-web &gt;/dev/null
+docker ps -a --format '{{.Names}}' | grep -E '^(web|api-new|legacy-app|src|dst)$' || echo "nothing left"
+<span class="out">nothing left</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>On AWS, the same rehearsal costs money and has a clock.</strong> A DMS
+        replication instance, an RDS target and the old database's network link all bill by the hour, and a replication
+        slot left behind on the source keeps WAL forever until the source disk fills. When you run this for real, drop
+        every slot you created (<code class="inline">SELECT slot_name FROM pg_replication_slots</code> should be empty on
+        both sides) as part of decommissioning.</div>
 
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>

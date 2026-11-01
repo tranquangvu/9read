@@ -528,7 +528,7 @@ flowchart LR
     rules:
       - alert: BookingApiErrorBudgetBurnFast
         expr: |
-            slo:sli_error:ratio_rate1h{slo="booking-api-availability"}  &gt; (14.4 * 0.001)
+          slo:sli_error:ratio_rate1h{slo="booking-api-availability"} &gt; (14.4 * 0.001)
           and slo:sli_error:ratio_rate5m{slo="booking-api-availability"} &gt; (14.4 * 0.001)
         labels: { severity: page, team: clinic }
         annotations:
@@ -536,7 +536,7 @@ flowchart LR
           runbook_url: "https://github.com/golden-owl/clinic-infra/blob/main/runbooks/booking-api-5xx.md"
       - alert: BookingApiErrorBudgetBurnSlow
         expr: |
-            slo:sli_error:ratio_rate6h{slo="booking-api-availability"}  &gt; (6 * 0.001)
+          slo:sli_error:ratio_rate6h{slo="booking-api-availability"} &gt; (6 * 0.001)
           and slo:sli_error:ratio_rate30m{slo="booking-api-availability"} &gt; (6 * 0.001)
         labels: { severity: page, team: clinic }       <span class="cm"># same annotations as above</span>
       - alert: BookingApiErrorBudgetBurnTicket
@@ -710,6 +710,268 @@ histogram_quantile(0.99, sum by (le, http_route) (rate(http_server_request_durat
         the saturated resource within two minutes, without writing a query? If not, the dashboard needs work, not the
         engineer.
       </p>
+
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Measure booking-api's SLIs and prove a burn-rate alert</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will run the lab-kit stack on your laptop, compute the availability and latency SLIs of
+        <code class="inline">booking-api</code> straight from its JSON logs, and watch the burn rate climb when a broken
+        client starts sending bad requests. Then you write the Prometheus recording and alerting rules from Part IV and
+        prove with <code class="inline">promtool</code> that they page on a real burn and stay quiet after a short blip.
+        Everything runs locally and costs nothing.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">An SLO sheet, a script that prints both SLIs and their burn rates, and alert rules with passing unit tests</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop: Docker Compose and the <code class="inline">prom/prometheus</code> image for <code class="inline">promtool</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">Docker, <code class="inline">jq</code>, <code class="inline">curl</code>, the lab kit in <code class="inline">~/clinic-app</code> (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Start the stack.</strong> The compose file already sets <code class="inline">CHAOS=on</code>, which you
+        need in step 5.
+        <pre class="code">cd ~/clinic-app &amp;&amp; docker compose up --build -d
+curl -s localhost:8080/healthz
+<span class="out">{"ok":true,"version":"local"}</span>
+mkdir -p ~/labs/sr1/rules &amp;&amp; cd ~/labs/sr1</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Write the SLO sheet and do the budget maths.</strong> Copy the two booking-api rows from Part II into a
+        file you will keep. Then work out what the budget means at the clinic's 4 requests per second.
+        <span class="code-label">~/labs/sr1/slo.md</span>
+        <pre class="code">| SLO                      | SLI (good / valid)                                      | Target · window     |
+|--------------------------|---------------------------------------------------------|---------------------|
+| booking-api availability | non-5xx / all requests to /bookings                     | 99.9% · rolling 30 d |
+| booking-api latency      | requests ≤ 300 ms / all non-5xx requests to /bookings   | 99%   · rolling 30 d |
+Excluded: /healthz, /readyz, /admin/*, 404s for unknown paths.</pre>
+        <pre class="code">python3 -c 'r=4*86400*30; print(f"requests={r:,} allowed_5xx={r*0.001:,.0f} allowed_slow={r*0.01:,.0f} outage_min={0.001*30*1440:.1f}")'
+<span class="out">requests=10,368,000 allowed_5xx=10,368 allowed_slow=103,680 outage_min=43.2</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Write a traffic generator and an SLI script.</strong> The traffic script plays a steady stream of
+        patients. The SLI script reads the API's request log lines (<code class="inline">msg</code>,
+        <code class="inline">path</code>, <code class="inline">status</code>, <code class="inline">ms</code>) for a window
+        and prints both SLIs and their burn rates: the error ratio divided by the ratio the SLO allows.
+        <span class="code-label">~/labs/sr1/traffic.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># Steady patient traffic: 4 reads + 1 booking, then a 1 s pause (about 4-5 req/s).</span>
+while true; do
+  for i in 1 2 3 4; do curl -s -o /dev/null localhost:8080/bookings; done
+  curl -s -o /dev/null -X POST localhost:8080/bookings -H 'content-type: application/json' \
+    -d '{"patient":"lab","slot":"2026-11-02T09:00"}'
+  sleep 1
+done</pre>
+        <span class="code-label">~/labs/sr1/sli.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># usage: ./sli.sh 5m  -&gt; both booking-api SLIs and burn rates over the last 5 minutes</span>
+set -euo pipefail
+W=${1:-5m}
+docker compose -f ~/clinic-app/compose.yaml logs booking-api --no-log-prefix --since "$W" |
+jq -Rrn --arg w "$W" '
+  def pct: . * 10000 | round / 100;
+  [inputs | fromjson? | select(.msg == "request" and .path == "/bookings")] as $r
+  | ($r | length) as $all
+  | ($r | map(select(.status &gt;= 500)) | length) as $bad
+  | ($r | map(select(.status &lt; 500))) as $ok
+  | ($ok | map(select(.ms &lt;= 300)) | length) as $fast
+  | if $all == 0 then "window=\($w): no /bookings traffic" else
+      "window=\($w) requests=\($all) 5xx=\($bad)",
+      "availability \(1 - $bad / $all | pct)%   burn rate \($bad / $all / 0.001 | . * 10 | round / 10)",
+      "latency&lt;=300ms \($fast / ($ok | length) | pct)%   burn rate \((1 - $fast / ($ok | length)) / 0.01 | . * 10 | round / 10)"
+    end'</pre>
+        <pre class="code">chmod +x traffic.sh sli.sh
+./traffic.sh &amp;                          <span class="cm"># leave it running for the rest of the lab</span>
+sleep 120; ./sli.sh 2m
+<span class="out">window=2m requests=561 5xx=0
+availability 100%   burn rate 0
+latency&lt;=300ms 100%   burn rate 0</span>                     <span class="cm"># your request count will differ a little</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Inject a bad client and watch the budget burn.</strong> A broken mobile release sends a truncated JSON
+        body every 10 seconds. The API answers <code class="inline">500</code> to it (it should answer 400, which is a bug
+        worth a ticket of its own), so about 2% of requests fail.
+        <span class="code-label">~/labs/sr1/bad-client.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># Every $1 seconds, POST a body with the closing brace missing.</span>
+while true; do
+  curl -s -o /dev/null -X POST localhost:8080/bookings -H 'content-type: application/json' \
+    -d '{"patient":"lab","slot":"2026-11-02T09:00"'
+  sleep "${1:-10}"
+done</pre>
+        <pre class="code">chmod +x bad-client.sh &amp;&amp; ./bad-client.sh 10 &amp;
+sleep 300; ./sli.sh 5m
+<span class="out">window=5m requests=1388 5xx=30
+availability 97.84%   burn rate 21.6</span>                   <span class="cm"># above 14.4: this is a fast-burn page</span>
+kill %2                                  <span class="cm"># stop the bad client (job 2), keep the traffic</span>
+sleep 90; ./sli.sh 1m; ./sli.sh 10m
+<span class="out">window=1m … availability 100%   burn rate 0</span>          <span class="cm"># short window: already recovered</span>
+<span class="out">window=10m … availability 98.9%   burn rate 10.9</span>     <span class="cm"># long window: still remembers</span></pre>
+        Write the two numbers into <code class="inline">slo.md</code>. This is the multi-window idea from Part IV in
+        miniature: the long window proves the burn mattered, the short window proves it is still happening, and only the
+        two together give an alert that fires fast and resets fast.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Find the latency SLI's blind spot.</strong> <code class="inline">/admin/burn</code> pins the API's only
+        CPU thread for 1.5 seconds. Time a request from the client side while it runs, then look at what the API logged
+        for the same request.
+        <pre class="code">curl -s "localhost:8080/admin/burn?ms=1500" &gt;/dev/null &amp; sleep 0.2
+curl -s -o /dev/null -w 'client saw %{time_total}s\n' localhost:8080/bookings
+<span class="out">client saw 1.298574s</span>
+docker compose -f ~/clinic-app/compose.yaml logs booking-api --no-log-prefix --since 10s \
+  | jq -c 'select(.path == "/bookings") | {status, ms}' | tail -1
+<span class="out">{"status":200,"ms":0}</span></pre>
+        The patient waited 1.3 seconds; the log says 0 ms. The API starts its timer only when Node gets round to
+        running the handler, so time spent queued behind a busy event loop is invisible to it. This is why Part II takes
+        latency from the load balancer (ALB <code class="inline">TargetResponseTime</code>) or a histogram recorded as
+        close to the socket as possible. Add one line to <code class="inline">slo.md</code> naming this gap.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Write the recording and alerting rules.</strong> Production gets these numbers from the OTel histogram
+        (<a href="./ob4.html" class="text-viol underline decoration-viol/40">OB4</a>), not from logs. Write the
+        availability SLI for the four windows the two paging alerts need, then the alerts.
+        <span class="code-label">~/labs/sr1/rules/sli.yaml</span>
+        <pre class="code">groups:
+  - name: slo-booking-api-sli
+    interval: 30s
+    rules:
+      - record: slo:sli_error:ratio_rate5m
+        labels: { slo: booking-api-availability }
+        expr: |
+          sum(rate(http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings",http_response_status_code=~"5.."}[5m]))
+          / sum(rate(http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings"}[5m]))   <span class="cm"># 5xx ÷ all</span>
+      - record: slo:sli_error:ratio_rate30m
+        labels: { slo: booking-api-availability }
+        expr: |
+          sum(rate(http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings",http_response_status_code=~"5.."}[30m]))
+          / sum(rate(http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings"}[30m]))
+      - record: slo:sli_error:ratio_rate1h
+        labels: { slo: booking-api-availability }
+        expr: |
+          sum(rate(http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings",http_response_status_code=~"5.."}[1h]))
+          / sum(rate(http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings"}[1h]))
+      - record: slo:sli_error:ratio_rate6h
+        labels: { slo: booking-api-availability }
+        expr: |
+          sum(rate(http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings",http_response_status_code=~"5.."}[6h]))
+          / sum(rate(http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings"}[6h]))</pre>
+        <span class="code-label">~/labs/sr1/rules/alerts.yaml</span>
+        <pre class="code">groups:
+  - name: slo-booking-api-alerts
+    rules:
+      - alert: BookingApiErrorBudgetBurnFast
+        expr: |
+          slo:sli_error:ratio_rate1h{slo="booking-api-availability"} &gt; (14.4 * 0.001)
+          and slo:sli_error:ratio_rate5m{slo="booking-api-availability"} &gt; (14.4 * 0.001)
+        labels: { severity: page }
+        annotations: { summary: "booking-api fast burn: 2% of the 30-day budget in 1 h" }
+      - alert: BookingApiErrorBudgetBurnSlow
+        expr: |
+          slo:sli_error:ratio_rate6h{slo="booking-api-availability"} &gt; (6 * 0.001)
+          and slo:sli_error:ratio_rate30m{slo="booking-api-availability"} &gt; (6 * 0.001)
+        labels: { severity: page }
+        annotations: { summary: "booking-api slow burn: 5% of the 30-day budget in 6 h" }</pre>
+        <pre class="code">cd ~/labs/sr1/rules
+alias promtool='docker run --rm -v "$PWD":/w -w /w --entrypoint promtool prom/prometheus:v3.5.0'
+promtool check rules sli.yaml alerts.yaml
+<span class="out">Checking sli.yaml
+  SUCCESS: 4 rules found
+
+Checking alerts.yaml
+  SUCCESS: 2 rules found</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Replay what you saw as unit tests.</strong> Test 1 is step 4 stretched to an hour: 5 requests per second,
+        2% failing. Test 2 is a two-minute total outage that recovers: it must page while it happens and be silent
+        18 minutes later.
+        <span class="code-label">~/labs/sr1/rules/tests.yaml</span>
+        <pre class="code">rule_files: [sli.yaml, alerts.yaml]
+evaluation_interval: 30s
+tests:
+  - name: 2% of requests fail for an hour -&gt; fast burn pages
+    interval: 30s
+    input_series:                                 <span class="cm"># 150 requests per 30 s, 3 of them 500</span>
+      - series: 'http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings",http_response_status_code="500"}'
+        values: '0+3x120'
+      - series: 'http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings",http_response_status_code="200"}'
+        values: '0+147x120'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: BookingApiErrorBudgetBurnFast
+        exp_alerts:
+          - exp_labels: { severity: page, slo: booking-api-availability }
+            exp_annotations: { summary: "booking-api fast burn: 2% of the 30-day budget in 1 h" }
+  - name: a 2-minute outage that is over -&gt; no page
+    interval: 30s
+    input_series:                                 <span class="cm"># everything fails from 10m to 12m</span>
+      - series: 'http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings",http_response_status_code="500"}'
+        values: '0x20 150+150x3 600x36'
+      - series: 'http_server_request_duration_seconds_count{job="booking-api",http_route="/bookings",http_response_status_code="200"}'
+        values: '0+150x20 3000x4 3000+150x36'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: BookingApiErrorBudgetBurnFast
+        exp_alerts:
+          - exp_labels: { severity: page, slo: booking-api-availability }
+            exp_annotations: { summary: "booking-api fast burn: 2% of the 30-day budget in 1 h" }
+      - eval_time: 30m
+        alertname: BookingApiErrorBudgetBurnFast
+        exp_alerts: []</pre>
+        <pre class="code">promtool test rules tests.yaml
+<span class="out">  SUCCESS</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">slo.md</code> holds both SLOs, the budget numbers and the latency blind spot;
+        <code class="inline">./sli.sh 5m</code> showed a burn rate above 14.4 while the bad client ran and 0 a minute
+        after you stopped it; <code class="inline">promtool check rules</code> finds 4 + 2 rules; and
+        <code class="inline">promtool test rules tests.yaml</code> prints <code class="inline">SUCCESS</code>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Break the threshold.</strong> A teammate "simplifies" the fast-burn rule while copying it from a
+        99% SLO service. Run this, then the tests, and work out from the failure output alone why the page went
+        missing before you open the answer.
+        <pre class="code">sed -i.bak 's/(14.4 \* 0.001)/(14.4 * 0.01)/g' alerts.yaml
+promtool test rules tests.yaml
+<span class="out">  FAILED:
+    name: 2% of requests fail for an hour -&gt; fast burn pages,
+    alertname: BookingApiErrorBudgetBurnFast, time: 1h,
+        exp:[ 0: Labels:{alertname="BookingApiErrorBudgetBurnFast", severity="page", …} ],
+        got:[]</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <p class="mt-2">The rule now multiplies the burn rate by the <em>99%</em> budget (0.01), so it fires only at a
+          14.4% error ratio. Your 2% outage, which spends 2% of a month's budget per hour, never pages. Restore the file
+          with <code class="inline">mv alerts.yaml.bak alerts.yaml</code> and run the tests again. The lesson: the
+          allowed error ratio belongs in one place (a label or a generated constant), and every alert rule change runs
+          <code class="inline">promtool test rules</code> in CI. A threshold typo is silent in production until the
+          outage nobody was paged for.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Stop the background scripts, then the stack. <code class="inline">-v</code> removes the
+        Postgres volume and the test bookings in it.
+        <pre class="code">pkill -f 'traffic.sh|bad-client.sh'
+pgrep -fl 'traffic.sh|bad-client.sh' || echo "no lab scripts running"
+<span class="out">no lab scripts running</span>
+docker compose -f ~/clinic-app/compose.yaml down -v
+docker ps --filter name=clinic-app -q
+<span class="out"></span><span class="cm"># no output: no lab containers left</span></pre>
+        Keep <code class="inline">~/labs/sr1/</code>: the rules and tests are the start of the evidence item below.
+      </div></div>
 
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>

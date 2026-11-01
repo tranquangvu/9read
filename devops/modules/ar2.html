@@ -753,6 +753,233 @@ Allocated: 96.1% (target ≥ 95%) · Commitment coverage: 74% · SP utilisation:
         covered in <a href="./ar5.html" class="text-viol underline decoration-viol/40">AR5</a>.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Cost your own sandbox, guard it, and price 1,000 bookings</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will answer three FinOps questions about your own work in <code class="inline">gol-sandbox</code>: where your lab
+        money went (Cost Explorer by tag), what stops it running away next time (a budget and an anomaly monitor in
+        Terraform), and what one unit of value costs (USD per 1,000 bookings on the
+        <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a> stack, measured with k6 and priced from the
+        Pricing API). Then a one-character tag mistake makes your budget blind, and you find it.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A cost-by-lab table for your handle, a working budget and anomaly monitor, and a unit cost with the arithmetic shown</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code> (Cost Explorer and Pricing are global APIs)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">About USD 0.10 in Cost Explorer API calls (USD 0.01 each), plus about USD 0.06 per hour while the CN1 stack runs. Budgets without actions and anomaly monitors are free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain incl. <code class="inline">k6</code> and Terraform; the CN1 stack (step 1 says how to bring it back); an email address you read</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up, and bring back the CN1 stack if you destroyed it.</strong> Cost allocation tags are activated in
+        <code class="inline">gol-management</code>; the platform team has activated <code class="inline">Owner</code> and
+        <code class="inline">Lab</code> there, which is why every lab tags them.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login
+export ACCOUNT=888899990000 REPO=888899990000.dkr.ecr.ap-southeast-1.amazonaws.com/lab-$ME/booking-api
+export START=$(date -v-30d +%F 2&gt;/dev/null || date -d '30 days ago' +%F) END=$(date +%F)
+mkdir -p ~/labs/ar2 &amp;&amp; cd ~/labs/ar2
+<span class="cm"># CN1 stack gone? re-run CN1 step 2 (push the image), then:</span>
+terraform -chdir=$HOME/labs/cn1 apply -var me=$ME -var image=$REPO:1.0.0
+export URL=$(terraform -chdir=$HOME/labs/cn1 output -raw url); curl -s $URL/healthz
+<span class="out">{"ok":true,"version":"cn1-lab"}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Ask Cost Explorer where your money went.</strong> Filter on your <code class="inline">Owner</code> tag and
+        group by <code class="inline">Lab</code>. This is query 01 from Part II at sandbox scale.
+        <pre class="code">aws ce get-cost-and-usage --time-period Start=$START,End=$END --granularity MONTHLY \
+  --metrics UnblendedCost --group-by Type=TAG,Key=Lab \
+  --filter "{\"Tags\":{\"Key\":\"Owner\",\"Values\":[\"$ME\"]}}" \
+  --query 'ResultsByTime[].Groups[].[Keys[0],Metrics.UnblendedCost.Amount]' --output text
+<span class="out">Lab$CN1      3.41
+Lab$CN3     11.87
+Lab$KS14    16.02
+Lab$         0.44</span>     <span class="cm"># "Lab$" with no value: your resources missing the Lab tag</span>
+<span class="cm"># results come back per calendar month, so a 30-day window can list a key twice</span></pre>
+        Write the table into <code class="inline">~/labs/ar2/finops-note.md</code>. Then run the same query grouped by
+        <code class="inline">Type=DIMENSION,Key=SERVICE</code> and note your top three services. Expect the ALB, EKS
+        control plane hours and public IPv4 addresses, not compute.
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Find the untagged spend in the whole sandbox.</strong> Group by <code class="inline">Owner</code> with no
+        filter. The empty value is money nobody owns.
+        <pre class="code">aws ce get-cost-and-usage --time-period Start=$START,End=$END --granularity MONTHLY \
+  --metrics UnblendedCost --group-by Type=TAG,Key=Owner \
+  --query 'ResultsByTime[].Groups[].[Keys[0],Metrics.UnblendedCost.Amount]' --output text | sort -k2 -nr | head -5
+<span class="out">Owner$           41.30</span>     <span class="cm"># untagged: NAT gateways, EBS volumes from Karpenter, Config, …</span>
+<span class="out">Owner$yourhandle 31.74
+Owner$linh       22.15</span></pre>
+        Note one more fact in your note: today's k6 run will not appear in Cost Explorer until tomorrow, because billing
+        data lags by up to 24 hours. That is why step 5 prices the stack from the price list instead.
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Put a budget and an anomaly monitor on your own spend.</strong> A USD 10 monthly budget on your
+        <code class="inline">Owner</code> tag that warns on forecast, and a custom anomaly monitor scoped to the same tag.
+        <span class="code-label">~/labs/ar2/guardrails.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "AR2" } }
+}
+variable "me" { type = string }
+variable "email" { type = string }
+resource "aws_budgets_budget" "mine" {
+  name         = "lab-${var.me}-monthly"
+  budget_type  = "COST"
+  limit_amount = "10"
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+  cost_filter {
+    name   = "TagKeyValue"
+    values = [format("user:Owner$%s", var.me)]          <span class="cm"># tag keys are case-sensitive</span>
+  }
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 80
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "FORECASTED"
+    subscriber_email_addresses = [var.email]
+  }
+}</pre>
+        <span class="code-label">~/labs/ar2/anomaly.tf</span>
+        <pre class="code">resource "aws_ce_anomaly_monitor" "mine" {
+  name         = "lab-${var.me}-owner"
+  monitor_type = "CUSTOM"                                <span class="cm"># DIMENSIONAL SERVICE is one per account; yours is tag-scoped</span>
+  monitor_specification = jsonencode({
+    Tags = { Key = "Owner", Values = [var.me], MatchOptions = ["EQUALS"] }
+  })
+}
+resource "aws_ce_anomaly_subscription" "mine" {
+  name             = "lab-${var.me}-daily"
+  frequency        = "DAILY"                             <span class="cm"># EMAIL needs DAILY or WEEKLY; IMMEDIATE needs SNS</span>
+  monitor_arn_list = [aws_ce_anomaly_monitor.mine.arn]
+  subscriber {
+    type    = "EMAIL"
+    address = var.email
+  }
+  threshold_expression {
+    dimension {
+      key           = "ANOMALY_TOTAL_IMPACT_ABSOLUTE"
+      match_options = ["GREATER_THAN_OR_EQUAL"]
+      values        = ["1"]                              <span class="cm"># USD 1 is right for a sandbox; prod uses ~75</span>
+    }
+  }
+}</pre>
+        <pre class="code">terraform init &amp;&amp; terraform apply -var me=$ME -var email=you@goldenowl.asia
+<span class="out">Apply complete! Resources: 3 added, 0 changed, 0 destroyed.</span>
+aws budgets describe-budget --account-id $ACCOUNT --budget-name lab-$ME-monthly \
+  --query 'Budget.[CostFilters, CalculatedSpend.ActualSpend.Amount]' --output json
+<span class="out">[ { "TagKeyValue": [ "user:Owner$yourhandle" ] }, "3.18" ]</span>   <span class="cm"># month-to-date, refreshed a few times a day</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Price the CN1 stack per hour from the Pricing API.</strong> Find the Graviton Fargate usage types for
+        Singapore (<code class="inline">APS1</code>), then read their on-demand prices. The Pricing API answers only in a
+        few regions, so pass <code class="inline">--region us-east-1</code>.
+        <pre class="code">aws pricing get-attribute-values --region us-east-1 --service-code AmazonECS --attribute-name usagetype \
+  --query 'AttributeValues[].Value' --output text | tr '\t' '\n' | grep '^APS1-Fargate-ARM'
+<span class="out">APS1-Fargate-ARM-GB-Hours
+APS1-Fargate-ARM-vCPU-Hours:perCPU</span>
+price() { aws pricing get-products --region us-east-1 --service-code AmazonECS \
+  --filters Type=TERM_MATCH,Field=usagetype,Value=$1 --query 'PriceList[0]' --output text \
+  | jq -r '.terms.OnDemand[].priceDimensions[].pricePerUnit.USD'; }
+export VCPU_H=$(price APS1-Fargate-ARM-vCPU-Hours:perCPU) GB_H=$(price APS1-Fargate-ARM-GB-Hours)
+echo $VCPU_H $GB_H
+<span class="out">0.0404800000 0.0044400000</span>          <span class="cm"># use your numbers; prices change</span>
+<span class="cm"># 2 tasks x (0.25 vCPU + 0.5 GB) + 1 ALB-hour (0.0252) + 4 public IPv4 (0.005 each); LCUs ignored at this load</span>
+export STACK_H=$(awk -v c=$VCPU_H -v g=$GB_H 'BEGIN{printf "%.4f", 2*(0.25*c+0.5*g)+0.0252+4*0.005}')
+echo $STACK_H
+<span class="out">0.0699</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Count real bookings under load.</strong> The unit is a booking the API accepted (HTTP 201), not a request.
+        <span class="code-label">~/labs/ar2/book.js</span>
+        <pre class="code">import http from 'k6/http';
+import { check } from 'k6';
+export const options = { vus: 10, duration: '5m' };
+export default function () {
+  const body = JSON.stringify({ patient: `k6-${__VU}-${__ITER}`, slot: '2026-11-02T09:00' });
+  const r = http.post(`${__ENV.URL}/bookings`, body, { headers: { 'content-type': 'application/json' } });
+  check(r, { booked: (res) =&gt; res.status === 201 });      <span class="cm">// failures are not bookings</span>
+}
+export function handleSummary(d) {
+  const c = d.metrics.checks.values;
+  return { stdout: `booked=${c.passes} failed=${c.fails} seconds=${d.state.testRunDurationMs / 1000}\n` };
+}</pre>
+        <pre class="code">k6 run -e URL=$URL book.js
+<span class="out">booked=41870 failed=0 seconds=300.1</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Compute the unit cost twice: at test load and at real load.</strong> The same stack costs the same per
+        hour whether it serves 500,000 bookings an hour or 20.
+        <pre class="code">awk -v h=$STACK_H -v b=41870 -v s=300.1 'BEGIN{
+  bph = b * 3600 / s
+  printf "load test : %8.0f bookings/h  USD %.5f per 1k bookings\n", bph, 1000*h/bph
+  printf "real clinic: %7d bookings/h  USD %.2f per 1k bookings\n", 20, 1000*h/20 }'
+<span class="out">load test :   502273 bookings/h  USD 0.00014 per 1k bookings
+real clinic:      20 bookings/h  USD 3.50 per 1k bookings</span></pre>
+        Add both lines to <code class="inline">finops-note.md</code> with one paragraph: at real volume, almost all of the
+        cost is idle capacity and fixed charges (ALB-hours, IPv4), so rightsizing the tasks barely moves the unit cost.
+        Removing fixed cost (sharing one ALB across services, IPv6, no public IPs) does.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">finops-note.md</code> holds
+        your cost-by-lab table, your top three services and the untagged sandbox total; <code class="inline">describe-budget</code>
+        shows your tag filter and a non-zero <code class="inline">ActualSpend</code>;
+        <code class="inline">aws ce get-anomaly-monitors --query 'AnomalyMonitors[].MonitorName'</code> lists
+        <code class="inline">lab-$ME-owner</code>; and you can explain why the two unit costs in step 7 differ by four
+        orders of magnitude.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Make the budget blind.</strong> In <code class="inline">guardrails.tf</code> change
+        <code class="inline">user:Owner$%s</code> to <code class="inline">user:owner$%s</code> and apply. Terraform and the
+        Budgets API both accept it without a warning. Tomorrow the budget reports USD 0 and never alerts again. Prove why
+        today, using Cost Explorer, before you open the answer.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">for k in Owner owner; do printf "%s " $k; aws ce get-cost-and-usage --time-period Start=$START,End=$END \
+  --granularity MONTHLY --metrics UnblendedCost --filter "{\"Tags\":{\"Key\":\"$k\",\"Values\":[\"$ME\"]}}" \
+  --query 'ResultsByTime[-1].Total.UnblendedCost.Amount' --output text; done
+<span class="out">Owner 3.18
+owner 0</span></pre>
+          <p class="mt-2">Tag keys are case-sensitive, and a filter on a key that does not exist matches nothing instead of
+          failing. The budget is now watching an empty set, so "no alert" looks exactly like "under budget". Put
+          <code class="inline">Owner</code> back and apply. The lesson: after you create any cost filter (a budget, an
+          anomaly monitor, a saved Athena query), run the same filter in Cost Explorer and check it returns money. The
+          Part II tag policy exists so that <code class="inline">owner</code> and <code class="inline">Owner</code> can't
+          both appear on resources in the first place.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Remove the guardrails, then the CN1 stack if you brought it back for this lab. Keep
+        <code class="inline">finops-note.md</code>.
+        <pre class="code">terraform destroy -var me=$ME -var email=you@goldenowl.asia
+<span class="out">Destroy complete! Resources: 3 destroyed.</span>
+terraform -chdir=$HOME/labs/cn1 destroy -var me=$ME -var image=$REPO:1.0.0
+aws ce get-anomaly-monitors --query "AnomalyMonitors[?MonitorName=='lab-$ME-owner'].MonitorName"
+<span class="out">[]</span>
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=CN1 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Leaving the CN1 stack up is the expensive mistake here.</strong> It
+        costs about USD 0.07 an hour (USD 1.70 a day, USD 50 a month), which is five times the budget you just created.
+        The budget would warn you by email, which is exactly why you built it, but the destroy is still your job.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

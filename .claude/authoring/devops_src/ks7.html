@@ -731,6 +731,270 @@ arn:aws:sts::444455556666:assumed-role/AWSReservedSSO_PlatformAdmin_…   bookin
         finding can be traced to a namespace, a service account and an IAM role, which is exactly what Parts I and II set up.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Lock down the booking namespace on EKS</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will give an IAM role read-mostly access to one namespace and prove it by actually becoming that role. Then you
+        run <code class="inline">booking-worker</code> with its own Pod Identity role that can read one SQS queue and nothing
+        else, switch the namespace to Pod Security <code class="inline">restricted</code>, and add a Kyverno rule that only
+        admits images from your ECR repositories. Each layer gets tested by trying to break it. The day-to-day access model
+        for people (Identity Center, break-glass, prod-safe habits) is
+        <a href="./ks15.html" class="text-viol underline decoration-viol/40">KS15</a>; this lab is about the mechanisms.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A <code class="inline">booking</code> namespace where a viewer role cannot read Secrets, the worker reaches only its queue, a root Pod is rejected and a Docker Hub image is rejected</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code>, the EKS cluster from the <a href="./ks5.html" class="text-viol underline decoration-viol/40">KS5</a> lab</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Nothing beyond the KS5 cluster (about USD 0.20 per hour). SQS and IAM are free at this volume</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>), the lab kit in <code class="inline">~/clinic-app/</code>, Docker with buildx</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell and the namespace.</strong> If the KS5 cluster is gone, recreate it with
+        <code class="inline">cd ~/labs/ks5 &amp;&amp; terraform apply -var me=$ME</code> first. The Pod Identity agent add-on must be
+        <code class="inline">ACTIVE</code>; if the command errors, run
+        <code class="inline">aws eks create-addon --cluster-name $CLUSTER --addon-name eks-pod-identity-agent</code>.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login
+export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)   <span class="cm"># must be 888899990000</span>
+export CLUSTER=lab-$ME-eks
+aws eks describe-addon --cluster-name $CLUSTER --addon-name eks-pod-identity-agent --query addon.status --output text
+<span class="out">ACTIVE</span>
+aws eks update-kubeconfig --name $CLUSTER --alias lab-ks7
+kubectl create namespace booking
+mkdir -p ~/labs/ks7 &amp;&amp; cd ~/labs/ks7</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create a viewer role and its access entry.</strong> The role stands in for an on-call permission set. The
+        access entry maps it to the Kubernetes group <code class="inline">booking-oncall</code>, and the EKS view policy is
+        scoped to the <code class="inline">booking</code> namespace only.
+        <pre class="code">cat &gt; viewer-trust.json &lt;&lt;EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::$ACCOUNT:root"},"Action":"sts:AssumeRole"}]}
+EOF
+aws iam create-role --role-name lab-$ME-ks7-viewer --assume-role-policy-document file://viewer-trust.json \
+  --tags Key=Owner,Value=$ME Key=Lab,Value=KS7 &gt;/dev/null
+export VIEWER=arn:aws:iam::$ACCOUNT:role/lab-$ME-ks7-viewer
+aws eks create-access-entry --cluster-name $CLUSTER --principal-arn $VIEWER --kubernetes-groups booking-oncall &gt;/dev/null
+aws eks associate-access-policy --cluster-name $CLUSTER --principal-arn $VIEWER \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy \
+  --access-scope type=namespace,namespaces=booking &gt;/dev/null
+aws eks list-associated-access-policies --cluster-name $CLUSTER --principal-arn $VIEWER \
+  --query 'associatedAccessPolicies[].[policyArn,accessScope.type]' --output text
+<span class="out">arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy	namespace</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Add the RBAC the access policy cannot express.</strong> On-call may restart a Deployment (a
+        <code class="inline">patch</code>) and delete a stuck Pod, nothing more. Check the RBAC half with impersonation before
+        anyone relies on it. Impersonation only exercises RBAC, not the EKS access policy, which is why step 4 exists.
+        <span class="code-label">~/labs/ks7/rbac.yaml</span>
+        <pre class="code">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: oncall-operator, namespace: booking }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]      <span class="cm"># patch = rollout restart; no update, no delete</span>
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: booking-oncall, namespace: booking }
+subjects: [{ kind: Group, name: booking-oncall, apiGroup: rbac.authorization.k8s.io }]
+roleRef: { kind: Role, name: oncall-operator, apiGroup: rbac.authorization.k8s.io }</pre>
+        <pre class="code">kubectl apply -f rbac.yaml
+for v in "patch deployments" "delete deployments" "get secrets" "delete pods"; do
+  printf '%-20s ' "$v"; kubectl auth can-i $v -n booking --as=test --as-group=booking-oncall; done
+<span class="out">patch deployments    yes
+delete deployments   no
+get secrets          no
+delete pods          yes</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Become the viewer and test the real path.</strong> A second kubeconfig context assumes the role for every
+        call, so the request goes through IAM, the access entry, the access policy and RBAC, exactly as for a person.
+        Switch back to your admin context straight away so you never run the rest of the lab as the wrong identity.
+        <pre class="code">aws eks update-kubeconfig --name $CLUSTER --role-arn $VIEWER --alias ks7-viewer
+kubectl config use-context lab-ks7
+kubectl --context ks7-viewer auth whoami -o jsonpath='{.status.userInfo.groups}'; echo
+<span class="out">["booking-oncall","system:authenticated"]</span>
+kubectl --context ks7-viewer -n booking get pods
+<span class="out">No resources found in booking namespace.</span>          <span class="cm"># allowed, just empty</span>
+kubectl --context ks7-viewer -n kube-system get pods
+<span class="out">Error from server (Forbidden): pods is forbidden: User "arn:aws:sts::888899990000:assumed-role/lab-yourhandle-ks7-viewer/…"
+cannot list resource "pods" in API group "" in the namespace "kube-system"</span>
+kubectl --context ks7-viewer -n booking get secrets
+<span class="out">Error from server (Forbidden): secrets is forbidden: …</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Create the queue and the worker's Pod Identity role.</strong> The policy names one queue ARN and two actions,
+        the ones <code class="inline">worker.js</code> calls.
+        <pre class="code">export QURL=$(aws sqs create-queue --queue-name lab-$ME-ks7-reminders --tags Owner=$ME,Lab=KS7 --query QueueUrl --output text)
+export QARN=arn:aws:sqs:$AWS_REGION:$ACCOUNT:lab-$ME-ks7-reminders
+cat &gt; pod-trust.json &lt;&lt;'EOF'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},
+  "Action":["sts:AssumeRole","sts:TagSession"]}]}
+EOF
+aws iam create-role --role-name lab-$ME-ks7-worker --assume-role-policy-document file://pod-trust.json \
+  --tags Key=Owner,Value=$ME Key=Lab,Value=KS7 &gt;/dev/null
+aws iam put-role-policy --role-name lab-$ME-ks7-worker --policy-name sqs-consume --policy-document \
+  "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"sqs:ReceiveMessage\",\"sqs:DeleteMessage\"],\"Resource\":\"$QARN\"}]}"
+aws eks create-pod-identity-association --cluster-name $CLUSTER --namespace booking --service-account booking-worker \
+  --role-arn arn:aws:iam::$ACCOUNT:role/lab-$ME-ks7-worker --query association.associationId --output text
+<span class="out">a-1bcd2efg3hij4klm5</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Build and run booking-worker, already restricted-compliant.</strong> The distroless user is called
+        <code class="inline">nonroot</code>, and the kubelet cannot verify a user <em>name</em> against
+        <code class="inline">runAsNonRoot</code>, so set the numeric UID 65532. <code class="inline">AWS_REGION</code> is set
+        because Pod Identity injects credentials, not a region.
+        <pre class="code">export WREPO=$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/lab-$ME/booking-worker
+aws ecr create-repository --repository-name lab-$ME/booking-worker --tags Key=Owner,Value=$ME Key=Lab,Value=KS7 &gt;/dev/null
+aws ecr get-login-password | docker login -u AWS --password-stdin ${WREPO%%/*}
+docker buildx build --platform linux/arm64 -t $WREPO:1.0.0 --push ~/clinic-app/booking-worker</pre>
+        <span class="code-label">~/labs/ks7/worker.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: ServiceAccount
+metadata: { name: booking-worker, namespace: booking }   <span class="cm"># the name in the association</span>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-worker, namespace: booking }
+spec:
+  selector: { matchLabels: { app: booking-worker } }
+  template:
+    metadata: { labels: { app: booking-worker } }
+    spec:
+      serviceAccountName: booking-worker
+      automountServiceAccountToken: false                  <span class="cm"># Pod Identity uses its own token</span>
+      securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: worker
+          image: WREPO:1.0.0
+          env: [{ name: QUEUE_URL, value: QURL }, { name: AWS_REGION, value: ap-southeast-1 }]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          resources: { requests: { cpu: 25m, memory: 64Mi }, limits: { memory: 128Mi } }</pre>
+        <pre class="code">sed -e "s#WREPO#$WREPO#" -e "s#QURL#$QURL#" worker.yaml | kubectl apply -f -
+aws sqs send-message --queue-url $QURL --message-body '{"type":"booking.created","booking":{"id":42}}' &gt;/dev/null
+kubectl -n booking logs deploy/booking-worker --tail=1
+<span class="out">{"ts":"2026-11-01T10:02:11.418Z","level":"info","msg":"reminder sent","service":"booking-worker","bookingId":42}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Enforce Pod Security <code class="inline">restricted</code> and try a root Pod.</strong> The label applies to
+        new Pods only; <code class="inline">kubectl</code> warns if running Pods would fail it. The worker passes, so there is
+        no warning.
+        <pre class="code">kubectl label namespace booking pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/enforce-version=v1.33
+<span class="out">namespace/booking labeled</span>
+kubectl -n booking run root-test --image=busybox:1.36 --restart=Never -- sleep 600
+<span class="out">Error from server (Forbidden): pods "root-test" is forbidden: violates PodSecurity "restricted:v1.33":
+allowPrivilegeEscalation != false (container "root-test" must set securityContext.allowPrivilegeEscalation=false),
+unrestricted capabilities (…), runAsNonRoot != true (…), seccompProfile (…)</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Install Kyverno and allow only your ECR images.</strong> Start the policy in <code class="inline">Audit</code>,
+        read the report, then switch to <code class="inline">Enforce</code>. The policy matches the
+        <code class="inline">booking</code> namespace only, so a Kyverno outage cannot block system Pods.
+        <pre class="code">helm repo add kyverno https://kyverno.github.io/kyverno/ &amp;&amp; helm repo update kyverno
+helm upgrade --install kyverno kyverno/kyverno -n kyverno --create-namespace --version 3.5.2 --wait</pre>
+        <span class="code-label">~/labs/ks7/registry-policy.yaml</span>
+        <pre class="code">apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata: { name: lab-ecr-only }
+spec:
+  background: true
+  rules:
+    - name: own-ecr-only
+      match: { any: [{ resources: { kinds: [Pod], namespaces: [booking] } }] }
+      validate:
+        failureAction: Audit                              <span class="cm"># step 8b changes this to Enforce</span>
+        message: "Images must come from ACCOUNT.dkr.ecr.ap-southeast-1.amazonaws.com/lab-ME/ and not use :latest."
+        pattern:
+          spec:
+            containers:
+              - image: "ACCOUNT.dkr.ecr.ap-southeast-1.amazonaws.com/lab-ME/* &amp; !*:latest"</pre>
+        <pre class="code">sed -e "s/ACCOUNT/$ACCOUNT/g" -e "s/lab-ME/lab-$ME/g" registry-policy.yaml | kubectl apply -f -
+kubectl -n booking get policyreport -o custom-columns=KIND:.scope.kind,NAME:.scope.name,PASS:.summary.pass,FAIL:.summary.fail
+<span class="out">KIND         NAME                         PASS   FAIL
+Deployment   booking-worker               1      0
+Pod          booking-worker-5c8d9f7b6-q4tzx 1    0</span>      <span class="cm"># every FAIL is 0: safe to enforce</span>
+sed -e "s/ACCOUNT/$ACCOUNT/g" -e "s/lab-ME/lab-$ME/g" -e "s/failureAction: Audit/failureAction: Enforce/" \
+  registry-policy.yaml | kubectl apply -f -
+kubectl -n booking run hub --image=nginxinc/nginx-unprivileged:1.27-alpine --restart=Never
+<span class="out">Error from server: admission webhook "validate.kyverno.svc-fail" denied the request: …
+  own-ecr-only: 'validation error: Images must come from 888899990000.dkr.ecr…/lab-yourhandle/ and not use :latest. …'</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> as <code class="inline">ks7-viewer</code> you can list
+        Pods in <code class="inline">booking</code> but get <code class="inline">Forbidden</code> for Secrets and for
+        <code class="inline">kube-system</code>; the worker logged <code class="inline">reminder sent</code> for booking 42 with no
+        access keys anywhere; <code class="inline">aws eks list-pod-identity-associations --cluster-name $CLUSTER</code> shows
+        exactly one association in <code class="inline">booking</code>; a root busybox Pod and a Docker Hub image are both
+        rejected, each by a different admission layer that you can name.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Ship a Deployment that admission silently starves.</strong> Apply a second copy of the worker with the two
+        <code class="inline">securityContext</code> lines deleted. <code class="inline">kubectl apply</code> succeeds (with a
+        warning that is easy to miss in CI logs), the Deployment exists, and yet no Pod ever appears. Find out why from the
+        Deployment's own objects before you open the answer.
+        <pre class="code">sed -e "s#WREPO#$WREPO#" -e "s#QURL#$QURL#" -e '/securityContext/d' -e 's/name: booking-worker, namespace/name: booking-worker-2, namespace/' \
+  -e 's/app: booking-worker/app: booking-worker-2/g' worker.yaml | kubectl apply -f -
+kubectl -n booking get deploy booking-worker-2
+<span class="out">NAME               READY   UP-TO-DATE   AVAILABLE   AGE
+booking-worker-2   0/1     0            0           40s</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl -n booking describe rs -l app=booking-worker-2 | grep FailedCreate | head -1
+<span class="out">Warning  FailedCreate  …  replicaset-controller  Error creating: pods "booking-worker-2-7d9c…" is forbidden:
+violates PodSecurity "restricted:v1.33": allowPrivilegeEscalation != false …</span></pre>
+          <p class="mt-2">Pod Security checks Pods, not Deployments. The Deployment and its ReplicaSet are accepted; the
+          ReplicaSet controller is the one refused, and it reports that only as an event on the ReplicaSet. Nothing is
+          Pending or crashing, so a Pod-centric search finds nothing. Fix it by putting the two
+          <code class="inline">securityContext</code> blocks back (or delete it:
+          <code class="inline">kubectl -n booking delete deploy booking-worker-2</code>). In real life the fix is in the shared
+          Helm chart (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>), and the habit is: when
+          <code class="inline">READY 0/N</code> has no Pods at all, describe the ReplicaSet.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Clean up.</strong> Kubernetes objects first, then the AWS identities they referenced, then the queue and
+        repository. Keep the cluster only if you continue with EKS today.
+        <pre class="code">kubectl delete namespace booking
+helm -n kyverno uninstall kyverno &amp;&amp; kubectl delete namespace kyverno
+ASSOC=$(aws eks list-pod-identity-associations --cluster-name $CLUSTER --namespace booking \
+  --query 'associations[0].associationId' --output text)
+aws eks delete-pod-identity-association --cluster-name $CLUSTER --association-id $ASSOC &gt;/dev/null
+aws eks delete-access-entry --cluster-name $CLUSTER --principal-arn $VIEWER
+aws iam delete-role-policy --role-name lab-$ME-ks7-worker --policy-name sqs-consume
+aws iam delete-role --role-name lab-$ME-ks7-worker &amp;&amp; aws iam delete-role --role-name lab-$ME-ks7-viewer
+aws sqs delete-queue --queue-url $QURL
+aws ecr delete-repository --repository-name lab-$ME/booking-worker --force &gt;/dev/null
+kubectl config delete-context ks7-viewer
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=KS7 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span>                                       <span class="cm"># IAM roles are not listed here: check with aws iam get-role</span>
+# done with EKS for the day:  cd ~/labs/ks5 &amp;&amp; terraform destroy -var me=$ME</pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>The cost here is the cluster, not the lab.</strong> Everything this lab
+        creates is free, but the KS5 cluster it runs on is about USD 5 a day. A leftover access entry is the other risk: it
+        keeps granting access to a role that may later be reused. Run <code class="inline">aws eks list-access-entries --cluster-name $CLUSTER</code>
+        and make sure only the entries KS5 created remain.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

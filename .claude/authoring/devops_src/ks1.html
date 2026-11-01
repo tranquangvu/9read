@@ -435,7 +435,9 @@ nodes:
   - role: control-plane
     image: kindest/node:v1.33.1      <span class="cm"># match the EKS minor version</span>
   - role: worker
-  - role: worker                     <span class="cm"># two workers, so scheduling and draining are real</span></pre>
+    image: kindest/node:v1.33.1      <span class="cm"># every node: unset ones get kind's newer default</span>
+  - role: worker                     <span class="cm"># two workers, so scheduling and draining are real</span>
+    image: kindest/node:v1.33.1</pre>
       </div>
       <pre class="code mt-3">kind create cluster --config kind-config.yaml
 kubectl get nodes
@@ -514,6 +516,270 @@ kubectl get pods -l app=booking-api -o custom-columns=POD:.metadata.name,NODE:.s
         shell completion (<code class="inline">source &lt;(kubectl completion zsh)</code>), and a prompt that shows the
         current context and namespace. Most "I ran it against prod" mistakes happen because the prompt didn't show which
         cluster you were connected to.</div>
+
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Run booking-api on a three-node kind cluster</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You build a local cluster that has the same Kubernetes minor version as our EKS clusters, find every control plane
+        component from Part II running in it, and deploy the lab-kit <code class="inline">booking-api</code> with the
+        Deployment and Service from Part III. Then you watch the control loops do their job: a deleted Pod comes back, a
+        relabelled Pod is dropped from the Service, and a bad rollout stalls without taking anything down. It all runs on
+        your laptop and costs nothing.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">Three <code class="inline">booking-api</code> replicas behind a Service on kind, plus a rollout, a rollback and a self-heal you watched happen</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop: Docker plus a kind cluster called <code class="inline">ks1</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free. About 2 GB of RAM while the cluster runs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>): Docker, <code class="inline">kind</code> 0.29 or newer, <code class="inline">kubectl</code> 1.33; the lab kit in <code class="inline">~/clinic-app</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Check your tools.</strong> kind runs each Kubernetes node as a Docker container, so Docker must be running.
+        <pre class="code">docker info --format '{{.ServerVersion}}'      <span class="cm"># any version; an error means Docker is not running</span>
+kind version
+<span class="out">kind v0.29.0 go1.24.2 darwin/arm64</span>
+kubectl version --client | head -1
+<span class="out">Client Version: v1.33.3</span>
+mkdir -p ~/labs/ks1/k8s &amp;&amp; cd ~/labs/ks1</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create the cluster and find the control plane.</strong> Save the <code class="inline">kind-config.yaml</code>
+        from Part IV (one control-plane node, two workers, image <code class="inline">kindest/node:v1.33.1</code>) as
+        <code class="inline">~/labs/ks1/kind-config.yaml</code>, then create the cluster. kind also switches your
+        <code class="inline">kubectl</code> context to <code class="inline">kind-ks1</code>.
+        <pre class="code">kind create cluster --config kind-config.yaml
+kubectl config current-context
+<span class="out">kind-ks1</span>
+kubectl get pods -n kube-system -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName
+<span class="out">POD                                         NODE
+coredns-674b8bbfcf-7mqzk                    ks1-control-plane
+coredns-674b8bbfcf-xv4lp                    ks1-control-plane
+etcd-ks1-control-plane                      ks1-control-plane
+kindnet-5r8wq                               ks1-worker
+kube-apiserver-ks1-control-plane            ks1-control-plane
+kube-controller-manager-ks1-control-plane   ks1-control-plane
+kube-proxy-9kz2d                            ks1-worker2
+kube-scheduler-ks1-control-plane            ks1-control-plane
+…</span>                                           <span class="cm"># plus one kindnet and one kube-proxy per node</span></pre>
+        Match each line to the architecture diagram in Part II: etcd, the API server, the scheduler and the controller
+        manager live on the control-plane node, and every node runs kube-proxy and the CNI agent (kindnet here, the VPC CNI
+        on EKS). The kubelet and containerd are not Pods. They run inside each node container:
+        <code class="inline">docker exec ks1-worker systemctl is-active kubelet containerd</code> prints
+        <code class="inline">active</code> twice.
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Build the image and load it into the nodes.</strong> kind nodes cannot see your laptop's Docker images, and
+        you have no registry yet, so <code class="inline">kind load</code> copies the image into each node's containerd.
+        <pre class="code">docker build -t booking-api:1.0.0 ~/clinic-app/booking-api
+kind load docker-image booking-api:1.0.0 --name ks1
+<span class="out">Image: "booking-api:1.0.0" with ID "sha256:…" not yet present on node "ks1-worker", loading...</span>
+docker exec ks1-worker crictl images | grep booking-api
+<span class="out">docker.io/library/booking-api   1.0.0   …</span>          <span class="cm"># note the full name containerd gave it</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Write the manifests.</strong> These are the Part III objects, pointed at the local image.
+        <span class="code-label">~/labs/ks1/k8s/deployment.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booking-api
+  namespace: booking
+  labels: { app: booking-api }
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: booking-api }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: booking-api }
+    spec:
+      containers:
+        - name: api
+          image: booking-api:1.0.0
+          imagePullPolicy: IfNotPresent      <span class="cm"># use the loaded copy; there is no registry to pull from</span>
+          ports: [{ name: http, containerPort: 8080 }]
+          env:
+            - { name: APP_VERSION, value: "1.0.0" }</pre>
+        <span class="code-label">~/labs/ks1/k8s/service.yaml and namespace.yaml</span>
+        <pre class="code">apiVersion: v1
+kind: Service
+metadata: { name: booking-api, namespace: booking }
+spec:
+  selector: { app: booking-api }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: booking }</pre>
+        Save the second block as two files, <code class="inline">service.yaml</code> (above the
+        <code class="inline">---</code>) and <code class="inline">namespace.yaml</code>. Create the namespace first:
+        the server-side dry run checks that the namespace exists.
+        <pre class="code">kubectl apply -f k8s/namespace.yaml
+kubectl config set-context --current --namespace=booking
+kubectl apply -f k8s/ --dry-run=server
+<span class="out">deployment.apps/booking-api created (server dry run)
+namespace/booking unchanged (server dry run)
+service/booking-api created (server dry run)</span>
+kubectl apply -f k8s/ &amp;&amp; kubectl rollout status deploy/booking-api
+<span class="out">deployment "booking-api" successfully rolled out</span>
+kubectl get pods -o wide
+<span class="out">NAME                           READY   STATUS    RESTARTS   IP           NODE
+booking-api-6d9b7f8c5d-4kq7p   1/1     Running   0          10.244.1.2   ks1-worker
+booking-api-6d9b7f8c5d-hx2lm   1/1     Running   0          10.244.2.2   ks1-worker2
+booking-api-6d9b7f8c5d-t8vns   1/1     Running   0          10.244.2.3   ks1-worker2</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Call it through the Service.</strong> Run a throwaway client Pod inside the cluster. It finds the Service
+        by its short name, and each new connection may land on a different replica.
+        <pre class="code">kubectl run curl --rm -it --restart=Never --image=curlimages/curl:8.11.1 -- sh -c '
+  curl -s -XPOST booking-api/bookings -H "content-type: application/json" \
+       -d "{\"patient\":\"An\",\"slot\":\"2026-11-02T09:00\"}"; echo
+  for i in 1 2 3 4 5 6; do curl -s booking-api/bookings; echo; done'
+<span class="out">{"id":1,"patient":"An","slot":"2026-11-02T09:00",…}
+[]
+[{"id":1,"patient":"An",…}]
+[]
+[]
+[{"id":1,"patient":"An",…}]
+[]
+pod "curl" deleted</span></pre>
+        One replica in three has the booking. Same lesson as the CN1 lab: each Pod has its own in-memory store, and
+        that is why state goes in a database (KS4 runs Postgres in the cluster). For a quick look from your laptop,
+        <code class="inline">kubectl port-forward svc/booking-api 8080:80</code> and
+        <code class="inline">curl localhost:8080/healthz</code> also work, but port-forward pins one Pod, so it hides this
+        behaviour.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Watch the ReplicaSet heal, and watch apply win.</strong> Delete a Pod and look at who created its
+        replacement. Then scale by hand and re-apply the manifest.
+        <pre class="code">POD=$(kubectl get pods -l app=booking-api -o jsonpath='{.items[0].metadata.name}')
+kubectl delete pod $POD
+kubectl get events --field-selector reason=SuccessfulCreate --sort-by=.lastTimestamp | tail -1
+<span class="out">Normal   SuccessfulCreate   replicaset/booking-api-6d9b7f8c5d   Created pod: booking-api-6d9b7f8c5d-w9fzc</span>
+kubectl scale deploy/booking-api --replicas=5 &amp;&amp; kubectl get deploy booking-api
+<span class="out">NAME          READY   UP-TO-DATE   AVAILABLE
+booking-api   5/5     5            5</span>
+kubectl apply -f k8s/ &amp;&amp; kubectl get deploy booking-api
+<span class="out">booking-api   3/3     3            3</span>       <span class="cm"># the file says 3, so 3 it is</span></pre>
+        The imperative <code class="inline">scale</code> lasted until the next <code class="inline">apply</code>. In a GitOps
+        cluster the next sync does the same within minutes, which is why you change the file, not the cluster.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Quarantine a Pod with a label.</strong> Selectors are live queries. Change a Pod's
+        <code class="inline">app</code> label, and the ReplicaSet and the Service both stop counting it. The Pod keeps
+        running, so you can inspect it while a fresh replica takes its place. This is a real incident technique for a Pod
+        that misbehaves in a way you want to keep for analysis.
+        <pre class="code">POD=$(kubectl get pods -l app=booking-api -o jsonpath='{.items[0].metadata.name}')
+kubectl label pod $POD app=quarantine --overwrite
+kubectl get pods -L app
+<span class="out">NAME                           READY   STATUS    RESTARTS   AGE   APP
+booking-api-6d9b7f8c5d-hx2lm   1/1     Running   0          9m    quarantine
+booking-api-6d9b7f8c5d-q5r2d   1/1     Running   0          4s    booking-api
+booking-api-6d9b7f8c5d-t8vns   1/1     Running   0          9m    booking-api
+booking-api-6d9b7f8c5d-w9fzc   1/1     Running   0          2m    booking-api</span>
+kubectl get endpointslices -l kubernetes.io/service-name=booking-api \
+  -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]} {end}{"\n"}'
+<span class="out">10.244.1.4 10.244.2.3 10.244.1.3</span>          <span class="cm"># 10.244.2.2, the quarantined Pod, is gone</span>
+kubectl logs $POD --tail=3                    <span class="cm"># still there to investigate</span>
+kubectl delete pod $POD                       <span class="cm"># done with it: nothing recreates it</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Roll out a change and roll it back.</strong> In <code class="inline">deployment.yaml</code>, change the
+        <code class="inline">APP_VERSION</code> value to <code class="inline">"1.0.1"</code>. A change to the Pod template
+        creates a new ReplicaSet.
+        <pre class="code">kubectl diff -f k8s/
+<span class="out">-            value: "1.0.0"
++            value: "1.0.1"</span>
+kubectl apply -f k8s/ &amp;&amp; kubectl rollout status deploy/booking-api
+kubectl get rs -l app=booking-api
+<span class="out">NAME                     DESIRED   CURRENT   READY
+booking-api-6d9b7f8c5d   0         0         0          <span class="cm"># the old one is kept, scaled to 0</span>
+booking-api-7f4c8d6b9    3         3         3</span>
+kubectl rollout undo deploy/booking-api &amp;&amp; kubectl rollout status deploy/booking-api
+kubectl get deploy booking-api -o jsonpath='{.spec.template.spec.containers[0].env[0].value}{"\n"}'
+<span class="out">1.0.0</span></pre>
+        <code class="inline">undo</code> scaled the old ReplicaSet back up. Your file still says 1.0.1, so the next
+        <code class="inline">apply</code> would redo the change. Put the file back to <code class="inline">"1.0.0"</code>
+        now. In real life the rollback is a Git revert, and <code class="inline">undo</code> is for emergencies.
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>kubectl fluency drill.</strong> Answer each question with one command, then compare with the answers.
+        (1) Which node runs each <code class="inline">booking-api</code> Pod? (2) Which image does the Deployment run?
+        (3) What is the Service's ClusterIP? (4) What does <code class="inline">maxSurge</code> mean, without opening a
+        browser? (5) Which Pods in the whole cluster have restarted?
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answers</summary>
+          <pre class="code mt-3">kubectl get pods -l app=booking-api -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName
+kubectl get deploy booking-api -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl get svc booking-api -o jsonpath='{.spec.clusterIP}{"\n"}'
+<span class="out">10.96.142.17</span>            <span class="cm"># from kind's default Service range 10.96.0.0/16</span>
+kubectl explain deployment.spec.strategy.rollingUpdate.maxSurge
+kubectl get pods -A -o custom-columns=NS:.metadata.namespace,POD:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount \
+  | awk 'NR==1 || $3&gt;0'</pre>
+        </details>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">kubectl get deploy booking-api</code> shows <code class="inline">3/3</code>; you can name the
+        node each control plane component runs on; you saw a <code class="inline">SuccessfulCreate</code> event from the
+        ReplicaSet after deleting a Pod; the quarantined Pod's IP disappeared from the EndpointSlice; and
+        <code class="inline">kubectl rollout history deploy/booking-api</code> lists the revisions you created.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Ship a tag that does not exist.</strong> In <code class="inline">deployment.yaml</code>, change the image
+        to <code class="inline">booking-api:1.0.2</code> (you never built it) and apply.
+        <code class="inline">kubectl rollout status</code> stops at "1 out of 3 new replicas have been updated" and never
+        finishes, yet the client Pod from step 5 still gets answers. Using only get, describe, events and logs, find the
+        cause, and explain why the Service never went down.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl get pods -l app=booking-api
+<span class="out">NAME                           READY   STATUS             RESTARTS   AGE
+booking-api-5c7d9b8f4-zk2mq    0/1     ImagePullBackOff   0          2m
+booking-api-6d9b7f8c5d-t8vns   1/1     Running            0          31m
+…</span>                                           <span class="cm"># the three old Pods are untouched</span>
+kubectl describe pod booking-api-5c7d9b8f4-zk2mq | grep -A1 'Failed '
+<span class="out">Warning  Failed  kubelet  Failed to pull image "booking-api:1.0.2": failed to resolve reference
+         "docker.io/library/booking-api:1.0.2": pull access denied, repository does not exist …</span></pre>
+          <p class="mt-2">The tag is not on the nodes, so the kubelet tries Docker Hub (a short name means
+          <code class="inline">docker.io/library/…</code>) and fails. Logs show nothing because the container never started.
+          With <code class="inline">maxSurge: 1, maxUnavailable: 0</code>, the Deployment creates one extra Pod and waits for it
+          to become Ready before removing an old one, so a broken image costs you nothing but a stuck rollout. Fix it the
+          declarative way: put <code class="inline">1.0.0</code> back in the file and apply. With
+          <code class="inline">maxUnavailable: 1</code>, one replica would have been removed before the new Pod failed.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">11</div><div class="step-body">
+        <strong>Clean up.</strong> Deleting the cluster removes its node containers and everything in them. The KS2 lab
+        creates its own cluster, so you lose nothing you need. Keep <code class="inline">~/labs/ks1</code>: KS2 starts from
+        these manifests.
+        <pre class="code">kind delete cluster --name ks1
+<span class="out">Deleting cluster "ks1" ...</span>
+kind get clusters
+<span class="out">No kind clusters found.</span>
+docker ps --filter name=ks1 --format '{{.Names}}' | wc -l
+<span class="out">0</span></pre>
+      </div></div>
 
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>

@@ -612,6 +612,350 @@ smoke tests green, SLI at baseline      T+55      T+52
 <span class="out">RTO achieved: 52 min (target 60) · RPO achieved: 2 s replica lag (target 5 min)</span>
 <span class="cm"># fail-back to Singapore took 3 h 10 min, as a planned change two days later</span></pre>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Measure a real restore, then break ECS on purpose with FIS</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Two drills from this module, on a small scale. First you put a Postgres instance under an AWS Backup plan,
+        write bookings into it continuously, take a recovery point, run the most likely disaster (a careless
+        <code class="inline">DELETE</code>), restore, and measure the RTO and RPO you actually got. Then you write an FIS
+        experiment with a stop condition that kills half of the CN1 service's tasks under load, check the hypothesis, and
+        see what a stop condition can and cannot protect you from.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A measured RTO and RPO for a restore, and an FIS experiment result written against its hypothesis</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">3–4 hours, much of it waiting on backup and restore jobs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code>, plus Docker on your laptop</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">About USD 0.15 per hour (two <code class="inline">db.t4g.micro</code> at most, the CN1 stack) plus about USD 0.60 per FIS run (USD 0.10 per action-minute)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The CN1 lab stack running (<a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a>), Terraform ≥ 1.10, Docker, the lab kit in <code class="inline">~/clinic-app</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up and bring back the CN1 stack.</strong> This lab reuses the CN1 VPC for the database and the CN1
+        service for the experiment. If you destroyed it, repeat CN1 steps 2 and 6 (push the image, then
+        <code class="inline">terraform apply</code>), about 10 minutes.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login
+aws sts get-caller-identity --query Account --output text
+<span class="out">888899990000</span>
+aws ecs describe-services --cluster lab-$ME-cn1 --services booking-api --query 'services[0].runningCount'
+<span class="out">2</span>
+export URL=$(terraform -chdir=$HOME/labs/cn1 output -raw url)
+mkdir -p ~/labs/sr3 &amp;&amp; cd ~/labs/sr3</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Write a small database and its backup plan.</strong> The instance sits in a CN1 public subnet so your
+        laptop can write to it, locked to your own IP. That is a lab shortcut; production databases live in isolated
+        subnets (<a href="./aw5.html" class="text-viol underline decoration-viol/40">AW5</a>). The plan selects by the
+        <code class="inline">backup</code> tag, exactly as Part III does for <code class="inline">tier-gold</code>.
+        <span class="code-label">~/labs/sr3/db.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers {
+    aws    = { source = "hashicorp/aws", version = "~&gt; 6.0" }
+    random = { source = "hashicorp/random", version = "~&gt; 3.6" }
+  }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "SR3" } }
+}
+variable "me" { type = string }
+variable "my_ip" { type = string }                         <span class="cm"># your laptop, x.x.x.x/32</span>
+locals { name = "lab-${var.me}-sr3" }
+data "aws_vpc" "cn1" { tags = { Name = "lab-${var.me}-cn1" } }
+data "aws_subnets" "public" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.cn1.id]
+  }
+}
+resource "aws_security_group" "db" {
+  name   = "${local.name}-db"
+  vpc_id = data.aws_vpc.cn1.id
+  ingress {
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip]                               <span class="cm"># lab only: never 0.0.0.0/0</span>
+  }
+}</pre>
+        <span class="code-label">~/labs/sr3/db.tf (continued)</span>
+        <pre class="code">resource "aws_db_subnet_group" "db" {
+  name       = local.name
+  subnet_ids = data.aws_subnets.public.ids
+}
+resource "random_password" "db" {
+  length  = 24
+  special = false                                           <span class="cm"># safe inside a URL</span>
+}
+resource "aws_db_instance" "db" {
+  identifier              = local.name
+  engine                  = "postgres"
+  engine_version          = "16"
+  instance_class          = "db.t4g.micro"
+  allocated_storage       = 20
+  storage_type            = "gp3"
+  db_name                 = "clinic"
+  username                = "clinic"
+  password                = random_password.db.result
+  db_subnet_group_name    = aws_db_subnet_group.db.name
+  vpc_security_group_ids  = [aws_security_group.db.id]
+  publicly_accessible     = true                            <span class="cm"># lab only, locked to my_ip</span>
+  backup_retention_period = 1
+  skip_final_snapshot     = true
+  tags                    = { backup = "lab-${var.me}" }    <span class="cm"># what the selection matches</span>
+}
+output "dsn" {
+  value     = "postgres://clinic:${random_password.db.result}@${aws_db_instance.db.address}:5432/clinic"
+  sensitive = true
+}
+output "db_arn" { value = aws_db_instance.db.arn }</pre>
+        <span class="code-label">~/labs/sr3/backup.tf</span>
+        <pre class="code">resource "aws_backup_vault" "lab" {
+  name          = local.name
+  force_destroy = true                                      <span class="cm"># lab only; prod uses Vault Lock</span>
+}
+resource "aws_iam_role" "backup" {
+  name = "${local.name}-backup"
+  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{ Effect = "Allow",
+    Action = "sts:AssumeRole", Principal = { Service = "backup.amazonaws.com" } }] })
+}
+resource "aws_iam_role_policy_attachment" "backup" {
+  for_each   = toset(["AWSBackupServiceRolePolicyForBackup", "AWSBackupServiceRolePolicyForRestores"])
+  role       = aws_iam_role.backup.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/${each.value}"
+}
+resource "aws_backup_plan" "lab" {
+  name = local.name
+  rule {
+    rule_name         = "daily"
+    target_vault_name = aws_backup_vault.lab.name
+    schedule          = "cron(0 18 * * ? *)"                <span class="cm"># 01:00 ICT</span>
+    lifecycle { delete_after = 7 }
+  }
+}
+resource "aws_backup_selection" "lab" {
+  name         = local.name
+  plan_id      = aws_backup_plan.lab.id
+  iam_role_arn = aws_iam_role.backup.arn
+  selection_tag {
+    type  = "STRINGEQUALS"
+    key   = "backup"
+    value = "lab-${var.me}"
+  }
+}
+output "backup_role" { value = aws_iam_role.backup.arn }</pre>
+        <pre class="code">terraform init
+terraform apply -var me=$ME -var my_ip=$(curl -s https://checkip.amazonaws.com)/32
+<span class="out">Apply complete! Resources: 10 added, 0 changed, 0 destroyed.</span>     <span class="cm"># about 6 min, mostly RDS</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Write bookings continuously.</strong> Run <code class="inline">booking-api</code> on your laptop against
+        the new database and post one booking every 2 seconds. Each row gets a <code class="inline">created_at</code>
+        timestamp, which is how you will measure data loss.
+        <pre class="code">export DSN=$(terraform output -raw dsn)
+alias psql='docker run --rm -i postgres:16-alpine psql'
+docker build -q -t booking-api:lab ~/clinic-app/booking-api
+docker run -d --name sr3-api -p 8081:8080 -e DATABASE_URL="$DSN" -e DATABASE_SSL=true booking-api:lab
+while true; do curl -s -o /dev/null -X POST localhost:8081/bookings -H 'content-type: application/json' \
+  -d '{"patient":"sr3","slot":"2026-12-01T09:00"}'; sleep 2; done &amp;
+sleep 30; psql "$DSN?sslmode=require" -Atc "select count(*), max(created_at) from bookings"
+<span class="out">15|2026-11-01 03:12:44.81+00</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Take an on-demand recovery point.</strong> The plan's schedule will not fire during the lab, so start the
+        same kind of job by hand. Keep the writer running: every booking after the recovery point is data you are about
+        to lose.
+        <pre class="code">JOB=$(aws backup start-backup-job --backup-vault-name lab-$ME-sr3 \
+  --resource-arn $(terraform output -raw db_arn) --iam-role-arn $(terraform output -raw backup_role) \
+  --query BackupJobId --output text)
+aws backup describe-backup-job --backup-job-id $JOB --query '[State,PercentDone]' --output text
+<span class="out">RUNNING	0.0</span>                                          <span class="cm"># repeat every minute; 5–15 min</span>
+<span class="out">COMPLETED	100.0</span>
+export RP=$(aws backup describe-backup-job --backup-job-id $JOB --query RecoveryPointArn --output text)
+aws backup describe-recovery-point --backup-vault-name lab-$ME-sr3 --recovery-point-arn $RP \
+  --query '[Status,CreationDate]' --output text
+<span class="out">COMPLETED	2026-11-01T03:14:02.512000+00:00</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Cause the disaster, then restore.</strong> Wait about five minutes after the recovery point, then run
+        the mistake and note the exact time. Restore into a <em>new</em> instance (never over the damaged one) by taking
+        the metadata AWS Backup recorded and giving the copy a new name.
+        <pre class="code">kill %1                                               <span class="cm"># stop the writer: the "app" is now broken</span>
+psql "$DSN?sslmode=require" -Atc "select now(), count(*) from bookings" -c "delete from bookings"
+<span class="out">2026-11-01 03:19:31.07+00|218
+DELETE 218</span>
+aws backup get-recovery-point-restore-metadata --backup-vault-name lab-$ME-sr3 \
+  --recovery-point-arn $RP --query RestoreMetadata &gt; meta.json
+jq --arg id lab-$ME-sr3-restored '.DBInstanceIdentifier = $id' meta.json &gt; restore.json
+RJOB=$(aws backup start-restore-job --recovery-point-arn $RP --resource-type RDS \
+  --iam-role-arn $(terraform output -raw backup_role) --metadata file://restore.json \
+  --query RestoreJobId --output text)
+aws rds wait db-instance-available --db-instance-identifier lab-$ME-sr3-restored   <span class="cm"># 10–20 min</span></pre>
+        If the restore job fails, <code class="inline">aws backup describe-restore-job --restore-job-id $RJOB --query StatusMessage</code>
+        names the metadata key it did not accept.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Measure RTO and RPO.</strong> RPO is the gap between the newest row you got back and the moment of the
+        disaster. RTO is from the disaster to a database you could point the app at.
+        <pre class="code">aws backup describe-restore-job --restore-job-id $RJOB --query '[Status,CreationDate,CompletionDate]' --output text
+<span class="out">COMPLETED	2026-11-01T03:20:05+00:00	2026-11-01T03:36:47+00:00</span>
+R=$(aws rds describe-db-instances --db-instance-identifier lab-$ME-sr3-restored \
+  --query 'DBInstances[0].Endpoint.Address' --output text)
+psql "${DSN/@*:5432/@$R:5432}?sslmode=require" -Atc "select count(*), max(created_at) from bookings"
+<span class="out">53|2026-11-01 03:14:01.66+00</span></pre>
+        Here the restore lost 165 bookings (the 5½ minutes between the recovery point and the disaster) and took
+        17 minutes for the job alone, plus 1 minute of your own reaction. Write both into
+        <code class="inline">~/labs/sr3/results.md</code> next to the targets in Part II (RPO ≤ 5 min, RTO ≤ 2 h for
+        corruption), and say which control would close the gap: continuous backup (PITR) makes RPO about 5 minutes no
+        matter when the mistake happens; a daily snapshot alone gives up to 24 hours.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Write the FIS experiment.</strong> Hypothesis first, then the template. The stop condition is an alarm on
+        5xx returned by the ALB itself; the <code class="inline">aws:fis:wait</code> action keeps the experiment open for
+        five minutes so the stop condition is watched while ECS replaces the tasks.
+        <span class="code-label">~/labs/sr3/fis.tf</span>
+        <pre class="code">data "aws_lb" "cn1" { name = "lab-${var.me}-cn1" }
+resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
+  alarm_name          = "${local.name}-alb-5xx"
+  namespace           = "AWS/ApplicationELB"
+  metric_name         = "HTTPCode_ELB_5XX_Count"              <span class="cm"># 502/503 from the ALB itself</span>
+  dimensions          = { LoadBalancer = data.aws_lb.cn1.arn_suffix }
+  statistic           = "Sum"
+  period              = 60
+  evaluation_periods  = 1
+  threshold           = 5
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+}
+resource "aws_iam_role" "fis" {
+  name = "${local.name}-fis"
+  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{ Effect = "Allow",
+    Action = "sts:AssumeRole", Principal = { Service = "fis.amazonaws.com" } }] })
+}
+resource "aws_iam_role_policy_attachment" "fis" {
+  role       = aws_iam_role.fis.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorECSAccess"
+}</pre>
+        <span class="code-label">~/labs/sr3/fis.tf (continued)</span>
+        <pre class="code">resource "aws_fis_experiment_template" "kill_half" {
+  description = "Stop 50% of booking-api tasks; expect at most 5 ALB 5xx per minute"
+  role_arn    = aws_iam_role.fis.arn
+  stop_condition {
+    source = "aws:cloudwatch:alarm"
+    value  = aws_cloudwatch_metric_alarm.alb_5xx.arn
+  }
+  action {
+    name      = "stop-tasks"
+    action_id = "aws:ecs:stop-task"
+    target {
+      key   = "Tasks"
+      value = "api-tasks"
+    }
+  }
+  action {
+    name        = "observe"
+    action_id   = "aws:fis:wait"
+    start_after = ["stop-tasks"]
+    parameter {
+      key   = "duration"
+      value = "PT5M"
+    }
+  }
+  target {
+    name           = "api-tasks"
+    resource_type  = "aws:ecs:task"
+    selection_mode = "PERCENT(50)"                            <span class="cm"># the blast radius</span>
+    parameters     = { cluster = "lab-${var.me}-cn1", service = "booking-api" }
+  }
+}
+output "template_id" { value = aws_fis_experiment_template.kill_half.id }</pre>
+        <span class="code-label">~/labs/sr3/hypothesis.md</span>
+        <pre class="code">Steady state:   GET /healthz 200 at ~5 req/s, 2 running tasks
+Fault:          stop 50% of booking-api tasks (1 of 2)
+Hypothesis:     ≤ 5 ALB 5xx in any minute; runningCount back to 2 within 2 min
+Stop condition: alarm lab-&lt;me&gt;-sr3-alb-5xx (&gt; 5 per minute)</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Run it under load and check the hypothesis.</strong>
+        <pre class="code">terraform apply -var me=$ME -var my_ip=$(curl -s https://checkip.amazonaws.com)/32
+while true; do curl -s -o /dev/null -w '%{http_code}\n' $URL/healthz; sleep 0.2; done &gt; codes.txt &amp;
+EXP=$(aws fis start-experiment --experiment-template-id $(terraform output -raw template_id) \
+  --query experiment.id --output text)
+for i in $(seq 8); do aws ecs describe-services --cluster lab-$ME-cn1 --services booking-api \
+  --query 'services[0].[runningCount,pendingCount]' --output text; sleep 20; done
+<span class="out">1	1
+2	0</span>
+aws fis get-experiment --id $EXP --query experiment.state.status --output text   <span class="cm"># after ~6 min</span>
+<span class="out">completed</span>
+kill %1; sort codes.txt | uniq -c
+<span class="out">   1712 200
+      2 502</span></pre>
+        Two 502s from in-flight requests on the stopped task, under the threshold: the hypothesis held. Add a row to
+        <code class="inline">results.md</code> in the game-day format from Part IV.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">results.md</code> states the measured RPO (minutes and rows lost) and RTO (restore job
+        duration plus your reaction time) against the Part II targets; the restored instance answered your
+        <code class="inline">select</code>; <code class="inline">aws fis get-experiment</code> shows
+        <code class="inline">completed</code> for the 50% run; and you can explain from <code class="inline">codes.txt</code>
+        why a few 5xx appeared at all.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Widen the blast radius.</strong> Change <code class="inline">selection_mode</code> to
+        <code class="inline">"ALL"</code>, apply, and repeat step 8. The run ends in under five minutes with status
+        <code class="inline">stopped</code>, and <code class="inline">codes.txt</code> is full of 503s for about a minute.
+        Using <code class="inline">aws fis get-experiment</code> (<code class="inline">state</code> and
+        <code class="inline">actions</code>), <code class="inline">aws cloudwatch describe-alarm-history --alarm-name lab-$ME-sr3-alb-5xx</code>
+        and the ECS service events, explain what the stop condition did and what it could not do.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">aws fis get-experiment --id $EXP --query 'experiment.actions.*.state.status' --output text
+<span class="out">completed	stopped</span>                                   <span class="cm"># stop-tasks done, observe cut short</span></pre>
+          <p class="mt-2">Both tasks were stopped at once, the target group had no healthy targets, and the ALB answered
+          503 until ECS started and registered replacements. The alarm went to <code class="inline">ALARM</code> about a
+          minute in and FIS halted the experiment, but stopping a task is instantaneous: the stop condition can only cancel
+          actions that have not finished, never undo one that has. For one-shot faults your protection is the blast
+          radius, not the alarm. Put <code class="inline">PERCENT(50)</code> back and apply. In production the same lesson
+          reads: run at least three tasks across AZs (Part I, static stability), and review
+          <code class="inline">selection_mode</code> in every FIS PR as carefully as the stop condition.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Clean up.</strong> Delete the restored instance first (Terraform does not know about it and it uses the
+        security group and subnet group Terraform is about to remove), then destroy. <code class="inline">force_destroy</code>
+        empties the vault. Leave the CN1 stack up only if you go straight on to another lab.
+        <pre class="code">docker rm -f sr3-api
+aws rds delete-db-instance --db-instance-identifier lab-$ME-sr3-restored \
+  --skip-final-snapshot --delete-automated-backups &gt;/dev/null
+aws rds wait db-instance-deleted --db-instance-identifier lab-$ME-sr3-restored
+terraform destroy -var me=$ME -var my_ip=0.0.0.0/32
+<span class="out">Destroy complete! Resources: 14 destroyed.</span>
+terraform -chdir=$HOME/labs/cn1 destroy -var me=$ME -var image=$REPO:1.0.0   <span class="cm"># if you are done with CN1</span>
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=SR3 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span>
+aws rds describe-db-instances --query "DBInstances[?starts_with(DBInstanceIdentifier,'lab-$ME')].DBInstanceIdentifier"
+<span class="out">[]</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Forgot to destroy?</strong> One <code class="inline">db.t4g.micro</code> with
+        20 GB costs about USD 0.60 a day, and the restored copy doubles it; it is untagged by Terraform, so check for it by
+        name as above. The CN1 stack adds about USD 1.50 a day. FIS charges only while an experiment runs.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

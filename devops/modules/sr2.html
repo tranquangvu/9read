@@ -674,6 +674,213 @@ gh issue list -R golden-owl/clinic-infra --label postmortem,P1 --state open \
         That is the argument you make in planning, with the table attached.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Run a mock incident from page to postmortem</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will run the lab-kit stack locally, put a synthetic probe in front of it, and let a script (or a teammate)
+        inject a real fault at a moment you do not know. Then you work the incident the way Parts I–III describe:
+        declare, assign roles, announce before you act, mitigate, close with the checklist, and write a blameless
+        postmortem from evidence rather than memory. The fault is genuine behaviour of <code class="inline">booking-api</code>,
+        not a staged error page, so the root cause is yours to find.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A pinned declaration, a timestamped timeline, and a postmortem with three to five owned action items, one of them proven</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours (best with a teammate playing comms lead and client)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop, two terminals; a scratch Slack channel such as <code class="inline">#inc-drill-$ME</code> if you have one</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">Docker, <code class="inline">jq</code>, the lab kit in <code class="inline">~/clinic-app</code> (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Start the stack and a patient's-eye probe.</strong> The probe books nothing; it reads
+        <code class="inline">/bookings</code> every 5 seconds, which needs the database, and logs one line per check.
+        It is your alert and later your timeline. Run it in a second terminal and leave it there.
+        <pre class="code">cd ~/clinic-app &amp;&amp; docker compose up --build -d
+mkdir -p ~/labs/sr2 &amp;&amp; cd ~/labs/sr2</pre>
+        <span class="code-label">~/labs/sr2/probe.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># Synthetic check, as a patient sees it: 200 from /bookings within 3 s, or DOWN.</span>
+while true; do
+  code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' localhost:8080/bookings)
+  [ "$code" = 200 ] &amp;&amp; s=UP || s=DOWN
+  echo "$(date -u +%H:%M:%S) $s $code" | tee -a probe.log
+  sleep 5
+done</pre>
+        <pre class="code">chmod +x probe.sh &amp;&amp; ./probe.sh                 <span class="cm"># terminal 2</span>
+<span class="out">09:58:01 UP 200
+09:58:06 UP 200</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Prepare the incident kit before anything breaks.</strong> Copy the declaration from Part II into a file
+        with blanks, so the first minutes are mechanical. Decide now who plays which role. Solo, you are IC and ops lead
+        at once, so say out loud which hat you are wearing before each action.
+        <span class="code-label">~/labs/sr2/incident.md</span>
+        <pre class="code">:rotating_light: SEV_ declared __:__ UTC · #inc-drill-&lt;handle&gt;
+Impact:   ____ of GET /bookings failing since ~__:__ (probe.log)
+IC: @___   Ops lead: @___   Comms: @___   Scribe: @___
+Status:   investigating. Last change: ____
+Next:     mitigation decision by __:__. Next status check __:__.
+Rules:    announce every change here BEFORE running it.
+
+## Timeline (UTC) — scribe writes everything, dead ends included
+__:__  </pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Arm the fault.</strong> Ideally a teammate runs the next command whenever they like. Solo, this script
+        waits one to four minutes at random and then restarts Postgres, the way an unannounced database maintenance
+        would. It writes the true start time to a file you open only during the postmortem.
+        <span class="code-label">~/labs/sr2/chaos.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+sleep $(( RANDOM % 180 + 60 ))
+date -u +%H:%M:%S &gt; .fault-time                        <span class="cm"># the answer key: don't peek</span>
+docker compose -f ~/clinic-app/compose.yaml restart postgres &gt;/dev/null 2&gt;&amp;1</pre>
+        <pre class="code">chmod +x chaos.sh &amp;&amp; nohup ./chaos.sh &gt;/dev/null 2&gt;&amp;1 &amp;</pre>
+        Now do something else, such as reading Part IV again, with terminal 2 in view.
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Detect and declare.</strong> When the probe flips to <code class="inline">DOWN</code>, write the time
+        down, then fill in and post the declaration. Every check fails, so no patient can book: by the table in Part I
+        that is <strong>SEV1</strong>, even in a drill. Do not open a terminal for debugging until the declaration is out.
+        <pre class="code"><span class="out">10:01:41 UP 200
+10:01:46 DOWN 000
+10:01:51 DOWN 000</span>                                <span class="cm"># 000 = connection refused: nothing is listening</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Triage, announce, mitigate.</strong> Ask the Part I question first: what changed? Nothing was deployed,
+        so look at the state of the containers, then at the API's last words. Post each command in the channel before
+        you run it.
+        <pre class="code">cd ~/clinic-app
+docker compose ps -a --format 'table {{.Service}}\t{{.Status}}'
+<span class="out">SERVICE       STATUS
+booking-api   Exited (1) 40 seconds ago
+booking-web   Up 14 minutes
+postgres      Up 38 seconds (healthy)</span>           <span class="cm"># postgres restarted; the API did not come back</span>
+docker compose logs booking-api --tail 8 | grep -v '"level"'
+<span class="out">booking-api-1  | node:events:…
+booking-api-1  |     throw er; // Unhandled 'error' event
+booking-api-1  | error: terminating connection due to administrator command</span>
+<span class="cm"># announce: "restarting booking-api now", then:</span>
+docker compose up -d booking-api</pre>
+        Watch the probe return to <code class="inline">UP 200</code>, note the time, and post an "Identified / mitigated"
+        update. Before you close, walk the Part I checklist: is it stable for a few minutes, is any manual change
+        recorded, who owns the postmortem?
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Build the timeline from evidence.</strong> Docker records every container that died or started, with an
+        exit code. Merge that with <code class="inline">probe.log</code> and your channel notes, then open
+        <code class="inline">.fault-time</code> to see how close your detection was.
+        <pre class="code">docker events --since 30m --until "$(date +%s)" --filter type=container \
+  --filter event=die --filter event=start --format '{{json .}}' \
+  | jq -r '"\(.time | todate)  \(.Actor.Attributes.name)  \(.Action)  exit=\(.Actor.Attributes.exitCode // "-")"'
+<span class="out">2026-11-01T10:01:44Z  clinic-app-postgres-1  die  exit=0
+2026-11-01T10:01:44Z  clinic-app-booking-api-1  die  exit=1
+2026-11-01T10:01:45Z  clinic-app-postgres-1  start  exit=-
+2026-11-01T10:04:58Z  clinic-app-booking-api-1  start  exit=-</span>
+grep -c DOWN ~/labs/sr2/probe.log; cat ~/labs/sr2/.fault-time
+<span class="out">38
+10:01:43</span></pre>
+        The API died within a second of Postgres and stayed down for three minutes after Postgres was healthy again.
+        Write TTD (fault to probe DOWN), TTA (DOWN to declaration) and TTM (fault to probe UP) into the timeline.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Write the blameless postmortem.</strong> Use the Part IV structure. Contributing factors are about the
+        system: no one "forgot" anything. Three to five action items, each with an owner, a priority and a date.
+        <span class="code-label">~/labs/sr2/postmortem.md</span>
+        <pre class="code"># Postmortem: booking-api down after Postgres restart (SEV1 drill)
+Status: draft · Author: &lt;you&gt; · Blameless
+## Summary
+From __:__ to __:__ UTC every booking request failed. No data lost.
+## Impact          TTD _ min · TTA _ min · TTM _ min
+## Timeline        (from docker events + probe.log + channel)
+## What happened
+Postgres restarted. Its idle pool connection in booking-api received
+"terminating connection due to administrator command". The pg pool has no
+'error' listener, so Node threw and the process exited with code 1.
+Nothing restarted it: the compose service has no restart policy.
+## Contributing factors
+- An expected event (DB restart, RDS failover) kills the process instead of
+  failing one request.
+- The platform layer does not restart a dead API (ECS and Kubernetes would).
+- Liveness (/healthz) says nothing about whether the API can reach its DB.
+## Action items      (owner · priority · due)
+1. Restart policy for booking-api in compose (proved in step 8) · you · P1
+2. App: add db.on('error') handler, log and keep serving        · backend · P1
+3. Game day: restart/fail over the DB monthly (SR3)            · you · P2</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Prove one action item.</strong> An action item you have not tested is a hope. Add a restart policy with a
+        compose override file (compose merges it automatically), then repeat the fault and watch the probe.
+        <span class="code-label">~/clinic-app/compose.override.yaml</span>
+        <pre class="code">services:
+  booking-api:
+    restart: unless-stopped                <span class="cm"># Docker restarts it after exit 1</span></pre>
+        <pre class="code">cd ~/clinic-app &amp;&amp; docker compose up -d
+docker compose restart postgres
+<span class="out">10:22:16 UP 200
+10:22:21 DOWN 000
+10:22:26 UP 200</span>                                   <span class="cm"># one failed check instead of three minutes</span></pre>
+        Mark item 1 done with this output as evidence. Item 2 is still needed: in ECS and Kubernetes the platform
+        restarts the task too, but every in-flight request on it still fails, and a Multi-AZ failover would crash every
+        task at once.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        your declaration was posted before your first debugging command; the timeline has at least six timestamped
+        entries including the <code class="inline">docker events</code> lines; <code class="inline">postmortem.md</code>
+        states TTD, TTA and TTM and has three to five action items with owners; and the step 8 rerun shows at most two
+        <code class="inline">DOWN</code> lines.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>A gray failure.</strong> Have your teammate run the command below without telling you (solo: run it and
+        then work through it as if you had not). The probe shows <code class="inline">DOWN 000</code> after a 3-second
+        timeout, yet <code class="inline">curl localhost:8080/healthz</code> answers 200 and nothing has restarted. Declare,
+        then find the cause using only <code class="inline">curl</code> on the API's two health endpoints and
+        <code class="inline">docker compose ps</code>.
+        <pre class="code">docker compose -f ~/clinic-app/compose.yaml pause postgres     <span class="cm"># the teammate's command</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">curl -s -m 3 -w ' %{http_code}\n' localhost:8080/healthz
+<span class="out">{"ok":true,"version":"local"} 200</span>
+curl -s -m 3 -w ' %{http_code}\n' localhost:8080/readyz
+<span class="out"> 000</span>                                       <span class="cm"># readiness hangs: it queries the DB</span>
+docker compose -f ~/clinic-app/compose.yaml ps --format 'table {{.Service}}\t{{.Status}}'
+<span class="out">postgres      Up 25 minutes (Paused)</span></pre>
+          <p class="mt-2">Postgres is frozen, so every query waits forever: the pool has no connection or query
+          timeout, and the API's process is perfectly alive. Mitigate with
+          <code class="inline">docker compose unpause postgres</code> and watch the probe recover. Add two action items:
+          a query timeout in the app, and paging on the patient-facing probe (or the SLO burn from
+          <a href="./sr1.html" class="text-viol underline decoration-viol/40">SR1</a>) rather than on liveness. A liveness
+          check that stays green during an outage is exactly why Part I says severity follows user impact, not
+          dashboards.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Clean up.</strong> Stop the probe (Ctrl-C in terminal 2), make sure the chaos script is gone, remove the
+        override so later labs start from the stock kit, and stop the stack.
+        <pre class="code">pkill -f chaos.sh; pgrep -fl 'chaos.sh|probe.sh' || echo "no drill scripts running"
+<span class="out">no drill scripts running</span>
+cd ~/clinic-app &amp;&amp; docker compose unpause postgres 2&gt;/dev/null; rm -f compose.override.yaml
+docker compose down -v
+docker compose ps -a -q | wc -l
+<span class="out">0</span></pre>
+        Keep <code class="inline">~/labs/sr2/</code>: <code class="inline">incident.md</code> and
+        <code class="inline">postmortem.md</code> are your evidence.
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

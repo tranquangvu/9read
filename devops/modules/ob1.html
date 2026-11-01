@@ -738,6 +738,328 @@ aws cloudwatch get-metric-data --start-time $(( $(date +%s) - 600 )) --end-time 
         fails the nightly check if the list is not empty. It catches every group that a new service or Lambda creates
         implicitly.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Make booking-api page you when it starts failing</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will take the Fargate service from the <a href="./cn1.html" class="text-viol underline decoration-viol/40">CN1</a> lab,
+        turn on Container Insights, answer real questions about its JSON logs with Logs Insights, and then write about 90
+        lines of Terraform: a metric filter that counts 5xx responses, two alarms that email you through SNS, a saved query
+        and a dashboard. Finally you make the API fail for real and watch the page arrive. The lab kit logs its latency as
+        <code class="inline">ms</code>, not <code class="inline">duration_ms</code> as in the Part III examples, so every query
+        below uses <code class="inline">ms</code>.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">An alarm email in your inbox caused by real 500s from <code class="inline">booking-api</code>, plus a dashboard and a saved query you built as code</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours, including CN1 if you need to recreate it</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">About USD 0.07 per hour while the CN1 stack runs. Alarms, one custom metric and the Logs Insights scans add a few cents for the whole lab; the dashboard is free (first three)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The CN1 stack in <code class="inline">~/labs/cn1</code>, the lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>), an email address you can read now</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell and check the CN1 stack is up.</strong> If you destroyed it, recreate it first: push the
+        image (CN1 step 2) and run <code class="inline">terraform apply -var me=$ME -var image=$REPO:1.0.0</code> in
+        <code class="inline">~/labs/cn1</code>. That takes about five minutes.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login
+aws sts get-caller-identity --query Account --output text
+<span class="out">888899990000</span>
+export URL=$(terraform -chdir=$HOME/labs/cn1 output -raw url)
+export LG=/ecs/lab-$ME-cn1/booking-api
+curl -s $URL/healthz
+<span class="out">{"ok":true,"version":"cn1-lab"}</span>
+mkdir -p ~/labs/ob1 &amp;&amp; cd ~/labs/ob1</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Turn on Container Insights in Terraform, not in the console.</strong> CN1's Terraform owns the cluster, so
+        change it there. A console click would show up as drift on the next CN1 plan.
+        <span class="code-label">~/labs/cn1/ecs.tf (replaces the one-line aws_ecs_cluster)</span>
+        <pre class="code">resource "aws_ecs_cluster" "this" {
+  name = local.name
+  setting {
+    name  = "containerInsights"
+    value = "enhanced"                                       <span class="cm"># per-task and per-container metrics</span>
+  }
+}</pre>
+        <pre class="code">terraform -chdir=$HOME/labs/cn1 apply -var me=$ME -var image=$REPO:1.0.0
+<span class="out">Plan: 0 to add, 1 to change, 0 to destroy.</span>     <span class="cm"># only the cluster; anything else: stop and read</span>
+aws ecs describe-clusters --clusters lab-$ME-cn1 --include SETTINGS --query 'clusters[0].settings'
+<span class="out">[ { "name": "containerInsights", "value": "enhanced" } ]</span></pre>
+        If <code class="inline">$REPO</code> is not set in this shell, export it as in CN1 step 1 first.
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Send some realistic traffic.</strong> A mix of reads, writes, a bad request (400) and an unknown path (404),
+        so the queries in the next step have something to find.
+        <pre class="code">for i in $(seq 40); do
+  curl -s -o /dev/null -XPOST $URL/bookings -H 'content-type: application/json' \
+    -d '{"patient":"An","slot":"2026-11-02T09:00"}'
+  curl -s -o /dev/null $URL/bookings
+  curl -s -o /dev/null -XPOST $URL/bookings -H 'content-type: application/json' -d '{"patient":"An"}'   <span class="cm"># 400</span>
+  curl -s -o /dev/null $URL/v1/bookings                                                               <span class="cm"># 404</span>
+done
+aws logs tail $LG --since 2m --format short | tail -1
+<span class="out">2026-11-01T09:20:41 {"ts":"…","level":"info","msg":"request","service":"booking-api","version":"cn1-lab","method":"GET","path":"/v1/bookings","status":404,"ms":0}</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Ask questions with Logs Insights from the CLI.</strong> Logs Insights finds the JSON fields by itself. This
+        small function runs a query over the last 30 minutes, waits for it to finish and prints the rows. Keep it: you use
+        it again in steps 9 and 10.
+        <pre class="code">insights() {
+  local id; id=$(aws logs start-query --log-group-name $LG --start-time $(( $(date +%s) - 1800 )) \
+    --end-time $(date +%s) --query-string "$1" --query queryId --output text)
+  until [ "$(aws logs get-query-results --query-id $id --query status --output text)" = Complete ]; do sleep 2; done
+  aws logs get-query-results --query-id $id | jq -r '.results[] | map(.value) | @tsv'
+}
+insights 'filter msg = "request" | stats count(*) as n by status | sort n desc'
+<span class="out">200	412           <span class="cm"># most of these are ALB health checks on /healthz</span>
+201	40
+400	40
+404	40</span>
+insights 'filter msg = "request" and path != "/healthz"
+  | stats count(*) as n, avg(ms) as avg_ms, pct(ms, 99) as p99 by method, path'
+<span class="out">POST	/bookings	80	0.6	2
+GET	/bookings	40	0.4	1
+GET	/v1/bookings	40	0.1	1</span></pre>
+        The first query is the lesson in miniature: without the <code class="inline">path != "/healthz"</code> filter, health
+        checks dominate every average you compute. Exclude them on purpose.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Write the provider, the SNS topic and a saved query.</strong> The data sources look up the CN1 load balancer
+        by name, so this stack never edits CN1's resources. Use an address you can open right now.
+        <span class="code-label">~/labs/ob1/main.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "OB1" } }
+}
+variable "me" { type = string }
+variable "email" { type = string }
+locals {
+  cn1  = "lab-${var.me}-cn1"
+  name = "lab-${var.me}-ob1"
+  logs = "/ecs/lab-${var.me}-cn1/booking-api"
+}
+data "aws_lb" "cn1" { name = local.cn1 }
+data "aws_lb_target_group" "api" { name = "${local.cn1}-api" }
+
+resource "aws_sns_topic" "alerts" { name = "${local.name}-alerts" }
+resource "aws_sns_topic_subscription" "me" {
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"                                        <span class="cm"># stays pending until you click the link</span>
+  endpoint  = var.email
+}
+resource "aws_cloudwatch_query_definition" "errors" {
+  name            = "${local.name}/errors-by-path"           <span class="cm"># "/" makes a folder in the console</span>
+  log_group_names = [local.logs]
+  query_string    = "filter status &gt;= 500 | stats count(*) as errors by bin(1m), path | sort errors desc"
+}
+output "topic" { value = aws_sns_topic.alerts.arn }</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Write the metric filter and two alarms.</strong> The first alarm counts 5xx lines in the app's own logs.
+        The second is the Part II rate alarm on the ALB, with the traffic guard lowered to 10 requests a minute so a lab
+        can trigger it. Two alarms on the same symptom would page twice in production; here they let you compare the two
+        sources.
+        <span class="code-label">~/labs/ob1/alarms.tf</span>
+        <pre class="code">resource "aws_cloudwatch_log_metric_filter" "api_5xx" {
+  name           = "${local.name}-api-5xx"
+  log_group_name = local.logs
+  pattern        = "{ $.status &gt;= 500 }"                   <span class="cm"># the field name the app really logs</span>
+  metric_transformation {
+    namespace     = "Lab/${var.me}"
+    name          = "BookingApi5xx"
+    value         = "1"
+    default_value = "0"
+    unit          = "Count"
+  }
+}
+resource "aws_cloudwatch_metric_alarm" "api_5xx" {
+  alarm_name          = "${local.name}-api-5xx"
+  alarm_description   = "booking-api logged 5 or more 5xx responses in one minute. Lab OB1."
+  namespace           = "Lab/${var.me}"
+  metric_name         = "BookingApi5xx"
+  statistic           = "Sum"
+  period              = 60
+  evaluation_periods  = 1
+  threshold           = 5
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]           <span class="cm"># you also get the "resolved" email</span>
+}</pre>
+        <span class="code-label">~/labs/ob1/alarms.tf (continued)</span>
+        <pre class="code">resource "aws_cloudwatch_metric_alarm" "alb_5xx_rate" {
+  alarm_name          = "${local.name}-alb-5xx-rate"
+  alarm_description   = "Target 5xx above 10% for 2 of 3 minutes. Lab OB1."
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 10
+  evaluation_periods  = 3
+  datapoints_to_alarm = 2
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  metric_query {
+    id          = "rate"
+    expression  = "IF(req &gt; 10, 100 * FILL(err, 0) / req, 0)"
+    label       = "5xx %"
+    return_data = true
+  }
+  metric_query {
+    id = "err"
+    metric {
+      namespace   = "AWS/ApplicationELB"
+      metric_name = "HTTPCode_Target_5XX_Count"
+      dimensions  = { LoadBalancer = data.aws_lb.cn1.arn_suffix, TargetGroup = data.aws_lb_target_group.api.arn_suffix }
+      period      = 60
+      stat        = "Sum"
+    }
+  }
+  metric_query {
+    id = "req"
+    metric {
+      namespace   = "AWS/ApplicationELB"
+      metric_name = "RequestCount"
+      dimensions  = { LoadBalancer = data.aws_lb.cn1.arn_suffix, TargetGroup = data.aws_lb_target_group.api.arn_suffix }
+      period      = 60
+      stat        = "Sum"
+    }
+  }
+}</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Write the dashboard.</strong> Symptoms on top, saturation next, logs at the bottom: the reading order from
+        Part IV. The <code class="inline">"."</code> entries repeat the value from the row above.
+        <span class="code-label">~/labs/ob1/dashboard.tf</span>
+        <pre class="code">resource "aws_cloudwatch_dashboard" "api" {
+  dashboard_name = local.name
+  dashboard_body = jsonencode({
+    widgets = [
+      { type = "alarm", x = 0, y = 0, width = 24, height = 3, properties = { title = "Alarms",
+        alarms = [aws_cloudwatch_metric_alarm.api_5xx.arn, aws_cloudwatch_metric_alarm.alb_5xx_rate.arn] } },
+      { type = "metric", x = 0, y = 3, width = 12, height = 6, properties = {
+        title = "Requests and 5xx (ALB)", region = "ap-southeast-1", stat = "Sum", period = 60,
+        metrics = [
+          ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", data.aws_lb.cn1.arn_suffix],
+          [".", "HTTPCode_Target_5XX_Count", ".", "."],
+      ] } },
+      { type = "metric", x = 12, y = 3, width = 12, height = 6, properties = {
+        title = "Task memory MiB (Container Insights)", region = "ap-southeast-1", stat = "Maximum", period = 60,
+        metrics = [["ECS/ContainerInsights", "MemoryUtilized", "ClusterName", local.cn1, "ServiceName", "booking-api"]] } },
+      { type = "log", x = 0, y = 9, width = 24, height = 6, properties = {
+        title = "Slowest paths", region = "ap-southeast-1",
+        query = "SOURCE '${local.logs}' | filter msg = 'request' | stats count(*) as n, pct(ms, 99) as p99 by path | sort p99 desc" } },
+    ]
+  })
+}</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Apply, confirm the subscription, and drill the routing.</strong> Open the "AWS Notification - Subscription
+        Confirmation" email and click the link before you go on. Then force the alarm once to prove that the path from
+        alarm to inbox works.
+        <pre class="code">terraform init
+terraform apply -var me=$ME -var email=you@example.com
+<span class="out">Apply complete! Resources: 7 added, 0 changed, 0 destroyed.</span>
+aws sns list-subscriptions-by-topic --topic-arn $(terraform output -raw topic) \
+  --query 'Subscriptions[0].SubscriptionArn' --output text
+<span class="out">arn:aws:sns:ap-southeast-1:888899990000:lab-yourhandle-ob1-alerts:5c0e…</span>   <span class="cm"># "PendingConfirmation" = not clicked yet</span>
+aws cloudwatch set-alarm-state --alarm-name lab-$ME-ob1-api-5xx \
+  --state-value ALARM --state-reason "OB1 drill: routing test"</pre>
+        An email titled <code class="inline">ALARM: "lab-yourhandle-ob1-api-5xx" in Asia Pacific (Singapore)</code> arrives
+        within a minute, and an OK email shortly after when CloudWatch re-evaluates. This proves routing. It does not prove
+        the alarm can detect anything: that is the next step.
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Make it fail for real and watch both alarms fire.</strong> A malformed JSON body makes
+        <code class="inline">booking-api</code> throw inside its request handler, log an error and answer 500. Run the loop
+        for three minutes in one terminal and watch the alarm state in another.
+        <pre class="code">end=$((SECONDS+180)); while [ $SECONDS -lt $end ]; do
+  curl -s -o /dev/null -w '%{http_code}\n' -XPOST $URL/bookings -H 'content-type: application/json' -d '{bad'
+  sleep 1
+done | sort | uniq -c
+<span class="out">    172 500</span>
+<span class="cm"># second terminal (same exports): waits up to ~3 minutes</span>
+aws cloudwatch wait alarm-exists --alarm-names lab-$ME-ob1-api-5xx --state-value ALARM &amp;&amp; echo fired
+<span class="out">fired</span>
+aws cloudwatch describe-alarms --alarm-name-prefix lab-$ME-ob1 --query 'MetricAlarms[].[AlarmName,StateValue]' --output text
+<span class="out">lab-yourhandle-ob1-alb-5xx-rate	ALARM
+lab-yourhandle-ob1-api-5xx	ALARM</span>
+insights 'filter level = "error" | stats count(*) as n by err | sort n desc'
+<span class="out">Expected property name or '}' in JSON at position 1 (line 1 column 2)	172</span></pre>
+        Open the dashboard in the console (CloudWatch → Dashboards → <code class="inline">lab-yourhandle-ob1</code>): the 5xx
+        line rises with the request line, and both alarm boxes are red. About two minutes after the loop stops, the OK
+        email for <code class="inline">api-5xx</code> arrives. Finally, check that Container Insights is publishing:
+        <pre class="code">aws cloudwatch list-metrics --namespace ECS/ContainerInsights \
+  --dimensions Name=ClusterName,Value=lab-$ME-cn1 Name=ServiceName,Value=booking-api \
+  --query 'Metrics[].MetricName' --output text | tr '\t' '\n' | sort -u | grep -E 'Memory|RunningTask'
+<span class="out">MemoryReserved
+MemoryUtilized
+RunningTaskCount</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">insights</code> returns the status mix and per-path p99 for your traffic; the SNS subscription
+        shows an ARN, not <code class="inline">PendingConfirmation</code>; you received a real ALARM email caused by the 500
+        loop (not only the drill) and the OK email after it; the dashboard shows the 5xx spike and task memory; and the saved
+        query <code class="inline">lab-yourhandle-ob1/errors-by-path</code> appears under Logs Insights → Saved queries.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Ship an alarm that can never fire.</strong> An agent wrote the metric filter from another service's log
+        format. In <code class="inline">alarms.tf</code> change the pattern to
+        <code class="inline">"{ $.statusCode &gt;= 500 }"</code>, apply, and rerun the step 9 loop. The ALB rate alarm goes
+        to ALARM; <code class="inline">lab-$ME-ob1-api-5xx</code> stays <code class="inline">OK</code>, and its graph is a
+        calm flat line at zero. Find out why using only the CLI before you open the answer.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">LINE=$(aws logs filter-log-events --log-group-name $LG --filter-pattern '{ $.status = 500 }' \
+  --max-items 1 --query 'events[0].message' --output text)
+aws logs test-metric-filter --filter-pattern '{ $.statusCode &gt;= 500 }' --log-event-messages "$LINE" --query 'length(matches)'
+<span class="out">0</span>
+aws logs test-metric-filter --filter-pattern '{ $.status &gt;= 500 }' --log-event-messages "$LINE" --query 'length(matches)'
+<span class="out">1</span></pre>
+          <p class="mt-2">The app logs <code class="inline">status</code>; the filter asks for <code class="inline">statusCode</code>,
+          so nothing ever matches. Because <code class="inline">default_value = "0"</code>, CloudWatch publishes a zero for
+          every minute that has log events, so the metric looks exactly like a healthy service instead of missing data. The
+          <code class="inline">set-alarm-state</code> drill would still pass, because it tests routing, not detection. Put
+          <code class="inline">$.status</code> back and apply. The lesson: test every new filter pattern against a real log
+          line with <code class="inline">test-metric-filter</code>, and drill alarms with a real fault at least once.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">11</div><div class="step-body">
+        <strong>Clean up.</strong> Destroy this stack first (it reads CN1 through data sources), then CN1 and its repository
+        if you are done with them. Container Insights creates a performance log group that no Terraform state owns, so
+        delete it by hand.
+        <pre class="code">terraform destroy -var me=$ME -var email=you@example.com
+<span class="out">Destroy complete! Resources: 7 destroyed.</span>
+terraform -chdir=$HOME/labs/cn1 destroy -var me=$ME -var image=$REPO:1.0.0   <span class="cm"># $REPO as in CN1 step 1</span>
+aws ecr delete-repository --repository-name lab-$ME/booking-api --force &gt;/dev/null
+aws logs delete-log-group --log-group-name /aws/ecs/containerinsights/lab-$ME-cn1/performance
+aws logs describe-log-groups --query "logGroups[?contains(logGroupName, 'lab-$ME')].logGroupName"
+<span class="out">[]</span>
+aws cloudwatch describe-alarms --alarm-name-prefix lab-$ME --query 'MetricAlarms[].AlarmName'
+<span class="out">[]</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Forgot to destroy?</strong> The CN1 stack underneath costs about USD 1.50
+        a day. The OB1 pieces are cheap on their own (two alarms and one custom metric are about USD 0.60 a month), but the
+        Container Insights performance log group keeps whatever it ingested until you delete it, and an alarm whose load
+        balancer is gone sits in <code class="inline">INSUFFICIENT_DATA</code> confusing the next person who opens the
+        sandbox.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

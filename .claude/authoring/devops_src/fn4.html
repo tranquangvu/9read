@@ -658,6 +658,230 @@ c81e2f0 feat(rds): enable Performance Insights on booking-db (#412)</span></pre>
         borrowed identity, or a script pushing with a stolen token and no signing key.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Guard a practice clinic-infra repository</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will create <code class="inline">clinic-infra-lab</code>, a small copy of the infra repo layout, under your own
+        GitHub account. Then you add the guardrails from Parts III and IV as code: CODEOWNERS, two required checks
+        (Terraform formatting and a Conventional Commits PR title), a ruleset that blocks direct pushes to
+        <code class="inline">main</code>, and a second ruleset that makes released module tags immutable. Every guardrail
+        is proved by watching it refuse something.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A repo where the only way into <code class="inline">main</code> is a green, squash-merged PR, and tag <code class="inline">rds-v1.0.0</code> cannot be moved or deleted</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">About 1.5 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop and a public repository in your personal GitHub account (no AWS)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free: rulesets and Actions are free on public repositories (private ones need a paid plan)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3"><code class="inline">git</code>, <code class="inline">gh</code> and Terraform from the <a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>. No Terraform knowledge: you only format two small files</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up.</strong> <code class="inline">ME</code> is your GitHub username.
+        <pre class="code">export ME=yourhandle
+gh api user --jq .login
+<span class="out">yourhandle</span>
+mkdir -p ~/labs/fn4/clinic-infra-lab &amp;&amp; cd ~/labs/fn4/clinic-infra-lab
+git init -q -b main &amp;&amp; mkdir -p modules/rds envs/dev .github/workflows rulesets</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Write the layout: one module, one environment that uses it.</strong> This is the Part II layout in
+        miniature: shared code in <code class="inline">modules/</code>, one folder per environment in
+        <code class="inline">envs/</code>.
+        <span class="code-label">modules/rds/main.tf</span>
+        <pre class="code">variable "identifier" {
+  type = string
+}
+
+variable "instance_class" {
+  type    = string
+  default = "db.t4g.micro"
+}
+
+output "summary" {
+  value = "${var.identifier} on ${var.instance_class}"
+}</pre>
+        <span class="code-label">envs/dev/main.tf</span>
+        <pre class="code">module "booking_db" {
+  source     = "../../modules/rds"
+  identifier = "booking-db-dev"
+}
+
+output "booking_db" {
+  value = module.booking_db.summary
+}</pre>
+        <pre class="code">terraform fmt -check -recursive &amp;&amp; echo "formatted"
+<span class="out">formatted</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Add the checks and CODEOWNERS.</strong> Two workflows run on every pull request. Each job's id
+        (<code class="inline">fmt</code>, <code class="inline">lint</code>) becomes the name of a check the ruleset will
+        require. CODEOWNERS is written with your handle filled in by the shell.
+        <span class="code-label">.github/workflows/checks.yml</span>
+        <pre class="code">name: checks
+on:
+  pull_request:
+jobs:
+  fmt:                                             <span class="cm"># check name the ruleset requires</span>
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive -diff  <span class="cm"># exit 3 + a diff when unformatted</span></pre>
+        <p class="mt-2">Copy <code class="inline">.github/workflows/pr-title.yml</code> exactly as shown in Part IV (job id
+        <code class="inline">lint</code>, <code class="inline">requireScope: true</code>). Then:</p>
+        <pre class="code">printf '*          @%s\n/envs/     @%s\n/.github/  @%s\n' $ME $ME $ME &gt; .github/CODEOWNERS
+cat .github/CODEOWNERS
+<span class="out">*          @yourhandle
+/envs/     @yourhandle
+/.github/  @yourhandle</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Create the repository, push, and check CODEOWNERS.</strong> This first push goes straight to
+        <code class="inline">main</code>; after the next step, nothing ever will again.
+        <pre class="code">git add . &amp;&amp; git commit -qm "chore: initial layout and checks"
+gh repo create clinic-infra-lab --public --source . --push
+gh api repos/$ME/clinic-infra-lab/codeowners/errors --jq '.errors'
+<span class="out">[]</span>                                                <span class="cm"># a typo in a handle would be listed here</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Apply the main ruleset from a file.</strong> It is the Part IV ruleset adapted to a one-person repo:
+        approvals are set to <code class="inline">0</code> and code-owner review is off, because GitHub never lets you
+        approve your own PR. Everything else is the same, including an empty bypass list, which means the rules bind you
+        too even though you are the admin.
+        <span class="code-label">rulesets/main.json</span>
+        <pre class="code">{
+  "name": "main-protection",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+  "bypass_actors": [],
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    { "type": "required_linear_history" },
+    { "type": "pull_request", "parameters": {
+        "required_approving_review_count": 0,
+        "require_code_owner_review": false,
+        "dismiss_stale_reviews_on_push": true,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": true,
+        "allowed_merge_methods": ["squash"] } },
+    { "type": "required_status_checks", "parameters": {
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [ { "context": "fmt" }, { "context": "lint" } ] } }
+  ]
+}</pre>
+        <pre class="code">gh api repos/$ME/clinic-infra-lab/rulesets --method POST --input rulesets/main.json --jq '.name'
+<span class="out">main-protection</span>
+gh api repos/$ME/clinic-infra-lab/rules/branches/main --jq '.[].type'
+<span class="out">deletion
+non_fast_forward
+required_linear_history
+pull_request
+required_status_checks</span>
+echo "# clinic-infra-lab" &gt; README.md &amp;&amp; git add README.md &amp;&amp; git commit -qm "docs: readme" &amp;&amp; git push origin main
+<span class="out">remote: error: GH013: Repository rule violations found for refs/heads/main.
+remote: - Changes must be made through a pull request.
+ ! [remote rejected] main -&gt; main (push declined due to repository rule violations)</span>
+git reset -q --hard origin/main                    <span class="cm"># drop the rejected local commit</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Make a change the right way.</strong> Branch, commit with a Conventional Commits message, open a PR whose
+        title follows the format, wait for both checks, squash-merge.
+        <pre class="code">git switch -q -c rds-small
+sed -i.bak 's/db.t4g.micro/db.t4g.small/' modules/rds/main.tf &amp;&amp; rm modules/rds/main.tf.bak
+git commit -qam "feat(rds): default to db.t4g.small"
+git push -qu origin rds-small
+gh pr create --title "feat(rds): default to db.t4g.small" --body "Plan: 0 to add, 0 to change, 0 to destroy (no real resources)."
+sleep 10 &amp;&amp; gh pr checks --watch
+<span class="out">All checks were successful
+✓  fmt   7s
+✓  lint  4s</span>
+gh pr merge --squash --delete-branch &amp;&amp; git switch -q main &amp;&amp; git pull -q
+git log --oneline -2
+<span class="out">a41c9e2 feat(rds): default to db.t4g.small (#1)
+5f02d17 chore: initial layout and checks</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Release the module and make the tag immutable.</strong> The change added nothing incompatible, so the
+        first release is <code class="inline">rds-v1.0.0</code>. Protect tags first, then publish.
+        <span class="code-label">rulesets/tags.json</span>
+        <pre class="code">{
+  "name": "immutable-release-tags",
+  "target": "tag",
+  "enforcement": "active",
+  "conditions": { "ref_name": { "include": ["refs/tags/*-v*"], "exclude": [] } },
+  "bypass_actors": [],
+  "rules": [ { "type": "deletion" }, { "type": "update" }, { "type": "non_fast_forward" } ]
+}</pre>
+        <pre class="code">gh api repos/$ME/clinic-infra-lab/rulesets --method POST --input rulesets/tags.json --jq '.name'
+<span class="out">immutable-release-tags</span>
+git tag -a rds-v1.0.0 -m "rds: first release (#1)" &amp;&amp; git push -q origin rds-v1.0.0
+gh release create rds-v1.0.0 --title "rds v1.0.0" --notes "feat(rds): default to db.t4g.small"
+<span class="out">https://github.com/yourhandle/clinic-infra-lab/releases/tag/rds-v1.0.0</span>
+git tag -f -a rds-v1.0.0 -m "moved" HEAD~1 &amp;&amp; git push -f origin rds-v1.0.0
+<span class="out">remote: error: GH013: Repository rule violations found for refs/tags/rds-v1.0.0.
+ ! [remote rejected] rds-v1.0.0 -&gt; rds-v1.0.0 (push declined due to repository rule violations)</span>
+git push origin :refs/tags/rds-v1.0.0              <span class="cm"># try to delete it: also rejected</span>
+git fetch -q origin --tags --force                 <span class="cm"># put your local tag back where GitHub has it</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> a direct push to <code class="inline">main</code>
+        is rejected with <code class="inline">GH013</code>; <code class="inline">git log</code> on main shows only
+        squash-merged, Conventional Commits messages after the initial commit;
+        <code class="inline">gh api …/rules/branches/main</code> lists the five rules; and moving or deleting
+        <code class="inline">rds-v1.0.0</code> is rejected.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Open a sloppy PR.</strong> Make the change the way a hurried teammate (or an agent) would:
+        <pre class="code">git switch -q -c quick-fix
+printf '\nvariable "multi_az" {\ndefault=false\n}\n' &gt;&gt; modules/rds/main.tf
+git commit -qam "update stuff" &amp;&amp; git push -qu origin quick-fix
+gh pr create --fill &amp;&amp; sleep 10 &amp;&amp; gh pr checks --watch; gh pr merge --squash</pre>
+        Both checks go red and the merge is refused. Find out from <code class="inline">gh pr checks</code> and
+        <code class="inline">gh run view --log-failed</code> exactly what each check wants, fix the PR without closing it,
+        and merge it.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">gh pr checks
+<span class="out">X  fmt   …  terraform fmt -check found modules/rds/main.tf
+X  lint  …  No release type found in pull request title "update stuff"</span>
+terraform fmt -recursive &amp;&amp; git commit -qam "style: terraform fmt" &amp;&amp; git push -q
+gh pr edit --title "feat(rds): add multi_az input"   <span class="cm"># the "edited" event re-runs lint</span>
+sleep 10 &amp;&amp; gh pr checks --watch &amp;&amp; gh pr merge --squash --delete-branch
+<span class="out">✓ Squashed and merged pull request yourhandle/clinic-infra-lab#2 (feat(rds): add multi_az input)</span></pre>
+          <p class="mt-2"><code class="inline">fmt</code> failed because <code class="inline">default=false</code> is not
+          aligned and indented the way <code class="inline">terraform fmt</code> writes it. <code class="inline">lint</code>
+          failed because the title has no type or scope. Because we squash, the fixed PR title, not "update stuff", is the
+          commit that lands on <code class="inline">main</code>. Also notice the new variable has no
+          <code class="inline">type</code>: neither check catches that, which is why a human still reviews (Part III). It is a
+          new input with a default, so it would ship as <code class="inline">rds-v1.1.0</code>.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Take screenshots of the rejected pushes first if you are using them for the evidence
+        task. Deleting a repository needs one extra permission on your <code class="inline">gh</code> login.
+        <pre class="code">gh auth refresh -h github.com -s delete_repo
+gh repo delete $ME/clinic-infra-lab --yes
+<span class="out">✓ Deleted repository yourhandle/clinic-infra-lab</span>
+cd ~ &amp;&amp; rm -rf ~/labs/fn4/clinic-infra-lab
+gh repo list $ME --json name --jq '.[].name' | grep -c clinic-infra-lab
+<span class="out">0</span></pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
@@ -751,7 +975,7 @@ Explain which pattern wins for apps/booking-api/overlays/prod/values.yaml.</pre>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="trunk"> <span>I can explain why we use trunk-based development with environment folders instead of environment branches, and I keep my branches under two days old.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="review"> <span>I reviewed an infra PR together with its plan, using the checklist, and left at least one comment that states a risk and a concrete ask.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="signing"> <span>My commits and tags are signed with an SSH key and show as Verified on GitHub; my PR titles follow Conventional Commits.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="guardrails"> <span class="font-semibold">In a practice copy of clinic-infra, set up the layout from Part II, a PR template, CODEOWNERS, a main ruleset and an immutable-tag ruleset applied from JSON with gh api. Then show, with screenshots, a direct push to main rejected, an unsigned commit blocked, a PR blocked until the code owner approved, and a released module tag that cannot be moved (mentor evidence ✓).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="guardrails"> <span class="font-semibold">Completed the hands-on lab, then in a practice copy of clinic-infra set up the layout from Part II, a PR template, CODEOWNERS, a main ruleset and an immutable-tag ruleset applied from JSON with gh api. Then show, with screenshots, a direct push to main rejected, an unsigned commit blocked, a PR blocked until the code owner approved, and a released module tag that cannot be moved (mentor evidence ✓).</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>

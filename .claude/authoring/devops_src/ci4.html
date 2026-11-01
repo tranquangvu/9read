@@ -53,7 +53,10 @@
   scan_type = <span class="st">"ENHANCED"</span>                      <span class="cm"># Amazon Inspector, see Part II</span>
   rule {
     scan_frequency = <span class="st">"CONTINUOUS_SCAN"</span>
-    repository_filter { filter = <span class="st">"clinic/*"</span>, filter_type = <span class="st">"WILDCARD"</span> }
+    repository_filter {
+      filter      = <span class="st">"clinic/*"</span>
+      filter_type = <span class="st">"WILDCARD"</span>
+    }
   }
 }</pre>
       </div>
@@ -172,7 +175,10 @@ aws ecr get-lifecycle-policy-preview --repository-name clinic/booking-api \
   statement {
     sid     = <span class="st">"OrgPull"</span>
     actions = [<span class="st">"ecr:BatchGetImage"</span>, <span class="st">"ecr:GetDownloadUrlForLayer"</span>, <span class="st">"ecr:BatchCheckLayerAvailability"</span>]
-    principals { type = <span class="st">"AWS"</span>, identifiers = [<span class="st">"*"</span>] }
+    principals {
+      type        = <span class="st">"AWS"</span>
+      identifiers = [<span class="st">"*"</span>]
+    }
     condition {                                   <span class="cm"># "*" is safe ONLY with this condition</span>
       test     = <span class="st">"StringEquals"</span>
       variable = <span class="st">"aws:PrincipalOrgID"</span>
@@ -627,6 +633,204 @@ got subjects [https://github.com/an-nguyen/clinic-app-fork/.github/workflows/bui
           </tbody>
         </table>
       </div>
+
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Lock down a repository, scan, SBOM and sign an image</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will create an immutable ECR repository, push three versions of booking-api, and then apply every control in
+        this module to them by hand: try to overwrite a release tag, scan with ECR and with Trivy, generate an SBOM and
+        answer a question from it, sign one digest and watch verification reject the unsigned one, and grant
+        Organization-wide pull. Last, you preview a lifecycle policy an agent wrote and catch it deleting your releases.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A repository where tags cannot move, one signed and verifiable release digest with an SBOM on disk, and a lifecycle policy you previewed before applying</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">About 2 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop and <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">A few cents: three images of about 60 MB at USD 0.10 per GB-month, deleted at the end. Basic scanning is free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">Docker with buildx, the lab kit in <code class="inline">~/clinic-app</code>, and <code class="inline">brew install trivy syft cosign</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up and create an immutable repository with scan on push.</strong> This lab uses its own repository, so
+        the lifecycle experiments cannot touch the images CI1 and CN1 run.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login &amp;&amp; mkdir -p ~/labs/ci4 &amp;&amp; cd ~/labs/ci4
+export REPO=$(aws ecr create-repository --repository-name lab-$ME/ci4-booking-api \
+  --image-tag-mutability IMMUTABLE --image-scanning-configuration scanOnPush=true \
+  --tags Key=Owner,Value=$ME Key=Lab,Value=CI4 --query repository.repositoryUri --output text)
+echo $REPO
+<span class="out">888899990000.dkr.ecr.ap-southeast-1.amazonaws.com/lab-yourhandle/ci4-booking-api</span>
+aws ecr get-login-password | docker login --username AWS --password-stdin ${REPO%%/*}
+<span class="out">Login Succeeded</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Push two releases and one PR build.</strong> The label makes each build a different image with the same
+        layers, so the second and third builds take seconds. <code class="inline">--provenance=false</code> keeps each tag a
+        single manifest, which makes the listings in this lab easy to read; real pipelines keep provenance on.
+        <pre class="code">for v in 1.0.0 1.1.0 pr-7; do
+  docker buildx build --platform linux/arm64 --provenance=false \
+    --label org.opencontainers.image.version=$v -t $REPO:$v --push ~/clinic-app/booking-api
+done
+aws ecr describe-images --repository-name lab-$ME/ci4-booking-api \
+  --query 'sort_by(imageDetails,&amp;imagePushedAt)[].[imageTags[0],imageDigest]' --output text
+<span class="out">1.0.0	sha256:5c0d…
+1.1.0	sha256:a41f…
+pr-7	sha256:e9b2…</span>
+export D10=$(aws ecr describe-images --repository-name lab-$ME/ci4-booking-api --image-ids imageTag=1.0.0 \
+  --query 'imageDetails[0].imageDigest' --output text)
+export D11=$(aws ecr describe-images --repository-name lab-$ME/ci4-booking-api --image-ids imageTag=1.1.0 \
+  --query 'imageDetails[0].imageDigest' --output text)</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Try to move a release tag.</strong> Rebuild with a different label and push it as
+        <code class="inline">1.0.0</code>. On a mutable repository this would silently change what every future pull of
+        <code class="inline">1.0.0</code> gets.
+        <pre class="code">docker buildx build --platform linux/arm64 --provenance=false --label hotfix=true \
+  -t $REPO:1.0.0 --push ~/clinic-app/booking-api 2&gt;&amp;1 | grep -o "tag invalid.*"
+<span class="out">tag invalid: The image tag '1.0.0' already exists in the 'lab-yourhandle/ci4-booking-api' repository and cannot be overwritten because the repository is immutable.</span></pre>
+        A fix gets a new version (<code class="inline">1.0.1</code>). Nobody can change what
+        <code class="inline">1.0.0</code> means, and deploys still pin the digest, because a tag is a name, not a promise.
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Scan twice: what ECR sees, and what the build gate sees.</strong> Check which scanning mode the registry
+        uses first; it is one setting for the whole account, so in the sandbox only a mentor changes it.
+        <pre class="code">aws ecr get-registry-scanning-configuration --query 'scanningConfiguration.scanType' --output text
+<span class="out">BASIC</span>
+aws ecr wait image-scan-complete --repository-name lab-$ME/ci4-booking-api --image-id imageTag=1.1.0
+aws ecr describe-image-scan-findings --repository-name lab-$ME/ci4-booking-api --image-id imageTag=1.1.0 \
+  --query 'imageScanFindings.findingSeverityCounts'
+<span class="out">{ "LOW": 9, "MEDIUM": 2 }</span>                              <span class="cm"># OS packages only; your counts will differ</span>
+trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 $REPO:1.1.0; echo "gate exit=$?"
+<span class="out">… (debian 12.12)
+Total: 0 (HIGH: 0, CRITICAL: 0)
+
+Node.js (node-pkg)
+Total: 0 (HIGH: 0, CRITICAL: 0)
+gate exit=0</span></pre>
+        Basic scanning looks only at Debian packages. Trivy also reads <code class="inline">node_modules</code>, which is
+        where almost all of this image's risk lives. If your gate exits 1, read the table: a finding with a
+        <code class="inline">Fixed Version</code> means a lockfile bump, which is exactly what the gate is for.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Generate an SBOM and answer a question with it.</strong> The question you will get on the day a CVE lands
+        in the Postgres driver: "which version of <code class="inline">pg</code> does 1.1.0 ship?"
+        <pre class="code">syft $REPO@$D11 -o spdx-json=booking-api-1.1.0.spdx.json
+jq '.packages | length' booking-api-1.1.0.spdx.json
+<span class="out">143</span>                                                  <span class="cm"># your count will differ slightly</span>
+jq -r '.packages[] | select(.name == "pg") | .versionInfo' booking-api-1.1.0.spdx.json
+<span class="out">8.23.1</span>                                               <span class="cm"># whatever npm resolved when you built</span></pre>
+        You answered from a file, without pulling or rebuilding the image. Keep SBOMs next to the release (as a build
+        artifact or an attestation) and the answer for every service takes a minute.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Sign one digest, then verify both.</strong> In CI you sign keyless with the workflow's OIDC identity
+        (Part III). On a laptop, a key pair shows the same mechanics. cosign stores the signature in ECR next to the image
+        and records it in Sigstore's public transparency log: the log gets your public key, the signature and a hash, not
+        your image.
+        <pre class="code">COSIGN_PASSWORD=lab cosign generate-key-pair
+<span class="out">Private key written to cosign.key
+Public key written to cosign.pub</span>
+COSIGN_PASSWORD=lab cosign sign --yes --key cosign.key $REPO@$D11    <span class="cm"># always sign a digest, never a tag</span>
+cosign verify --key cosign.pub $REPO@$D11 | jq -r '.[0].critical.image."docker-manifest-digest"'
+<span class="out">Verification for 888899990000.dkr.ecr.ap-southeast-1.amazonaws.com/lab-yourhandle/ci4-booking-api@sha256:a41f… --
+The following checks were performed on each of these signatures:
+  - The cosign claims were validated
+  - Existence of the claims in the transparency log was verified offline
+  - The signatures were verified against the specified public key
+sha256:a41f…</span>
+cosign verify --key cosign.pub $REPO@$D10 &gt;/dev/null; echo "exit=$?"
+<span class="out">Error: no signatures found
+exit=1</span>                                               <span class="cm"># the deploy job stops here</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Let every account in the Organization pull, and nobody push.</strong> This is the
+        <code class="inline">gol-shared</code> pattern from Part I, applied to your repository. The pulling role in the other
+        account still needs its own IAM allow; the repository policy is only half of a cross-account pull.
+        <pre class="code">ORG=$(aws organizations describe-organization --query Organization.Id --output text)   <span class="cm"># fails outside an Organization: skip the step</span>
+aws ecr set-repository-policy --repository-name lab-$ME/ci4-booking-api --policy-text "$(jq -nc --arg org "$ORG" '{
+  Version: "2012-10-17", Statement: [{ Sid: "OrgPull", Effect: "Allow", Principal: { AWS: "*" },
+  Action: ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"],
+  Condition: { StringEquals: { "aws:PrincipalOrgID": $org } } }] }')" --query 'policyText' --output text | jq -c '.Statement[0].Condition'
+<span class="out">{"StringEquals":{"aws:PrincipalOrgID":"o-a1b2c3d4e5"}}</span>   <span class="cm"># "*" is safe only because of this line</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> pushing over <code class="inline">1.0.0</code>
+        fails with <code class="inline">tag invalid</code>; you have a scan result from ECR and an exit code from Trivy;
+        <code class="inline">booking-api-1.1.0.spdx.json</code> tells you the <code class="inline">pg</code> version;
+        <code class="inline">cosign verify</code> passes for the 1.1.0 digest and fails for 1.0.0; and
+        <code class="inline">aws ecr get-repository-policy</code> shows a pull-only statement with an Organization
+        condition.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Review a lifecycle policy before it deletes something.</strong> An agent proposed this "keep the registry
+        small" policy. Save it as <code class="inline">agent-policy.json</code> and preview it. Do not apply it. Work out what
+        it would delete and write the policy you would merge instead, before you open the answer.
+        <span class="code-label">~/labs/ci4/agent-policy.json</span>
+        <pre class="code">{ "rules": [
+  { "rulePriority": 1, "description": "keep the registry small",
+    "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 1 },
+    "action": { "type": "expire" } }
+] }</pre>
+        <pre class="code">aws ecr start-lifecycle-policy-preview --repository-name lab-$ME/ci4-booking-api \
+  --lifecycle-policy-text file://agent-policy.json &gt;/dev/null
+aws ecr wait lifecycle-policy-preview-complete --repository-name lab-$ME/ci4-booking-api
+aws ecr get-lifecycle-policy-preview --repository-name lab-$ME/ci4-booking-api \
+  --query 'previewResults[].[imageTags[0],imagePushedAt,action.type]' --output text</pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3"><span class="out">1.1.0	2026-11-01T10:02:41+07:00	EXPIRE
+1.0.0	2026-11-01T10:01:12+07:00	EXPIRE</span>          <span class="cm"># plus, possibly, an untagged signature artifact</span></pre>
+          <p class="mt-2">"Keep one image of any kind" keeps the newest push, which is the PR build, and deletes both
+          releases, including the signed one. A service that scales out on 1.1.0 tomorrow would fail with
+          <code class="inline">CannotPullContainerError</code>. Rules must separate releases from throwaway builds:</p>
+          <span class="code-label">~/labs/ci4/lifecycle.json</span>
+          <pre class="code">{ "rules": [
+  { "rulePriority": 10, "description": "keep the last 30 releases",
+    "selection": { "tagStatus": "tagged", "tagPatternList": ["*.*.*"],
+                   "countType": "imageCountMoreThan", "countNumber": 30 },
+    "action": { "type": "expire" } },
+  { "rulePriority": 20, "description": "PR builds live 14 days",
+    "selection": { "tagStatus": "tagged", "tagPrefixList": ["pr-"],
+                   "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 14 },
+    "action": { "type": "expire" } }
+] }</pre>
+          <pre class="code mt-3">aws ecr start-lifecycle-policy-preview --repository-name lab-$ME/ci4-booking-api \
+  --lifecycle-policy-text file://lifecycle.json &gt;/dev/null
+aws ecr wait lifecycle-policy-preview-complete --repository-name lab-$ME/ci4-booking-api
+aws ecr get-lifecycle-policy-preview --repository-name lab-$ME/ci4-booking-api --query 'summary'
+<span class="out">{ "expiringImageTotalCount": 0 }</span>                       <span class="cm"># nothing you keep is touched today</span>
+aws ecr put-lifecycle-policy --repository-name lab-$ME/ci4-booking-api \
+  --lifecycle-policy-text file://lifecycle.json --query repositoryName --output text</pre>
+          <p class="mt-2">The preview is free and takes seconds. Make it a required step in any PR that changes a lifecycle
+          policy, and check the digest production runs is not in <code class="inline">previewResults</code>.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Delete the repository with its images and signatures, and the local key pair and SBOM.
+        <pre class="code">aws ecr delete-repository --repository-name lab-$ME/ci4-booking-api --force --query 'repository.repositoryName' --output text
+<span class="out">lab-yourhandle/ci4-booking-api</span>
+rm -f ~/labs/ci4/cosign.key ~/labs/ci4/cosign.pub ~/labs/ci4/*.spdx.json
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=CI4 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Small bill, real lesson.</strong> Three images cost a few cents a
+        month, so a forgotten repository will not hurt your budget. Scale is what hurts: a repository with no lifecycle
+        policy and a push per commit reaches thousands of images in a year, and with enhanced scanning each one is also
+        rescanned. Every repository you create from now on gets a lifecycle policy on day one.</div>
 
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>

@@ -868,6 +868,214 @@ aws ec2 create-snapshot --profile gol-prod-breakglass --volume-id vol-0a1b2c3d4e
         Our first run took 2 h 10 min, mostly spent finding the break-glass procedure. After writing it into the runbook
         the second run took 18 minutes.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: A finding, a page and a leaked-key game day</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This is the Score-4 game day from Part IV, sized for one person. You check which detective services the sandbox
+        already runs, route High GuardDuty findings to your own inbox, and trigger a sample finding to prove the route
+        works. Then you create a throwaway IAM user with an almost powerless key, "leak" it to yourself, and run the
+        leaked-key runbook against the clock: contain, investigate in CloudTrail, clean up. The key never leaves your
+        terminal.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A finding-to-email route you proved, and a timed incident log for a contained key with its CloudTrail evidence</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours, including up to 15 minutes waiting for CloudTrail</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, <code class="inline">ap-southeast-1</code> (IAM and some CloudTrail events in <code class="inline">us-east-1</code>)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Effectively free: sample findings, one SNS topic, one EventBridge rule, one IAM user</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">AWS CLI v2, Terraform ≥ 1.10, <code class="inline">jq</code>, an email inbox, and ideally a teammate to play the attacker</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up and see what is already watching.</strong> GuardDuty, Security Hub and Config are account-wide:
+        one detector, one hub, one recorder per region, shared by everyone in the sandbox. Look before you touch.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login
+aws sts get-caller-identity --query Account --output text
+<span class="out">888899990000</span>
+export DET=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text); echo $DET
+<span class="out">4ab6e1c2d9f04e7b8c3a5d1e2f6a7b80</span>                  <span class="cm"># "None" = no detector: see below</span>
+aws securityhub describe-hub --query SubscribedAt --output text
+<span class="out">2026-03-02T04:11:09.513Z</span>
+aws configservice describe-configuration-recorder-status --query 'ConfigurationRecordersStatus[].recording'
+<span class="out">[ true ]</span>
+mkdir -p ~/labs/se1 &amp;&amp; cd ~/labs/se1</pre>
+        If <code class="inline">DET</code> is <code class="inline">None</code> or a command answers that the service is
+        not enabled or subscribed, ask your mentor to enable it for the whole sandbox. Do not create your own: a second
+        learner doing the same thing turns into an argument about who owns the detector.
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Route High findings to your inbox.</strong> A cut-down version of Part III's routing: an EventBridge rule
+        for GuardDuty findings of severity 7 or more, sending to an SNS topic with your email subscribed.
+        <span class="code-label">~/labs/se1/routing.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "SE1" } }
+}
+variable "me" { type = string }
+variable "email" { type = string }
+resource "aws_sns_topic" "pager" { name = "lab-${var.me}-se1-pager" }
+resource "aws_sns_topic_subscription" "me" {
+  topic_arn = aws_sns_topic.pager.arn
+  protocol  = "email"
+  endpoint  = var.email
+}
+resource "aws_sns_topic_policy" "events" {                   <span class="cm"># let EventBridge publish</span>
+  arn = aws_sns_topic.pager.arn
+  policy = jsonencode({ Version = "2012-10-17", Statement = [{ Effect = "Allow",
+    Principal = { Service = "events.amazonaws.com" }, Action = "sns:Publish", Resource = aws_sns_topic.pager.arn }] })
+}
+resource "aws_cloudwatch_event_rule" "high" {
+  name = "lab-${var.me}-se1-guardduty-high"
+  event_pattern = jsonencode({
+    source        = ["aws.guardduty"]
+    "detail-type" = ["GuardDuty Finding"]
+    detail        = { severity = [{ numeric = ["&gt;=", 7] }] }   <span class="cm"># High and Critical</span>
+  })
+}
+resource "aws_cloudwatch_event_target" "pager" {
+  rule = aws_cloudwatch_event_rule.high.name
+  arn  = aws_sns_topic.pager.arn
+}</pre>
+        <pre class="code">terraform init &amp;&amp; terraform apply -var me=$ME -var email=you@goldenowl.asia
+<span class="out">Apply complete! Resources: 5 added, 0 changed, 0 destroyed.</span></pre>
+        Click the confirmation link AWS emails you. Until you do, the subscription is
+        <code class="inline">PendingConfirmation</code> and nothing is delivered.
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Trigger a sample finding and follow it.</strong> Sample findings are real findings with made-up
+        resources: they flow through EventBridge and Security Hub exactly like the real thing.
+        <pre class="code">T=UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS
+aws guardduty create-sample-findings --detector-id $DET --finding-types $T
+aws guardduty list-findings --detector-id $DET \
+  --finding-criteria "{\"Criterion\":{\"type\":{\"Eq\":[\"$T\"]}}}" \
+  --sort-criteria AttributeName=updatedAt,OrderBy=DESC --max-results 1 --query 'FindingIds[0]' --output text \
+  | xargs aws guardduty get-findings --detector-id $DET --query 'Findings[0].[Type,Severity]' --output text --finding-ids
+<span class="out">UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS	8.0</span></pre>
+        Within a few minutes an email titled <em>AWS Notification Message</em> arrives with the finding JSON. Note the
+        time between the command and the email: that is your detection-to-page latency for this route. Other learners'
+        sample findings will page you too; that is a shared sandbox, and also a fair taste of noise.
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Plant the key.</strong> A throwaway user whose only permission is listing bucket names. Write the key to a
+        file in your lab folder and nowhere else. Never commit it, paste it in chat or push it anywhere: a real leak of
+        even a harmless key triggers AWS's quarantine policy and a real security incident.
+        <pre class="code">aws iam create-user --user-name lab-$ME-leaky --tags Key=Owner,Value=$ME Key=Lab,Value=SE1 &gt;/dev/null
+aws iam put-user-policy --user-name lab-$ME-leaky --policy-name list-buckets-only --policy-document \
+  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*"}]}'
+aws iam create-access-key --user-name lab-$ME-leaky \
+  --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text &gt; leaked.txt
+chmod 600 leaked.txt; echo "leaked.txt" &gt;&gt; .gitignore
+export KEY=$(cut -f1 leaked.txt); echo $KEY
+<span class="out">AKIA45EXAMPLEXR7Q2KL</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Play the attacker.</strong> Better: give <code class="inline">leaked.txt</code> to a teammate over a
+        call and let them choose what to try. The attacker checks who they are, looks around, and tries to persist.
+        <span class="code-label">~/labs/se1/attacker.sh</span>
+        <pre class="code">#!/usr/bin/env bash
+<span class="cm"># Runs as the leaked key, not your SSO session.</span>
+export AWS_ACCESS_KEY_ID=$(cut -f1 leaked.txt) AWS_SECRET_ACCESS_KEY=$(cut -f2 leaked.txt)
+unset AWS_PROFILE AWS_SESSION_TOKEN
+aws sts get-caller-identity --query Arn --output text
+aws s3 ls | head -3
+aws iam create-user --user-name support-admin 2&gt;&amp;1 | tail -1      <span class="cm"># persistence attempt</span>
+aws sts get-session-token --duration-seconds 3600 --output json &gt; stolen-session.json</pre>
+        <pre class="code">chmod +x attacker.sh &amp;&amp; ./attacker.sh
+<span class="out">arn:aws:iam::888899990000:user/lab-yourhandle-leaky
+2026-03-02 11:20:41 gol-sandbox-cloudtrail-888899990000
+An error occurred (AccessDenied) when calling the CreateUser operation: User: arn:aws:iam::888899990000:user/lab-yourhandle-leaky is not authorized to perform: iam:CreateUser …</span></pre>
+        Start your incident log now: <code class="inline">echo "$(date -u +%H:%M:%S) key reported leaked" &gt;&gt; incident.log</code>.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Contain.</strong> The runbook order from Part IV: deactivate the key (do not delete it yet, so it stays
+        identifiable in the trail), then deny any session issued before now. Log each action with a timestamp.
+        <pre class="code">aws iam update-access-key --user-name lab-$ME-leaky --access-key-id $KEY --status Inactive
+echo "$(date -u +%H:%M:%S) key deactivated" &gt;&gt; incident.log
+aws iam put-user-policy --user-name lab-$ME-leaky --policy-name revoke-older-sessions \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Action\":\"*\",
+  \"Resource\":\"*\",\"Condition\":{\"DateLessThan\":{\"aws:TokenIssueTime\":\"$(date -u +%FT%TZ)\"}}}]}"
+echo "$(date -u +%H:%M:%S) older sessions denied" &gt;&gt; incident.log
+env -u AWS_PROFILE AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$(cut -f2 leaked.txt) aws sts get-caller-identity
+<span class="out">An error occurred (InvalidClientTokenId) when calling the GetCallerIdentity operation: The security token included in the request is invalid.</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Investigate in CloudTrail, in every region that matters.</strong> CloudTrail event history takes up to
+        15 minutes to show events. IAM is a global service, so its calls (including the failed
+        <code class="inline">CreateUser</code>) are recorded in <code class="inline">us-east-1</code>; regional calls are
+        recorded where they were made. Check both, as the warning in Part IV says.
+        <pre class="code">for r in ap-southeast-1 us-east-1; do
+  aws cloudtrail lookup-events --region $r --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=$KEY \
+    --query 'Events[].CloudTrailEvent' --output json \
+    | jq -r --arg r $r '.[] | fromjson | "\($r)\t\(.eventTime)\t\(.eventName)\t\(.errorCode // "ok")\t\(.sourceIPAddress)"'
+done | sort -k2
+<span class="out">ap-southeast-1	2026-11-01T04:02:11Z	GetCallerIdentity	ok	203.0.113.24
+ap-southeast-1	2026-11-01T04:02:13Z	ListBuckets	ok	203.0.113.24
+us-east-1	2026-11-01T04:02:14Z	CreateUser	AccessDenied	203.0.113.24
+ap-southeast-1	2026-11-01T04:02:15Z	GetSessionToken	ok	203.0.113.24</span></pre>
+        Add every line to <code class="inline">incident.log</code>. The last line matters most: the attacker turned the
+        key into temporary credentials before you contained it.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        you received the sample finding by email and wrote down how long it took; the leaked key returns
+        <code class="inline">InvalidClientTokenId</code>; <code class="inline">incident.log</code> has the report,
+        deactivation and deny times, plus every CloudTrail event from both regions; and you can say how many minutes
+        passed from "reported" to "contained".</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>The key is dead, but is the attacker?</strong> Simulate the on-call engineer who stopped after deactivating
+        the key: remove the second containment step with
+        <code class="inline">aws iam delete-user-policy --user-name lab-$ME-leaky --policy-name revoke-older-sessions</code>,
+        wait a minute, then use the session the attacker saved in step 5 (it expires one hour after step 5). Before you open the answer, explain why it works and which
+        CloudTrail event in step 7 warned you.
+        <pre class="code">export $(jq -r '.Credentials | "AWS_ACCESS_KEY_ID=\(.AccessKeyId) AWS_SECRET_ACCESS_KEY=\(.SecretAccessKey) AWS_SESSION_TOKEN=\(.SessionToken)"' stolen-session.json)
+env -u AWS_PROFILE aws s3 ls | head -1
+<span class="out">2026-03-02 11:20:41 gol-sandbox-cloudtrail-888899990000</span>              <span class="cm"># still works</span>
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN</pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <p class="mt-2">Temporary credentials from <code class="inline">GetSessionToken</code> stay valid until they
+          expire (here one hour, up to 36 hours), even after the key that created them is deactivated or deleted. Only a
+          change to the user's permissions stops them, which is exactly what the
+          <code class="inline">aws:TokenIssueTime</code> deny does: every session issued before the cut-off is refused,
+          while a key you might reissue later would still work. Put the policy back (the step 6 command), wait a minute
+          for it to propagate, and the same <code class="inline">aws s3 ls</code> returns
+          <code class="inline">AccessDenied</code>. The <code class="inline">GetSessionToken</code> line in CloudTrail was the
+          warning: when you see it, deactivating the key is not containment.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Delete the key, the inline policies and the user (in that order: IAM refuses to delete
+        a user that still has keys or policies), then destroy the routing. Sample findings stay in GuardDuty, marked as
+        samples; archive them if your mentor asks.
+        <pre class="code">aws iam delete-access-key --user-name lab-$ME-leaky --access-key-id $KEY
+for p in list-buckets-only revoke-older-sessions; do
+  aws iam delete-user-policy --user-name lab-$ME-leaky --policy-name $p 2&gt;/dev/null; done
+aws iam delete-user --user-name lab-$ME-leaky
+terraform destroy -var me=$ME -var email=you@goldenowl.asia
+<span class="out">Destroy complete! Resources: 5 destroyed.</span>
+shred -u leaked.txt stolen-session.json 2&gt;/dev/null || rm -P leaked.txt stolen-session.json
+aws iam list-users --query "Users[?starts_with(UserName,'lab-$ME')].UserName"
+<span class="out">[]</span></pre>
+        Keep <code class="inline">incident.log</code>: with the email screenshot it is the evidence for this module.
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

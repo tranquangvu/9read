@@ -698,6 +698,388 @@ topk(5, count by (__name__) ({__name__=~".+", namespace="booking"}))</pre>
         deploy. The lasting fix is in the code: per-clinic latency is a trace
         attribute or a log field, queried in Tempo, Loki or Logs Insights, never a metric label.</div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Metrics, logs and a real page for booking-api on kind</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will run kube-prometheus-stack, Loki and Alloy on a local kind cluster next to the lab-kit
+        <code class="inline">booking-api</code>, query it with PromQL and LogQL, write an alert that fires on a crash loop,
+        and keep the Grafana dashboard in Terraform. One honest limit shapes the lab: <strong>the lab kit has no
+        <code class="inline">/metrics</code> endpoint</strong>. So the Prometheus side uses what any pod gets for free
+        (cAdvisor container metrics, kube-state-metrics and a blackbox probe of <code class="inline">/readyz</code>), and
+        per-request numbers (rate, status, latency) come from its JSON logs in Loki. In production you would add a metrics
+        endpoint (an OTel or prom-client exporter, <a href="./ob4.html" class="text-viol underline decoration-viol/40">OB4</a>)
+        and a ServiceMonitor.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A crash-loop alert you watched fire in Alertmanager, PromQL and LogQL answers about <code class="inline">booking-api</code>, and a dashboard that lives in Terraform</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">3–4 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop: a one-node kind cluster. Give Docker at least 6 GB of memory</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>): Docker, kind, kubectl, Helm 3, Terraform, <code class="inline">jq</code>; the lab kit in <code class="inline">~/clinic-app</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Create the cluster, load the image, add the chart repositories.</strong> The Loki OSS chart moved to the
+        <code class="inline">grafana-community</code> repository in March 2026; Alloy is still in
+        <code class="inline">grafana</code>.
+        <span class="code-label">~/labs/ob2/kind.yaml</span>
+        <pre class="code">kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ob2
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.33.1</pre>
+        <pre class="code">mkdir -p ~/labs/ob2 &amp;&amp; cd ~/labs/ob2
+kind create cluster --config kind.yaml
+docker build -t booking-api:lab ~/clinic-app/booking-api
+kind load docker-image booking-api:lab --name ob2
+<span class="out">Image: "booking-api:lab" with ID "sha256:…" not yet present on node "ob2-control-plane", loading...</span>
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo add grafana-community https://grafana-community.github.io/helm-charts
+helm repo update</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Deploy booking-api.</strong> In-memory store, <code class="inline">CHAOS=on</code> for the drills, and a
+        128 MiB memory limit you will hit on purpose in step 10.
+        <span class="code-label">~/labs/ob2/booking-api.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-api, namespace: booking }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: booking-api } }
+  template:
+    metadata: { labels: { app.kubernetes.io/name: booking-api } }
+    spec:
+      containers:
+        - name: api
+          image: booking-api:lab
+          env:
+            - { name: APP_VERSION, value: ob2-lab }
+            - { name: CHAOS, value: "on" }                <span class="cm"># lab only: enables /admin/*</span>
+          ports: [{ containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8080 }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /healthz, port: 8080 } }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: booking-api, namespace: booking }
+spec:
+  selector: { app.kubernetes.io/name: booking-api }
+  ports: [{ port: 8080, targetPort: 8080 }]</pre>
+        <pre class="code">kubectl create namespace booking &amp;&amp; kubectl apply -f booking-api.yaml
+kubectl -n booking rollout status deploy/booking-api
+<span class="out">deployment "booking-api" successfully rolled out</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Install kube-prometheus-stack.</strong> These values are the lab version of the Part III production values:
+        the same selector flags, a short retention, Grafana switched on with a Loki data source. kind runs etcd, the
+        scheduler, the controller manager and kube-proxy where Prometheus cannot scrape them, so those jobs are off;
+        otherwise you start the lab with four alerts already firing.
+        <span class="code-label">~/labs/ob2/kps-values.yaml</span>
+        <pre class="code">fullnameOverride: kps                         <span class="cm"># short names: kps-prometheus, kps-alertmanager</span>
+kubeEtcd: { enabled: false }
+kubeScheduler: { enabled: false }
+kubeControllerManager: { enabled: false }
+kubeProxy: { enabled: false }
+prometheus:
+  prometheusSpec:
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false       <span class="cm"># or the Probe in step 5 is ignored</span>
+    ruleSelectorNilUsesHelmValues: false        <span class="cm"># or the rules in step 8 are ignored</span>
+    retention: 2d
+grafana:
+  adminPassword: lab-only-admin
+  additionalDataSources:
+    - { name: Loki, type: loki, uid: loki, access: proxy, url: "http://loki-gateway.monitoring.svc" }</pre>
+        <pre class="code">helm install kps prometheus-community/kube-prometheus-stack --version 92.7.0 \
+  -n monitoring --create-namespace -f kps-values.yaml --wait --timeout 10m
+kubectl -n monitoring get pods
+<span class="out">alertmanager-kps-alertmanager-0             2/2   Running
+kps-grafana-6d9c…                           3/3   Running
+kps-kube-state-metrics-5b7f…                1/1   Running
+kps-operator-7f4c…                          1/1   Running
+kps-prometheus-node-exporter-x2kq9          1/1   Running
+prometheus-kps-prometheus-0                 2/2   Running</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Install Loki and Alloy.</strong> Loki runs as one binary on the node's disk: the lab stand-in for the S3
+        setup in Part IV. Alloy runs as a single-replica Deployment because <code class="inline">loki.source.kubernetes</code>
+        reads logs through the API server, so every replica of a DaemonSet would ship every line unless you enable
+        clustering. The pipeline is Part IV's, minus the trace ID the lab kit does not log, and it drops both probe paths.
+        <span class="code-label">~/labs/ob2/loki-values.yaml</span>
+        <pre class="code">deploymentMode: Monolithic
+loki:
+  auth_enabled: false                           <span class="cm"># single tenant; lab only</span>
+  commonConfig: { replication_factor: 1 }
+  storage: { type: filesystem }
+  schemaConfig:
+    configs:
+      - { from: "2026-01-01", store: tsdb, object_store: filesystem, schema: v13,
+          index: { prefix: loki_index_, period: 24h } }
+singleBinary: { replicas: 1 }
+backend: { replicas: 0 }                        <span class="cm"># the chart defaults these to 3</span>
+read: { replicas: 0 }
+write: { replicas: 0 }
+chunksCache: { enabled: false }                 <span class="cm"># memcached asks for 8 GiB by default</span>
+resultsCache: { enabled: false }
+lokiCanary: { enabled: false }
+test: { enabled: false }</pre>
+        <span class="code-label">~/labs/ob2/alloy-values.yaml</span>
+        <pre class="code">controller: { type: deployment, replicas: 1 }
+alloy:
+  configMap:
+    content: |
+      discovery.kubernetes "pods" { role = "pod" }
+      discovery.relabel "pods" {
+        targets = discovery.kubernetes.pods.targets
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+          target_label  = "app"
+        }
+      }
+      loki.source.kubernetes "pods" {
+        targets    = discovery.relabel.pods.output
+        forward_to = [loki.process.json.receiver]
+      }
+      loki.process "json" {
+        stage.json { expressions = { level = "level", path = "path" } }
+        stage.drop {
+          source     = "path"
+          expression = "^/(healthz|readyz)$"
+        }
+        stage.labels { values = { level = "" } }
+        forward_to = [loki.write.default.receiver]
+      }
+      loki.write "default" {
+        endpoint { url = "http://loki-gateway.monitoring.svc/loki/api/v1/push" }
+      }</pre>
+        <pre class="code">helm install loki grafana-community/loki --version 18.15.1 -n monitoring -f loki-values.yaml --wait
+helm install alloy grafana/alloy --version 1.13.1 -n monitoring -f alloy-values.yaml --wait
+kubectl -n monitoring get pods -l 'app.kubernetes.io/name in (loki,alloy)'
+<span class="out">alloy-5c8d…   2/2   Running
+loki-0        2/2   Running</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Probe booking-api from inside the cluster.</strong> The blackbox exporter is the exporter pattern from Part I:
+        it turns "does <code class="inline">/readyz</code> answer 2xx?" into <code class="inline">probe_success</code>.
+        <span class="code-label">~/labs/ob2/probe.yaml</span>
+        <pre class="code">apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata: { name: booking-api-readyz, namespace: booking }
+spec:
+  jobName: booking-api-readyz
+  interval: 15s
+  module: http_2xx
+  prober: { url: "blackbox-prometheus-blackbox-exporter.monitoring.svc:9115" }
+  targets:
+    staticConfig:
+      static: ["http://booking-api.booking.svc:8080/readyz"]</pre>
+        <pre class="code">helm install blackbox prometheus-community/prometheus-blackbox-exporter --version 11.20.0 -n monitoring --wait
+kubectl apply -f probe.yaml</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Open the ports, send traffic, and answer questions in PromQL.</strong> Keep this terminal open: the
+        port-forwards run in the background. If one dies (it will when its pod is replaced), rerun its line.
+        <pre class="code">kubectl -n booking port-forward svc/booking-api 8080:8080 &gt;/dev/null &amp;
+kubectl -n monitoring port-forward svc/kps-prometheus 9090:9090 &gt;/dev/null &amp;
+kubectl -n monitoring port-forward svc/kps-alertmanager 9093:9093 &gt;/dev/null &amp;
+kubectl -n monitoring port-forward svc/loki-gateway 3100:80 &gt;/dev/null &amp;
+kubectl -n monitoring port-forward svc/kps-grafana 3000:80 &gt;/dev/null &amp;
+for i in $(seq 60); do
+  curl -s -o /dev/null -XPOST localhost:8080/bookings -H 'content-type: application/json' -d '{"patient":"An","slot":"2026-11-02T09:00"}'
+  curl -s -o /dev/null localhost:8080/bookings
+  curl -s -o /dev/null -XPOST localhost:8080/bookings -H 'content-type: application/json' -d '{bad'    <span class="cm"># 500</span>
+done
+curl -s 'localhost:8080/admin/burn?ms=15000' &gt;/dev/null      <span class="cm"># 15 s of one busy core; ~30 s and liveness kills it</span>
+pq() { curl -sG localhost:9090/api/v1/query --data-urlencode "query=$1" | jq -r '.data.result[] | "\(.metric) \(.value[1])"'; }
+pq 'probe_success{job="booking-api-readyz"}'
+<span class="out">{"__name__":"probe_success","instance":"http://booking-api.booking.svc:8080/readyz","job":"booking-api-readyz",…} 1</span>
+sleep 30; pq 'sum by (pod) (increase(container_cpu_usage_seconds_total{namespace="booking", container="api"}[2m]))'
+<span class="out">{"pod":"booking-api-6f8b9c7d5-k2x4p"} 15.6</span>            <span class="cm"># CPU-seconds in 2 min: the burn plus normal work</span>
+pq 'container_memory_working_set_bytes{namespace="booking", container="api"} / 2^20'
+<span class="out">{…,"pod":"booking-api-6f8b9c7d5-k2x4p"} 46.2</span>            <span class="cm"># MiB of the 128 MiB limit</span>
+pq 'histogram_quantile(0.99, sum by (le) (rate(prometheus_http_request_duration_seconds_bucket[5m])))'
+<span class="out">{} 0.098</span>                                                <span class="cm"># Prometheus's own API p99, in seconds</span></pre>
+        The last query uses Prometheus's own histogram because <code class="inline">booking-api</code> exposes none: it is the
+        Part II <code class="inline">histogram_quantile</code> pattern on a series that really has buckets.
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Answer the request questions in LogQL.</strong> Status mix, latency per path and the error lines, all from
+        the JSON logs and without one new Prometheus series.
+        <pre class="code">lq() { curl -sG localhost:3100/loki/api/v1/query --data-urlencode "query=$1" | jq -r '.data.result[] | "\(.metric) \(.value[1])"'; }
+lq 'sum by (status) (count_over_time({namespace="booking", app="booking-api"} | json | msg="request" [10m]))'
+<span class="out">{"status":"200"} 61
+{"status":"201"} 60
+{"status":"500"} 60</span>
+lq 'quantile_over_time(0.99, {namespace="booking", app="booking-api"} | json | msg="request" | unwrap ms [10m]) by (path)'
+<span class="out">{"path":"/admin/burn"} 15001
+{"path":"/bookings"} 2</span>
+curl -sG localhost:3100/loki/api/v1/query_range --data-urlencode 'query={namespace="booking", level="error"}' \
+  --data-urlencode limit=1 | jq -r '.data.result[].values[][1]'
+<span class="out">{"ts":"…","level":"error","msg":"request failed","service":"booking-api","version":"ob2-lab","path":"/bookings","err":"Expected property name or '}' in JSON at position 1 (line 1 column 2)"}</span></pre>
+        Notice <code class="inline">level="error"</code> uses the index (it is a label Alloy set), while
+        <code class="inline">status</code> and <code class="inline">path</code> are parsed at query time. That is the Part IV
+        label rule working: few values become labels, everything else stays in the line.
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Write the alert rules, then ship a bad config and watch the page fire.</strong> The crash-loop rule reads
+        kube-state-metrics, so it works for any workload with no app metrics at all.
+        <span class="code-label">~/labs/ob2/rules.yaml</span>
+        <pre class="code">apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata: { name: booking-api, namespace: booking }
+spec:
+  groups:
+    - name: booking-api.alerts
+      rules:
+        - alert: BookingApiCrashLooping
+          expr: |                              <span class="cm"># max_over_time: the state flickers between restarts</span>
+            max_over_time(kube_pod_container_status_waiting_reason{namespace="booking", reason="CrashLoopBackOff"}[5m]) &gt;= 1
+          for: 1m
+          labels: { severity: page, service: booking-api }
+          annotations:
+            summary: "{{ $labels.pod }} is crash-looping"
+            runbook: "kubectl -n booking logs {{ $labels.pod }} --previous"
+        - alert: BookingApiNotReady
+          expr: probe_success{job="booking-api-readyz"} == 0
+          for: 2m
+          labels: { severity: page, service: booking-api }
+          annotations: { summary: "booking-api /readyz is failing from inside the cluster" }</pre>
+        <pre class="code">kubectl apply -f rules.yaml
+kubectl -n booking set env deploy/booking-api DATABASE_URL=postgres://clinic:clinic@postgres-typo:5432/clinic
+kubectl -n booking get pods
+<span class="out">booking-api-6f8b9c7d5-k2x4p   1/1   Running            0             25m
+booking-api-7d4c8b6f9-q9wzt   0/1   CrashLoopBackOff   3 (20s ago)   90s</span>
+sleep 90; curl -s localhost:9093/api/v2/alerts | jq -r '.[] | select(.labels.service=="booking-api") | "\(.labels.alertname) \(.status.state)"'
+<span class="out">BookingApiCrashLooping active</span>
+BAD=$(kubectl -n booking get pods | awk '/CrashLoopBackOff/{print $1}')
+kubectl -n booking logs $BAD --previous | grep -m1 ENOTFOUND
+<span class="out">Error: getaddrinfo ENOTFOUND postgres-typo</span>          <span class="cm"># migration on start cannot reach the DB</span>
+kubectl -n booking rollout undo deploy/booking-api</pre>
+        Two things to notice. <code class="inline">BookingApiNotReady</code> never fired: the old pod kept serving, so users
+        were fine while the rollout was stuck. That is the right outcome, and the reason you alert on both symptoms and
+        stuck rollouts. And the alert reached Alertmanager but went nowhere, because the chart's default receiver is
+        <code class="inline">null</code>; routing it to a channel is the Part II Alertmanager config. The alert resolves
+        about five minutes after the undo, when the bad pod leaves the <code class="inline">max_over_time</code> window.
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Keep the dashboard in Terraform.</strong> The same provider as Part III, pointed at your port-forward with
+        the lab admin password instead of a minted token.
+        <span class="code-label">~/labs/ob2/dash/main.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { grafana = { source = "grafana/grafana", version = "~&gt; 4.0" } }
+}
+provider "grafana" {
+  url  = "http://localhost:3000"
+  auth = "admin:lab-only-admin"                       <span class="cm"># lab only; CI mints a token (Part III)</span>
+}
+locals {
+  prom = { type = "prometheus", uid = "prometheus" }  <span class="cm"># uid the chart gives its data source</span>
+  loki = { type = "loki", uid = "loki" }
+  sel  = "namespace=\"booking\", container=\"api\""
+}
+resource "grafana_folder" "booking" { title = "Clinic · booking (lab)" }
+resource "grafana_dashboard" "api" {
+  folder    = grafana_folder.booking.uid
+  overwrite = true
+  config_json = jsonencode({
+    title = "booking-api (OB2 lab)", uid = "ob2-booking-api", schemaVersion = 39, time = { from = "now-30m", to = "now" }
+    panels = [
+      { type = "timeseries", title = "Requests per second by status (from logs)", datasource = local.loki,
+        gridPos = { x = 0, y = 0, w = 12, h = 8 }, targets = [{ refId = "A",
+        expr = "sum by (status) (rate({namespace=\"booking\", app=\"booking-api\"} | json | msg=\"request\" [1m]))" }] },
+      { type = "timeseries", title = "Ready, probed from inside the cluster", datasource = local.prom,
+        gridPos = { x = 12, y = 0, w = 12, h = 8 }, targets = [{ refId = "A", expr = "probe_success{job=\"booking-api-readyz\"}" }] },
+      { type = "timeseries", title = "CPU cores", datasource = local.prom, gridPos = { x = 0, y = 8, w = 12, h = 8 },
+        targets = [{ refId = "A", expr = "sum by (pod) (rate(container_cpu_usage_seconds_total{${local.sel}}[2m]))" }] },
+      { type = "timeseries", title = "Memory working set vs limit", datasource = local.prom, gridPos = { x = 12, y = 8, w = 12, h = 8 },
+        targets = [{ refId = "A", expr = "sum by (pod) (container_memory_working_set_bytes{${local.sel}})" },
+          { refId = "B", expr = "max(kube_pod_container_resource_limits{${local.sel}, resource=\"memory\"})" }] },
+    ]
+  })
+}</pre>
+        <pre class="code">cd ~/labs/ob2/dash &amp;&amp; terraform init &amp;&amp; terraform apply
+<span class="out">Apply complete! Resources: 2 added, 0 changed, 0 destroyed.</span>
+curl -s -u admin:lab-only-admin localhost:3000/api/dashboards/uid/ob2-booking-api | jq -r '.meta.folderTitle + " / " + .dashboard.title'
+<span class="out">Clinic · booking (lab) / booking-api (OB2 lab)</span></pre>
+        Open <code class="inline">http://localhost:3000</code>, move a panel, save, and run <code class="inline">terraform plan</code>:
+        it shows the change it will revert. Git wins.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">pq 'probe_success{job="booking-api-readyz"}'</code> returns <code class="inline">1</code>;
+        your LogQL status query shows the 200/201/500 mix you sent; you saw
+        <code class="inline">BookingApiCrashLooping active</code> in Alertmanager and watched it resolve after the undo;
+        the dashboard opens in Grafana with all four panels drawing; and <code class="inline">terraform plan</code> in
+        <code class="inline">dash/</code> reports no changes after you revert your UI edit.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Explain a restart nobody saw.</strong> Run the command below, then act as the on-call engineer who did not:
+        a colleague reports "booking-api restarted, and <code class="inline">kubectl logs</code> only shows a clean start".
+        Using only Prometheus and Loki, find what killed it, which request caused it, and then make sure the next one pages
+        someone. No crash loop happens, so your step 8 alert stays quiet.
+        <pre class="code">kubectl -n booking run drill --rm -i --restart=Never --image=curlimages/curl:8.11.1 -- \
+  sh -c 'for i in 1 2 3; do curl -s booking-api:8080/admin/leak; echo; sleep 2; done'</pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">pq 'kube_pod_container_status_last_terminated_reason{namespace="booking"}'
+<span class="out">{…,"container":"api","pod":"booking-api-6f8b9c7d5-k2x4p","reason":"OOMKilled"} 1</span>
+pq 'max_over_time(container_memory_working_set_bytes{namespace="booking", container="api"}[15m]) / 2^20'
+<span class="out">{…} 121.4</span>                    <span class="cm"># near the 128 MiB limit; the real peak fell between two scrapes</span>
+lq 'sum by (path) (count_over_time({namespace="booking", app="booking-api"} | json | path=~"/admin/.*" [15m]))'
+<span class="out">{"path":"/admin/leak"} 2</span>     <span class="cm"># the third call died with the process before it was logged</span></pre>
+          <p class="mt-2">The kernel killed the container for exceeding its memory limit, and the logs of the dead container
+          are gone from <code class="inline">kubectl logs</code> but still in Loki, which shows the
+          <code class="inline">/admin/leak</code> calls just before. Fix the detection gap by adding this rule to
+          <code class="inline">rules.yaml</code> and applying it, then rerun the drill and watch it reach Alertmanager.
+          Restarting does not fix a leak; turning <code class="inline">CHAOS</code> off here, or fixing the code in real life,
+          does.</p>
+          <pre class="code mt-3">        - alert: BookingApiOOMKilled
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="booking"}[10m]) &gt; 0
+            and on (namespace, pod, container)
+            kube_pod_container_status_last_terminated_reason{namespace="booking", reason="OOMKilled"} == 1
+          labels: { severity: ticket, service: booking-api }
+          annotations: { summary: "{{ $labels.pod }} was OOMKilled: check memory trend and recent requests in Loki" }</pre>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">11</div><div class="step-body">
+        <strong>Clean up.</strong> Stop the port-forwards, delete the cluster (it takes every chart and volume with it), and
+        remove the dashboard state that now points at nothing.
+        <pre class="code">kill $(jobs -p) 2&gt;/dev/null                     <span class="cm"># in the terminal that started the port-forwards</span>
+kind delete cluster --name ob2
+<span class="out">Deleting cluster "ob2" ...</span>
+rm -rf ~/labs/ob2/dash/terraform.tfstate* ~/labs/ob2/dash/.terraform
+kind get clusters | grep -c ob2
+<span class="out">0</span></pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

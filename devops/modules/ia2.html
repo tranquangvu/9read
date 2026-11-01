@@ -696,6 +696,376 @@ sequenceDiagram
         read-only, which is the number to show a client.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: A tested module, two environments and plan-on-PR</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will turn the IA1 network into a module with tests, call it from a <code class="inline">dev</code> and a
+        <code class="inline">staging</code> directory with separate state, lint it, and give your own GitHub repo a
+        workflow that plans every pull request through an OIDC role and posts the result as a comment. The point to feel
+        in your hands: a module change shows up in dev's plan at once, and in staging's only when you move its version pin.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A PR in <code class="inline">lab-$ME-infra</code> whose checks run <code class="inline">terraform test</code> and post a dev and a staging plan, using no stored AWS keys</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop, a new public GitHub repo under your account, and <code class="inline">gol-sandbox</code> in <code class="inline">ap-southeast-1</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Under USD 0.01: VPCs, subnets, empty log groups and IAM roles are free; public-repo Actions minutes are free</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The IA1 state bucket, the GitHub OIDC provider from the <a href="./ci1.html" class="text-viol underline decoration-viol/40">CI1</a> lab, <code class="inline">gh</code> logged in, and <code class="inline">tflint</code> (<code class="inline">brew install tflint</code>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up, and check the two things this lab depends on.</strong> If the bucket is gone, run
+        <code class="inline">terraform apply</code> in <code class="inline">~/labs/ia1/bootstrap</code>. If the provider list
+        is empty, run CI1 step 2.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1 TF_VAR_me=yourhandle
+aws sso login &amp;&amp; gh auth status
+export BUCKET=lab-$ME-tfstate-888899990000
+aws s3api head-bucket --bucket $BUCKET &amp;&amp; echo bucket ok
+<span class="out">bucket ok</span>
+aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text
+<span class="out">arn:aws:iam::888899990000:oidc-provider/token.actions.githubusercontent.com</span>
+mkdir -p ~/labs/ia2/lab-$ME-infra/{modules/lab-network/tests,live/dev,live/staging,.github/workflows} ~/labs/ia2/plan-role
+cd ~/labs/ia2/lab-$ME-infra &amp;&amp; git init -b main</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Write the module.</strong> It is the IA1 network with every environment-specific value turned into a
+        typed, validated input. The module pins the provider with <code class="inline">&gt;=</code>; the callers pin it
+        tightly.
+        <span class="code-label">modules/lab-network/variables.tf</span>
+        <pre class="code">variable "name" {
+  type        = string
+  description = "Prefix for every resource, e.g. lab-an-dev"
+}
+variable "cidr" {
+  type = string
+  validation {
+    condition     = can(cidrhost(var.cidr, 0))
+    error_message = "cidr must be a valid IPv4 CIDR block."
+  }
+}
+variable "subnets" {
+  type        = map(string)
+  description = "AZ =&gt; subnet CIDR"
+}
+variable "services" {
+  type    = set(string)
+  default = ["booking-api"]
+}
+variable "log_retention_days" {
+  type    = number
+  default = 3
+  validation {
+    condition     = contains([1, 3, 5, 7, 14, 30], var.log_retention_days)
+    error_message = "log_retention_days must be one of 1, 3, 5, 7, 14, 30."
+  }
+}</pre>
+        <span class="code-label">modules/lab-network/main.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "&gt;= 6.0" } }
+}
+resource "aws_vpc" "this" {
+  cidr_block = var.cidr
+  tags       = { Name = var.name }
+}
+resource "aws_subnet" "this" {
+  for_each          = var.subnets
+  vpc_id            = aws_vpc.this.id
+  availability_zone = each.key
+  cidr_block        = each.value
+  tags              = { Name = "${var.name}-${each.key}" }
+}
+resource "aws_cloudwatch_log_group" "svc" {
+  for_each          = var.services
+  name              = "/lab/${var.name}/${each.key}"
+  retention_in_days = var.log_retention_days
+}
+output "vpc_id" { value = aws_vpc.this.id }
+output "subnet_ids" { value = [for s in aws_subnet.this : s.id] }</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Test the module's contract with a mocked provider.</strong> No AWS credentials are used: unset
+        <code class="inline">AWS_PROFILE</code> for this one command if you want proof.
+        <span class="code-label">modules/lab-network/tests/defaults.tftest.hcl</span>
+        <pre class="code">mock_provider "aws" {}                                     <span class="cm"># fake AWS: no credentials, no cost</span>
+
+variables {
+  name    = "lab-test-dev"
+  cidr    = "10.96.0.0/16"
+  subnets = { "ap-southeast-1a" = "10.96.0.0/24", "ap-southeast-1b" = "10.96.1.0/24" }
+}
+
+run "one_subnet_per_az_and_safe_defaults" {
+  command = plan
+  assert {
+    condition     = length(aws_subnet.this) == 2
+    error_message = "expected one subnet per entry in var.subnets"
+  }
+  assert {
+    condition     = aws_cloudwatch_log_group.svc["booking-api"].retention_in_days == 3
+    error_message = "default log retention must stay 3 days"
+  }
+}
+
+run "rejects_unsupported_retention" {
+  command = plan
+  variables { log_retention_days = 2 }
+  expect_failures = [var.log_retention_days]                 <span class="cm"># the validation must fire</span>
+}</pre>
+        <pre class="code">cd modules/lab-network &amp;&amp; terraform init -backend=false &gt;/dev/null &amp;&amp; terraform test
+<span class="out">tests/defaults.tftest.hcl... in progress
+  run "one_subnet_per_az_and_safe_defaults"... pass
+  run "rejects_unsupported_retention"... pass
+tests/defaults.tftest.hcl... tearing down
+tests/defaults.tftest.hcl... pass
+
+Success! 2 passed, 0 failed.</span>
+cd ../..</pre>
+        Change the default in <code class="inline">variables.tf</code> to <code class="inline">7</code>, run the test again
+        and read the failure, then put it back. That is the test doing its job.
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Write the two environments.</strong> Each directory is its own root with its own state key. Dev calls the
+        module by relative path, so it always runs the code in your branch. Staging pins a released tag, which you create
+        in step 5. Replace <code class="inline">yourhandle</code> in the staging source: module sources cannot use
+        variables.
+        <span class="code-label">live/dev/main.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+  backend "s3" {
+    key          = "ia2/dev/network.tfstate"                 <span class="cm"># bucket comes from -backend-config</span>
+    region       = "ap-southeast-1"
+    use_lockfile = true
+  }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "IA2", Env = "dev" } }
+}
+variable "me" { type = string }
+
+module "network" {
+  source             = "../../modules/lab-network"           <span class="cm"># dev: the working copy</span>
+  name               = "lab-${var.me}-dev"
+  cidr               = "10.96.0.0/16"
+  subnets            = { "ap-southeast-1a" = "10.96.0.0/24", "ap-southeast-1b" = "10.96.1.0/24" }
+  services           = ["booking-api", "booking-web"]
+  log_retention_days = 3
+}
+output "vpc_id" { value = module.network.vpc_id }</pre>
+        <p class="mt-2"><code class="inline">live/staging/main.tf</code> is the same file with four differences:</p>
+        <pre class="code">    key          = "ia2/staging/network.tfstate"
+  default_tags { tags = { Owner = var.me, Lab = "IA2", Env = "staging" } }
+  source             = "git::https://github.com/yourhandle/lab-yourhandle-infra.git//modules/lab-network?ref=lab-network/v1.0.0"
+  name               = "lab-${var.me}-staging"               <span class="cm"># and cidr 10.97.0.0/16, subnets 10.97.0.0/24 + 10.97.1.0/24</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Lint, format, publish, tag, and build both environments once.</strong> The repo is public so staging can
+        fetch the module without a token (a client's infra repo is private; CI then needs a read token for module
+        sources). In real work only the pipeline applies; this first apply is the bootstrap.
+        <span class="code-label">.tflint.hcl</span>
+        <pre class="code">config {
+  call_module_type = "local"                                 <span class="cm"># also lint the module through its callers</span>
+}
+plugin "terraform" {
+  enabled = true
+  preset  = "recommended"
+}
+plugin "aws" {
+  enabled = true
+  version = "0.50.0"
+  source  = "github.com/terraform-linters/tflint-ruleset-aws"
+}</pre>
+        <pre class="code">terraform fmt -recursive                                 <span class="cm"># realigns the comments you pasted; CI checks this</span>
+tflint --init &amp;&amp; tflint --recursive &amp;&amp; echo lint clean
+<span class="out">lint clean</span>
+printf '.terraform/\n*.tfplan\ntfplan\n' &gt; .gitignore
+git add . &amp;&amp; git commit -qm "lab-network module, dev and staging"
+gh repo create lab-$ME-infra --public --source . --push
+git tag lab-network/v1.0.0 &amp;&amp; git push -q origin lab-network/v1.0.0
+for env in dev staging; do (cd live/$env &amp;&amp; terraform init -input=false -backend-config="bucket=$BUCKET" &gt;/dev/null &amp;&amp; terraform apply -auto-approve | tail -1); done
+<span class="out">Apply complete! Resources: 5 added, 0 changed, 0 destroyed.
+Apply complete! Resources: 5 added, 0 changed, 0 destroyed.</span>
+git add live/*/.terraform.lock.hcl &amp;&amp; git commit -qm "provider lock files" &amp;&amp; git push -q</pre>
+        Add an unused <code class="inline">variable "enable_flow_logs"</code> to the module and run
+        <code class="inline">tflint --recursive</code> again: you get
+        <code class="inline">Warning: [Fixable] variable "enable_flow_logs" is declared but not used</code> and exit code 2.
+        Delete it.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Create the read-only plan role that only PRs of your repo can assume.</strong> It reads everything (to plan)
+        and may write exactly one kind of object: the lock files in your state prefix. This stack is small enough for local
+        state.
+        <span class="code-label">~/labs/ia2/plan-role/main.tf</span>
+        <pre class="code">terraform {
+  required_version = "&gt;= 1.10"
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 6.0" } }
+}
+provider "aws" {
+  default_tags { tags = { Owner = var.me, Lab = "IA2" } }
+}
+variable "me" { type = string }
+variable "state_bucket" { type = string }
+data "aws_iam_openid_connect_provider" "github" { url = "https://token.actions.githubusercontent.com" }
+
+resource "aws_iam_role" "plan" {
+  name = "lab-${var.me}-gha-tf-plan"
+  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
+    Effect    = "Allow", Action = "sts:AssumeRoleWithWebIdentity"
+    Principal = { Federated = data.aws_iam_openid_connect_provider.github.arn }
+    Condition = { StringEquals = {
+      "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+      "token.actions.githubusercontent.com:sub" = "repo:${var.me}/lab-${var.me}-infra:pull_request"
+  } } }] })
+}
+resource "aws_iam_role_policy_attachment" "read" {
+  role       = aws_iam_role.plan.name
+  policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+}
+resource "aws_iam_role_policy" "state_lock" {
+  role = aws_iam_role.plan.id
+  policy = jsonencode({ Version = "2012-10-17", Statement = [{
+    Effect = "Allow", Action = ["s3:PutObject", "s3:DeleteObject"]
+    Resource = "arn:aws:s3:::${var.state_bucket}/ia2/*.tflock" }] })   <span class="cm"># the lock, never the state</span>
+}
+output "role_arn" { value = aws_iam_role.plan.arn }</pre>
+        <pre class="code">cd ~/labs/ia2/plan-role &amp;&amp; terraform init &gt;/dev/null &amp;&amp; terraform apply -var state_bucket=$BUCKET
+<span class="out">Apply complete! Resources: 3 added, 0 changed, 0 destroyed.</span>
+cd ~/labs/ia2/lab-$ME-infra
+gh variable set TF_PLAN_ROLE_ARN --body "$(terraform -chdir=../plan-role output -raw role_arn)"
+gh variable set TF_STATE_BUCKET --body $BUCKET
+gh variable set ME --body $ME</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Write the plan-on-PR workflow.</strong> One job runs the cheap checks; a matrix plans each environment and
+        comments the summary on the PR. <code class="inline">shell: bash</code> turns on
+        <code class="inline">pipefail</code>, so a failing plan piped into <code class="inline">tee</code> still fails the job.
+        <span class="code-label">.github/workflows/terraform-plan.yml</span>
+        <pre class="code">name: terraform-plan
+on:
+  pull_request:
+    paths: ["live/**", "modules/**"]
+permissions: { contents: read, id-token: write, pull-requests: write }
+concurrency: { group: "plan-${{ github.event.pull_request.number }}", cancel-in-progress: true }
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: 1.13.4, terraform_wrapper: false }
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false &amp;&amp; terraform test
+        working-directory: modules/lab-network
+  plan:
+    needs: checks
+    runs-on: ubuntu-24.04
+    strategy: { fail-fast: false, matrix: { env: [dev, staging] } }
+    defaults: { run: { shell: bash, working-directory: "live/${{ matrix.env }}" } }
+    env: { TF_VAR_me: "${{ vars.ME }}", GH_TOKEN: "${{ github.token }}" }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: 1.13.4, terraform_wrapper: false }
+      - uses: aws-actions/configure-aws-credentials@v6
+        with: { role-to-assume: "${{ vars.TF_PLAN_ROLE_ARN }}", aws-region: ap-southeast-1 }
+      - run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+      - run: terraform plan -input=false -no-color -out=tfplan | tee plan.txt
+      - run: |
+          { echo "**live/${{ matrix.env }}**"; echo '```'; grep -E '^(Plan:|No changes)|  # ' plan.txt; echo '```'; } &gt; c.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file c.md</pre>
+        <pre class="code">git add . &amp;&amp; git commit -qm "plan on PR" &amp;&amp; git push -q</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Open a PR that changes the module, and read both plans.</strong> Tag the log groups with the service they
+        belong to.
+        <pre class="code">git switch -c log-group-service-tag
+<span class="cm"># in modules/lab-network/main.tf, inside aws_cloudwatch_log_group.svc, add:  tags = { Service = each.key }</span>
+terraform fmt -recursive &amp;&amp; git commit -qam "tag log groups with their service" &amp;&amp; git push -qu origin HEAD
+gh pr create --fill &amp;&amp; gh pr checks --watch
+<span class="out">✓ checks
+✓ plan (dev)
+✓ plan (staging)</span>
+gh pr view --comments | grep -A1 -E 'live/|Plan:|No changes'
+<span class="out">**live/dev**
+  # module.network.aws_cloudwatch_log_group.svc["booking-api"] will be updated in-place
+  # module.network.aws_cloudwatch_log_group.svc["booking-web"] will be updated in-place
+Plan: 0 to add, 2 to change, 0 to destroy.
+**live/staging**
+No changes. Your infrastructure matches the configuration.</span></pre>
+        Staging did not move because it still pins <code class="inline">v1.0.0</code>. Merge the PR, then release and
+        promote the module the way Part I describes:
+        <pre class="code">gh pr merge --squash --delete-branch &amp;&amp; git switch main &amp;&amp; git pull -q
+git tag lab-network/v1.1.0 &amp;&amp; git push -q origin lab-network/v1.1.0
+git switch -c staging-lab-network-1.1.0
+sed -i.bak 's#ref=lab-network/v1.0.0#ref=lab-network/v1.1.0#' live/staging/main.tf &amp;&amp; rm live/staging/main.tf.bak
+git commit -qam "staging: lab-network v1.1.0" &amp;&amp; git push -qu origin HEAD &amp;&amp; gh pr create --fill</pre>
+        This PR's staging plan now shows the same <code class="inline">2 to change</code>, and dev shows
+        <code class="inline">2 to change</code> too, because nobody has applied dev since the merge. That is the gap the
+        apply-on-merge job in Part IV closes. Apply dev and staging from your laptop this once
+        (<code class="inline">terraform init</code> in staging fetches the new tag first) to bring them level.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">terraform test</code> passes locally and in the <code class="inline">checks</code> job;
+        <code class="inline">aws s3 ls s3://$BUCKET/ia2/ --recursive</code> lists a dev and a staging state file;
+        your first PR has two plan comments, dev with <code class="inline">2 to change</code> and staging with
+        <code class="inline">No changes</code>; and <code class="inline">gh secret list</code> prints nothing, because no AWS key is stored anywhere in the repo.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>A teammate "tightens" the plan role.</strong> They argue a plan role should be pure ReadOnlyAccess, so in
+        <code class="inline">plan-role/main.tf</code> comment out the whole <code class="inline">aws_iam_role_policy.state_lock</code>
+        block and apply. Then rerun the plan jobs on your open PR with
+        <code class="inline">gh run rerun $(gh run list -L1 --json databaseId -q '.[0].databaseId')</code>. Both plan legs
+        fail. Find the line in the log that explains why, and decide on the fix, before you open the answer.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">gh run view --log-failed | grep -A3 "acquiring the state lock"
+<span class="out">Error: Error acquiring the state lock
+Error message: operation error S3: PutObject, https response error StatusCode: 403,
+api error AccessDenied: User: arn:aws:sts::888899990000:assumed-role/lab-yourhandle-gha-tf-plan/GitHubActions
+is not authorized to perform: s3:PutObject on resource: "arn:aws:s3:::lab-yourhandle-tfstate-…/ia2/dev/network.tfstate.tflock"</span></pre>
+          <p class="mt-2">A plan takes the state lock, and with <code class="inline">use_lockfile</code> the lock is an S3
+          object the role must be able to create and delete. ReadOnlyAccess cannot. Restore the
+          <code class="inline">state_lock</code> policy: it allows writes only to <code class="inline">*.tflock</code>, so the
+          role still cannot change state or any resource. The other fix you may see, <code class="inline">terraform plan
+          -lock=false</code>, is acceptable for the nightly drift job but not for PR plans: an unlocked plan can read a state
+          that an apply is halfway through writing.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">10</div><div class="step-body">
+        <strong>Clean up.</strong> Destroy the environments, then the role, then the repo. Leave the OIDC provider: other
+        people in the sandbox use it. Keep the IA1 bucket if you continue to another Terraform lab.
+        <pre class="code">cd ~/labs/ia2/lab-$ME-infra
+for env in staging dev; do (cd live/$env &amp;&amp; terraform destroy -auto-approve | tail -1); done
+<span class="out">Destroy complete! Resources: 5 destroyed.
+Destroy complete! Resources: 5 destroyed.</span>
+cd ../plan-role &amp;&amp; terraform destroy -var state_bucket=$BUCKET -auto-approve | tail -1
+<span class="out">Destroy complete! Resources: 3 destroyed.</span>
+gh auth refresh -s delete_repo &amp;&amp; gh repo delete $ME/lab-$ME-infra --yes
+aws s3 rm s3://$BUCKET/ia2/ --recursive                  <span class="cm"># the empty state files</span>
+aws resourcegroupstaggingapi get-resources --tag-filters Key=Owner,Values=$ME Key=Lab,Values=IA2 \
+  --query 'ResourceTagMappingList[].ResourceARN'
+<span class="out">[]</span></pre>
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Nothing in this lab bills by the hour.</strong> The real risk is the
+        role: an IAM role trusted by a GitHub repo outlives the lab if you forget it. Check with
+        <code class="inline">aws iam list-roles --query "Roles[?starts_with(RoleName,'lab-$ME')].RoleName"</code> before you
+        log off.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

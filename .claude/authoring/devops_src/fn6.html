@@ -653,6 +653,205 @@ docker inspect clinic-booking-api-1 -f '{{range .Config.Env}}{{println .}}{{end}
         </table>
       </div>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Build, measure, scan and run the clinic images</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        This is where you meet the lab kit properly: the small clinic stand-in that every later lab deploys to ECS and
+        EKS. You will build <code class="inline">booking-api</code> from its real multi-stage Dockerfile, build a naive
+        version next to it, and compare size, user and CVE count. Then you publish a multi-arch image to a local registry,
+        run the whole stack with Compose, prove the data survives on a volume, and finally debug a health check that
+        fails on a perfectly healthy container.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A non-root, multi-arch <code class="inline">booking-api</code> image with a CVE count you measured, and the clinic stack healthy on <code class="inline">localhost:3000</code></td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2–3 hours (the first builds and the Trivy database download are slow)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop (Docker); no AWS until CN1 pushes this image to ECR</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free; about 3 GB of disk for images</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">Docker Desktop (or Colima) with buildx, <code class="inline">jq</code>, the lab kit (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>, section 3)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Check Docker and get the lab kit.</strong> <code class="inline">$SITE</code> is the address of this site.
+        Skip the download if <code class="inline">~/clinic-app</code> already exists from an earlier lab.
+        <pre class="code">docker version --format '{{.Server.Os}}/{{.Server.Arch}} {{.Server.Version}}'
+<span class="out">linux/arm64 28.3.2</span>                                  <span class="cm"># Apple silicon; x86 laptops say amd64</span>
+docker buildx version | cut -d' ' -f1-2
+<span class="out">github.com/docker/buildx v0.25.0</span>
+cd ~ &amp;&amp; curl -fsSLO "$SITE/devops/lab-kit/fetch.sh" &amp;&amp; bash fetch.sh "$SITE/devops/lab-kit"
+<span class="out">got README.md
+…
+done: cd clinic-app &amp;&amp; docker compose up --build</span>
+cd ~/clinic-app/booking-api &amp;&amp; cat Dockerfile</pre>
+        Read the Dockerfile before you build it. Find the two <code class="inline">FROM</code> lines, the
+        <code class="inline">COPY --from=deps</code> that carries only <code class="inline">node_modules</code> across,
+        and <code class="inline">USER nonroot</code>. Those three lines are Part III.
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Build it and look inside.</strong> <code class="inline">docker history</code> lists the layers, newest
+        first, with the instruction that made each one.
+        <pre class="code">docker build -t booking-api:lab .
+docker images booking-api --format '{{.Tag}}  {{.Size}}'
+<span class="out">lab  176MB</span>                                           <span class="cm"># about; differs a little by architecture</span>
+docker history booking-api:lab --format '{{.Size}}\t{{.CreatedBy}}' | head -6
+<span class="out">0B	CMD ["server.js"]
+0B	USER nonroot
+0B	EXPOSE map[8080/tcp:{}]
+0B	ENV NODE_ENV=production PORT=8080
+12.3kB	COPY package.json server.js healthcheck.js ./ # buildkit
+19.6MB	COPY /app/node_modules ./node_modules # buildkit</span>   <span class="cm"># the only thing kept from stage 1</span>
+docker inspect -f '{{.Config.User}} {{json .Config.Entrypoint}} {{json .Config.Cmd}}' booking-api:lab
+<span class="out">nonroot ["/nodejs/bin/node"] ["server.js"]</span>        <span class="cm"># exec form: node is PID 1</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Run it: non-root, and a clean stop.</strong> Distroless has no shell and no <code class="inline">id</code>
+        command, but it has node, so ask node who it is. Then time a stop: the app's SIGTERM handler waits
+        <code class="inline">DRAIN_MS</code> (5 s) and exits 0, well inside Docker's 10 s before SIGKILL.
+        <pre class="code">docker run -d --name api -p 8080:8080 booking-api:lab
+curl -s localhost:8080/healthz
+<span class="out">{"ok":true,"version":"dev"}</span>
+docker exec api /nodejs/bin/node -e 'console.log(process.getuid())'
+<span class="out">65532</span>                                               <span class="cm"># "nonroot", not 0</span>
+time docker stop api; docker inspect -f '{{.State.ExitCode}}' api
+<span class="out">real    0m5.3s
+0</span>
+docker logs api | tail -1
+<span class="out">{"ts":"…","level":"info","msg":"SIGTERM received, draining","service":"booking-api","version":"dev"}</span>
+docker rm api &gt;/dev/null</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Build the naive version for comparison.</strong> This is the Dockerfile people write on their first
+        day, and the one an agent often produces when you do not specify. Same code, one stage, full base image.
+        <span class="code-label">~/clinic-app/booking-api/Dockerfile.naive</span>
+        <pre class="code">FROM node:22
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 8080
+CMD ["node", "server.js"]</pre>
+        <pre class="code">docker build -f Dockerfile.naive -t booking-api:naive .
+docker images booking-api --format '{{.Tag}}  {{.Size}}'
+<span class="out">naive  1.15GB
+lab    176MB</span>
+docker run --rm --entrypoint id booking-api:naive
+<span class="out">uid=0(root) gid=0(root) groups=0(root)</span>              <span class="cm"># no USER line = root</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Scan both images and both Dockerfiles with Trivy.</strong> Trivy runs as a container and reads your local
+        images through the Docker socket. The first run downloads its vulnerability database (a few hundred MB) into a
+        named volume, so later runs are fast. Counts change every day as new CVEs are published; compare the two
+        numbers, not the exact values.
+        <pre class="code">trivy() { docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/ \
+  -v "$PWD":/src aquasec/trivy:0.61.0 "$@"; }      <span class="cm"># pin a version you checked on the releases page</span>
+for t in naive lab; do
+  printf '%s  ' $t
+  trivy image --scanners vuln --severity HIGH,CRITICAL --format json --quiet booking-api:$t \
+    | jq '[.Results[]?.Vulnerabilities[]?] | length'
+done
+<span class="out">naive  38
+lab  2</span>
+trivy config --format json --quiet /src \
+  | jq -r '.Results[] | .Target as $f | .Misconfigurations[]? | "\($f)  \(.ID)  \(.Title)"'
+<span class="out">Dockerfile  DS026  No HEALTHCHECK defined
+Dockerfile.naive  DS002  Image user should not be 'root'
+Dockerfile.naive  DS026  No HEALTHCHECK defined</span></pre>
+        The real Dockerfile has no <code class="inline">HEALTHCHECK</code> on purpose: ECS and Kubernetes ignore it and
+        use their own health checks (container <code class="inline">healthCheck</code> in the task definition, probes in
+        the Pod), and Compose sets one in <code class="inline">compose.yaml</code>. A finding is a question to answer, not
+        an order. The root user in the naive image has no such excuse.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Publish a multi-arch image to a local registry.</strong> A multi-platform build needs a BuildKit builder
+        running in a container and somewhere to push the result. A local registry stands in for ECR. On Colima, run
+        <code class="inline">docker run --privileged --rm tonistiigi/binfmt --install all</code> once first so the other
+        architecture can be emulated; Docker Desktop has this built in.
+        <pre class="code">docker run -d --name registry -p 5001:5000 registry:2
+docker buildx create --name multi --driver docker-container --driver-opt network=host --use
+docker buildx build --platform linux/amd64,linux/arm64 -t localhost:5001/booking-api:1.0.0 --push .
+docker buildx imagetools inspect localhost:5001/booking-api:1.0.0 | grep -E 'MediaType|Platform' | head -4
+<span class="out">MediaType: application/vnd.oci.image.index.v1+json</span>   <span class="cm"># an index: one tag, several images</span>
+<span class="out">  MediaType: application/vnd.oci.image.manifest.v1+json
+  Platform:  linux/amd64
+  MediaType: application/vnd.oci.image.manifest.v1+json</span>
+docker buildx imagetools inspect localhost:5001/booking-api:1.0.0 | grep -cE 'Platform: +linux/'
+<span class="out">2</span>                                                   <span class="cm"># amd64 and arm64 (unknown/unknown entries are build attestations)</span>
+docker buildx use default</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Run the whole stack with Compose and prove the volume works.</strong> Compose builds both images, starts
+        Postgres first and waits for its health check, then the API and the web front end on one private network.
+        <pre class="code">cd ~/clinic-app &amp;&amp; docker compose up --build -d
+docker compose ps --format '{{.Service}}  {{.Status}}'
+<span class="out">booking-api  Up 15 seconds (healthy)
+booking-web  Up 14 seconds
+postgres  Up 26 seconds (healthy)</span>
+curl -s -XPOST localhost:3000/api/bookings -H 'content-type: application/json' -d '{"patient":"An","slot":"2026-11-02T09:00"}'
+<span class="out">{"id":1,"patient":"An","slot":"2026-11-02T09:00:00.000Z","created_at":"…"}</span>
+docker compose exec booking-web wget -qO- http://booking-api:8080/healthz
+<span class="out">{"ok":true,"version":"local"}</span>                       <span class="cm"># containers find each other by service name</span>
+docker compose down &amp;&amp; docker compose up -d        <span class="cm"># containers deleted and recreated…</span>
+sleep 10 &amp;&amp; curl -s localhost:3000/api/bookings
+<span class="out">[{"id":1,"patient":"An",…}]</span>                         <span class="cm"># …but the booking lives on volume pgdata</span></pre>
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">booking-api:lab</code> is under
+        about 200 MB and reports UID <code class="inline">65532</code>; <code class="inline">docker stop</code> takes about
+        5 s and exits 0; you have the HIGH/CRITICAL CVE counts for both images written down;
+        <code class="inline">imagetools inspect</code> shows an index with <code class="inline">linux/amd64</code> and
+        <code class="inline">linux/arm64</code>; and your booking survived <code class="inline">docker compose down</code>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>A health check that cannot pass.</strong> Compose automatically merges a file called
+        <code class="inline">compose.override.yaml</code> over <code class="inline">compose.yaml</code>. Create this one,
+        which is the health check most tutorials (and many agents) write, then run
+        <code class="inline">docker compose up -d</code> and wait 40 seconds.
+        <span class="code-label">~/clinic-app/compose.override.yaml</span>
+        <pre class="code">services:
+  booking-api:
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]</pre>
+        <code class="inline">docker compose ps</code> now says <code class="inline">(unhealthy)</code>, yet
+        <code class="inline">curl localhost:8080/healthz</code> from your laptop answers fine. Find out what the health
+        check itself reported, and fix it.
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">docker inspect -f '{{json .State.Health.Log}}' clinic-app-booking-api-1 | jq -r '.[-1].Output'
+<span class="out">OCI runtime exec failed: exec failed: unable to start container process: exec: "curl": executable file not found in $PATH: unknown</span>
+rm compose.override.yaml &amp;&amp; docker compose up -d
+sleep 15 &amp;&amp; docker compose ps --format '{{.Service}}  {{.Status}}' | grep api
+<span class="out">booking-api  Up 14 seconds (healthy)</span></pre>
+          <p class="mt-2">The distroless image has no <code class="inline">curl</code> (and no shell), so the check fails
+          before it ever reaches the app. That is why the lab kit ships <code class="inline">healthcheck.js</code> and checks
+          with <code class="inline">["CMD", "/nodejs/bin/node", "healthcheck.js"]</code>. On ECS the same mistake is worse:
+          the container health check fails, ECS replaces the task, and the new one fails too. Whenever a health check
+          disagrees with a manual <code class="inline">curl</code>, read the check's own output before you touch the app.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Stop the stack and delete its volume, then the registry, the builder, the images and
+        the Trivy cache. Keep <code class="inline">~/clinic-app</code>: later labs use it.
+        <pre class="code">cd ~/clinic-app &amp;&amp; docker compose down -v
+docker rm -f registry &gt;/dev/null &amp;&amp; docker buildx rm multi
+docker image rm booking-api:lab booking-api:naive registry:2 aquasec/trivy:0.61.0 &gt;/dev/null
+docker volume rm trivy-cache &gt;/dev/null
+rm ~/clinic-app/booking-api/Dockerfile.naive
+docker ps -a --format '{{.Names}}' | grep -cE 'clinic-app|registry|^api$'
+<span class="out">0</span>
+docker system df                                   <span class="cm"># reclaim build cache too: docker builder prune</span></pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

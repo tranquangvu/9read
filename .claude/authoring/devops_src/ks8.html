@@ -707,6 +707,251 @@ partner-registry.example.com/sms-sidecar:0.9                           </span>
         installing when teams want daily feedback rather than a monthly report.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: Make booking-api scale under load, then hand it to KEDA</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        On a local <code class="inline">kind</code> cluster you will install metrics-server, put an HPA with a behaviour block
+        on <code class="inline">booking-api</code>, and drive it with the lab kit's <code class="inline">/admin/burn</code>
+        endpoint until it scales out. You check the HPA's arithmetic by hand, time the scale-down, then replace the HPA with
+        a KEDA ScaledObject that adds a clinic-hours floor. Everything runs on your laptop; the node layer (Karpenter) needs
+        real EC2 and is covered at the end.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">Watch booking-api go from 1 to 6 replicas under CPU load and back, and explain every number the HPA printed</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">2 hours</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Your laptop: <code class="inline">kind</code> with Kubernetes 1.33</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Free. Give Docker at least 4 CPUs and 6 GiB of memory</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">The lab toolchain (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>): Docker, <code class="inline">kind</code>, <code class="inline">kubectl</code>, Helm; the lab kit in <code class="inline">~/clinic-app/</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Create the cluster and load the image.</strong> kind nodes cannot see your laptop's Docker images, so
+        <code class="inline">kind load</code> copies the image into every node. The tag is not <code class="inline">latest</code>,
+        so Kubernetes uses the loaded copy instead of trying a registry.
+        <span class="code-label">~/labs/ks8/kind.yaml</span>
+        <pre class="code">kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: lab-ks8
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.33.1
+  - role: worker
+    image: kindest/node:v1.33.1
+  - role: worker
+    image: kindest/node:v1.33.1</pre>
+        <pre class="code">mkdir -p ~/labs/ks8 &amp;&amp; cd ~/labs/ks8      <span class="cm"># save kind.yaml here first</span>
+kind create cluster --config kind.yaml
+docker build -t booking-api:lab ~/clinic-app/booking-api
+kind load docker-image booking-api:lab --name lab-ks8
+kubectl create namespace booking &amp;&amp; kubectl config set-context --current --namespace=booking</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Install metrics-server.</strong> Without it every HPA shows <code class="inline">&lt;unknown&gt;</code>. kind's
+        kubelets use self-signed certificates, hence the insecure flag, which you never set on EKS (there it is an add-on).
+        <pre class="code">helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ &amp;&amp; helm repo update metrics-server
+helm upgrade --install metrics-server metrics-server/metrics-server -n kube-system --version 3.13.0 \
+  --set 'args={--kubelet-insecure-tls}' --wait
+kubectl top nodes                            <span class="cm"># may take 60 s to have data</span>
+<span class="out">NAME                    CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+lab-ks8-control-plane   142m         1%       702Mi           8%
+lab-ks8-worker          31m          0%       214Mi           2%
+lab-ks8-worker2         29m          0%       198Mi           2%</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Deploy booking-api with chaos endpoints, and a load generator switched off.</strong> The CPU request is
+        deliberately small (100m) so the arithmetic is easy. The load generator runs four parallel loops of
+        <code class="inline">/admin/burn?ms=500</code> from inside the cluster, so the Service spreads it across Pods.
+        <span class="code-label">~/labs/ks8/app.yaml</span>
+        <pre class="code">apiVersion: apps/v1
+kind: Deployment
+metadata: { name: booking-api }
+spec:
+  selector: { matchLabels: { app: booking-api } }
+  template:
+    metadata: { labels: { app: booking-api } }
+    spec:
+      containers:
+        - name: api
+          image: booking-api:lab
+          env: [{ name: CHAOS, value: "on" }, { name: APP_VERSION, value: ks8-lab }]
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /readyz, port: http } }
+          resources: { requests: { cpu: 100m, memory: 64Mi }, limits: { cpu: 500m, memory: 256Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: booking-api }
+spec: { selector: { app: booking-api }, ports: [{ port: 80, targetPort: http }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: load }
+spec:
+  replicas: 0                                         <span class="cm"># step 5 turns it on</span>
+  selector: { matchLabels: { app: load } }
+  template:
+    metadata: { labels: { app: load } }
+    spec:
+      containers:
+        - name: load
+          image: busybox:1.36
+          command: ["sh", "-c", "for i in 1 2 3 4; do (while true; do wget -q -O /dev/null http://booking-api/admin/burn?ms=500; done) &amp; done; wait"]</pre>
+        <pre class="code">kubectl apply -f app.yaml
+kubectl rollout status deploy/booking-api
+<span class="out">deployment "booking-api" successfully rolled out</span></pre>
+        Note that the Deployment has no <code class="inline">replicas:</code> field. Once an HPA owns the count, a value in the
+        manifest would reset it on every apply (Part I).
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Write the HPA.</strong> Target 50% of the request (50m per Pod), at most 6 replicas, and a 60-second
+        scale-down window so you do not wait five minutes in a lab.
+        <span class="code-label">~/labs/ks8/hpa.yaml</span>
+        <pre class="code">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: booking-api }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: booking-api }
+  minReplicas: 1
+  maxReplicas: 6                                      <span class="cm"># the ceiling is a cost decision</span>
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 50 } }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{ type: Pods, value: 2, periodSeconds: 15 }]   <span class="cm"># at most +2 Pods per 15 s</span>
+    scaleDown:
+      stabilizationWindowSeconds: 60                  <span class="cm"># prod: 300</span>
+      policies: [{ type: Pods, value: 1, periodSeconds: 15 }]</pre>
+        <pre class="code">kubectl apply -f hpa.yaml
+kubectl get hpa booking-api
+<span class="out">NAME          REFERENCE                TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+booking-api   Deployment/booking-api   cpu: 1%/50%   1         6         1          30s</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Turn on the load and watch it scale.</strong> Keep the watch running in a second terminal. Within about a
+        minute the first reading arrives, and replicas climb two at a time because of the scale-up policy.
+        <pre class="code">kubectl scale deploy/load --replicas=1
+kubectl get hpa booking-api -w
+<span class="out">booking-api   Deployment/booking-api   cpu: 1%/50%     1   6   1
+booking-api   Deployment/booking-api   cpu: 487%/50%   1   6   1
+booking-api   Deployment/booking-api   cpu: 487%/50%   1   6   3
+booking-api   Deployment/booking-api   cpu: 301%/50%   1   6   5
+booking-api   Deployment/booking-api   cpu: 268%/50%   1   6   6</span>
+kubectl describe hpa booking-api | grep SuccessfulRescale
+<span class="out">Normal  SuccessfulRescale  …  New size: 3; reason: cpu resource utilization (percentage of request) above target</span>
+kubectl top pods -l app=booking-api</pre>
+        Do the formula by hand for the second line: <code class="inline">ceil(1 × 487 / 50) = 10</code>. The HPA wanted 10,
+        the scale-up policy allowed +2 (so 3), and <code class="inline">maxReplicas</code> stops it at 6. A single Pod read
+        487% because it used close to its 500m limit against a 100m request. Your exact numbers depend on your laptop.
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Stop the load and time the scale-down.</strong> Note the time when you stop it. CPU falls within a minute,
+        but nothing is removed until the 60-second window has passed, and then one Pod goes every 15 seconds.
+        <pre class="code">kubectl scale deploy/load --replicas=0; date +%T
+kubectl get hpa booking-api -w
+<span class="out">booking-api   Deployment/booking-api   cpu: 2%/50%   1   6   6</span>      <span class="cm"># window still open</span>
+<span class="out">booking-api   Deployment/booking-api   cpu: 2%/50%   1   6   5</span>
+<span class="out">booking-api   Deployment/booking-api   cpu: 1%/50%   1   6   1</span>      <span class="cm"># about 3 minutes after the stop</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Replace the HPA with a KEDA ScaledObject.</strong> Delete the HPA first: KEDA creates its own, and two HPAs on
+        one Deployment fight. The cron trigger below keeps at least 3 replicas during the current hour in Vietnam time (a
+        stand-in for clinic opening hours), and the cpu trigger handles load above that floor.
+        <pre class="code">kubectl delete hpa booking-api
+helm repo add kedacore https://kedacore.github.io/charts &amp;&amp; helm repo update kedacore
+helm upgrade --install keda kedacore/keda -n keda --create-namespace --version 2.17.2 --wait
+H=$((10#$(TZ=Asia/Ho_Chi_Minh date +%H))); echo "start: 0 $H * * *   end: 0 $(( (H+1) % 24 )) * * *"</pre>
+        <span class="code-label">~/labs/ks8/scaledobject.yaml (put your two cron lines in)</span>
+        <pre class="code">apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: booking-api }
+spec:
+  scaleTargetRef: { name: booking-api }
+  minReplicaCount: 1
+  maxReplicaCount: 6
+  triggers:
+    - type: cron
+      metadata:
+        timezone: Asia/Ho_Chi_Minh
+        start: "0 14 * * *"                           <span class="cm"># replace with the line printed above</span>
+        end: "0 15 * * *"
+        desiredReplicas: "3"                          <span class="cm"># the opening-hours floor</span>
+    - type: cpu
+      metricType: Utilization
+      metadata: { value: "50" }</pre>
+        <pre class="code">kubectl apply -f scaledobject.yaml
+kubectl get scaledobject booking-api
+<span class="out">NAME          SCALETARGETKIND      SCALETARGETNAME   MIN   MAX   READY   ACTIVE   …
+booking-api   apps/v1.Deployment   booking-api       1     6     True    True     …</span>
+kubectl get hpa                                       <span class="cm"># KEDA's HPA, with both metrics</span>
+<span class="out">NAME                   REFERENCE                TARGETS                         MINPODS   MAXPODS   REPLICAS
+keda-hpa-booking-api   Deployment/booking-api   1/1 (avg), cpu: 2%/50%  …     1         6         3</span></pre>
+        Turn the load on again (<code class="inline">kubectl scale deploy/load --replicas=1</code>): replicas go above the
+        floor to 6, and back down to 3, not 1, when you stop it. On EKS the SQS trigger works the same way but needs a Pod
+        Identity role for the KEDA operator (Part II); <a href="./ks14.html" class="text-viol underline decoration-viol/40">KS14</a>
+        wires it up for <code class="inline">booking-worker</code>.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong> <code class="inline">kubectl top pods</code> works; you saw
+        the HPA go from 1 to 6 replicas and back to 1, and you can point at the line of the behaviour block responsible for
+        each pause; you calculated one desired replica count by hand and it matched (before the policy and ceiling were
+        applied); and <code class="inline">keda-hpa-booking-api</code> held 3 replicas with no load during your cron window.</div>
+
+      <div class="mt-4 callout callout-info"><strong>Optional on EKS: watch Karpenter buy a node.</strong> kind cannot add
+        nodes: if your Pods did not fit, they would simply stay <code class="inline">Pending</code>. On the KS5 sandbox
+        cluster with Karpenter installed (Part III), set the CPU request to 1 and <code class="inline">maxReplicaCount</code> to
+        10, start the load, and follow <code class="inline">kubectl get nodeclaims -w</code>. Expect one extra small Graviton
+        node for 10–20 minutes, about USD 0.01–0.03, then delete the ScaledObject and check that consolidation removes the
+        node. The full Karpenter setup is built in <a href="./ks14.html" class="text-viol underline decoration-viol/40">KS14</a>.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>Remove the requests.</strong> Someone "cleans up" the Deployment and drops the
+        <code class="inline">resources</code> block. Run the patch, turn the load on, and wait two minutes. Replicas stay at
+        the cron floor of 3 while every Pod burns CPU. <code class="inline">kubectl top pods</code> clearly shows the load,
+        so metrics-server is fine. Find out why the cpu trigger has stopped working before you open the answer.
+        <pre class="code">kubectl patch deploy booking-api --type json -p '[{"op":"remove","path":"/spec/template/spec/containers/0/resources"}]'
+kubectl scale deploy/load --replicas=1</pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">kubectl get hpa keda-hpa-booking-api
+<span class="out">… TARGETS: 1/1 (avg), cpu: &lt;unknown&gt;/50% …</span>
+kubectl describe hpa keda-hpa-booking-api | grep -m1 FailedGetResourceMetric
+<span class="out">Warning  FailedGetResourceMetric  …  failed to get cpu utilization: missing request for cpu in container "api" of Pod "booking-api-…"</span></pre>
+          <p class="mt-2">Utilization is usage divided by request. With no request there is nothing to divide by, so the cpu
+          metric is <code class="inline">&lt;unknown&gt;</code> and only the cron trigger counts. The Pods are also now
+          <code class="inline">BestEffort</code>, the first to be evicted under node pressure. Fix it by re-applying
+          <code class="inline">app.yaml</code> (which also sets the load generator back to 0, so scale it to 1 again); within
+          a minute the cpu target reads a number again and replicas climb. The
+          lesson: requests are the currency of the whole chain (Part I). Your chart should refuse to render without them
+          (<a href="./ks9.html" class="text-viol underline decoration-viol/40">KS9</a>), and a Kyverno rule can enforce it
+          (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>).</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> Deleting the cluster removes everything inside it. If you ran the optional EKS step, delete
+        the ScaledObject there and check <code class="inline">kubectl get nodeclaims</code> is back to where it started before
+        you leave.
+        <pre class="code">kind delete cluster --name lab-ks8
+<span class="out">Deleting cluster "lab-ks8" ...</span>
+kind get clusters
+<span class="out">No kind clusters found.</span>                   <span class="cm"># or only clusters from other labs you still use</span>
+docker image rm booking-api:lab                 <span class="cm"># optional: KS9–KS11 rebuild it anyway</span></pre>
+      </div></div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">

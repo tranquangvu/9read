@@ -620,6 +620,229 @@ age: 51234</span>
         CloudFront VPC origin so the ALB can be internal.
       </p>
 
+      <!-- ═══════════════ HANDS-ON LAB ═══════════════ -->
+      <h2 class="font-display text-2xl font-bold mt-14">Hands-on lab: A private bucket, a presigned link and CloudFront with OAC</h2>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        You will build two buckets the way Parts I–IV describe. The uploads bucket gets Block Public Access, versioning
+        and a lifecycle rule; you delete a file and get it back, then hand out a link that stops working after a minute.
+        The web bucket stays fully private and serves the lab-kit <code class="inline">booking-web</code> page to the
+        world through CloudFront with Origin Access Control. Then a copied bucket policy breaks the site and you find out
+        why. All of it is S3 and CloudFront CLI calls; the Terraform version is the module's evidence task.
+      </p>
+      <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
+        <table class="w-full text-sm bg-card dark:bg-carddark">
+          <tbody class="divide-y divide-line dark:divide-linedark align-top">
+            <tr><td class="px-4 py-3 font-semibold w-32">Goal</td><td class="px-4 py-3">A CloudFront URL serving <code class="inline">index.html</code> from a bucket that answers 403 to everyone else, plus a restored object and an expired presigned link as evidence</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Time</td><td class="px-4 py-3">60–90 minutes, about 15 of them waiting for CloudFront to deploy and to disable</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Where</td><td class="px-4 py-3">Sandbox account <code class="inline">gol-sandbox</code>, buckets in <code class="inline">ap-southeast-1</code> (CloudFront is global)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cost</td><td class="px-4 py-3">Under one US cent per hour. A few KB in S3 and a few hundred requests; CloudFront has no hourly charge and its free tier covers this lab</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">You need</td><td class="px-4 py-3">AWS CLI v2, <code class="inline">jq</code>, <code class="inline">curl</code>, the lab kit in <code class="inline">~/clinic-app/</code> (<a href="../index.html#lab-setup" class="text-viol underline decoration-viol/40">lab setup</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 class="font-semibold text-lg mt-7">Steps</h3>
+      <div class="step"><div class="step-n">1</div><div class="step-body">
+        <strong>Set up your shell.</strong> Bucket names are global across every AWS customer, so the account ID goes in
+        the name.
+        <pre class="code">export ME=yourhandle AWS_PROFILE=gol-sandbox AWS_REGION=ap-southeast-1
+aws sso login --sso-session gol
+export ACCOUNT=$(aws sts get-caller-identity --query Account --output text); echo $ACCOUNT
+<span class="out">888899990000</span>
+export UP=lab-$ME-aw4-uploads-$ACCOUNT WEB=lab-$ME-aw4-web-$ACCOUNT
+mkdir -p ~/labs/aw4 &amp;&amp; cd ~/labs/aw4</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">2</div><div class="step-body">
+        <strong>Create the uploads bucket with the four settings that always go together.</strong> Block Public Access
+        (on by default for new buckets, set explicitly anyway), tags, versioning, and a lifecycle rule so old versions
+        do not pile up for ever.
+        <span class="code-label">~/labs/aw4/lifecycle.json</span>
+        <pre class="code">{
+  "Rules": [{
+    "ID": "uploads-tiering",
+    "Status": "Enabled",
+    "Filter": { "Prefix": "uploads/" },
+    "Transitions": [{ "Days": 30, "StorageClass": "STANDARD_IA" }],
+    "NoncurrentVersionExpiration": { "NoncurrentDays": 7 },        <span class="cm"># lab: 7 days; prod: 30</span>
+    "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+  }]
+}</pre>
+        <pre class="code">bucket() {
+  aws s3api create-bucket --bucket $1 --create-bucket-configuration LocationConstraint=$AWS_REGION &gt;/dev/null
+  aws s3api put-public-access-block --bucket $1 --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  aws s3api put-bucket-tagging --bucket $1 --tagging "TagSet=[{Key=Owner,Value=$ME},{Key=Lab,Value=AW4}]"
+}
+bucket $UP
+aws s3api put-bucket-versioning --bucket $UP --versioning-configuration Status=Enabled
+aws s3api put-bucket-lifecycle-configuration --bucket $UP --lifecycle-configuration file://lifecycle.json
+aws s3api get-bucket-lifecycle-configuration --bucket $UP --query 'Rules[].[ID,Status]' --output text
+<span class="out">uploads-tiering   Enabled</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">3</div><div class="step-body">
+        <strong>Delete a file and get it back.</strong> With versioning on, a delete only adds a <em>delete marker</em> on
+        top of the versions. Removing the marker is the restore.
+        <pre class="code">echo "referral v1" &gt; ref-1.txt &amp;&amp; aws s3 cp ref-1.txt s3://$UP/uploads/ref-1.txt
+echo "referral v2" &gt; ref-1.txt &amp;&amp; aws s3 cp ref-1.txt s3://$UP/uploads/ref-1.txt
+aws s3 rm s3://$UP/uploads/ref-1.txt
+aws s3 ls s3://$UP/uploads/                          <span class="cm"># prints nothing: looks gone</span>
+aws s3api list-object-versions --bucket $UP --prefix uploads/ref-1.txt \
+  --query 'DeleteMarkers[].[VersionId,IsLatest]' --output text
+<span class="out">Xk2bLq9wP0dR7sVnT4yZcA1eHf3uJm8o   True</span>
+aws s3api list-object-versions --bucket $UP --prefix uploads/ref-1.txt \
+  --query 'Versions[].[VersionId,Size]' --output text
+<span class="out">Lp4GvW8nQ2sX6tYb0cE3rU7iKo1aZh5j   12
+Bd9mR1kF5yH3wN7qJ2xT6vC0sP8gL4eA   12</span>
+MARKER=$(aws s3api list-object-versions --bucket $UP --prefix uploads/ref-1.txt \
+  --query 'DeleteMarkers[0].VersionId' --output text)
+aws s3api delete-object --bucket $UP --key uploads/ref-1.txt --version-id $MARKER &gt;/dev/null
+aws s3 cp s3://$UP/uploads/ref-1.txt -
+<span class="out">referral v2</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">4</div><div class="step-body">
+        <strong>Share it with a link that expires.</strong> The object is private, so a plain URL fails. A presigned URL
+        carries your signature and an expiry time; it works for anyone holding it, until it does not.
+        <pre class="code">curl -s -o /dev/null -w '%{http_code}\n' https://$UP.s3.$AWS_REGION.amazonaws.com/uploads/ref-1.txt
+<span class="out">403</span>
+LINK=$(aws s3 presign s3://$UP/uploads/ref-1.txt --expires-in 60)
+curl -s "$LINK"
+<span class="out">referral v2</span>
+sleep 65; curl -s "$LINK" | grep -o '&lt;Message&gt;[^&lt;]*'
+<span class="out">&lt;Message&gt;Request has expired</span></pre>
+        <code class="inline">aws s3 presign</code> only makes download (GET) links. Upload links, with a server-chosen key
+        and a size limit, are made by booking-api with the SDK as in Part II.
+      </div></div>
+
+      <div class="step"><div class="step-n">5</div><div class="step-body">
+        <strong>Create the web bucket and upload the site.</strong> The HTML gets <code class="inline">no-cache</code> so
+        a deploy shows up at once; a hashed asset gets a one-year, immutable cache, because a new version is a new file
+        name.
+        <pre class="code">bucket $WEB
+aws s3 cp ~/clinic-app/booking-web/index.html s3://$WEB/index.html \
+  --content-type text/html --cache-control "no-cache"
+echo 'console.log("clinic v1")' &gt; app.4f1a9c2e.js
+aws s3 cp app.4f1a9c2e.js s3://$WEB/assets/app.4f1a9c2e.js \
+  --content-type application/javascript --cache-control "public, max-age=31536000, immutable"</pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">6</div><div class="step-body">
+        <strong>Create the OAC and the distribution.</strong> The cache policy ID is AWS's managed
+        <code class="inline">CachingOptimized</code>, which honours the <code class="inline">Cache-Control</code> headers you
+        just set. <code class="inline">PriceClass_200</code> includes the Asia edges our patients use.
+        <pre class="code">OAC=$(aws cloudfront create-origin-access-control --origin-access-control-config \
+  Name=lab-$ME-aw4,SigningProtocol=sigv4,SigningBehavior=always,OriginAccessControlOriginType=s3 \
+  --query OriginAccessControl.Id --output text)
+jq -n --arg b $WEB --arg oac $OAC --arg me $ME --arg r $AWS_REGION '{
+  DistributionConfig: {
+    CallerReference: "lab-\($me)-aw4", Comment: "lab-\($me)-aw4", Enabled: true,
+    DefaultRootObject: "index.html", PriceClass: "PriceClass_200",
+    Origins: { Quantity: 1, Items: [{ Id: "web", DomainName: "\($b).s3.\($r).amazonaws.com",
+      OriginAccessControlId: $oac, S3OriginConfig: { OriginAccessIdentity: "" } }] },
+    DefaultCacheBehavior: { TargetOriginId: "web", ViewerProtocolPolicy: "redirect-to-https",
+      CachePolicyId: "658327ea-f89d-4fab-a63d-7e88639e58f6", Compress: true }
+  },
+  Tags: { Items: [{ Key: "Owner", Value: $me }, { Key: "Lab", Value: "AW4" }] }
+}' &gt; dist.json
+read DIST CF &lt;&lt;&lt; $(aws cloudfront create-distribution-with-tags --distribution-config-with-tags file://dist.json \
+  --query 'Distribution.[Id,DomainName]' --output text)
+echo $DIST $CF
+<span class="out">E3LABX7Q2W9ZRT d1a2b3c4d5e6f7.cloudfront.net</span></pre>
+      </div></div>
+
+      <div class="step"><div class="step-n">7</div><div class="step-body">
+        <strong>Let only this distribution read the bucket, then verify from both sides.</strong> Until the bucket
+        policy exists, CloudFront gets 403 like everyone else.
+        <pre class="code">cat &gt; web-policy.json &lt;&lt;EOF
+{ "Version": "2012-10-17", "Statement": [{
+  "Sid": "AllowCloudFrontOAC", "Effect": "Allow",
+  "Principal": { "Service": "cloudfront.amazonaws.com" },
+  "Action": "s3:GetObject", "Resource": "arn:aws:s3:::$WEB/*",
+  "Condition": { "StringEquals": { "AWS:SourceArn": "arn:aws:cloudfront::$ACCOUNT:distribution/$DIST" } } }] }
+EOF
+aws s3api put-bucket-policy --bucket $WEB --policy file://web-policy.json
+aws cloudfront wait distribution-deployed --id $DIST        <span class="cm"># 3–10 minutes</span>
+curl -s -o /dev/null -w 'direct S3: %{http_code}\n' https://$WEB.s3.$AWS_REGION.amazonaws.com/index.html
+<span class="out">direct S3: 403</span>
+curl -s https://$CF/ | grep -o '&lt;h1&gt;[^&lt;]*'
+<span class="out">&lt;h1&gt;Clinic booking</span>
+for i in 1 2 3; do curl -sI https://$CF/assets/app.4f1a9c2e.js | grep -i '^x-cache'; done
+<span class="out">x-cache: Miss from cloudfront
+x-cache: Hit from cloudfront
+x-cache: Hit from cloudfront</span></pre>
+        Notice that Block Public Access accepted this policy: a service principal limited to one
+        <code class="inline">SourceArn</code> does not count as public access.
+      </div></div>
+
+      <div class="mt-5 callout callout-tip"><strong>Done when:</strong>
+        <code class="inline">aws s3 cp s3://$UP/uploads/ref-1.txt -</code> prints <code class="inline">referral v2</code>
+        after you deleted it; your presigned link worked and then returned <code class="inline">Request has expired</code>;
+        a direct S3 URL to the web bucket returns <code class="inline">403</code> while <code class="inline">https://$CF/</code>
+        shows "Clinic booking"; and the hashed asset reports <code class="inline">Hit from cloudfront</code> on repeat.</div>
+
+      <h3 class="font-semibold text-lg mt-8">Break it, then fix it</h3>
+      <div class="step"><div class="step-n">8</div><div class="step-body">
+        <strong>A copied bucket policy.</strong> Someone "standardises" the bucket policy by pasting the one from Part IV.
+        Afterwards the home page returns 403, yet the JavaScript file still loads. Work out why both of those are true
+        before you open the answer.
+        <pre class="code">sed "s|distribution/$DIST|distribution/E2QWRUHAPOMQZL|" web-policy.json &gt; copied.json
+aws s3api put-bucket-policy --bucket $WEB --policy file://copied.json
+curl -s -o /dev/null -w '%{http_code}\n' https://$CF/
+<span class="out">403</span>
+curl -s -o /dev/null -w '%{http_code}\n' https://$CF/assets/app.4f1a9c2e.js
+<span class="out">200</span></pre>
+        <details class="mt-3 rounded-xl border border-line dark:border-linedark bg-sand dark:bg-sanddark p-4">
+          <summary class="cursor-pointer font-semibold">Answer</summary>
+          <pre class="code mt-3">aws s3api get-bucket-policy --bucket $WEB --query Policy --output text \
+  | jq -r '.Statement[0].Condition.StringEquals["AWS:SourceArn"]'
+<span class="out">arn:aws:cloudfront::888899990000:distribution/E2QWRUHAPOMQZL</span>   <span class="cm"># not $DIST</span>
+curl -sI https://$CF/ | grep -iE '^(HTTP|x-cache)'
+<span class="out">HTTP/2 403
+x-cache: Error from cloudfront</span>
+aws s3api put-bucket-policy --bucket $WEB --policy file://web-policy.json
+sleep 15; curl -s -o /dev/null -w '%{http_code}\n' https://$CF/    <span class="cm"># CloudFront caches errors for 10 s</span>
+<span class="out">200</span></pre>
+          <p class="mt-2">The condition names a different distribution, so S3 refuses your distribution's signed requests
+          with <code class="inline">AccessDenied</code>, and CloudFront passes that on as a 403. The HTML is
+          <code class="inline">no-cache</code>, so every request goes back to the origin and fails at once. The asset is
+          cached at the edge for a year, so it keeps being served without asking S3 at all. That is how a broken origin
+          hides behind a CDN: some pages work, some do not, and the pattern follows the cache headers. When CloudFront
+          returns 403 for an S3 origin, check the OAC <code class="inline">SourceArn</code> before anything else.</p>
+        </details>
+      </div></div>
+
+      <div class="step"><div class="step-n">9</div><div class="step-body">
+        <strong>Clean up.</strong> A distribution must be disabled, and the change deployed, before it can be deleted. A
+        versioned bucket must have every version and delete marker removed before it can be deleted.
+        <pre class="code">aws cloudfront get-distribution-config --id $DIST --query DistributionConfig \
+  | jq '.Enabled = false' &gt; disabled.json
+aws cloudfront update-distribution --id $DIST --distribution-config file://disabled.json \
+  --if-match $(aws cloudfront get-distribution-config --id $DIST --query ETag --output text) &gt;/dev/null
+aws cloudfront wait distribution-deployed --id $DIST        <span class="cm"># another 3–10 minutes</span>
+aws cloudfront delete-distribution --id $DIST \
+  --if-match $(aws cloudfront get-distribution --id $DIST --query ETag --output text)
+aws cloudfront delete-origin-access-control --id $OAC \
+  --if-match $(aws cloudfront get-origin-access-control --id $OAC --query ETag --output text)
+for b in $UP $WEB; do
+  aws s3api list-object-versions --bucket $b \
+    | jq '{Objects: [(.Versions // [])[], (.DeleteMarkers // [])[] | {Key, VersionId}]}' &gt; del.json
+  aws s3api delete-objects --bucket $b --delete file://del.json &gt;/dev/null
+  aws s3api delete-bucket --bucket $b
+done
+aws s3api list-buckets --query "Buckets[?contains(Name,'lab-$ME-aw4')].Name"
+<span class="out">[]</span>
+aws cloudfront list-distributions --query "DistributionList.Items[?Comment=='lab-$ME-aw4'].Id"
+<span class="out">[]</span></pre>
+        If <code class="inline">delete-distribution</code> says <code class="inline">DistributionNotDisabled</code>, the
+        waiter returned before the change reached every edge: wait a minute and rerun it.
+      </div></div>
+      <div class="mt-4 callout callout-warn"><strong>Cheap is not the same as harmless.</strong> This lab costs well under a
+        cent an hour, but a forgotten distribution is a public endpoint in front of your bucket, and versioned objects keep
+        billing for storage until the lifecycle rule or you remove them. If you add a large file to test, every version of
+        it counts. Run the clean-up the same day.</div>
+
       <!-- ═══════════════ claude code ═══════════════ -->
       <h2 class="font-display text-2xl font-bold mt-14">Working with Claude Code</h2>
       <p class="mt-4 text-[15px] leading-relaxed">
