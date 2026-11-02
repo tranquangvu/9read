@@ -64,11 +64,11 @@ tailwind.config = {
         </div>
         <h1 class="font-display text-2xl md:text-3xl font-bold mt-4 tracking-tight">SLIs, SLOs, Error Budgets &amp; Alerting</h1>
         <p class="mt-3 text-[15px] md:text-base text-mute dark:text-mutedark leading-relaxed">
-          You can already collect metrics in CloudWatch, Prometheus and Datadog. This module decides which of those numbers
+          You can already collect metrics in CloudWatch and Prometheus (AMP). This module decides which of those numbers
           matter to a patient trying to book an appointment, how reliable they need to be, and when a human should be woken
           up. You will pick SLIs for each clinic booking service, do the SLO and error-budget maths with real traffic
           numbers, write an error budget policy the product owner signs, and replace threshold alerts with multi-window
-          burn-rate alerts in PromQL, Datadog and CloudWatch.
+          burn-rate alerts in PromQL and CloudWatch, with the SLO itself tracked in CloudWatch Application Signals.
         </p>
         <div class="mt-6 callout callout-why">
           <strong>Why it matters in production:</strong> most teams have two failure modes at once. They page on CPU at 80%
@@ -210,7 +210,7 @@ python3 -c "print(0.9999 * 0.9999 * 0.9999 * 0.9995)"
           <text x="12" y="22" font-size="11" font-weight="700" fill="#6E6B64">WHERE TO MEASURE · closer to the user sees more failures</text>
           <g class="anim-pulse"><rect x="15" y="60" width="130" height="56" rx="9" fill="#DB2777"/>
             <text x="80" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Patient browser</text>
-            <text x="80" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">RUM · Datadog</text></g>
+            <text x="80" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">CloudWatch RUM</text></g>
           <g class="anim-pulse d1"><rect x="200" y="60" width="130" height="56" rx="9" fill="#2563EB"/>
             <text x="265" y="83" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ALB</text>
             <text x="265" y="99" text-anchor="middle" fill="#ffffffbb" font-size="9">RequestCount · 5XX</text></g>
@@ -424,37 +424,55 @@ time_to_empty  = window / burn_rate
         </svg>
       </div>
 
-      <h3 class="font-semibold text-lg mt-8">SLOs as code in Datadog and CloudWatch</h3>
+      <h3 class="font-semibold text-lg mt-8">SLOs as code in Application Signals</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Prometheus rules are one implementation. Datadog has first-class SLO objects with built-in budget and burn-rate
-        widgets (<a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>), and CloudWatch Application
-        Signals offers SLOs on its service metrics. Whichever you use, define it in Terraform in
-        <code class="inline">clinic-infra</code>, never by clicking, so the target in the tool always matches the signed
-        sheet.
+        Prometheus rules are one implementation. CloudWatch Application Signals has first-class SLO objects with a built-in
+        attainment, error budget and burn-rate view next to the service map and traces
+        (<a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>). Whichever you use, define it in
+        Terraform in <code class="inline">clinic-infra</code>, never by clicking, so the target in the tool always matches
+        the signed sheet. The <code class="inline">aws</code> provider has no resource for these SLOs yet, so use the
+        <code class="inline">awscc</code> provider, which is generated from CloudFormation's
+        <code class="inline">AWS::ApplicationSignals::ServiceLevelObjective</code>.
       </p>
       <div class="mt-4">
-        <span class="code-label">clinic-infra/slo/datadog.tf</span>
-        <pre class="code">resource <span class="st">"datadog_service_level_objective"</span> <span class="st">"booking_api_availability"</span> {
-  name        = <span class="st">"booking-api availability"</span>
-  type        = <span class="st">"metric"</span>
+        <span class="code-label">clinic-infra/slo/application-signals.tf</span>
+        <pre class="code">locals {   <span class="cm"># one ALB metric query per id; only the expressions return data</span>
+  alb = { for id, name in { req = <span class="st">"RequestCount"</span>, t5 = <span class="st">"HTTPCode_Target_5XX_Count"</span>, e5 = <span class="st">"HTTPCode_ELB_5XX_Count"</span> } :
+    id =&gt; { id = id, return_data = id == <span class="st">"req"</span>, metric_stat = { period = <span class="st">60</span>, stat = <span class="st">"Sum"</span>, metric = {
+      namespace = <span class="st">"AWS/ApplicationELB"</span>, metric_name = name,
+      dimensions = [{ name = <span class="st">"LoadBalancer"</span>, value = aws_lb.api.arn_suffix }] } } }
+}
+resource <span class="st">"awscc_applicationsignals_service_level_objective"</span> <span class="st">"booking_api_availability"</span> {
+  name        = <span class="st">"booking-api-availability"</span>
   description = <span class="st">"Non-5xx share of ALB requests to booking-api. Sheet: slo/README.md"</span>
-  query {
-    numerator   = <span class="st">"sum:aws.applicationelb.request_count{env:prod,service:booking-api}.as_count() - sum:aws.applicationelb.httpcode_target_5xx{env:prod,service:booking-api}.as_count() - sum:aws.applicationelb.httpcode_elb_5xx{env:prod,service:booking-api}.as_count()"</span>
-    denominator = <span class="st">"sum:aws.applicationelb.request_count{env:prod,service:booking-api}.as_count()"</span>
+  request_based_sli = {   <span class="cm"># request-based: good requests / all requests, not good minutes</span>
+    request_based_sli_metric = {
+      total_request_count_metric = [local.alb.req]
+      monitored_request_count_metric = {
+        bad_count_metric = [local.alb.t5, local.alb.e5,
+          { id = <span class="st">"bad"</span>, expression = <span class="st">"FILL(t5,0) + FILL(e5,0)"</span>, return_data = true }]
+      }
+    }
   }
-  thresholds {
-    timeframe = <span class="st">"30d"</span>
-    target    = <span class="st">99.9</span>
-    warning   = <span class="st">99.95</span>     <span class="cm"># dashboard turns yellow before the budget is gone</span>
+  goal = {
+    attainment_goal   = <span class="st">99.9</span>
+    warning_threshold = <span class="st">50</span>     <span class="cm"># SLO turns "warning" when half the budget is gone</span>
+    interval = { rolling_interval = { duration = <span class="st">30</span>, duration_unit = <span class="st">"DAY"</span> } }
   }
-  tags = [<span class="st">"service:booking-api"</span>, <span class="st">"env:prod"</span>, <span class="st">"team:clinic"</span>]
+  burn_rate_configurations = [for m in [<span class="st">5</span>, <span class="st">30</span>, <span class="st">60</span>, <span class="st">360</span>] : { look_back_window_minutes = m }]
+  tags = [{ key = <span class="st">"Service"</span>, value = <span class="st">"booking-api"</span> }, { key = <span class="st">"Team"</span>, value = <span class="st">"clinic"</span> }]
 }</pre>
       </div>
       <p class="mt-3 text-[15px] leading-relaxed">
-        The ALB-level SLI counts <code class="inline">httpcode_elb_5xx</code> too: those are the 502s and 503s the load
-        balancer itself returns when no target is healthy, which is exactly the failure an app metric cannot see. The
-        <code class="inline">service</code> tag on ALB metrics comes from the AWS resource tags imported by the Datadog AWS
-        integration, so tag the target group and load balancer in Terraform. <a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>
+        The ALB-level SLI counts <code class="inline">HTTPCode_ELB_5XX_Count</code> too: those are the 502s and 503s the
+        load balancer itself returns when no target is healthy, which is exactly the failure an app metric cannot see.
+        That is why this SLO is built from ALB metrics rather than the Application Signals
+        <code class="inline">AVAILABILITY</code> metric (set with <code class="inline">key_attributes</code> and
+        <code class="inline">metric_type</code>), which is measured inside the service from its spans. Use the
+        Application Signals metric for per-operation latency SLOs, where the route matters. The
+        <code class="inline">FILL</code> calls matter because the ALB publishes no 5XX datapoint in a minute with no
+        errors. <code class="inline">burn_rate_configurations</code> makes Application Signals publish one burn-rate
+        series per look-back window, which shows on the SLO page. <a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>
         shows the same object with an illustrative 99.5% target; the clinic's signed booking-api target is 99.9%.
       </p>
 
@@ -580,32 +598,19 @@ tests:
         or cover the quiet hours with a synthetic check that books a test slot every minute and gives the SLI a steady
         denominator.</div>
 
-      <h3 class="font-semibold text-lg mt-8">The same alerts in Datadog and CloudWatch</h3>
+      <h3 class="font-semibold text-lg mt-8">The same alerts in CloudWatch</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
-        Datadog has burn-rate monitors built into its SLO objects: you give it the SLO, the long and short windows and the
-        threshold. CloudWatch has no burn-rate primitive, so you build it from two metric-math alarms and a composite alarm
-        (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>). Where the SLO alert lives follows
-        our signal routing: app metrics go to CloudWatch for ECS services and to Prometheus (AMP) for EKS services, and
-        to Datadog when the client pays for it (our Datadog site is <code class="inline">ap1.datadoghq.com</code>).
-        AWS-resource alarms stay in CloudWatch regardless. Pick one place to page from per service. Paging from both is
-        how one outage wakes two people with two different alerts.
+        Where the SLO alert lives follows our signal routing: app metrics go to CloudWatch for ECS services and to
+        Prometheus (AMP) for EKS services, where the rules above run as AMP alert rules. AWS-resource alarms stay in
+        CloudWatch regardless. A CloudWatch alarm watches one series, so the "long window AND short window" rule is two
+        metric-math alarms and a composite alarm (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>).
+        The Application Signals console can also create alarms on the SLO's burn-rate series, and AWS recommends the same
+        long/short pairing with a composite alarm. We keep the metric-math version in Terraform because every threshold
+        is visible in review and the alarm does not depend on how the SLO object is configured. Pick one place to page
+        from per service: paging from both CloudWatch and AMP is how one outage wakes two people with two different
+        alerts. Both end at the same SNS topic, which Amazon Q Developer in chat applications posts to Slack
+        (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>).
       </p>
-      <div class="mt-4">
-        <span class="code-label">clinic-infra/slo/datadog.tf — burn-rate monitor</span>
-        <pre class="code">resource <span class="st">"datadog_monitor"</span> <span class="st">"booking_api_burn_fast"</span> {
-  name    = <span class="st">"[clinic] booking-api burning error budget fast"</span>
-  type    = <span class="st">"slo alert"</span>
-  query   = <span class="st">"burn_rate(\"${datadog_service_level_objective.booking_api_availability.id}\").over(\"30d\").long_window(\"1h\").short_window(\"5m\") &gt; 14.4"</span>
-  message = &lt;&lt;-EOT
-    booking-api is spending its 30-day budget 14.4x faster than allowed.
-    Runbook: https://github.com/golden-owl/clinic-infra/blob/main/runbooks/booking-api-5xx.md
-    @pagerduty-clinic-prod
-  EOT
-  monitor_thresholds { critical = <span class="st">14.4</span> }
-  tags = [<span class="st">"service:booking-api"</span>, <span class="st">"env:prod"</span>, <span class="st">"severity:page"</span>]
-}
-<span class="cm"># slow-burn monitor: long_window("6h").short_window("30m") &gt; 6, same message</span></pre>
-      </div>
       <div class="mt-4">
         <span class="code-label">clinic-infra/slo/cloudwatch.tf — burn rate from ALB metrics</span>
         <pre class="code">locals { burn_fast = { long = 3600, short = 300 } }   <span class="cm"># 1 h and 5 min periods</span>
@@ -675,7 +680,7 @@ resource <span class="st">"aws_cloudwatch_composite_alarm"</span> <span class="s
         <li><strong>Urgent:</strong> waiting until 9 a.m. would hurt users or the budget measurably.</li>
         <li><strong>Actionable:</strong> the responder can do something now, and the runbook says what (<a href="./sr2.html" class="text-viol underline decoration-viol/40">SR2</a> owns runbooks).</li>
         <li><strong>Unique:</strong> no other alert fires for the same failure. Group by service, not by pod.</li>
-        <li><strong>Owned:</strong> it routes to one team's rotation through Alertmanager or the Datadog handle (<a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>).</li>
+        <li><strong>Owned:</strong> it routes to one team's rotation through Alertmanager or the SNS topic its CloudWatch alarm notifies (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>, <a href="./ob2.html" class="text-viol underline decoration-viol/40">OB2</a>).</li>
         <li><strong>Linked:</strong> the notification carries the runbook URL and the SLO dashboard.</li>
       </ul>
       <div class="mt-4 callout callout-tip"><strong>Set a page budget, too:</strong> no more than two paging incidents per
@@ -995,7 +1000,7 @@ formula for each number so I can check it.</pre>
           <ul class="mt-2 space-y-1.5 list-disc pl-4 leading-relaxed">
             <li>Generate recording and alert rules for every window from one SLO definition</li>
             <li>Write <code class="inline">promtool</code> tests with synthetic outages and near-misses</li>
-            <li>Translate the same SLO into Datadog and CloudWatch Terraform</li>
+            <li>Translate the same SLO into an Application Signals SLO and CloudWatch alarms in Terraform</li>
             <li>Audit an existing alarm list against the five page checks</li>
           </ul>
         </div>
@@ -1021,7 +1026,7 @@ formula for each number so I can check it.</pre>
       <div class="mt-4 rounded-2xl border border-line dark:border-linedark bg-card dark:bg-carddark divide-y divide-line dark:divide-linedark text-sm">
         <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-0">0</span><div><strong>No exposure.</strong> Alerts on whatever metric looked interesting; has not heard of an error budget.</div></div>
         <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-1">1</span><div><strong>Awareness.</strong> Can define SLI, SLO and SLA and quote 43.2 minutes for 99.9%, but cannot choose an SLI for a worker or explain burn rate.</div></div>
-        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Writes recording rules and a Datadog SLO from a provided sheet. Still reaches for threshold alerts and needs review on SLI exclusions.</div></div>
+        <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-2">2</span><div><strong>Works with support.</strong> Writes recording rules and an Application Signals SLO from a provided sheet. Still reaches for threshold alerts and needs review on SLI exclusions.</div></div>
         <div class="ladder-row target px-5 py-4 flex gap-4 items-start"><span class="score-chip score-3">3</span><div><strong>Works independently (target).</strong> Chooses SLIs and measurement points for a new service, does the budget maths unaided, ships multi-window burn-rate alerts with unit tests, and deletes cause-based pages with a written reason for each.</div></div>
         <div class="ladder-row px-5 py-4 flex gap-4 items-start"><span class="score-chip score-4">4</span><div><strong>Leads &amp; coaches.</strong> Negotiates targets and the error budget policy with a client's product owner, runs the weekly budget review, and uses budget data to justify reliability work in planning.</div></div>
       </div>
@@ -1043,7 +1048,7 @@ formula for each number so I can check it.</pre>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
           <div class="font-semibold text-rose-500">✗ An SLO nobody acts on</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">A Datadog SLO widget with no signed policy is decoration. If an exhausted budget does not change what ships next week, you have a metric, not an SLO.</p>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">An Application Signals SLO or a Grafana budget panel with no signed policy is decoration. If an exhausted budget does not change what ships next week, you have a metric, not an SLO.</p>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
           <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Start with one SLO per service</div>
@@ -1051,7 +1056,7 @@ formula for each number so I can check it.</pre>
         </div>
         <div class="rounded-xl border border-line dark:border-linedark bg-card dark:bg-carddark p-5">
           <div class="font-semibold text-emerald-600 dark:text-emerald-400">✓ Annotate deploys on the budget graph</div>
-          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Push a Grafana or Datadog event from the deploy job (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>). When the budget drops, the first question is "what changed?", and the answer should be on the chart.</p>
+          <p class="mt-1.5 leading-relaxed text-mute dark:text-mutedark">Push a Grafana annotation from the deploy job to Amazon Managed Grafana (<a href="./ci2.html" class="text-viol underline decoration-viol/40">CI2</a>). When the budget drops, the first question is "what changed?", and the answer should be on the chart.</p>
         </div>
       </div>
 
@@ -1061,8 +1066,8 @@ formula for each number so I can check it.</pre>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="vocab"> <span>I can explain SLI, SLO, error budget and SLA, and why the SLO must be stricter than any SLA.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="sli-choice"> <span>I chose SLIs and measurement points for an API, a worker and a frontend, with written exclusions.</span></label>
         <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="budget-maths"> <span>I can compute budget minutes, budget requests, burn rate and time-to-empty for any SLO and traffic level.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="burn-alerts"> <span>I wrote multi-window burn-rate alerts in PromQL and Datadog (or CloudWatch) and proved them with unit tests.</span></label>
-        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="slo-pr"> <span class="font-semibold">Opened a PR to clinic-infra (or a sandbox copy) with an SLO sheet and signed-off error budget policy for booking-api, recording rules, burn-rate alerts with passing promtool tests, a Datadog SLO in Terraform, and a Grafana screenshot of the budget panel during a simulated outage (mentor evidence ✓).</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="burn-alerts"> <span>I wrote multi-window burn-rate alerts in PromQL and CloudWatch (metric-math plus a composite alarm) and proved them with unit tests.</span></label>
+        <label class="flex gap-3 items-start"><input type="checkbox" class="evidence-box mt-0.5" data-key="slo-pr"> <span class="font-semibold">Opened a PR to clinic-infra (or a sandbox copy) with an SLO sheet and signed-off error budget policy for booking-api, recording rules, burn-rate alerts with passing promtool tests, an Application Signals SLO in Terraform, and a Grafana screenshot of the budget panel during a simulated outage (mentor evidence ✓).</span></label>
       </div>
 
       <h2 class="font-display text-2xl font-bold mt-14">Resources</h2>
@@ -1071,8 +1076,8 @@ formula for each number so I can check it.</pre>
         <li><a class="text-coral underline" href="https://sre.google/workbook/implementing-slos/" target="_blank" rel="noopener">Google SRE Workbook — Implementing SLOs</a> — SLI menus, worked examples and the error budget policy template behind Part III.</li>
         <li><a class="text-coral underline" href="https://sre.google/workbook/alerting-on-slos/" target="_blank" rel="noopener">Google SRE Workbook — Alerting on SLOs</a> — the derivation of the 14.4 / 6 / 3 / 1 burn-rate table in Part IV.</li>
         <li><a class="text-coral underline" href="https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/" target="_blank" rel="noopener">Prometheus — Unit testing for rules</a> — the <code class="inline">promtool test rules</code> format.</li>
-        <li><a class="text-coral underline" href="https://docs.datadoghq.com/service_management/service_level_objectives/burn_rate/" target="_blank" rel="noopener">Datadog — Burn rate alerts</a> — SLO monitors with long and short windows.</li>
-        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-ServiceLevelObjectives.html" target="_blank" rel="noopener">AWS — CloudWatch Application Signals SLOs</a> — the managed SLO option when the service already reports to Application Signals.</li>
+        <li><a class="text-coral underline" href="https://registry.terraform.io/providers/hashicorp/awscc/latest/docs/resources/applicationsignals_service_level_objective" target="_blank" rel="noopener">Terraform — awscc_applicationsignals_service_level_objective</a> — the full schema for the SLO resource in Part III.</li>
+        <li><a class="text-coral underline" href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-ServiceLevelObjectives.html" target="_blank" rel="noopener">AWS — CloudWatch Application Signals SLOs</a> — request-based SLOs, burn-rate look-back windows and the long/short composite alarm pattern.</li>
       </ul>
 
       <nav id="page-nav" class="mt-14 flex gap-4"></nav>

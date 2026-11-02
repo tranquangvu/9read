@@ -188,9 +188,9 @@ flowchart LR
             <tr><td class="px-4 py-3 font-semibold">Health data is <em>sensitive</em> personal data</td><td class="px-4 py-3">Booking reasons, referral letters and medical notes need stricter handling than names and phone numbers</td><td class="px-4 py-3">Classify and tag the stores that hold it; encryption, access logging, least privilege</td></tr>
             <tr><td class="px-4 py-3 font-semibold">Consent and purpose limitation</td><td class="px-4 py-3">Patients consent to specific purposes; data is not reused for others</td><td class="px-4 py-3">Store consent records durably; don't copy prod data to dev (use synthetic data)</td></tr>
             <tr><td class="px-4 py-3 font-semibold">Processing impact assessment</td><td class="px-4 py-3">The controller prepares and files a dossier with the Ministry of Public Security's cybersecurity department (A05)</td><td class="px-4 py-3">Supply the architecture, data flows, storage locations and security measures</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Cross-border transfer assessment</td><td class="px-4 py-3">Our data lives in <code class="inline">ap-southeast-1</code> (Singapore), so Vietnamese patients' data leaves Vietnam</td><td class="px-4 py-3">Keep an accurate list of regions and sub-processors (AWS, Datadog, the SMS provider)</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Cross-border transfer assessment</td><td class="px-4 py-3">Our data lives in <code class="inline">ap-southeast-1</code> (Singapore), so Vietnamese patients' data leaves Vietnam</td><td class="px-4 py-3">Keep an accurate list of regions and sub-processors (AWS, the SMS provider, Slack for alert messages); keeping telemetry in AWS <code class="inline">ap-southeast-1</code> keeps that list short</td></tr>
             <tr><td class="px-4 py-3 font-semibold">Breach notification (72 hours under Decree 13)</td><td class="px-4 py-3">The client must notify the authority quickly after discovering a breach</td><td class="px-4 py-3">Detection and a CloudTrail timeline fast enough to support it (<a href="./se1.html" class="text-viol underline decoration-viol/40">SE1</a>)</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Data subject rights</td><td class="px-4 py-3">Patients can ask to access, correct or delete their data</td><td class="px-4 py-3">Know every copy: backups, log archives, analytics exports, Datadog logs</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Data subject rights</td><td class="px-4 py-3">Patients can ask to access, correct or delete their data</td><td class="px-4 py-3">Know every copy: backups, log archives, analytics exports, CloudWatch Logs and X-Ray traces</td></tr>
           </tbody>
         </table>
       </div>
@@ -209,9 +209,13 @@ flowchart LR
   encryption: KMS key alias/clinic-prod-rds, TLS in transit
   access: booking-api task role; 3 DBAs via IAM auth (reviewed quarterly)
   backups: AWS Backup, 35 days, copy to ap-southeast-2
-- processor: Datadog (logs, APM)
+- store: telemetry (CloudWatch Logs, X-Ray, AMP, Managed Grafana)
   data: [request metadata, patient.id only; names scrubbed by log pipeline]
-  location: Datadog US1 site
+  location: AWS ap-southeast-1 (Singapore)                       <span class="cm"># same region as the database</span>
+  retention: app logs 90 days, X-Ray traces 30 days
+- processor: Slack (alarm notifications via Amazon Q Developer)
+  data: [alarm name, service, metric value; never patient data]
+  location: per the workspace's Slack data residency setting
   contract: DPA signed 2026-02-11
 - processor: SMS provider
   data: [patient phone, appointment time]
@@ -533,7 +537,7 @@ gh pr list --repo golden-owl/clinic-infra --state merged --base main --limit 500
             <tr><td class="px-4 py-3 font-semibold">Config history</td><td class="px-4 py-3"><code class="inline">gol-log-archive</code> S3</td><td class="px-4 py-3">Config console (7 years by default)</td><td class="px-4 py-3">400 days in S3</td><td class="px-4 py-3">State of a resource on a past date</td></tr>
             <tr><td class="px-4 py-3 font-semibold">VPC Flow Logs, ALB access logs</td><td class="px-4 py-3"><code class="inline">gol-log-archive</code> S3</td><td class="px-4 py-3">30 days via Athena</td><td class="px-4 py-3">400 days</td><td class="px-4 py-3">Network forensics; contain client IPs</td></tr>
             <tr><td class="px-4 py-3 font-semibold">RDS audit (pgaudit) logs</td><td class="px-4 py-3">CloudWatch Logs, exported to S3</td><td class="px-4 py-3">30 days</td><td class="px-4 py-3">400 days</td><td class="px-4 py-3">Who queried patient tables</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Application logs (<code class="inline">booking-api</code>)</td><td class="px-4 py-3">CloudWatch / Loki / Datadog (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>)</td><td class="px-4 py-3">14–30 days</td><td class="px-4 py-3">90 days</td><td class="px-4 py-3">May contain personal data: shortest that works</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Application logs (<code class="inline">booking-api</code>)</td><td class="px-4 py-3">CloudWatch Logs, or Loki on EKS (<a href="./ob1.html" class="text-viol underline decoration-viol/40">OB1</a>)</td><td class="px-4 py-3">14–30 days</td><td class="px-4 py-3">90 days</td><td class="px-4 py-3">May contain personal data: shortest that works</td></tr>
           </tbody>
         </table>
       </div>
@@ -632,7 +636,7 @@ USER    c4f8a2b9-1071-7085-d2a6-0e3b5c7f9a12</span>
             <tr><td class="px-4 py-3 font-semibold">GitHub org</td><td class="px-4 py-3">Members, outside collaborators, team membership, ruleset bypass list</td><td class="px-4 py-3">Bypass actors on <code class="inline">main</code>; departed contractors</td></tr>
             <tr><td class="px-4 py-3 font-semibold">EKS</td><td class="px-4 py-3">Access entries and their policies (<a href="./ks7.html" class="text-viol underline decoration-viol/40">KS7</a>)</td><td class="px-4 py-3"><code class="inline">AmazonEKSClusterAdminPolicy</code> holders</td></tr>
             <tr><td class="px-4 py-3 font-semibold">RDS Postgres</td><td class="px-4 py-3"><code class="inline">pg_roles</code> with login</td><td class="px-4 py-3">Human logins that can read patient tables</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Third parties</td><td class="px-4 py-3">Datadog users, paging tool, SMS provider console</td><td class="px-4 py-3">Shared logins, users who left</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">Third parties</td><td class="px-4 py-3">Slack workspace and alert-channel members, paging tool, SMS provider console</td><td class="px-4 py-3">Shared logins, users who left</td></tr>
           </tbody>
         </table>
       </div>

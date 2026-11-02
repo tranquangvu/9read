@@ -195,7 +195,7 @@ const DEVOPS_MODULES = [
   { code: "KS15", name: "Production Kubernetes: Access, Debugging & Fixing Live Issues", critical: true, level: 2 },
   { code: "OB1", name: "Monitoring on AWS with CloudWatch", critical: true, level: 2 },
   { code: "OB2", name: "Prometheus, Grafana & Loki", critical: true, level: 2 },
-  { code: "OB3", name: "Datadog: Infrastructure, APM & Logs", critical: true, level: 2 },
+  { code: "OB3", name: "AWS-native APM: Application Signals, X-Ray & Managed Grafana", critical: true, level: 2 },
   { code: "OB4", name: "OpenTelemetry & Distributed Tracing", critical: true, level: 2 },
   { code: "SR1", name: "SLIs, SLOs, Error Budgets & Alerting", critical: true, level: 2 },
   { code: "SR2", name: "Incident Management, On-call & Postmortems", critical: true, level: 2 },
@@ -267,7 +267,7 @@ const TOPICS = [
     blurb:
       "A level-by-level path from someone who has never run a server to a senior DevOps engineer on AWS: " +
       "Linux and networking, core AWS, Terraform, GitHub Actions, ECS and a deep Kubernetes/EKS track, " +
-      "observability with CloudWatch, Prometheus and Datadog, SRE, security and architecture leadership.",
+      "AWS-native observability with OpenTelemetry, CloudWatch, X-Ray and Managed Grafana, SRE, security and architecture leadership.",
     meta: `${DEVOPS_MODULES.length} modules`,
     tags: DEVOPS_GROUPS.map((g) => g.name),
     accent: "#EA580C",
