@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""qa_devops.py — structural + density QA for the DevOps Engineer Career Track (devops/).
+"""qa_devops.py — structural + density QA for the DevOps Mastery (devops/).
 
 Read-only. Exits non-zero on any FAIL. Normally invoked through qa.py:
 
@@ -140,7 +140,7 @@ def check_page(path: Path, mods: dict) -> None:
     if items and ("font-semibold" not in items[-1][0] or "(mentor evidence ✓)" not in items[-1][1]):
         fail(page, "last checklist item must be font-semibold and end '(mentor evidence ✓)'")
 
-    if f"DevOps Engineer Career Track · {page.upper()} " not in html:
+    if f"DevOps Mastery · {page.upper()} " not in html:
         fail(page, "footer mismatch — rebuild with devops_build.py")
 
     for t in set(re.findall(r'href="\./(\w+)\.html"', html)):

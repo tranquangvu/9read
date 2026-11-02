@@ -1,7 +1,7 @@
 # Clinic platform lab kit
 
 A small, runnable stand-in for the clinic booking platform used by every hands-on lab in the
-DevOps Engineer Career Track (`devops/`). It is deliberately framework-free so the infrastructure,
+DevOps Mastery (`devops/`). It is deliberately framework-free so the infrastructure,
 not the app, is what you learn.
 
 | Path | What it is |
