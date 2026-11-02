@@ -1,4 +1,4 @@
-// booking-api — lab stand-in for the clinic booking API (DevOps Career Track lab kit).
+// booking-api — lab stand-in for the clinic booking API (DevOps Mastery lab kit).
 // Plain Node 22, no framework. Runs with or without Postgres/SQS so every lab can use it.
 //   PORT=8080  DATABASE_URL=postgres://...  QUEUE_URL=https://sqs...  APP_VERSION=1.0.0
 import http from "node:http";

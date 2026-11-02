@@ -139,7 +139,7 @@ const INTERN_MODULES = [
   { code: "PP3", name: "Communication & Collaboration", critical: true },
 ];
 
-/* ---------- DevOps Engineer Career Track ---------- */
+/* ---------- DevOps Mastery ---------- */
 const DEVOPS_GROUPS = [
   { key: "FN", name: "Foundations", color: "#2563EB" },
   { key: "AW", name: "AWS Core Services", color: "#EA580C" },
@@ -262,7 +262,7 @@ const TOPICS = [
   },
   {
     slug: "devops",
-    name: "DevOps Engineer Career Track",
+    name: "DevOps Mastery",
     tagline: "AWS · zero to senior",
     blurb:
       "A level-by-level path from someone who has never run a server to a senior DevOps engineer on AWS: " +

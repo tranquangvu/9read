@@ -1,4 +1,4 @@
-# DEVOPS-SPEC.md — DevOps Engineer Career Track module contract
+# DEVOPS-SPEC.md — DevOps Mastery module contract
 
 The third program on the site (`devops/`). Pages use the same markup vocabulary as AIFDE and the
 internship, so everything in `PATTERNS.md` applies. The page shape is the internship shape from
