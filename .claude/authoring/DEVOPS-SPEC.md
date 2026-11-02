@@ -13,8 +13,8 @@ documents disagree, this one wins for `devops/`.
   an L0 page defines every term; an L3 page assumes L0–L2 and argues trade-offs.
 - Company stack is fixed. Never present an alternative as the default:
   **AWS** (region `ap-southeast-1`), **Terraform** for IaC, **GitHub Actions** for CI/CD,
-  **ECS on Fargate and EKS** for containers, **CloudWatch + Prometheus/Grafana/Loki + Datadog** for
-  observability (OpenTelemetry as the instrumentation layer that feeds them), **Argo CD** for GitOps,
+  **ECS on Fargate and EKS** for containers, **CloudWatch, X-Ray/Application Signals, Amazon Managed Prometheus and Amazon Managed Grafana** for
+  observability (OpenTelemetry/ADOT as the instrumentation layer that feeds them; no commercial APM), **Argo CD** for GitOps,
   **Helm** for packaging. Mention alternatives (CDK, GitLab, Flux, Pulumi…) in one line at most.
 - Teach operational judgement: *what* it is, *why* it exists, *how it fails in production*, *how to
   verify it*. Every topic should leave the reader able to review a Terraform plan / manifest / pipeline
@@ -92,7 +92,7 @@ Gateway API `v1`; Argo CD 3.x; Helm 3; GitHub Actions authenticating to AWS via 
 8. `Resources`: 5–8 links, official docs only (`docs.aws.amazon.com`, `aws.amazon.com/blogs`,
    `developer.hashicorp.com`, `registry.terraform.io`, `kubernetes.io`, `docs.github.com`,
    `argo-cd.readthedocs.io`, `docs.docker.com`, `boto3.amazonaws.com`, `docs.ansible.com`, `backstage.io`, `docs.claude.com`, `karpenter.sh`, `helm.sh`, `prometheus.io`, `grafana.com/docs`,
-   `docs.datadoghq.com`, `opentelemetry.io`, `sre.google`, `dora.dev`, `github.com/<org>` READMEs; for FN7 also
+   `aws-otel.github.io`, `opentelemetry.io`, `sre.google`, `dora.dev`, `github.com/<org>` READMEs; for FN7 also
    `documentation.ubuntu.com` and `restic.readthedocs.io`).
 
 No lab cards, no `<dialog>`, no "In the field" section.
@@ -229,9 +229,9 @@ Each module owns the topics listed. A neighbour writes one sentence and a link.
 | KS12 | Kubernetes API extension model, CRDs, controllers and reconcile loops, operators (when to adopt vs build), Kubebuilder/controller-runtime basics, admission webhooks, ACK (AWS Controllers for Kubernetes) and Crossplane for AWS resources |
 | KS13 | Service mesh concepts (sidecar vs ambient), Istio on EKS, mTLS, traffic splitting, retries/timeouts at the mesh, observability from the mesh, multi-cluster topologies (per-env, per-region), cross-cluster service discovery, when not to adopt a mesh |
 | OB1 | Three pillars and the observability vs monitoring distinction, CloudWatch metrics/dimensions/namespaces, Logs and Logs Insights, metric filters, alarms and composite alarms, dashboards, Container Insights for ECS/EKS, X-Ray / Application Signals, log retention and cost |
-| OB2 | Prometheus data model and pull model, exporters, PromQL (rate, histogram_quantile, aggregation), recording and alerting rules, Alertmanager routing, kube-prometheus-stack on EKS, Amazon Managed Prometheus/Grafana, Grafana dashboards-as-code, Loki for logs (LogQL), cardinality control |
-| OB3 | Datadog agent on EC2/ECS/EKS, integrations (AWS), infrastructure metrics, APM and service map, log pipelines and indexes, monitors and SLO objects, dashboards, tagging strategy (`env`, `service`, `version`), Datadog cost drivers, when we use Datadog vs the OSS stack |
-| OB4 | OpenTelemetry concepts (signals, SDKs, auto-instrumentation, context propagation, semantic conventions), the Collector (receivers/processors/exporters), ADOT on EKS/ECS, sampling (head vs tail), exporting the same telemetry to CloudWatch, Prometheus/Tempo and Datadog, trace-log-metric correlation |
+| OB2 | Prometheus data model and pull model, exporters, PromQL (rate, histogram_quantile, aggregation), recording and alerting rules, Alertmanager routing, kube-prometheus-stack on EKS, Amazon Managed Prometheus/Grafana (Grafana workspace setup → OB3), Grafana dashboards-as-code, Loki for logs (LogQL), cardinality control |
+| OB3 | AWS-native APM: what replaces a commercial APM, the reference architecture (OTel → CloudWatch agent/ADOT → X-Ray/Transaction Search, CloudWatch, AMP, CloudWatch Logs → Application Signals + Managed Grafana), the resource-attribute contract (`service.name`, `deployment.environment`, `service.version`, `aws.log.group.names`), enabling Application Signals on ECS (sidecar, ESM apps) and EKS (`amazon-cloudwatch-observability` add-on), Latency/Fault/Error at service/operation/dependency level, Transaction Search and `aws/spans`, X-Ray sampling rules, trace↔log correlation, Managed Grafana workspace and dashboards as code, alarms on ApplicationSignals metrics, SNS → Amazon Q Developer in chat applications (Slack) with read-only guardrails, Synthetics and RUM, telemetry cost drivers and guardrails, migrating off a commercial APM. OB1 keeps CloudWatch basics; SR1 keeps SLO maths |
+| OB4 | OpenTelemetry concepts (signals, SDKs, auto-instrumentation, context propagation, semantic conventions), the Collector (receivers/processors/exporters), ADOT on EKS/ECS, sampling (head vs tail), exporting the same telemetry to X-Ray/CloudWatch, AMP and self-run Prometheus/Tempo, trace-log-metric correlation |
 | SR1 | SRE principles, SLI selection per service type, SLO maths and windows, error budgets and policies, burn-rate alerting (multi-window), alert design (symptoms not causes, actionability), golden signals / RED / USE |
 | SR2 | Incident lifecycle and severity levels, incident commander and roles, comms templates and status pages, on-call rotations and handoffs, runbooks, PagerDuty/Opsgenie style escalation, blameless postmortems with timeline and action items, toil reduction |
 | SR3 | Failure modes on AWS, multi-AZ design, RTO/RPO, DR strategies (backup-restore, pilot light, warm standby, multi-site active-active), AWS Backup, cross-region replication, game days and chaos engineering with AWS FIS, dependency failure handling at the infra level |

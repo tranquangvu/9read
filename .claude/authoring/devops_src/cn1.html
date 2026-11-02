@@ -401,9 +401,10 @@ flowchart LR
       <h3 class="font-semibold text-lg mt-8">FireLens when logs need to go somewhere else too</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
         <strong>FireLens</strong> adds a Fluent Bit sidecar to the task (the AWS for Fluent Bit image) and routes your
-        container's output through it. Use it when logs must reach more than CloudWatch, for example Datadog for the clinic
-        client's on-call team (<a href="./ob3.html" class="text-viol underline decoration-viol/40">OB3</a>), or when you
-        want to filter debug noise before paying to ingest it.
+        container's output through it. Use it when logs must reach more than CloudWatch Logs, for example a copy in an S3
+        bucket in <code class="inline">gol-log-archive</code> through Amazon Data Firehose for long retention and Athena
+        queries, or an OpenSearch domain for full-text search, or when you want to filter debug noise before paying to
+        ingest it.
       </p>
       <div class="mt-4 overflow-x-auto rounded-xl border border-line dark:border-linedark">
         <table class="w-full text-sm bg-card dark:bg-carddark">
@@ -411,26 +412,49 @@ flowchart LR
             <th class="px-4 py-3">Need</th><th class="px-4 py-3">awslogs</th><th class="px-4 py-3">FireLens (Fluent Bit)</th></tr></thead>
           <tbody class="divide-y divide-line dark:divide-linedark align-top">
             <tr><td class="px-4 py-3 font-semibold">CloudWatch only</td><td class="px-4 py-3">Yes: simplest, no sidecar</td><td class="px-4 py-3">Works, but extra moving part</td></tr>
-            <tr><td class="px-4 py-3 font-semibold">Datadog, Loki, S3, several at once</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Yes: one output block each</td></tr>
+            <tr><td class="px-4 py-3 font-semibold">S3 via Firehose, OpenSearch, Loki, several at once</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Yes: one output block each</td></tr>
             <tr><td class="px-4 py-3 font-semibold">Drop or redact lines before shipping</td><td class="px-4 py-3">No</td><td class="px-4 py-3">Yes: grep/modify filters</td></tr>
             <tr><td class="px-4 py-3 font-semibold">Extra cost</td><td class="px-4 py-3">None</td><td class="px-4 py-3">Sidecar CPU/memory (~0.1 vCPU, 128 MB per task)</td></tr>
           </tbody>
         </table>
       </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        The <code class="inline">awsfirelens</code> log driver's options describe a single output. For two destinations,
+        put the outputs in a Fluent Bit config file instead. On Fargate the only supported config source is
+        <code class="inline">file</code>, so bake the file into a small image built from AWS for Fluent Bit.
+      </p>
+      <div class="mt-4">
+        <span class="code-label">clinic-app/log-router/extra.conf — copied into the log_router image</span>
+        <pre class="code">[OUTPUT]
+    Name              cloudwatch_logs
+    Match             *
+    region            ap-southeast-1
+    log_group_name    /ecs/clinic-prod/booking-api
+    log_stream_prefix api/
+    retry_limit       2
+[OUTPUT]
+    Name              kinesis_firehose            <span class="cm"># Firehose delivers to S3 in gol-log-archive</span>
+    Match             *
+    region            ap-southeast-1
+    delivery_stream   clinic-prod-app-logs
+    retry_limit       2</pre>
+      </div>
       <div class="mt-4">
         <span class="code-label">booking-api task definition — FireLens excerpt</span>
         <pre class="code">{ "name": "log_router", "essential": true,
-  "image": "public.ecr.aws/aws-observability/aws-for-fluent-bit:stable",   <span class="cm"># pin a version tag in prod</span>
-  "firelensConfiguration": { "type": "fluentbit" },
+  "image": "111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/clinic/log-router:1.0.0",   <span class="cm"># FROM aws-for-fluent-bit + extra.conf</span>
+  "firelensConfiguration": { "type": "fluentbit",
+    "options": { "config-file-type": "file", "config-file-value": "/extra.conf" } },
   "memoryReservation": 64 },
 { "name": "api",
-  "logConfiguration": {
-    "logDriver": "awsfirelens",
-    "options": { "Name": "datadog", "Host": "http-intake.logs.datadoghq.com", "TLS": "on",
-                 "dd_service": "booking-api", "dd_source": "nodejs", "dd_tags": "env:prod" },
-    "secretOptions": [{ "name": "apikey", "valueFrom": "arn:aws:secretsmanager:…:clinic/prod/datadog-api-key-Ab12Cd" }]
-  } }</pre>
+  "logConfiguration": { "logDriver": "awsfirelens" } }   <span class="cm"># no options: outputs live in extra.conf</span></pre>
       </div>
+      <p class="mt-3 text-[15px] leading-relaxed">
+        Fluent Bit calls CloudWatch Logs and Firehose itself, so the <strong>task role</strong> (not the execution role)
+        needs <code class="inline">logs:CreateLogStream</code>, <code class="inline">logs:PutLogEvents</code> and
+        <code class="inline">firehose:PutRecordBatch</code> on those two resources. Send the <code class="inline">log_router</code>
+        container's own output to <code class="inline">awslogs</code>, so a broken config still leaves you an error to read.
+      </p>
 
       <h3 class="font-semibold text-lg mt-8">ECS Exec, and what changes with a distroless image</h3>
       <p class="mt-2 text-[15px] leading-relaxed">
