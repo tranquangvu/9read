@@ -163,6 +163,7 @@ const DEVOPS_MODULES = [
   { code: "FN4", name: "Git Workflows for Infrastructure Teams", critical: true, level: 0 },
   { code: "FN5", name: "Bash & Python Automation", critical: true, level: 0 },
   { code: "FN6", name: "Containers in Depth with Docker", critical: true, level: 0 },
+  { code: "FN7", name: "Self-hosted Servers: Ubuntu, Docker & Shared SSH Access", critical: true, level: 1 },
   { code: "AW1", name: "AWS Accounts, IAM & Identity Center", critical: true, level: 1 },
   { code: "AW2", name: "VPC Networking", critical: true, level: 1 },
   { code: "AW3", name: "EC2, Auto Scaling & Load Balancers", critical: true, level: 1 },
